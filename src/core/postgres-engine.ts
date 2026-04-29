@@ -324,21 +324,22 @@ export class PostgresEngine implements BrainEngine {
     const limit = filters?.limit || 100;
     const offset = filters?.offset || 0;
     const updatedAfter = filters?.updated_after;
+    const createdAfter = filters?.created_after;
 
     // postgres.js sql.unsafe is awkward for conditional WHERE; use raw query branching.
-    // The 4 dimensions (type, tag, updated_after, none) cross-product into 8 cases;
-    // we use postgres.js's tagged-template chaining via sql`` fragments instead.
+    // We use postgres.js's tagged-template chaining via sql`` fragments instead.
 
     // Build conditions with sql fragments. postgres.js supports fragment composition.
     const typeCondition = filters?.type ? sql`AND p.type = ${filters.type}` : sql``;
     const tagJoin = filters?.tag ? sql`JOIN tags t ON t.page_id = p.id` : sql``;
     const tagCondition = filters?.tag ? sql`AND t.tag = ${filters.tag}` : sql``;
     const updatedCondition = updatedAfter ? sql`AND p.updated_at > ${updatedAfter}::timestamptz` : sql``;
+    const createdCondition = createdAfter ? sql`AND p.created_at >= ${createdAfter}::timestamptz` : sql``;
 
     const rows = await sql`
       SELECT p.* FROM pages p
       ${tagJoin}
-      WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition}
+      WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${createdCondition}
       ORDER BY p.updated_at DESC LIMIT ${limit} OFFSET ${offset}
     `;
 
@@ -427,6 +428,11 @@ export class PostgresEngine implements BrainEngine {
       params.push(symbolKind);
       symbolKindClause = `AND cc.symbol_type = $${params.length}`;
     }
+    let sinceClause = '';
+    if (opts?.since) {
+      params.push(opts.since.toISOString());
+      sinceClause = `AND p.created_at >= $${params.length}::timestamptz`;
+    }
     params.push(innerLimit);
     const innerLimitParam = `$${params.length}`;
     params.push(limit);
@@ -449,6 +455,7 @@ export class PostgresEngine implements BrainEngine {
           ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
           ${languageClause}
           ${symbolKindClause}
+          ${sinceClause}
           ${hardExcludeClause}
         ORDER BY score DESC
         LIMIT ${innerLimitParam}
@@ -529,6 +536,11 @@ export class PostgresEngine implements BrainEngine {
       params.push(symbolKind);
       symbolKindClause = `AND cc.symbol_type = $${params.length}`;
     }
+    let sinceClause = '';
+    if (opts?.since) {
+      params.push(opts.since.toISOString());
+      sinceClause = `AND p.created_at >= $${params.length}::timestamptz`;
+    }
     params.push(limit);
     const limitParam = `$${params.length}`;
     params.push(offset);
@@ -549,6 +561,7 @@ export class PostgresEngine implements BrainEngine {
         ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
         ${languageClause}
         ${symbolKindClause}
+        ${sinceClause}
         ${hardExcludeClause}
       ORDER BY score DESC
       LIMIT ${limitParam}
@@ -613,6 +626,11 @@ export class PostgresEngine implements BrainEngine {
       params.push(symbolKind);
       symbolKindClause = `AND cc.symbol_type = $${params.length}`;
     }
+    let sinceClause = '';
+    if (opts?.since) {
+      params.push(opts.since.toISOString());
+      sinceClause = `AND p.created_at >= $${params.length}::timestamptz`;
+    }
     params.push(innerLimit);
     const innerLimitParam = `$${params.length}`;
     params.push(limit);
@@ -635,6 +653,7 @@ export class PostgresEngine implements BrainEngine {
           ${excludeSlugsClause}
           ${languageClause}
           ${symbolKindClause}
+          ${sinceClause}
           ${hardExcludeClause}
         ORDER BY cc.embedding <=> $1::vector
         LIMIT ${innerLimitParam}

@@ -294,6 +294,10 @@ export class PGLiteEngine implements BrainEngine {
       params.push(filters.updated_after);
       where.push(`p.updated_at > $${params.length}::timestamptz`);
     }
+    if (filters?.created_after) {
+      params.push(filters.created_after);
+      where.push(`p.created_at >= $${params.length}::timestamptz`);
+    }
 
     const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
     params.push(limit, offset);
@@ -373,6 +377,10 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.symbolKind);
       extraFilter += ` AND cc.symbol_type = $${params.length}`;
     }
+    if (opts?.since) {
+      params.push(opts.since.toISOString());
+      extraFilter += ` AND p.created_at >= $${params.length}::timestamptz`;
+    }
 
     const { rows } = await this.db.query(
       `WITH ranked AS (
@@ -442,6 +450,10 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.symbolKind);
       extraFilter += ` AND cc.symbol_type = $${params.length}`;
     }
+    if (opts?.since) {
+      params.push(opts.since.toISOString());
+      extraFilter += ` AND p.created_at >= $${params.length}::timestamptz`;
+    }
 
     const { rows } = await this.db.query(
       `SELECT
@@ -498,6 +510,10 @@ export class PGLiteEngine implements BrainEngine {
     if (opts?.symbolKind) {
       params.push(opts.symbolKind);
       extraFilter += ` AND cc.symbol_type = $${params.length}`;
+    }
+    if (opts?.since) {
+      params.push(opts.since.toISOString());
+      extraFilter += ` AND p.created_at >= $${params.length}::timestamptz`;
     }
 
     const { rows } = await this.db.query(

@@ -45,6 +45,8 @@ export interface PageFilters {
   offset?: number;
   /** ISO date string (YYYY-MM-DD or full ISO timestamp). Filter to pages updated_at > value. */
   updated_after?: string;
+  /** ISO date string (YYYY-MM-DD or full ISO timestamp). Filter to pages created_at >= value. */
+  created_after?: string;
 }
 
 // Chunks
@@ -180,6 +182,13 @@ export interface SearchOpts {
    * undefined to search all sources.
    */
   sourceId?: string;
+  /**
+   * Filter to pages created_at >= since. Use parseSince() to convert
+   * `--since 7d` / `2w` / ISO-date strings into a Date. The threshold is
+   * inclusive on the lower bound (recent-week queries shouldn't drop the
+   * page added exactly seven days ago).
+   */
+  since?: Date;
 }
 
 /**
