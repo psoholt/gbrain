@@ -32,6 +32,8 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { writeReceipt } from '../extract/receipt-writer.ts';
+import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { parseFactsFence } from '../facts-fence.ts';
 import { extractFactsFromFenceText } from '../facts/extract-from-fence.ts';
 import {
@@ -40,6 +42,7 @@ import {
   type PhantomPassResult,
 } from './phantom-redirect.ts';
 import { embed, isAvailable } from '../ai/gateway.ts';
+import { isAborted } from '../abort-check.ts';
 
 export interface ExtractFactsOpts {
   /** Subset of slugs to reconcile. undefined = walk every page in the brain. */
@@ -57,6 +60,13 @@ export interface ExtractFactsOpts {
    * standard fence-reconcile loop).
    */
   brainDir?: string;
+  /**
+   * #1972: cooperative-abort signal. Checked at the top of the per-page loop,
+   * threaded into the phantom-redirect pass's lock-retry + phantom loop, and
+   * forwarded to the per-page batch embed — so a long extract_facts bails well
+   * under the worker's 30s force-evict instead of running to completion.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ExtractFactsResult {
@@ -139,6 +149,7 @@ export async function runExtractFacts(
         opts.brainDir,
         sourceId,
         opts.dryRun ?? false,
+        opts.signal,
       );
     } catch (e) {
       // The pass owns its own per-phantom try/catch; reaching this catch
@@ -186,6 +197,10 @@ export async function runExtractFacts(
 
   // ── Reconcile each page ───────────────────────────────────────
   for (const slug of slugs) {
+    // #1972: bail at the top of the per-page loop on abort. Each page is an
+    // independent delete-then-insert commit, so breaking leaves a consistent
+    // partial state; the receipt/rollup below still runs with partial counts.
+    if (isAborted(opts.signal)) break;
     result.pagesScanned += 1;
 
     const page = await engine.getPage(slug, { sourceId });
@@ -207,10 +222,15 @@ export async function runExtractFacts(
 
     if (opts.dryRun) continue;
 
-    // Wipe-and-reinsert per page. The deleteFactsForPage call targets
-    // source_markdown_slug = slug only, so NULL-source_markdown_slug
-    // legacy rows survive (the partial-UNIQUE-index keyspace).
-    const deleted = await engine.deleteFactsForPage(slug, sourceId);
+    // Wipe-and-reinsert per page. The delete targets source_markdown_slug =
+    // slug only, so NULL-source_markdown_slug legacy rows survive (the
+    // partial-UNIQUE-index keyspace). #1928: `cli:`-origin facts (conversation
+    // facts from extract-conversation-facts) are NOT fence-owned — the page
+    // carries no `## Facts` fence to recreate them — so they MUST survive this
+    // reconcile. Exclude them from the wipe.
+    const deleted = await engine.deleteFactsForPage(slug, sourceId, {
+      excludeSourcePrefixes: ['cli:'],
+    });
     result.factsDeleted += deleted.deleted;
 
     if (parsed.facts.length === 0) continue;
@@ -233,7 +253,9 @@ export async function runExtractFacts(
     if (isAvailable('embedding') && extracted.length > 0) {
       try {
         const texts = extracted.map(e => e.fact);
-        const embeddings = await embed(texts);
+        // #1972: forward the abort signal so a cancelled cycle's in-flight
+        // batch embed (a network call) is itself abortable, not just the loop.
+        const embeddings = await embed(texts, { abortSignal: opts.signal });
         // Defensive: embed should return one vector per input; if the
         // gateway returns a partial array (provider partial-batch retry
         // returning fewer than requested), only fill what we have.
@@ -251,6 +273,38 @@ export async function runExtractFacts(
 
     const inserted = await engine.insertFacts(extracted, { source_id: sourceId }); // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
     result.factsInserted += inserted.inserted;
+  }
+
+  // v0.42 Wave B3: receipt + rollup. extract_facts is deterministic
+  // (fence reconcile, no LLM cost); receipt only when facts were
+  // actually inserted; rollup always fires.
+  if (!opts.dryRun && result.factsInserted > 0) {
+    const runId = `efacts-${Date.now().toString(36)}-${sourceId.slice(0, 4)}`;
+    try {
+      await writeReceipt(engine, {
+        kind: 'facts.fence',
+        source_id: sourceId,
+        run_id: runId,
+        round: 'single',
+        extracted_at: new Date().toISOString(),
+        total_rows: result.factsInserted,
+        cost_usd: 0,
+        summary:
+          `Reconciled ${result.factsInserted} facts (and deleted ${result.factsDeleted}) ` +
+          `across ${result.pagesScanned} scanned pages.`,
+      });
+    } catch (err) {
+      console.error(`[extract_facts] receipt write failed: ${(err as Error).message}`);
+    }
+  }
+  if (!opts.dryRun) {
+    await upsertExtractRollup(engine, {
+      kind: 'facts.fence',
+      source_id: sourceId,
+      cost_delta: 0,
+      round_completed_delta: result.guardTriggered ? 0 : 1,
+      halt_delta: result.guardTriggered ? 1 : 0,
+    });
   }
 
   return result;

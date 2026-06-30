@@ -79,9 +79,9 @@ SEED_ELAPSED=$((SECONDS - SEED_START))
 echo "[fm_wallclock] fixture seeded in ${SEED_ELAPSED}s" | tee -a "$LOG"
 
 # Step 2: init brain + register the source.
-# --no-embedding: this test only seeds markdown and runs `gbrain doctor`; it
-# never embeds. Since gbrain v0.41 `init` fail-loud requires an embedding
-# provider unless deferred, and CI has no provider key set — so defer it.
+# `--no-embedding` opts out of the embedding-provider hard-require (v0.37 D9).
+# This script measures doctor's frontmatter-scan wallclock — it never embeds —
+# so the CI runner doesn't need OPENAI_API_KEY / ZEROENTROPY_API_KEY / VOYAGE_API_KEY.
 echo "[fm_wallclock] init brain..." | tee -a "$LOG"
 timeout 120s bun run src/cli.ts init --pglite --yes --no-embedding >> "$LOG" 2>&1 || {
   echo "[fm_wallclock] FAIL: gbrain init exited non-zero" >&2

@@ -129,7 +129,10 @@ describe('createAuditWriter — log()', () => {
     await withEnv({ GBRAIN_AUDIT_DIR: dir }, async () => {
       const writer = createAuditWriter<TestEvent>({ featureName: 'ts-override' });
       writer.log({ ts: fixedTs, message: 'pinned' });
-      const file = path.join(dir, writer.computeFilename());
+      // Events route to the ISO-week file for their OWN ts (so back-dated
+      // events stay readable by readRecent that walks by event week).
+      // Compute the file path using the event's ts, not wall-clock now.
+      const file = path.join(dir, writer.computeFilename(new Date(fixedTs)));
       const content = fs.readFileSync(file, 'utf8');
       const row = JSON.parse(content.trim());
       expect(row.ts).toBe(fixedTs);
@@ -209,7 +212,12 @@ describe('createAuditWriter — log()', () => {
 describe('createAuditWriter — readRecent()', () => {
   it('returns events from current week, filtered by ts cutoff', async () => {
     const dir = makeDir();
-    const now = new Date('2026-05-22T12:00:00Z');
+    // v0.41.6.0: use real `now` (not a hardcoded UTC date) so the writer
+    // (which uses real Date.now() to pick the per-week filename) lands
+    // events in the same ISO-week file that readRecent walks. The
+    // pre-existing hardcoded `2026-05-22T12:00:00Z` fixture broke when
+    // the machine clock moved past that week.
+    const now = new Date();
     await withEnv({ GBRAIN_AUDIT_DIR: dir }, async () => {
       const writer = createAuditWriter<TestEvent>({ featureName: 'read-current' });
 
@@ -219,21 +227,22 @@ describe('createAuditWriter — readRecent()', () => {
       const inWin2 = new Date(now.getTime() - 6 * 86400000).toISOString();
       const outOfWin = new Date(now.getTime() - 8 * 86400000).toISOString();
 
-      // Write all three directly to the file readRecent(now) reads (the
-      // current-week file relative to `now`). We can't use writer.log()
-      // here: log() always names the file from the REAL wall-clock week,
-      // not the event ts or the test's fixed `now`, so when the suite
-      // runs in a different ISO week than `now` the rows land in a file
-      // readRecent never reads. The ts-cutoff filter is what we're
-      // testing, not log()'s file placement (covered by the log() block
-      // above). Same direct-write pattern as the corrupt-JSON test below.
-      const file = path.join(dir, writer.computeFilename(now));
+      // Write events DIRECTLY to the file matching `now` (not via
+      // writer.log() which uses real `new Date()` for the filename).
+      // Pre-fix: writer.log() wrote to real-clock current-week file, but
+      // readRecent(now) read the test's mocked now's current/previous-week
+      // files — when real clock and mocked `now` were in different ISO
+      // weeks (which always happens at week boundaries), zero events
+      // overlapped and the test flaked. The second test in this describe
+      // (cross-week straddle) already used direct file writes for the
+      // previous-week event for the same reason.
+      const currentFile = path.join(dir, writer.computeFilename(now));
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(file, [
-        JSON.stringify({ ts: inWin1, message: 'in window 1' }),
-        JSON.stringify({ ts: inWin2, message: 'in window 2' }),
-        JSON.stringify({ ts: outOfWin, message: 'out of window' }),
-      ].join('\n') + '\n');
+      fs.appendFileSync(currentFile,
+        JSON.stringify({ ts: inWin1, message: 'in window 1' }) + '\n' +
+        JSON.stringify({ ts: inWin2, message: 'in window 2' }) + '\n' +
+        JSON.stringify({ ts: outOfWin, message: 'out of window' }) + '\n',
+      );
 
       const recent = writer.readRecent(7, now);
       expect(recent.length).toBe(2);
