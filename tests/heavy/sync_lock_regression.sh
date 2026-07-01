@@ -173,7 +173,15 @@ psql "$DATABASE_URL" -t -A -c "DELETE FROM gbrain_cycle_locks WHERE id = '$LOCK_
 # sync must acquire it, do its work, and complete (rc=0). Proves the lock
 # isn't stuck-held and a legitimate sync still works.
 FREE_OUT=$(mktemp -t sync-lock-free-XXXXXX)
-( bun run src/cli.ts sync --dir "$BRAIN_DIR" >"$FREE_OUT" 2>&1 ); FREE_RC=$?
+# Match Part A's flags. --repo is sync's canonical brain-dir flag (the older
+# --dir is silently ignored by sync's arg parser); --no-embed dodges the
+# embed-creds preflight (src/commands/sync.ts) that process.exit(1)s on CI
+# runners which don't pipe an embedding API key. Without both, this free sync
+# exits 1, and under `set -e` a bare `( ... ); FREE_RC=$?` aborts the script
+# before FREE_RC is captured — the Part B verdict never runs. Capture via
+# `|| FREE_RC=$?` so a nonzero sync is reported by the verdict below instead.
+FREE_RC=0
+( bun run src/cli.ts sync --repo "$BRAIN_DIR" --no-embed >"$FREE_OUT" 2>&1 ) || FREE_RC=$?
 if [ "$FREE_RC" = "0" ]; then
   echo "[sync_lock_regression] free-lock sync: rc=0 (acquired + completed)" | tee -a "$LOG"
 else
