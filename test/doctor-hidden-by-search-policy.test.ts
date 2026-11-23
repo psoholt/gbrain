@@ -1,3 +1,4 @@
+import { installFixtureChunks } from './helpers/page-projection.ts';
 /**
  * hidden_by_search_policy doctor check (issue #1777)
  *
@@ -14,6 +15,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { checkHiddenBySearchPolicy } from '../src/commands/doctor.ts';
@@ -53,11 +55,28 @@ async function seed(
         token_count: 4,
       });
     }
-    await engine.upsertChunks(slug, rows);
+    await installFixtureChunks(engine, slug, rows);
   }
 }
 
 beforeAll(async () => {
+  // Pin the embedding dim to 1536 BEFORE initSchema. basisEmbedding()
+  // hardcodes Float32Array(1536) vectors, but initSchema sizes vector
+  // columns from process-global gateway state (getEmbeddingDimensions(),
+  // default 1024 = Voyage). Whether this file passes therefore
+  // depended on which test files happened to run before it in the shard: a
+  // predecessor that leaves the gateway configured without dims (or a bare
+  // CI env) yields vector(1024) and every upsertChunks here dies with
+  // "expected 1024 dimensions, not 1536". Adding test files to the repo
+  // reshuffles the weight-packed shards, so unrelated PRs trip it (seen on
+  // #2800 CI, test (1)). Same fix + rationale as
+  // engine-find-trajectory.test.ts and cosine-rescore-column.test.ts, which
+  // document this exact class.
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: 1536,
+    env: { OPENAI_API_KEY: 'sk-test-hidden-by-search-policy' },
+  });
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -65,6 +84,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
+  resetGateway();
 });
 
 beforeEach(async () => {

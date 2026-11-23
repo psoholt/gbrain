@@ -127,9 +127,9 @@ you can use as a reference shape. The skillpack story for distributing
 your own resolvers across machines is covered in
 [skillpacks as scaffolding](skillpacks-as-scaffolding.md).
 
-## The compact list format (v0.41.7.0)
+## The compact list format
 
-GBrain's resolver parser used to require markdown tables:
+GBrain's resolver parser reads two dialects. Markdown tables:
 
 ```markdown
 | Trigger | Skill |
@@ -137,25 +137,19 @@ GBrain's resolver parser used to require markdown tables:
 | "gift idea" | `skills/gift-advisor/SKILL.md` |
 ```
 
-That's fine when you have 20 entries. It gets unwieldy at 200, and at 300
-it's unreadable. OpenClaw deployments quietly evolved a compact list
-format that scales better:
+Tables are fine at 20 entries, unwieldy at 200, unreadable at 300. The
+compact list format scales better:
 
 ```markdown
 - **gift-advisor**: gift idea | what should I bring | birthday gift
 - **flight-tracker**: track my flight | flight status | when does my flight land
 ```
 
-Before v0.41.7.0, `gbrain doctor` only spoke the table dialect. On a
-306-skill compact-format resolver, the doctor reported every skill as
-unreachable: **238 FAIL errors on every doctor run**. The parser was
-silently treating the compact dialect as zero skills.
-
-v0.41.7.0 ships dual-format support. The same `parseResolverEntries`
-function reads both table rows and list rows in the same file, with the
-v0.31.7 multi-resolver merge (skillpack `skills/RESOLVER.md` + workspace
-`../AGENTS.md`) folding everything into one unified view. Run `gbrain doctor`
-and the 238 FAILs collapse to 0.
+The same `parseResolverEntries` function reads table rows and list rows
+in the same file, with the multi-resolver merge (skillpack
+`skills/RESOLVER.md` + workspace `../AGENTS.md`) folding everything into
+one unified view, so a compact-format resolver is fully visible to
+`gbrain doctor`.
 
 ### The list-format contract
 
@@ -166,6 +160,10 @@ A few rules to keep the parser unambiguous:
   `Note`, `Convention`) are deliberately ignored. This is what stops prose
   bullets like `- **Note**: see [link]` from being mis-parsed as skill
   rows in real-world AGENTS.md files.
+- **In AGENTS.md, a list row needs its skill on disk.** AGENTS.md is the
+  agent's general instructions, so `- **memory**: search first` counts as a
+  routing row only when `skills/memory/SKILL.md` exists; otherwise it is a
+  prose bullet. List rows in `skills/RESOLVER.md` always count.
 - **The path always resolves to `skills/<name>/SKILL.md`.** An optional
   `→ \`skills/path\`` (or ASCII `->`) suffix is allowed for readability,
   but the parser strips it. For non-conventional paths (skills under
@@ -261,14 +259,12 @@ it checks the resolver, reads the matching SKILL.md, and executes.
 The doctor sweep tells you which skills don't have a routing path. Add a
 resolver entry for each one, re-run, repeat until the count is zero.
 
-## A lesson from the first version
+## Fix the tool, not the data
 
-I initially converted my resolver from a clean list format to a table
-format because the validator only spoke tables. That was wrong. When a
-tool fails against valid data, the right move is to fix the tool, not
-reshape the data. The list format was correct, compact, readable, easy
-to maintain. The parser needed to support both shapes. v0.41.7.0 is
-that fix.
+When a tool fails against valid data, the right move is to fix the tool,
+not reshape the data. A clean list-format resolver is correct, compact,
+readable, and easy to maintain; a validator that only understands one
+shape is the bug, and the parser accepts both shapes for that reason.
 
 The same principle applies everywhere in agent systems. Your SKILL.md is
 the source of truth. Your AGENTS.md is the source of truth. Your resolver
@@ -294,6 +290,50 @@ The architecture that gets you from 50 to 300 is different from the
 architecture that gets you from 10 to 50. That's normal. Systems that
 scale change shape. The important thing is that each tier preserves full
 capability. You're organizing, not deleting.
+
+## Plugin bundling is a curation decision
+
+Not every skill in `skills/` reaches downstream installs. The plugin
+manifest (`openclaw.plugin.json`) is the bundled set; everything else is a
+recorded exclusion in `skills/plugin-exclusions.json`, each with a reason.
+The two are test-pinned in both directions: every manifest skill is either
+bundled or a recorded exclusion, and no skill is both. Adding a skill to
+the tree does NOT ship it — bundling is an explicit decision, and an
+unbundled skill never reaches a downstream install. When you write a new
+skill, decide (and record) which side of that line it lives on.
+
+`bun run gate:skills` (`scripts/skills-commit-gate.sh`) is the per-commit gate
+for any change under `skills/`. It runs the conformance + resolver +
+plugin-manifest tests, `check-resolvable --strict`, the `skills.lock.json`
+regen + freshness check, and `check-skill-refs` in seconds — run it before
+committing a skills change so the membership/closure and `plugin.version`
+assertions fail locally instead of in CI.
+
+`check-skill-refs` fails on two things:
+
+- **A `gbrain` command that cannot run.** Every `gbrain <cmd>` in a code block
+  or inline span must be real (`gbrain embed refresh` fails with its
+  replacement). Paid commands go preview, user approval, then `--yes --max-usd <cap>`.
+- **A relative link that leaves `skills/`**, which dangles in every copied
+  skill. Link the protocol through `skills/conventions/agent-operator-protocol.md`
+  and other docs by absolute URL; `bun scripts/portable-skill-links.ts` rewrites
+  both (honoring `LLMS_REPO_BASE`). `skills/migrations/**` is exempt.
+
+## When a skill misroutes
+
+Treat a misroute like a failing test, because it becomes one. First
+reproduce it as a fixture in the skill's `routing-eval.jsonl` — the utterance
+that misrouted, with the expected skill (or `null`). Rewrite the misrouted
+utterance onto placeholder entities (`alice-example`, `acme-example`) before
+committing the fixture — same rule as skill-autobench; a routing fixture is a
+public artifact and must not carry a real contact or company name. Only then
+fix the cause:
+usually a trigger in the skill's frontmatter or its row in
+`skills/RESOLVER.md`. Regenerate the lock (`bun run
+scripts/generate-skills-manifest.ts`) and the llms bundles (`bun run
+build:llms`), verify with `gbrain check-resolvable --strict`, and ship it as
+a MICRO release. Downstream installs heal on their next upgrade — the fix
+travels with the skillpack, not with a support thread.
 
 ## Related
 

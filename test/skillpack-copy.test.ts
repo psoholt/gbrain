@@ -41,7 +41,12 @@ describe('walkSourceDir', () => {
 
     const items = walkSourceDir(src, '/some/dst');
     expect(items).toHaveLength(2);
-    expect(items.map(i => i.target).sort()).toEqual(['/some/dst/a.txt', '/some/dst/b.txt']);
+    // Build expectations with join(), the same way walkSourceDir builds targets,
+    // so they carry native separators (byte-identical on POSIX).
+    expect(items.map(i => i.target).sort()).toEqual([
+      join('/some/dst', 'a.txt'),
+      join('/some/dst', 'b.txt'),
+    ]);
   });
 
   it('walks nested directories recursively, mirroring structure', () => {
@@ -54,7 +59,11 @@ describe('walkSourceDir', () => {
     const items = walkSourceDir(src, '/dst');
     expect(items).toHaveLength(3);
     const targets = items.map(i => i.target).sort();
-    expect(targets).toEqual(['/dst/sub/deeper/low.txt', '/dst/sub/mid.txt', '/dst/top.txt']);
+    expect(targets).toEqual([
+      join('/dst', 'sub', 'deeper', 'low.txt'),
+      join('/dst', 'sub', 'mid.txt'),
+      join('/dst', 'top.txt'),
+    ]);
   });
 
   it('returns empty array for a non-existent source directory', () => {
@@ -93,6 +102,34 @@ describe('copyArtifacts — happy path', () => {
 
     expect(existsSync(join(dst, 'sub', 'nested.txt'))).toBe(true);
     expect(readFileSync(join(dst, 'sub', 'nested.txt'), 'utf-8')).toBe('N');
+  });
+
+  it('an inline-content item writes the content, not the source bytes (harness stub path)', () => {
+    const src = scratch('copy-src-');
+    const dst = scratch('copy-dst-');
+    writeFileSync(join(src, 'a.txt'), 'SOURCE BYTES');
+
+    const result = copyArtifacts([
+      { source: join(src, 'a.txt'), target: join(dst, 'a.txt'), content: 'RENDERED CONTENT' },
+      // The source-exists gate is skipped for content items — there is no read.
+      { source: join(src, 'ghost.txt'), target: join(dst, 'b.txt'), content: 'NO SOURCE NEEDED' },
+    ]);
+
+    expect(result.summary.wroteNew).toBe(2);
+    expect(readFileSync(join(dst, 'a.txt'), 'utf-8')).toBe('RENDERED CONTENT');
+    expect(readFileSync(join(dst, 'b.txt'), 'utf-8')).toBe('NO SOURCE NEEDED');
+  });
+
+  it('content items still refuse to overwrite an existing target', () => {
+    const src = scratch('copy-src-');
+    const dst = scratch('copy-dst-');
+    writeFileSync(join(src, 'a.txt'), 'SOURCE');
+    writeFileSync(join(dst, 'a.txt'), 'MINE');
+
+    const result = copyArtifacts([{ source: join(src, 'a.txt'), target: join(dst, 'a.txt'), content: 'RENDERED' }]);
+
+    expect(result.summary.skippedExisting).toBe(1);
+    expect(readFileSync(join(dst, 'a.txt'), 'utf-8')).toBe('MINE');
   });
 });
 
@@ -215,6 +252,38 @@ describe('copyArtifacts — canonical-path containment (harvest path)', () => {
     const dst = scratch('copy-dst-');
     const result = copyArtifacts(walkSourceDir(skillDir, dst), { confineRealpath: skillDir });
     expect(result.summary.wroteNew).toBe(1);
+    expect(readFileSync(join(dst, 'SKILL.md'), 'utf-8')).toBe('safe');
+  });
+
+  // Both sides of the containment check are realpathSync() output, so the
+  // prefix separator has to be the native one. A hardcoded '/' never matches
+  // a win32 realpath, which rejected EVERY source as path_traversal and made
+  // harvest a dead feature there. These two pin the fix from both directions:
+  // an in-root source is accepted, and the sibling-prefix guard the separator
+  // exists to provide still holds. Asserting only the first would pass equally
+  // well with the containment check deleted.
+  it('containment boundary holds with native separators (foo does not match foobar)', () => {
+    const harvestRoot = scratch('copy-harvest-');
+    const skillDir = join(harvestRoot, 'skills', 'foo');
+    const siblingDir = join(harvestRoot, 'skills', 'foobar');
+    mkdirSync(skillDir, { recursive: true });
+    mkdirSync(siblingDir, { recursive: true });
+    writeFileSync(join(siblingDir, 'SKILL.md'), 'sibling');
+
+    const dst = scratch('copy-dst-');
+    // Sources live in `skills/foobar`, confinement root is `skills/foo`.
+    // Rejected only because the prefix carries a trailing separator.
+    const items = walkSourceDir(siblingDir, dst);
+
+    try {
+      copyArtifacts(items, { confineRealpath: skillDir });
+      throw new Error('expected copyArtifacts to reject the sibling-prefix source');
+    } catch (err) {
+      expect(err).toBeInstanceOf(CopyError);
+      expect((err as CopyError).code).toBe('path_traversal');
+    }
+
+    expect(existsSync(join(dst, 'SKILL.md'))).toBe(false);
   });
 });
 

@@ -269,10 +269,18 @@ cd /path/to/gbrain/evals/functional-area-resolver
 TMP=$(mktemp -d)/variants && mkdir -p "$TMP"
 cp "$EDITED" "$TMP/my-edit.md"
 
-# Run the harness against your file (sequential, ~75 calls × $0.0076 ≈ $0.57 on Opus).
+# Without --yes the harness prints its cost estimate and exits (no model calls).
+ANTHROPIC_API_KEY=... node harness.mjs --variants-dir "$TMP" --variants my-edit \
+                                       --model opus --parallel 3
+
+# Only after the user approves that estimate:
 ANTHROPIC_API_KEY=... node harness.mjs --variants-dir "$TMP" --variants my-edit \
                                        --model opus --parallel 3 --yes
 ```
+
+Gate 2 makes paid model calls. Show the user the estimate the first command
+prints and get their agreement before you add `--yes`; `--yes` only skips
+the harness's own prompt, it is not the user's approval.
 
 The harness uses gbrain's bundled fixture set, so this verifies "did the LLM
 land in the right sub-skill for routing intents the gbrain-bundled fixtures
@@ -308,13 +316,20 @@ This skill guarantees:
 - Routing matches the canonical triggers in the frontmatter.
 - Compression is only performed when the preconditions in Step 1 pass (file ≥12KB AND clean working tree, or `--force`).
 - The mandatory verification gate in Step 6 fires on the user's edited file, not on sample variants. The user runs `gbrain routing-eval --json` AND the gbrain-repo harness (`node harness.mjs --variants-dir <tmp> --variants my-edit`) before committing the compressed file.
-- Privacy contract preserved: no fork-specific filesystem path literals (server-side brain home, OpenClaw fork home) leak into the compressed output.
+- No machine-specific filesystem paths leak into the compressed output.
 
-The full behavior contract is documented in the body sections above; this section exists for the conformance test.
+The full behavior contract is documented in the body sections above.
 
 ## Output Format
 
 The compressed routing file follows the area-entry template documented in Step 4 ("Build the area entry format"). Each entry: `- **{Area Name}**: {trigger phrases} -> \`{dispatcher-skill}\` (dispatcher for: {sub-skill list})`. The dispatcher arrow may be either ASCII `->` (default in this template) or Unicode `→` (used in some production deployments); the gbrain harness accepts both.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- Either verification gate fails (structural or LLM A/B): refuse to compress and report the failing gate; never ship a smaller resolver that routes worse.
+- The A/B harness lacks a provider key or hits a cost cap: say the LLM gate did not run and keep the original resolver.
 
 ## Anti-Patterns
 

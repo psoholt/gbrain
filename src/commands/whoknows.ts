@@ -1,3 +1,4 @@
+import type { PageReadPolicy } from '../core/types.ts';
 /**
  * gbrain whoknows — "Who should I talk to about X?"
  *
@@ -36,12 +37,14 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
-import type { PageType, SearchResult } from '../core/types.ts';
+import type { HybridSearchMeta, PageType, SearchResult } from '../core/types.ts';
 import { hybridSearch } from '../core/search/hybrid.ts';
+import { INTERNAL_BREADTH_SEARCH_OPTS } from '../core/search/internal-breadth.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
+import { rethrowCapabilityMissing } from '../core/rust-engine/errors.ts';
 
-export interface WhoknowsOpts {
+export interface WhoknowsOpts extends PageReadPolicy {
   topic: string;
   limit?: number;
   explain?: boolean;
@@ -58,6 +61,8 @@ export interface WhoknowsOpts {
    * falls back to DEFAULT_TYPES (person/company).
    */
   types?: PageType[];
+  /** GBRA-200: the inner search's meta, so the op can stamp a degraded (keyword-only, cut) ranking. */
+  onMeta?: (meta: HybridSearchMeta) => void;
   /**
    * v0.34.1 (#861, D3 — P0 leak seal): scope expert candidates to a
    * single source. The op-handler at operations.ts:find_experts threads
@@ -191,12 +196,17 @@ export async function findExperts(
   //    v0.34.1 (#861, D3): thread source-scope so an authenticated MCP
   //    client only ranks experts within its accessible sources.
   const results: SearchResult[] = await hybridSearch(engine, opts.topic, {
+    ...INTERNAL_BREADTH_SEARCH_OPTS,
     types,
     limit: innerLimit,
     salience: 'off',
     recency: 'off',
     sourceId: opts.sourceId,
     sourceIds: opts.sourceIds,
+    excludePrivate: opts.excludePrivate,
+    requireSafeChunks: opts.requireSafeChunks,
+    takesHoldersAllowList: opts.takesHoldersAllowList,
+    onMeta: opts.onMeta,
   });
 
   if (results.length === 0) return [];
@@ -212,19 +222,23 @@ export async function findExperts(
   }
   const candidates = Array.from(byKey.values());
 
-  // 3. Batch-fetch salience + effective_date per (slug, source_id) ref.
+  // 3. Enrich by exact page identity, then recheck admission. Salience is an
+  // optional ranking signal; dates also prove the current page is readable.
   const refs = candidates.map((c) => ({
     slug: c.slug,
     source_id: c.source_id ?? 'default',
   }));
-  const [salienceMap, dateMap] = await Promise.all([
-    engine.getSalienceScores(refs).catch(() => new Map<string, number>()),
-    engine.getEffectiveDates(refs).catch(() => new Map<string, Date>()),
-  ]);
+  const salienceMap = await engine.getSalienceScores(refs, opts).catch((e: unknown) => {
+    rethrowCapabilityMissing(e);
+    return new Map<string, number>();
+  });
+  // Admission must happen AFTER optional work: that work can race a source or
+  // visibility edit. This read is required for trusted local callers too.
+  const dateMap = await engine.getEffectiveDates(refs, opts);
 
   // 4. Build the ranking-function input shape.
   const now = Date.now();
-  const inputs = candidates.map((c) => {
+  const inputs = candidates.filter(c => dateMap.has(`${c.source_id ?? 'default'}::${c.slug}`)).map((c) => {
     const sourceId = c.source_id ?? 'default';
     const key = `${sourceId}::${c.slug}`;
     const salienceRaw = salienceMap.get(key);
@@ -313,6 +327,10 @@ export async function runWhoknows(
     return;
   }
   if ('error' in parsed) {
+    if (args.includes('--json')) {
+      const { exitCliError, usageError } = await import('../cli/cli-error.ts');
+      exitCliError(usageError(`gbrain whoknows: ${parsed.error}`, 'Pass the topic as the positional argument, e.g. gbrain whoknows "lab automation" --json.'), 'whoknows', { json: true });
+    }
     console.error(`gbrain whoknows: ${parsed.error}`);
     console.error(HELP);
     process.exit(2);
@@ -337,7 +355,8 @@ export async function runWhoknows(
     // CLI: ctx.remote=false so the trust gate accepts the resolution.
     const { loadActivePackBestEffort, expertTypesFromPack } = await import('../core/schema-pack/index.ts');
     const fakeCtx = { engine, config: {}, logger: console, dryRun: false, remote: false, sourceId: undefined } as unknown as import('../core/operations.ts').OperationContext;
-    const pack = await loadActivePackBestEffort(fakeCtx);
+    // An engine that cannot read the pack refuses: an empty filter would print [].
+    const pack = await loadActivePackBestEffort(fakeCtx, { rethrowRefusal: true });
     const types = pack ? (expertTypesFromPack(pack.manifest) as PageType[]) : [];
     results = await findExperts(engine, {
       topic: parsed.topic,

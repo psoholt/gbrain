@@ -12,7 +12,7 @@
  * Subcommands:
  *   gbrain integrity check              Read-only report to stdout
  *   gbrain integrity auto               Three-bucket repair with confidence
- *   gbrain integrity --dry-run          Same as auto, no writes
+ *   gbrain integrity auto --dry-run     Same as auto, no writes
  *
  * Three-bucket confidence (contract with x_handle_to_tweet resolver):
  *   >= 0.8 → auto-repair through BrainWriter transaction
@@ -30,7 +30,6 @@ import { dirname } from 'path';
 import { loadConfig, toEngineConfig, gbrainPath } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import type { BrainEngine } from '../core/engine.ts';
-import * as db from '../core/db.ts';
 import { BrainWriter } from '../core/output/writer.ts';
 import {
   getDefaultRegistry,
@@ -39,6 +38,13 @@ import {
 } from '../core/resolvers/index.ts';
 import { registerBuiltinResolvers } from './resolvers.ts';
 import { tweetCitation } from '../core/output/scaffold.ts';
+import { INTEGRITY_SUBCOMMANDS, ROUTERS, subcommandHelpRequested } from '../cli/subcommands.ts';
+import { OperationError } from '../core/ops/contract.ts';
+import { isSegmentedPage } from '../core/page-body/page-shape.ts';
+import type { BodyStorage } from '../core/page-body/types.ts';
+import { bodyLines } from '../core/page-body/segment-lines.ts';
+import { detachedValue } from '../core/page-body/segment-blocks.ts';
+import { HANDLE_FRONTMATTER_KEYS } from '../core/by-mention.ts';
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -80,32 +86,51 @@ export interface BareTweetHit {
   phrase: string;
 }
 
-export function findBareTweetHits(compiledTruth: string, slug: string): BareTweetHit[] {
-  const hits: BareTweetHit[] = [];
-  const lines = compiledTruth.split('\n');
-  let insideFence = false;
-  let fenceMarker = '';
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (insideFence) {
-      if (line.startsWith(fenceMarker)) insideFence = false;
+interface FenceState { inside: boolean; marker: string; line: number }
+const fenceState = (): FenceState => ({ inside: false, marker: '', line: 0 });
+
+/** Calls `visit` with each line outside a ``` or ~~~ fence and its 1-based number; `state` carries across calls, so lines may arrive in runs. */
+function unfencedLines(lines: readonly string[], state: FenceState, visit: (line: string, n: number) => void): void {
+  for (const line of lines) {
+    state.line++;
+    if (state.inside) {
+      if (line.startsWith(state.marker)) state.inside = false;
       continue;
     }
     if (line.startsWith('```') || line.startsWith('~~~')) {
-      insideFence = true;
-      fenceMarker = line.startsWith('```') ? '```' : '~~~';
+      state.inside = true;
+      state.marker = line.startsWith('```') ? '```' : '~~~';
       continue;
     }
-    // If the line already contains a tweet URL, it's cited — skip
-    if (URL_NEARBY_RE.test(line)) continue;
-    for (const re of BARE_TWEET_PHRASES) {
-      const m = line.match(re);
-      if (m) {
-        hits.push({ slug, line: i + 1, rawLine: line.trim(), phrase: m[0] });
-        break; // one finding per line is enough
-      }
-    }
+    visit(line, state.line);
   }
+}
+
+function bareTweetHit(line: string, n: number, slug: string): BareTweetHit | null {
+  // If the line already contains a tweet URL, it's cited — skip
+  if (URL_NEARBY_RE.test(line)) return null;
+  // If the line carries an explicit source citation (e.g.
+  // "[Source: X, @handle, 2026-05-28]"), it's already attributed — skip.
+  // Catches instructional/example lines in recipe docs that demonstrate
+  // the CORRECT citation format. (v0.42.x)
+  if (/\[\s*source:/i.test(line)) return null;
+  // Strip inline-code spans (`...`) before matching: phrases shown as
+  // inline-code templates in docs are examples, not bare claims. The
+  // fenced-code skip above only covers ``` blocks, not inline backticks.
+  const lineForMatch = line.replace(/`[^`]*`/g, '');
+  for (const re of BARE_TWEET_PHRASES) {
+    const m = lineForMatch.match(re);
+    if (m) return { slug, line: n, rawLine: line.trim(), phrase: m[0] }; // one finding per line is enough
+  }
+  return null;
+}
+
+export function findBareTweetHits(compiledTruth: string, slug: string): BareTweetHit[] {
+  const hits: BareTweetHit[] = [];
+  unfencedLines(compiledTruth.split('\n'), fenceState(), (line, n) => {
+    const hit = bareTweetHit(line, n, slug);
+    if (hit) hits.push(hit);
+  });
   return hits;
 }
 
@@ -121,29 +146,56 @@ export interface ExternalLinkHit {
   url: string;
 }
 
+function externalLinkHits(line: string, n: number, slug: string, hits: ExternalLinkHit[]): void {
+  MD_LINK_EXTERNAL_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = MD_LINK_EXTERNAL_RE.exec(line)) !== null) {
+    hits.push({ slug, line: n, url: m[1] });
+  }
+}
+
 export function findExternalLinks(compiledTruth: string, slug: string): ExternalLinkHit[] {
   const hits: ExternalLinkHit[] = [];
-  const lines = compiledTruth.split('\n');
-  let insideFence = false;
-  let fenceMarker = '';
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (insideFence) {
-      if (line.startsWith(fenceMarker)) insideFence = false;
-      continue;
-    }
-    if (line.startsWith('```') || line.startsWith('~~~')) {
-      insideFence = true;
-      fenceMarker = line.startsWith('```') ? '```' : '~~~';
-      continue;
-    }
-    MD_LINK_EXTERNAL_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = MD_LINK_EXTERNAL_RE.exec(line)) !== null) {
-      hits.push({ slug, line: i + 1, url: m[1] });
-    }
-  }
+  unfencedLines(compiledTruth.split('\n'), fenceState(), (line, n) => externalLinkHits(line, n, slug, hits));
   return hits;
+}
+
+/** A page the scan could not read; the run goes on without it. */
+export interface IntegritySkippedPage { slug: string; source_id: string; reason: string; message: string }
+
+/**
+ * Bare-tweet and external-link hits of a page's compiled truth. A segmented
+ * page (Wave B) is read block by block (`bodyLines` over its truth region),
+ * with fence state and line numbers carried across blocks, so it gets the
+ * hits the same text held as one string gets.
+ */
+async function integrityHitsOf(engine: BrainEngine, page: { id: number; slug: string; body_storage?: BodyStorage | null; compiled_truth?: string | null },
+  sourceId: string): Promise<{ bare: BareTweetHit[]; external: ExternalLinkHit[] }> {
+  if (!isSegmentedPage(page)) {
+    const text = page.compiled_truth ?? '';
+    return { bare: findBareTweetHits(text, page.slug), external: findExternalLinks(text, page.slug) };
+  }
+  const bare: BareTweetHit[] = [];
+  const external: ExternalLinkHit[] = [];
+  const bareState = fenceState(), externalState = fenceState();
+  for await (const lines of bodyLines(engine, { id: Number(page.id), slug: page.slug, source_id: sourceId }, { regions: ['truth'] })) {
+    unfencedLines(lines, bareState, (line, n) => {
+      const hit = bareTweetHit(line, n, page.slug);
+      if (hit) bare.push(detachedValue(hit));
+    });
+    unfencedLines(lines, externalState, (line, n) => {
+      const found: ExternalLinkHit[] = [];
+      externalLinkHits(line, n, page.slug, found);
+      external.push(...found.map(detachedValue));
+    });
+  }
+  return { bare, external };
+}
+
+/** A per-page refusal (a segmented page whose run is too long to read as one block) becomes a skipped page; anything else propagates. */
+function skippedPage(error: unknown, page: { slug: string; source_id: string }): IntegritySkippedPage {
+  if (error instanceof OperationError && error.code === 'page_body_segmented') return { slug: page.slug, source_id: page.source_id, reason: error.code, message: error.message };
+  throw error;
 }
 
 // ---------------------------------------------------------------------------
@@ -152,22 +204,45 @@ export function findExternalLinks(compiledTruth: string, slug: string): External
 
 interface ProgressEntry {
   slug: string;
+  /**
+   * Source the row belongs to. Progress used to be keyed by slug alone, so a
+   * resume SKIPPED same-slug pages in every other source (the scan iterates
+   * (slug, source_id) pairs). Legacy entries without source_id are treated as
+   * default-source only.
+   */
+  source_id?: string;
   status: 'repaired' | 'reviewed' | 'skipped' | 'error';
   timestamp: string;
+}
+
+/** Composite progress key — (source, slug), tab-separated (tabs can't appear in either). */
+function progressKey(sourceId: string | undefined, slug: string): string {
+  return `${sourceId ?? 'default'}\t${slug}`;
 }
 
 function loadProgress(): Set<string> {
   if (!existsSync(getProgressFile())) return new Set();
   const seen = new Set<string>();
   const content = readFileSync(getProgressFile(), 'utf-8');
+  let legacy = 0;
   for (const line of content.split('\n')) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line) as ProgressEntry;
-      seen.add(entry.slug);
+      if (entry.source_id == null) legacy++;
+      seen.add(progressKey(entry.source_id, entry.slug));
     } catch {
       /* skip malformed lines */
     }
+  }
+  if (legacy > 0) {
+    // Pre-(source_id, slug) ledger entries key as default-source only, so a
+    // resume re-scans non-default-source pages they may have covered. Say so
+    // once — a silent partial re-scan reads as "resume is broken".
+    console.error(
+      `integrity: ${legacy} resume-ledger entr${legacy === 1 ? 'y' : 'ies'} predate source tracking; ` +
+      `matching them to the default source only (non-default-source pages re-scan — idempotent, just slower).`,
+    );
   }
   return seen;
 }
@@ -190,11 +265,13 @@ function ensureDir(path: string): void {
 // CLI entry point
 // ---------------------------------------------------------------------------
 
-export async function runIntegrity(args: string[]): Promise<void> {
-  const sub = args[0];
+export { INTEGRITY_SUBCOMMANDS as SUBCOMMANDS } from '../cli/subcommands.ts';
 
-  if (!sub || sub === '--help' || sub === '-h') {
-    printHelp();
+export async function runIntegrity(args: string[]): Promise<void> {
+  const sub = args[0] as (typeof INTEGRITY_SUBCOMMANDS)[number] | undefined;
+
+  if (!sub || subcommandHelpRequested(args, ROUTERS.integrity)) {
+    printUsage();
     return;
   }
 
@@ -217,7 +294,7 @@ export async function runIntegrity(args: string[]): Promise<void> {
   }
 
   console.error(`Unknown subcommand: ${sub}`);
-  printHelp();
+  printUsage();
   process.exit(1);
 }
 
@@ -239,6 +316,7 @@ async function cmdCheck(args: string[]): Promise<void> {
         pagesScanned: res.pagesScanned,
         bareTweetHits: res.bareHits,
         externalLinkCount: res.externalHits.length,
+        ...(res.skipped.length ? { skipped: res.skipped } : {}),
       }, null, 2));
       return;
     }
@@ -246,6 +324,10 @@ async function cmdCheck(args: string[]): Promise<void> {
     console.log(`Scanned ${res.pagesScanned} pages.`);
     console.log(`Bare-tweet phrases: ${res.bareHits.length}`);
     console.log(`External links (for optional dead-link check): ${res.externalHits.length}`);
+    if (res.skipped.length > 0) {
+      console.log(`Pages not scanned: ${res.skipped.length}`);
+      for (const skipped of res.skipped) console.log(`  ${skipped.source_id}:${skipped.slug} (${skipped.reason}): ${skipped.message}`);
+    }
     if (res.topPages.length > 0) {
       console.log('\nTop 10 pages with bare-tweet references:');
       for (const { slug, count } of res.topPages) {
@@ -280,6 +362,8 @@ export interface IntegrityScanResult {
   externalHits: ExternalLinkHit[];
   /** Top 10 pages sorted by bare-tweet hit count, descending. */
   topPages: Array<{ slug: string; count: number }>;
+  /** Pages the scan could not read (a per-page refusal); counted in pagesScanned, no hits. */
+  skipped: IntegritySkippedPage[];
 }
 
 /**
@@ -297,12 +381,11 @@ export async function scanIntegrity(
 
   // Fast path: single SQL query instead of N sequential getPage() calls.
   // Eliminates ~500 round-trips through PgBouncer that caused doctor to
-  // timeout on transaction-mode pooling. Postgres-only: PGLite has no
-  // postgres.js connection, so the gate keeps the GBRAIN_DEBUG fallback
-  // log clean for real Postgres errors instead of expected PGLite skips.
+  // timeout on transaction-mode pooling. Postgres-only: PGLite runs in
+  // process, where the sequential walk costs no network round-trips.
   if (batchLoad && limit !== Infinity && engine.kind === 'postgres') {
     try {
-      return await scanIntegrityBatch(limit, typeFilter);
+      return await scanIntegrityBatch(engine, limit, typeFilter);
     } catch (err) {
       // GBRAIN_DEBUG=1 surfaces real Postgres errors (deadlock, connection
       // drop, SQL bug) that would otherwise vanish into the sequential
@@ -327,6 +410,8 @@ export async function scanIntegrity(
   const externalHits: ExternalLinkHit[] = [];
   let pagesScanned = 0;
 
+  const skipped: IntegritySkippedPage[] = [];
+
   for (const { slug, source_id } of allRefs) {
     if (typeFilter && !slug.startsWith(`${typeFilter}/`)) continue;
     if (pagesScanned >= limit) break;
@@ -335,8 +420,13 @@ export async function scanIntegrity(
     // Skip grandfathered pages (opted out of brain-integrity enforcement)
     if ((page.frontmatter as Record<string, unknown> | undefined)?.validate === false) continue;
     pagesScanned++;
-    bareHits.push(...findBareTweetHits(page.compiled_truth, slug));
-    externalHits.push(...findExternalLinks(page.compiled_truth, slug));
+    try {
+      const hits = await integrityHitsOf(engine, page, source_id);
+      bareHits.push(...hits.bare);
+      externalHits.push(...hits.external);
+    } catch (error) {
+      skipped.push(skippedPage(error, { slug, source_id }));
+    }
   }
 
   const byPage = new Map<string, number>();
@@ -346,45 +436,58 @@ export async function scanIntegrity(
     .slice(0, 10)
     .map(([slug, count]) => ({ slug, count }));
 
-  return { pagesScanned, bareHits, externalHits, topPages };
+  return { pagesScanned, bareHits, externalHits, topPages, skipped };
 }
 
 /**
  * Batch-load integrity scan: fetches all candidate pages in a single SQL
  * query, then scans in-memory. Reduces PgBouncer round-trips from ~500 to 1.
+ * A segmented page's body is read block by block from the same engine.
  */
 async function scanIntegrityBatch(
+  engine: BrainEngine,
   limit: number,
   typeFilter?: string,
 ): Promise<IntegrityScanResult> {
-  const sql = db.getConnection();
-  const typeCondition = typeFilter ? sql`AND slug LIKE ${typeFilter + '/%'}` : sql``;
+  const params: unknown[] = [limit];
+  const typeCondition = typeFilter ? `AND slug LIKE $${params.push(`${typeFilter}/%`)}` : '';
   // Boolean validate is the documented contract; stringly-typed 'false' (quoted
   // YAML) diverges from the sequential path's strict === false check. Intentional
   // — gbrain lint should reject stringly-typed validate at write time.
-  const validateCondition = sql`AND (frontmatter->>'validate' IS NULL OR frontmatter->>'validate' != 'false')`;
+  const validateCondition = `AND (frontmatter->>'validate' IS NULL OR frontmatter->>'validate' != 'false')`;
 
   // v0.32.8: scan ONE row per (source_id, slug) pair, not one per slug.
   // Pre-fix used DISTINCT ON (slug) which collapsed multi-source rows into
   // one — that was the bug class. Now batch parity matches the sequential
   // listAllPageRefs() walk: integrity violations in non-default-source pages
   // get reported instead of silently shadowed by their default-source twin.
-  const rows = await sql`
-    SELECT slug, compiled_truth, frontmatter
+  // deleted_at IS NULL: the sequential walk (listAllPageRefs + getPage) never
+  // sees a soft-deleted page, so the batch must not either — otherwise the
+  // sampled doctor check reports hits from tombstones and, once they
+  // outnumber `limit`, stops reaching live pages.
+  const rows = await engine.executeRaw<Record<string, unknown>>(`
+    SELECT id, source_id, slug, compiled_truth, body_storage
     FROM pages
-    WHERE 1=1 ${typeCondition} ${validateCondition}
+    WHERE deleted_at IS NULL ${typeCondition} ${validateCondition}
     ORDER BY source_id, slug
-    LIMIT ${limit}
-  `;
+    LIMIT $1
+  `, params);
 
   const bareHits: BareTweetHit[] = [];
   const externalHits: ExternalLinkHit[] = [];
 
+  const skipped: IntegritySkippedPage[] = [];
+
   for (const row of rows) {
-    const slug = row.slug as string;
-    const compiledTruth = row.compiled_truth as string;
-    bareHits.push(...findBareTweetHits(compiledTruth, slug));
-    externalHits.push(...findExternalLinks(compiledTruth, slug));
+    const page = { id: Number(row.id), source_id: row.source_id as string, slug: row.slug as string,
+      compiled_truth: row.compiled_truth as string | null, body_storage: row.body_storage as BodyStorage };
+    try {
+      const hits = await integrityHitsOf(engine, page, page.source_id);
+      bareHits.push(...hits.bare);
+      externalHits.push(...hits.external);
+    } catch (error) {
+      skipped.push(skippedPage(error, page));
+    }
   }
 
   const byPage = new Map<string, number>();
@@ -394,7 +497,7 @@ async function scanIntegrityBatch(
     .slice(0, 10)
     .map(([slug, count]) => ({ slug, count }));
 
-  return { pagesScanned: rows.length, bareHits, externalHits, topPages };
+  return { pagesScanned: rows.length, bareHits, externalHits, topPages, skipped };
 }
 
 // ---------------------------------------------------------------------------
@@ -420,7 +523,18 @@ async function cmdAuto(args: string[]): Promise<void> {
   const engine = await connect();
   const registry = getDefaultRegistry();
   registerBuiltinResolvers(registry);
-  const writer = new BrainWriter(engine, { strictMode: 'off' });
+  // One writer PER SOURCE: BrainWriter scopes every read/write (and
+  // addTimelineEntry) to its sourceId — a single default-scoped writer used
+  // for every source's pages was the unscoped-check/scoped-write bug class.
+  const writersBySource = new Map<string, BrainWriter>();
+  const writerFor = (sourceId: string): BrainWriter => {
+    let w = writersBySource.get(sourceId);
+    if (!w) {
+      w = new BrainWriter(engine, { strictMode: 'off', sourceId });
+      writersBySource.set(sourceId, w);
+    }
+    return w;
+  };
 
   const ctx: ResolverContext = {
     engine,
@@ -440,7 +554,9 @@ async function cmdAuto(args: string[]): Promise<void> {
   let bucketReview = 0;
   let bucketSkip = 0;
   let bucketErr = 0;
+  let bucketDeadLink = 0;
   let pagesProcessed = 0;
+  const skippedPages: IntegritySkippedPage[] = [];
 
   const { createProgress } = await import('../core/progress.ts');
   const { getCliOptions, cliOptsToProgressOptions } = await import('../core/cli-options.ts');
@@ -453,11 +569,12 @@ async function cmdAuto(args: string[]): Promise<void> {
     const allRefs = (await engine.listAllPageRefs()).sort((a, b) =>
       a.slug.localeCompare(b.slug) || a.source_id.localeCompare(b.source_id)
     );
-    const toScan = allRefs.filter(r => !seen.has(r.slug));
+    const toScan = allRefs.filter(r => !seen.has(progressKey(r.source_id, r.slug)));
     progress.start('integrity.auto', toScan.length);
     for (const { slug, source_id } of allRefs) {
       if (pagesProcessed >= limit) break;
-      if (seen.has(slug)) continue;
+      if (seen.has(progressKey(source_id, slug))) continue;
+      const writer = writerFor(source_id);
 
       const page = await engine.getPage(slug, { sourceId: source_id });
       if (!page) continue;
@@ -465,9 +582,17 @@ async function cmdAuto(args: string[]): Promise<void> {
       pagesProcessed++;
       progress.tick(1, slug);
 
+      let found: Awaited<ReturnType<typeof integrityHitsOf>>;
+      try {
+        found = await integrityHitsOf(engine, page, source_id);
+      } catch (error) {
+        skippedPages.push(skippedPage(error, { slug, source_id }));
+        continue;
+      }
+
       // Bare-tweet handling
       if (!skipTweet) {
-        const hits = findBareTweetHits(page.compiled_truth, slug);
+        const hits = found.bare;
         const handle = extractXHandleFromFrontmatter(page.frontmatter);
         if (hits.length > 0 && handle) {
           for (const hit of hits) {
@@ -488,26 +613,26 @@ async function cmdAuto(args: string[]): Promise<void> {
                 // Dry-run must NOT persist 'repaired' — the follow-on real
                 // run needs to revisit these slugs and actually write.
                 if (!dryRun) {
-                  appendProgress({ slug, status: 'repaired', timestamp: new Date().toISOString() });
+                  appendProgress({ slug, source_id, status: 'repaired', timestamp: new Date().toISOString() });
                 }
               } else if (result.confidence >= reviewLower) {
                 appendReview({ slug, hit, result, handle });
                 bucketReview++;
                 if (!dryRun) {
-                  appendProgress({ slug, status: 'reviewed', timestamp: new Date().toISOString() });
+                  appendProgress({ slug, source_id, status: 'reviewed', timestamp: new Date().toISOString() });
                 }
               } else {
                 logSkip({ slug, hit, reason: `confidence ${result.confidence.toFixed(2)} below threshold ${reviewLower}` });
                 bucketSkip++;
                 if (!dryRun) {
-                  appendProgress({ slug, status: 'skipped', timestamp: new Date().toISOString() });
+                  appendProgress({ slug, source_id, status: 'skipped', timestamp: new Date().toISOString() });
                 }
               }
             } catch (e) {
               bucketErr++;
               logSkip({ slug, hit, reason: `resolver error: ${e instanceof Error ? e.message : String(e)}` });
               if (!dryRun) {
-                appendProgress({ slug, status: 'error', timestamp: new Date().toISOString() });
+                appendProgress({ slug, source_id, status: 'error', timestamp: new Date().toISOString() });
               }
             }
           }
@@ -518,14 +643,14 @@ async function cmdAuto(args: string[]): Promise<void> {
           }
           bucketSkip += hits.length;
           if (!dryRun) {
-            appendProgress({ slug, status: 'skipped', timestamp: new Date().toISOString() });
+            appendProgress({ slug, source_id, status: 'skipped', timestamp: new Date().toISOString() });
           }
         }
       }
 
       // Dead-link handling (no auto-repair; just surface)
       if (!skipUrls) {
-        const externalHits = findExternalLinks(page.compiled_truth, slug);
+        const externalHits = found.external;
         // Limit to first few per page to keep the default run fast; --check
         // gives the full picture.
         for (const hit of externalHits.slice(0, 3)) {
@@ -540,7 +665,13 @@ async function cmdAuto(args: string[]): Promise<void> {
                 hit: { slug, line: hit.line, rawLine: hit.url, phrase: 'dead-link' },
                 reason: `dead link: ${result.value.reason ?? 'unknown'}`,
               });
-              bucketReview++;
+              // Dead links have no confidence score and are never written to
+              // the review file (appendReview() is only called from the
+              // bare-tweet path above) — they land in the skip log via
+              // logSkip() a few lines up. Count them separately so the
+              // printed "Review queue" total only ever reflects what's
+              // actually in ~/.gbrain/integrity-review.md.
+              bucketDeadLink++;
             }
           } catch {
             /* transient; don't fail the run */
@@ -559,6 +690,11 @@ async function cmdAuto(args: string[]): Promise<void> {
     console.log(`Review queue (≥${reviewLower} <${confidenceThreshold}): ${bucketReview}`);
     console.log(`Skipped (<${reviewLower}): ${bucketSkip}`);
     if (bucketErr > 0) console.log(`Resolver errors: ${bucketErr}`);
+    if (bucketDeadLink > 0) console.log(`Dead links surfaced (see skipped log): ${bucketDeadLink}`);
+    if (skippedPages.length > 0) {
+      console.log(`Pages not scanned: ${skippedPages.length}`);
+      for (const skipped of skippedPages) console.log(`  ${skipped.source_id}:${skipped.slug} (${skipped.reason}): ${skipped.message}`);
+    }
     console.log(`\nReview queue: ${getReviewFile()}`);
     console.log(`Skipped log:  ${getLogFile()}`);
     console.log(`Progress:     ${getProgressFile()}`);
@@ -698,8 +834,7 @@ function logSkip(args: SkipArgs): void {
 
 export function extractXHandleFromFrontmatter(fm: Record<string, unknown> | undefined): string | null {
   if (!fm) return null;
-  const keys = ['x_handle', 'twitter', 'twitter_handle', 'x'];
-  for (const k of keys) {
+  for (const k of HANDLE_FRONTMATTER_KEYS) {
     const v = fm[k];
     if (typeof v === 'string' && v.trim().length > 0) {
       return v.trim().replace(/^@/, '');
@@ -745,7 +880,7 @@ function truncate(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, n - 3) + '...';
 }
 
-function printHelp(): void {
+export function printUsage(): void {
   console.log(`Usage: gbrain integrity <subcommand> [options]
 
 Subcommands:

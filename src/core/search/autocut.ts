@@ -33,6 +33,8 @@ export interface AutocutConfig {
   jumpRatio: number;
   /** Failsafe: never return fewer than this when candidates exist (≥1). */
   minKeep: number;
+
+  minTopScore: number;
 }
 
 /**
@@ -44,6 +46,7 @@ export const DEFAULT_AUTOCUT: AutocutConfig = Object.freeze({
   enabled: true,
   jumpRatio: 0.2,
   minKeep: 1,
+  minTopScore: 0.35,
 });
 
 export interface AutocutDecision {
@@ -78,6 +81,10 @@ export function autocutFromConfig(
     const n =
       typeof search.autocut_min_keep === 'number' ? Math.floor(search.autocut_min_keep) : Number.NaN;
     if (Number.isFinite(n) && n >= 1) out.minKeep = n;
+  }
+  if (search.autocut_min_top !== undefined) {
+    const n = typeof search.autocut_min_top === 'number' ? search.autocut_min_top : Number.NaN;
+    if (Number.isFinite(n) && n >= 0 && n <= 1) out.minTopScore = n;
   }
   return out;
 }
@@ -159,6 +166,9 @@ export function applyAutocut<T>(
 
   const top = Math.max(...scores);
   if (!Number.isFinite(top) || top <= 0) return noOp(results);
+  // v0.46.15 (#1863): a weak top means the whole list is low-confidence — gap
+  // normalization by a weak top manufactures spurious cliffs. Never collapse.
+  if (top < cfg.minTopScore) return noOp(results);
 
   // Sort a copy descending (A2: don't trust upstream order) and normalize.
   const sorted = [...scores].sort((a, b) => b - a);

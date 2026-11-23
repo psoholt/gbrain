@@ -6,15 +6,21 @@
 # per file. This guard makes that recurrence structurally impossible. A written
 # rule caused the disease; a CI guard cures it.
 #
-# TWO HARD GATES (fail the build):
-#   1. Bolded-release-clause ban — the reference docs (docs/architecture/KEY_FILES.md,
+# THREE HARD GATES (fail the build):
+#   1. Bolded-release-clause ban — the reference docs (KEY_FILES.md + key-files/*,
 #      docs/architecture/thin-client.md, docs/TESTING.md) describe CURRENT behavior
 #      only. Release history lives in CHANGELOG.md + git. The bolded `**v0.<digit>`
 #      marker is the disease signature; it must not appear in those docs. Plain prose
 #      ("as of pgvector 0.7", "Postgres 11+") is fine — only the bolded release
 #      marker is banned, so this never false-fires on legitimate version mentions.
-#   2. CLAUDE.md size cap — the structural backstop. Even if someone ignores the
-#      prose rule and pads CLAUDE.md, the size gate catches it.
+#   2. Size caps for CLAUDE.md, the index, each subsystem and
+#      docs/TESTING.md. The TESTING.md cap is a ratchet: lower it when the file
+#      shrinks, never raise it; detail moves next to its code instead. A subsystem
+#      page at its cap continues on a new page linked from its last line, not
+#      on an unrelated page.
+#   3. One reference bullet per src file across the index and subsystems — a cherry-pick that keeps both sides
+#      of a hunk leaves two "- `src/x.ts`" bullets describing two different
+#      "current states" for one file. Merge into the survivor, never append a twin.
 #
 # SOFT WARNS (stderr, non-fatal): prose history markers that suggest narration
 # creeping back ("pre-fix", ", then v0.", "superseded by") in the reference docs.
@@ -24,9 +30,8 @@
 #
 # Env overrides (for the guard's own test):
 #   GBRAIN_DOC_GUARD_ROOT        repo root to scan (default: script's ../)
-#   GBRAIN_CLAUDE_MD_MAX_BYTES   CLAUDE.md hard cap (default: 60000; post-restructure
-#                                CLAUDE.md is ~39KB, so this leaves headroom while
-#                                staying far below the ~592KB disease state)
+#   GBRAIN_CLAUDE_MD_MAX_BYTES   CLAUDE.md hard cap (default: 35000)
+#   GBRAIN_TESTING_MD_MAX_BYTES  docs/TESTING.md hard cap (default: 120000)
 #
 # Exit codes:
 #   0   clean
@@ -35,7 +40,8 @@
 set -uo pipefail
 
 ROOT="${GBRAIN_DOC_GUARD_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-MAX_BYTES="${GBRAIN_CLAUDE_MD_MAX_BYTES:-60000}"
+MAX_BYTES="${GBRAIN_CLAUDE_MD_MAX_BYTES:-35000}"
+TESTING_MAX_BYTES="${GBRAIN_TESTING_MD_MAX_BYTES:-120000}"
 
 # Reference docs that MUST stay current-state (history-free).
 REFERENCE_DOCS=(
@@ -43,6 +49,16 @@ REFERENCE_DOCS=(
   "docs/architecture/thin-client.md"
   "docs/TESTING.md"
 )
+
+shopt -s nullglob
+KEY_FILE_DOCS=()
+if [ -f "$ROOT/docs/architecture/KEY_FILES.md" ]; then
+  KEY_FILE_DOCS+=("$ROOT/docs/architecture/KEY_FILES.md")
+fi
+for doc in "$ROOT"/docs/architecture/key-files/*.md; do
+  REFERENCE_DOCS+=("${doc#"$ROOT/"}")
+  KEY_FILE_DOCS+=("$doc")
+done
 
 fail=0
 
@@ -73,6 +89,49 @@ if [ -f "$claude" ]; then
   fi
 fi
 
+for spec in "docs/architecture/KEY_FILES.md:10000"; do
+  rel="${spec%:*}"
+  cap="${spec##*:}"
+  [ -f "$ROOT/$rel" ] || continue
+  bytes=$(wc -c < "$ROOT/$rel" | tr -d ' ')
+  if [ "$bytes" -gt "$cap" ]; then
+    fail=1
+    echo "FAIL: $rel is $bytes bytes, over the $cap cap. Move detail to a linked reference." >&2
+  fi
+done
+testing="$ROOT/docs/TESTING.md"
+if [ -f "$testing" ]; then
+  bytes=$(wc -c < "$testing" | tr -d ' ')
+  if [ "$bytes" -gt "$TESTING_MAX_BYTES" ]; then
+    fail=1
+    echo "FAIL: docs/TESTING.md is $bytes bytes, over the $TESTING_MAX_BYTES cap (a ratchet: it only goes down)." >&2
+    echo "      Trim: move subsystem detail next to its code (a README beside the harness or module) and leave a" >&2
+    echo "      two-line pointer; describe lanes and guards, not individual test files (each test's header does that)." >&2
+    echo "      Docs: docs/TESTING.md#quick-start" >&2
+  fi
+fi
+for doc in "$ROOT"/docs/architecture/key-files/*.md; do
+  bytes=$(wc -c < "$doc" | tr -d ' ')
+  if [ "$bytes" -gt 60000 ]; then
+    fail=1
+    echo "FAIL: ${doc#"$ROOT/"} is $bytes bytes, over the 60000 cap. Move its last entries to a continuation page that links back with [Previous entries](<page>.md), and link it from this page's last line; never raise the cap." >&2
+  fi
+done
+
+# ── Gate 3: one KEY_FILES.md bullet per src file ───────────────────────────
+# ponytail: KNOWN_DUP_PATHS seeds the pairs that pre-date the gate so it lands
+# green; merge a pair and delete its entry here — never add to this list.
+KNOWN_DUP_PATHS='src/cli.ts|src/commands/dream.ts|src/core/context/resolve-ipc.ts|src/core/context/turn-context.ts|src/core/cycle/transcript-discovery.ts'
+if [ "${#KEY_FILE_DOCS[@]}" -gt 0 ]; then
+  dups=$(grep -h -oE '^- `src/[^`]+`' "${KEY_FILE_DOCS[@]}" | sort | uniq -d | grep -vE "^- \`($KNOWN_DUP_PATHS)\`$" || true)
+  if [ -n "$dups" ]; then
+    fail=1
+    echo "FAIL: docs/architecture/KEY_FILES.md and its subsystems have more than one bullet for the same src file (two 'current states' for one file):" >&2
+    printf '%s\n' "$dups" | sed 's/^/        /' >&2
+    echo "      Fold the newer sentences into the existing bullet and delete the twin." >&2
+  fi
+fi
+
 # ── Soft warns: prose history markers creeping into reference docs ──────────
 for rel in "${REFERENCE_DOCS[@]}"; do
   doc="$ROOT/$rel"
@@ -86,4 +145,4 @@ done
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi
-echo "check-key-files-current-state: ok (reference docs history-free; CLAUDE.md within cap)"
+echo "check-key-files-current-state: ok (reference docs history-free; entry and subsystem docs within caps)"

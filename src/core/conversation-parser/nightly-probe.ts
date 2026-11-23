@@ -17,11 +17,11 @@
  * Cost: ~$0.05/night with default fixtures × Haiku polish. Bounded
  * by the active BudgetTracker the autopilot loop creates per-tick.
  *
- * **Wiring into the autopilot loop is deferred to a follow-up**
- * (filed in TODOS.md). v0.41.16.0 ships the phase as a callable
- * module so doctor + future cron drivers can invoke it; the
- * scheduler wire-up follows the same shape as
- * `src/core/cycle/nightly-quality-probe.ts` (v0.40.1.0 Track D / T6).
+ * Wired into the autopilot loop (step 4.6 in autopilot.ts), following
+ * the same shape as `src/core/cycle/nightly-quality-probe.ts`
+ * (v0.40.1.0 Track D / T6): the wiring resolves fixtures from the
+ * gbrain package root, writes real outcomes to the parser-probe audit
+ * trail (`audit-parser-probe.ts`), and never crashes the loop.
  *
  * Test seam: all dependencies are injected via NightlyProbeDeps so
  * unit tests don't touch real LLMs or real fixtures.
@@ -43,7 +43,8 @@ export type ProbeOutcome =
   | 'rate_limited'
   | 'budget_exceeded'
   | 'adversarial_false_positive'
-  | 'no_embedding_key';
+  | 'no_embedding_key'
+  | 'skipped';
 
 export interface NightlyProbeResult {
   outcome: ProbeOutcome;
@@ -132,7 +133,10 @@ export async function runConversationParserNightlyProbe(
     return {
       ...baseResult,
       outcome: 'no_embedding_key',
-      reason: 'no Anthropic key configured (polish/fallback would be no-ops)',
+      // Autopilot passes provider-generic chat availability here, and parser
+      // polish/fallback route through the AI Gateway. Keep the historical
+      // outcome value for compatibility, but do not diagnose one provider.
+      reason: 'no chat model available (polish/fallback would be no-ops)',
     };
   }
 
@@ -142,8 +146,10 @@ export async function runConversationParserNightlyProbe(
   if (!existsSync(fixturePath) || !existsSync(adversarialPath)) {
     return {
       ...baseResult,
-      outcome: 'fail',
-      reason: `fixture path missing: ${!existsSync(fixturePath) ? fixturePath : adversarialPath}`,
+      outcome: 'skipped',
+      reason:
+        `fixture_unavailable: ${!existsSync(fixturePath) ? fixturePath : adversarialPath} is not readable, ` +
+        'so the probe gave no parser signal. Reinstall gbrain (bun install -g github:garrytan/gbrain) and run gbrain doctor.',
     };
   }
 

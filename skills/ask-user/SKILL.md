@@ -11,7 +11,6 @@ triggers:
   - "ask before proceeding"
   - "choice gate"
   - "user decision"
-priority: 50
 ---
 
 # Ask User — Choice Gate Pattern
@@ -171,10 +170,9 @@ Format: `Action verb — brief qualifier`
 I can import your Google Contacts to seed the people/ directory.
 This creates a brain page for each real contact (~200 pages).
 
-1. **Import via ClawVisor** — secure credential gateway
-2. **Import via direct OAuth** — simpler, agent holds tokens
-3. **Import from Google Takeout export** — offline, from file
-4. **Skip** — move to the next phase
+1. **Import with gbrain's Google connector** — live sync; tokens stay in gbrain's vault
+2. **Import from Google Takeout export** — offline, from file
+3. **Skip** — move to the next phase
 ```
 
 ### Filing decision
@@ -215,6 +213,13 @@ This pattern is used by:
 
 When building a new skill that needs user input at a decision point,
 reference this pattern rather than inventing a new one.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- A gbrain call exited 3 (`confirmation_required`) or its `fix.next` is `ask_user`: this skill is the gate. Relay the `[SHOW USER]` block or `user_message` verbatim as the choice, then stop until the user answers.
+- The user answered "no" or did not answer: report the step as skipped. Never pass `--yes` or `--max-usd` on their behalf to move on.
 
 ## Anti-Patterns
 

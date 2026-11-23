@@ -19,16 +19,40 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { SemanticQueryCache, cacheRowId } from '../src/core/search/query-cache.ts';
 import type { SearchResult } from '../src/core/types.ts';
 import { knobsHash, resolveSearchMode } from '../src/core/search/mode.ts';
+import { resolveHardExcludes } from '../src/core/search/source-boost.ts';
+import { resetFtsLanguageCache } from '../src/core/fts-language.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
+
+/**
+ * Run `fn` with GBRAIN_FTS_LANGUAGE pinned, then restore this process's
+ * original value. getFtsLanguage() memoizes, so the cache is reset on both
+ * edges — otherwise the pin would leak into the mode hashes computed below
+ * (and, for an operator who runs the suite with the env set, flip them).
+ * Serial file: direct process.env mutation is the sanctioned pattern here
+ * (isolation guard R1).
+ */
+function withFtsLanguage<T>(language: string | undefined, fn: () => T): T {
+  const saved = process.env.GBRAIN_FTS_LANGUAGE;
+  if (language === undefined) delete process.env.GBRAIN_FTS_LANGUAGE;
+  else process.env.GBRAIN_FTS_LANGUAGE = language;
+  resetFtsLanguageCache();
+  try {
+    return fn();
+  } finally {
+    if (saved === undefined) delete process.env.GBRAIN_FTS_LANGUAGE;
+    else process.env.GBRAIN_FTS_LANGUAGE = saved;
+    resetFtsLanguageCache();
+  }
+}
 
 const conservativeHash = knobsHash(resolveSearchMode({ mode: 'conservative' }));
 const balancedHash = knobsHash(resolveSearchMode({ mode: 'balanced' }));
 const tokenmaxHash = knobsHash(resolveSearchMode({ mode: 'tokenmax' }));
 
 beforeAll(async () => {
-  // v0.36.2.0: DEFAULT_EMBEDDING_DIMENSIONS flipped to 1280 (ZE Matryoshka).
+  // v0.36.2.0: DEFAULT_EMBEDDING_DIMENSIONS flipped to 1024 (Voyage Matryoshka).
   // The makeEmbedding fixture below emits 1536-dim unit vectors. If we let
   // initSchema() inherit the default, query_cache.embedding gets sized at
   // halfvec(1280) and the inserts throw "expected 1280 dimensions, not 1536".
@@ -228,5 +252,191 @@ describe('SemanticQueryCache cross-mode isolation (CDX-4 hotfix)', () => {
     // Conservative-hash lookup misses (the no-mode row had empty hash).
     const conservativeHit = await cache.lookup(emb, { knobsHash: conservativeHash });
     expect(conservativeHit.hit).toBe(false);
+  });
+});
+
+describe('hard-exclude cache isolation (#2825)', () => {
+  // Hashes computed the way hybridSearchCached does: same resolved mode, ctx
+  // carrying the resolved hard-exclude list. A row written by a process
+  // WITHOUT GBRAIN_SEARCH_EXCLUDE (defaults only) must not be served to a
+  // process WITH it, and vice versa.
+  const noEnvHash = knobsHash(resolveSearchMode({ mode: 'balanced' }), {
+    hardExcludes: resolveHardExcludes(undefined, undefined, undefined),
+  });
+  const envExcludeHash = knobsHash(resolveSearchMode({ mode: 'balanced' }), {
+    hardExcludes: resolveHardExcludes(undefined, undefined, 'private/'),
+  });
+
+  test('row written without excludes is NOT served to a lookup with excludes', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const emb = makeEmbedding(6);
+
+    // Simulate a no-exclude process writing results that include a slug the
+    // excluding process must never see.
+    const leaky = makeResults('private', 5);
+    await cache.store('who is alice', emb, leaky, {
+      vector_enabled: true, detail_resolved: null, expansion_applied: false,
+    }, { knobsHash: noEnvHash });
+
+    // Excluding process → MISS (falls through to a fresh, filtered query).
+    const excluded = await cache.lookup(emb, { knobsHash: envExcludeHash });
+    expect(excluded.hit).toBe(false);
+
+    // Original no-exclude process still hits its own row.
+    const original = await cache.lookup(emb, { knobsHash: noEnvHash });
+    expect(original.hit).toBe(true);
+    expect(original.results?.length).toBe(5);
+  });
+
+  test('row written WITH excludes is not served back once excludes are lifted', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const emb = makeEmbedding(7);
+
+    await cache.store('who is alice', emb, makeResults('filtered', 3), {
+      vector_enabled: true, detail_resolved: null, expansion_applied: false,
+    }, { knobsHash: envExcludeHash });
+
+    expect((await cache.lookup(emb, { knobsHash: noEnvHash })).hit).toBe(false);
+    expect((await cache.lookup(emb, { knobsHash: envExcludeHash })).hit).toBe(true);
+  });
+});
+
+describe('detail cache isolation (#3515)', () => {
+  // Hashes computed the way hybridSearchCached does: same resolved mode, ctx
+  // carrying the effective detail level. A row written by a `--detail low`
+  // call (compiled-truth-only result set) must not be served to a default
+  // `medium` lookup, and vice versa.
+  const lowHash = knobsHash(resolveSearchMode({ mode: 'balanced' }), { detail: 'low' });
+  const mediumHash = knobsHash(resolveSearchMode({ mode: 'balanced' }), { detail: 'medium' });
+  const unsetHash = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+
+  test('detail=low write is NOT served to a default (medium) lookup', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const emb = makeEmbedding(8);
+
+    // Simulate `query "X" --detail low` populating the cache with the
+    // narrow compiled-truth-only result set.
+    await cache.store('what is the deploy process', emb, makeResults('narrow', 2), {
+      vector_enabled: true, detail_resolved: 'low', expansion_applied: false,
+    }, { knobsHash: lowHash });
+
+    // Default-detail lookup inside the TTL → MISS (falls through to a
+    // fresh, full search) instead of the narrow set.
+    expect((await cache.lookup(emb, { knobsHash: mediumHash })).hit).toBe(false);
+
+    // The low-detail caller still hits its own row.
+    const original = await cache.lookup(emb, { knobsHash: lowHash });
+    expect(original.hit).toBe(true);
+    expect(original.results?.length).toBe(2);
+  });
+
+  test('undefined detail keys like the documented medium default', () => {
+    expect(unsetHash).toBe(mediumHash);
+    expect(unsetHash).not.toBe(lowHash);
+  });
+});
+
+describe('FTS language cache isolation', () => {
+  // GBRAIN_FTS_LANGUAGE retokenizes BOTH sides of the keyword arm (the
+  // trigger-built search_vector and the query-side websearch_to_tsquery), so
+  // rows written under one language describe a different index than the one a
+  // post-`reindex-search-vector` process queries. knobsHash folds the resolved
+  // language in (`fts=`) so those rows can never be served across the switch.
+  const englishHash = withFtsLanguage(undefined, () =>
+    knobsHash(resolveSearchMode({ mode: 'balanced' })));
+  const portugueseHash = withFtsLanguage('portuguese', () =>
+    knobsHash(resolveSearchMode({ mode: 'balanced' })));
+
+  test('the resolved language changes the hash', () => {
+    expect(englishHash).not.toBe(portugueseHash);
+    // An invalid value falls back to english inside getFtsLanguage(), so it
+    // must land on the english row rather than minting an unreachable one.
+    expect(withFtsLanguage('NOT A CONFIG', () =>
+      knobsHash(resolveSearchMode({ mode: 'balanced' })))).toBe(englishHash);
+  });
+
+  test('a row written under english is NOT served after switching to portuguese', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const emb = makeEmbedding(8);
+
+    // English-tokenized run: 'running' stems to 'run', so these rows reflect
+    // an index the portuguese-configured process no longer has.
+    await cache.store('running', emb, makeResults('english-stemmed', 4), {
+      vector_enabled: true, detail_resolved: null, expansion_applied: false,
+    }, { knobsHash: englishHash });
+
+    // Post-reindex process → MISS (falls through to a fresh keyword query
+    // against the retokenized index).
+    expect((await cache.lookup(emb, { knobsHash: portugueseHash })).hit).toBe(false);
+
+    // Same-language process still hits its own row.
+    const same = await cache.lookup(emb, { knobsHash: englishHash });
+    expect(same.hit).toBe(true);
+    expect(same.results?.length).toBe(4);
+  });
+
+  test('switching back does not resurrect the other language rows', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const emb = makeEmbedding(9);
+
+    await cache.store('running', emb, makeResults('portuguese-stemmed', 2), {
+      vector_enabled: true, detail_resolved: null, expansion_applied: false,
+    }, { knobsHash: portugueseHash });
+
+    expect((await cache.lookup(emb, { knobsHash: englishHash })).hit).toBe(false);
+    expect((await cache.lookup(emb, { knobsHash: portugueseHash })).hit).toBe(true);
+  });
+});
+
+describe('excludePrivate cache isolation (#4352 follow-up)', () => {
+  // Hashes computed the way hybridSearchCached does: same resolved mode, ctx
+  // carrying the private-visibility posture. Folding the posture (xp=, v=23)
+  // replaces #4352's wholesale cache skip — excludePrivate=true is the
+  // default for every remote MCP caller, so the skip disabled the semantic
+  // cache for exactly the highest-volume beneficiaries. A trusted
+  // (private-included) write must never serve a remote-default
+  // (private-excluding) lookup, and vice versa.
+  const trustedHash = knobsHash(resolveSearchMode({ mode: 'balanced' }), { excludePrivate: false });
+  const excludingHash = knobsHash(resolveSearchMode({ mode: 'balanced' }), { excludePrivate: true });
+
+  test('postures produce different hashes; undefined keys like the trusted (included) default', () => {
+    expect(trustedHash).not.toBe(excludingHash);
+    // Mirrors enforcement's strict `=== true` predicate: legacy callers that
+    // don't thread the posture share the trusted rows.
+    expect(knobsHash(resolveSearchMode({ mode: 'balanced' }))).toBe(trustedHash);
+  });
+
+  test('private-included (trusted) write is NOT served to a private-excluding lookup', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const emb = makeEmbedding(10);
+
+    // Simulate a trusted local run whose stored rows contain a private page
+    // the remote caller must never see.
+    await cache.store('who is alice', emb, makeResults('with-private', 5), {
+      vector_enabled: true, detail_resolved: null, expansion_applied: false,
+    }, { knobsHash: trustedHash });
+
+    // Remote-default (excludePrivate=true) lookup → MISS (falls through to a
+    // fresh, visibility-filtered query).
+    expect((await cache.lookup(emb, { knobsHash: excludingHash })).hit).toBe(false);
+
+    // The trusted caller still hits its own row.
+    const original = await cache.lookup(emb, { knobsHash: trustedHash });
+    expect(original.hit).toBe(true);
+    expect(original.results?.length).toBe(5);
+  });
+
+  test('private-excluding write is NOT served back to a trusted lookup', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const emb = makeEmbedding(11);
+
+    // A remote write is a FILTERED result set — serving it to a trusted
+    // lookup would hide private pages the trusted caller is entitled to.
+    await cache.store('who is alice', emb, makeResults('filtered', 3), {
+      vector_enabled: true, detail_resolved: null, expansion_applied: false,
+    }, { knobsHash: excludingHash });
+
+    expect((await cache.lookup(emb, { knobsHash: trustedHash })).hit).toBe(false);
+    expect((await cache.lookup(emb, { knobsHash: excludingHash })).hit).toBe(true);
   });
 });

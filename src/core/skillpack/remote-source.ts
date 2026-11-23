@@ -21,13 +21,15 @@
  * registry layer.
  */
 
-import { execFileSync } from 'child_process';
+import { assertLegacySkillFilesystemWrite } from './writer-guard.ts';
+import { execFileSync } from '../spawn.ts';
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'fs';
 import { isAbsolute, join, resolve } from 'path';
 
 import { gbrainPath } from '../config.ts';
 import { GIT_SSRF_FLAGS, RemoteUrlError, cloneRepo, parseRemoteUrl } from '../git-remote.ts';
 import { extractTarball, fileSha256 } from './tarball.ts';
+import { gitChildEnv } from '../git-env.ts';
 
 /** Kinds of third-party source we accept. */
 export type ResolvedSourceKind = 'git' | 'tarball' | 'local';
@@ -148,7 +150,7 @@ function resolveRemoteHead(url: string, branch: string | undefined): string {
   try {
     const output = execFileSync('git', argv, {
       encoding: 'utf-8',
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      env: gitChildEnv({ GIT_TERMINAL_PROMPT: '0' }),
       timeout: 60_000,
     });
     const firstLine = output.split('\n').find((l) => l.trim().length > 0);
@@ -215,6 +217,8 @@ function resolveGitSource(
 
   // Stage in a sibling .tmp dir so a failed clone doesn't poison the cache slot.
   const stageDir = cacheDir + '.tmp-' + process.pid + '-' + Date.now();
+  assertLegacySkillFilesystemWrite(cacheDir);
+  assertLegacySkillFilesystemWrite(stageDir);
   mkdirSync(stageDir, { recursive: true });
   try {
     cloneRepo(parsedSafe.toString(), stageDir, { depth: 1, timeoutMs: 600_000 });
@@ -234,6 +238,7 @@ function resolveGitSource(
   let cloneSha: string;
   try {
     cloneSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+      env: gitChildEnv(),
       cwd: stageDir,
       encoding: 'utf-8',
       timeout: 30_000,
@@ -258,6 +263,7 @@ function resolveGitSource(
     } catch {}
   } else {
     mkdirSync(join(cacheDir, '..'), { recursive: true });
+    assertLegacySkillFilesystemWrite(cacheDir);
     renameSync(stageDir, cacheDir);
   }
 
@@ -309,6 +315,8 @@ function resolveTarballSource(
   }
 
   const stageDir = cacheDir + '.tmp-' + process.pid + '-' + Date.now();
+  assertLegacySkillFilesystemWrite(cacheDir);
+  assertLegacySkillFilesystemWrite(stageDir);
   mkdirSync(stageDir, { recursive: true });
   try {
     extractTarball({ tgzPath: tarballPath, destDir: stageDir });
@@ -325,6 +333,7 @@ function resolveTarballSource(
     } catch {}
   } else {
     mkdirSync(join(cacheDir, '..'), { recursive: true });
+    assertLegacySkillFilesystemWrite(cacheDir);
     renameSync(stageDir, cacheDir);
   }
 

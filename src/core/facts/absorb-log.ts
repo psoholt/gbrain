@@ -18,6 +18,14 @@
  *   - 'queue_shutdown'  — queue rejected the enqueue because shutdown is in progress.
  *   - 'embed_failure'   — gateway down on embedOne; row inserts with NULL embedding.
  *   - 'pipeline_error'  — anything else absorbed inside runFactsBackstop's catch.
+ *   - 'gateway_auth'    — provider authentication/authorization failed.
+ *   - 'gateway_billing' — provider credit, quota, or billing hard limit failed.
+ *   - 'gateway_rate_limit' — provider rate limit; retry policy remains with the caller.
+ *   - 'write_refused'   — the write path refused the facts write (an OperationError); the detail starts with its code.
+ *   - 'write_pending_accepted' — the facts write was accepted and its durable receipt is still queued, running or
+ *     recovering after the publish wait; it commits later. Information, not a failure.
+ *   - 'write_deferred_unadmitted' — the canonical writer was busy before admission (writer_lock_unavailable, no
+ *     receipt): nothing was accepted and the job retries.
  *   - eligibility_skip is intentionally NOT logged (high cardinality, low signal).
  *
  * The writer is best-effort — a failure to log SHOULDN'T blow up the
@@ -26,6 +34,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { classifyGlobalLlmError } from '../ai/errors.ts';
 import { GBrainError } from '../types.ts';
 
 export const FACTS_ABSORB_REASONS = [
@@ -35,7 +44,44 @@ export const FACTS_ABSORB_REASONS = [
   'queue_shutdown',
   'embed_failure',
   'pipeline_error',
+  // Extraction-outcome codes (keyed-but-failing states; keyless-expected
+  // states deliberately write NO row — see backstop.ts
+  // surfaceExtractionFailure). Doctor's facts_extraction_health groups by
+  // split_part(summary,':',1), so new codes surface with zero schema change.
+  'chat_unavailable',
+  'refusal',
+  'content_filter',
+  'malformed_output',
+  'non_terminal_stop',
+  'truncated_output',
+  'gateway_auth',
+  'gateway_billing',
+  'gateway_rate_limit',
+  'gateway_model_not_found',
+  'write_refused',
+  'write_pending_accepted',
+  'write_deferred_unadmitted',
 ] as const;
+
+/**
+ * #5362: write-path refusals that no retry can change until an operator acts
+ * (a claimed canonical worktree before activation, a missing grant, a bad
+ * request, an unregistered writer). The facts-absorb job dead-letters them on
+ * the first attempt instead of re-running inference before the same refusal.
+ */
+export const DETERMINISTIC_WRITE_REFUSALS: readonly string[] = [
+  'writer_coordinator_required', 'permission_denied', 'invalid_params', 'writer_registration_required',
+];
+
+/** #6778: reasons for facts writes that are not refusals; doctor facts_extraction_health keeps them out of the failure threshold. */
+export const WRITE_PENDING_ACCEPTED = 'write_pending_accepted';
+export const WRITE_DEFERRED_UNADMITTED = 'write_deferred_unadmitted';
+
+/** The OperationError code of a write-path refusal, or null. Name check keeps this module import-light. */
+export function writeRefusalCode(err: unknown): string | null {
+  const code = (err as { code?: unknown } | null)?.code;
+  return err instanceof Error && err.name === 'OperationError' && typeof code === 'string' ? code : null;
+}
 
 // v0.39.3.0 WARN-4 + CV13 — module-scoped flag so the first-occurrence
 // diagnostic log fires ONCE per process. Subsequent occurrences of the
@@ -117,6 +163,68 @@ export async function writeFactsAbsorbLog(
 }
 
 /**
+ * Persist an extraction failure without copying provider response bodies,
+ * keys, or request payloads into ingest_log. A write-path refusal records its
+ * own code (`write_refused`); global provider failures get stable typed reason
+ * codes; all other failures retain the existing classifier.
+ */
+export async function writeFactsAbsorbFailure(
+  engine: BrainEngine,
+  ref: string,
+  err: unknown,
+  sourceId: string = 'default',
+): Promise<void> {
+  const errorType = err instanceof Error && err.name ? err.name : 'Error';
+  const refusal = writeRefusalCode(err);
+  if (refusal) {
+    const message = (err as Error).message;
+    if (refusal === 'write_pending') {
+      const pending = await pendingReceipt(engine, err);
+      if (pending) {
+        await writeFactsAbsorbLog(engine, ref, WRITE_PENDING_ACCEPTED,
+          `${refusal} (${errorType}) request_id ${pending.request_id} (${pending.state}): ${message}`, sourceId);
+        return;
+      }
+    } else if (refusal === 'writer_lock_unavailable' && (err as { writeRequest?: unknown }).writeRequest === undefined) {
+      await writeFactsAbsorbLog(engine, ref, WRITE_DEFERRED_UNADMITTED, `${refusal} (${errorType}): ${message}`, sourceId);
+      return;
+    }
+    await writeFactsAbsorbLog(engine, ref, 'write_refused', `${refusal} (${errorType}): ${message}`, sourceId);
+    return;
+  }
+  const globalClass = classifyGlobalLlmError(err);
+  const reason: FactsAbsorbReason = globalClass === 'auth'
+    ? 'gateway_auth'
+    : globalClass === 'billing'
+      ? 'gateway_billing'
+      : globalClass === 'rate_limit'
+        ? 'gateway_rate_limit'
+        : globalClass === 'model_not_found'
+          ? 'gateway_model_not_found'
+          : classifyFactsAbsorbError(err);
+  await writeFactsAbsorbLog(engine, ref, reason, `${reason.startsWith('gateway_') ? 'provider request failed' : 'extraction failed'} (${errorType})`, sourceId);
+}
+
+/**
+ * #6778: the durable receipt behind a `write_pending` error, read back from the journal, when it is still queued,
+ * running or recovering; null when the error names no receipt, the row is gone or terminal, or the read fails.
+ */
+async function pendingReceipt(engine: BrainEngine, err: unknown): Promise<{ request_id: string; state: string } | null> {
+  const { writeRequest, receiptFields } = err as { writeRequest?: { request_id?: unknown }; receiptFields?: { principal_kind?: unknown; principal_id?: unknown } };
+  const requestId = writeRequest?.request_id;
+  if (typeof requestId !== 'string' || typeof receiptFields?.principal_kind !== 'string' || typeof receiptFields.principal_id !== 'string') return null;
+  try {
+    const [row] = await engine.executeRaw<{ request_id: string; state: string }>(
+      `SELECT request_id::text AS request_id, state FROM persistence_requests
+        WHERE principal_kind=$1 AND principal_id=$2 AND request_id=$3::uuid AND state IN ('queued','running','recovering')`,
+      [receiptFields.principal_kind, receiptFields.principal_id, requestId]);
+    return row ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Classify an arbitrary error into one of the stable reason codes. Heuristic
  * pattern match on error name + message; falls back to 'pipeline_error' when
  * nothing matches. Public so callers can route the same way the helper does
@@ -126,6 +234,20 @@ export function classifyFactsAbsorbError(err: unknown): FactsAbsorbReason {
   if (!err) return 'pipeline_error';
   const msg = err instanceof Error ? err.message : String(err);
   const name = err instanceof Error ? err.name : '';
+
+  // Typed extraction failures carry their reason — map precisely instead of
+  // pattern-matching the message (a 401/invalid-model provider_error would
+  // otherwise fall through to the generic 'pipeline_error'). instanceof via
+  // name check: the class lives in extract.ts and this module must stay
+  // import-light; the name is stable and set in the constructor.
+  if (name === 'FactsExtractionError') {
+    const reason = (err as { reason?: string }).reason;
+    if (reason === 'provider_error') return 'gateway_error';
+    if (reason && (FACTS_ABSORB_REASONS as readonly string[]).includes(reason)) {
+      return reason as FactsAbsorbReason;
+    }
+    return 'pipeline_error';
+  }
 
   // Anthropic / OpenAI / Voyage all surface 4xx/5xx + timeouts in similar shapes.
   if (/timeout|timed?\s?out|ETIMEDOUT/i.test(msg)) return 'gateway_error';

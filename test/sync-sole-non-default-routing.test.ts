@@ -21,9 +21,13 @@ import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runSources } from '../src/commands/sources.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 let repoPath: string;
+// runSync records the monthly backup check under GBRAIN_HOME; a file-local home keeps that
+// (and every other state file sync writes) out of the shared per-run test home.
+let home: string;
 
 async function pageCountBySource(): Promise<Record<string, number>> {
   const rows = await engine.executeRaw<{ source_id: string; n: number }>(
@@ -36,6 +40,7 @@ async function pageCountBySource(): Promise<Record<string, number>> {
 
 describe('#1434 — runSync auto-routes to sole_non_default source', () => {
   beforeAll(async () => {
+    home = mkdtempSync(join(tmpdir(), 'gbrain-snd-home-'));
     engine = new PGLiteEngine();
     await engine.connect({});
     await engine.initSchema();
@@ -43,6 +48,7 @@ describe('#1434 — runSync auto-routes to sole_non_default source', () => {
 
   afterAll(async () => {
     if (engine) await engine.disconnect();
+    rmSync(home, { recursive: true, force: true });
   }, 60_000);
 
   beforeEach(async () => {
@@ -67,7 +73,7 @@ describe('#1434 — runSync auto-routes to sole_non_default source', () => {
     if (repoPath) rmSync(repoPath, { recursive: true, force: true });
   });
 
-  test('sole non-default source: performSync without --source routes there', async () => {
+  test('sole non-default source: performSync without --source routes there', () => withEnv({ GBRAIN_HOME: home }, async () => {
     // local_path is required for tier 5.5 to fire — point at the synthetic
     // git repo so resolveSourceWithTier sees one non-default source with
     // a local_path AND falls through brain_default (unset).
@@ -90,7 +96,10 @@ describe('#1434 — runSync auto-routes to sole_non_default source', () => {
       // runSync takes (engine, args). With no --source it relies on the
       // resolver to pick sole_non_default. --full to bypass git-diff
       // bookmarking. --no-embed since we have no embedding provider.
-      // --repo points at the synthetic vault.
+      // No --repo: since #3765 an explicit --repo routes via the repo-derived
+      // tier (dotfile/local_path anchored at the repo dir), which would
+      // short-circuit the sole_non_default tier this test pins. The anchor
+      // resolves from the source row's local_path instead.
       // Note: runSync calls process.exit on some paths — guard accordingly.
       const origExit = process.exit;
       let exitCode: number | undefined;
@@ -100,7 +109,7 @@ describe('#1434 — runSync auto-routes to sole_non_default source', () => {
       }) as typeof process.exit;
 
       try {
-        await runSync(engine, ['--full', '--no-embed', '--repo', repoPath]);
+        await runSync(engine, ['--full', '--no-embed']);
       } catch (e) {
         if ((e as Error).message !== '__exit__') throw e;
       } finally {
@@ -121,9 +130,9 @@ describe('#1434 — runSync auto-routes to sole_non_default source', () => {
     const stderrText = captured.join('');
     expect(stderrText).toContain("routing to source 'studiovault'");
     expect(stderrText).toContain('sole non-default source registered');
-  }, 60_000);
+  }), 60_000);
 
-  test('explicit --source overrides auto-routing (no nudge)', async () => {
+  test('explicit --source overrides auto-routing (no nudge)', () => withEnv({ GBRAIN_HOME: home }, async () => {
     await runSources(engine, ['add', 'studiovault', '--path', repoPath, '--no-federated']);
     const { runSync } = await import('../src/commands/sync.ts');
 
@@ -159,14 +168,37 @@ describe('#1434 — runSync auto-routes to sole_non_default source', () => {
     // Pages went to 'default' as requested.
     const counts = await pageCountBySource();
     expect(counts['default']).toBeGreaterThan(0);
-  }, 60_000);
+  }), 60_000);
 
-  test('2+ non-default sources: no auto-route, no nudge, falls through to default', async () => {
+  test('2+ non-default sources: no auto-route, no nudge, falls through to default', () => withEnv({ GBRAIN_HOME: home }, async () => {
     // Both need local_path to be counted by the sole_non_default helper.
     // Pre-existing helper filters local_path IS NOT NULL.
+    // secondRepo is a bare temp dir (no git init) — its content is
+    // irrelevant to what this test verifies (that 2+ non-default sources
+    // disable auto-routing); --force skips #2707's registration-time git
+    // validation, which is orthogonal to this test's assertion.
+    //
+    // #3765: --repo now routes via the repo-derived tier when the path
+    // belongs to a registered source, so this test's --repo must point at an
+    // UNREGISTERED repo — otherwise the repo tier (correctly) routes to
+    // studiovault and the seed_default fall-through under test never runs.
     const secondRepo = mkdtempSync(join(tmpdir(), 'gbrain-snd-routing-second-'));
+    const unregisteredRepo = mkdtempSync(join(tmpdir(), 'gbrain-snd-routing-unreg-'));
+    execSync('git init', { cwd: unregisteredRepo, stdio: 'pipe' });
+    execSync('git config user.email "t@t.com"', { cwd: unregisteredRepo, stdio: 'pipe' });
+    execSync('git config user.name "T"', { cwd: unregisteredRepo, stdio: 'pipe' });
+    mkdirSync(join(unregisteredRepo, 'topics'), { recursive: true });
+    writeFileSync(join(unregisteredRepo, 'topics/bar.md'), [
+      '---',
+      'type: concept',
+      'title: Bar',
+      '---',
+      '',
+      'fall-through body.',
+    ].join('\n'));
+    execSync('git add -A && git commit -m initial', { cwd: unregisteredRepo, stdio: 'pipe' });
     await runSources(engine, ['add', 'studiovault', '--path', repoPath, '--no-federated']);
-    await runSources(engine, ['add', 'second-vault', '--path', secondRepo, '--no-federated']);
+    await runSources(engine, ['add', 'second-vault', '--path', secondRepo, '--no-federated', '--force']);
     const { runSync } = await import('../src/commands/sync.ts');
 
     const origWrite = process.stderr.write.bind(process.stderr);
@@ -184,7 +216,7 @@ describe('#1434 — runSync auto-routes to sole_non_default source', () => {
       const origExit = process.exit;
       process.exit = ((_code?: number) => { throw new Error('__exit__'); }) as typeof process.exit;
       try {
-        await runSync(engine, ['--full', '--no-embed', '--repo', repoPath]);
+        await runSync(engine, ['--full', '--no-embed', '--repo', unregisteredRepo]);
       } catch (e) {
         if ((e as Error).message !== '__exit__') throw e;
       } finally {
@@ -202,5 +234,5 @@ describe('#1434 — runSync auto-routes to sole_non_default source', () => {
     expect(counts['default'] ?? 0).toBeGreaterThan(0);
     expect(counts['studiovault'] ?? 0).toBe(0);
     expect(counts['second-vault'] ?? 0).toBe(0);
-  }, 60_000);
+  }), 60_000);
 });

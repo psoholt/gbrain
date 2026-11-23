@@ -18,6 +18,7 @@ import {
   EMBEDDING_COST_PER_1K_TOKENS,
   estimateEmbeddingCostUsd,
   willEmbedSynchronously,
+  resolveWorkerBackedSyncEmbedMode,
   shouldBlockSync,
 } from '../src/core/embedding.ts';
 import { lookupEmbeddingPrice } from '../src/core/embedding-pricing.ts';
@@ -61,22 +62,22 @@ describe('Layer 8 D1 — embedding cost model', () => {
   test('cost preview uses the CONFIGURED model rate, not a hardcoded OpenAI rate', () => {
     // Regression: the cost gate previously hardcoded $0.00013/1k (OpenAI
     // text-embedding-3-large) regardless of the configured embedding model,
-    // so a brain on a cheaper model (e.g. zeroentropyai:zembed-1 @ $0.05/Mtok)
-    // saw a preview that named the wrong provider and over-stated spend ~2.6x.
+    // so a brain on a cheaper model (e.g. voyage:voyage-4 @ $0.06/Mtok)
+    // saw a preview that named the wrong provider and over-stated spend ~2.2x.
     // The pricing table is the single source of truth per provider:model.
     const TOKENS = 2_590_710_262; // a real large-brain sync preview
     const openai = lookupEmbeddingPrice('openai:text-embedding-3-large');
-    const zeroentropy = lookupEmbeddingPrice('zeroentropyai:zembed-1');
+    const voyage = lookupEmbeddingPrice('voyage:voyage-4');
     expect(openai.kind).toBe('known');
-    expect(zeroentropy.kind).toBe('known');
-    if (openai.kind === 'known' && zeroentropy.kind === 'known') {
+    expect(voyage.kind).toBe('known');
+    if (openai.kind === 'known' && voyage.kind === 'known') {
       const openaiCost = (TOKENS / 1_000_000) * openai.pricePerMTok;
-      const zeCost = (TOKENS / 1_000_000) * zeroentropy.pricePerMTok;
+      const voyageCost = (TOKENS / 1_000_000) * voyage.pricePerMTok;
       // The two models must produce materially different previews; a fix that
       // collapses both to the OpenAI number would regress this assertion.
       expect(openaiCost).toBeCloseTo(336.79, 1);
-      expect(zeCost).toBeCloseTo(129.54, 1);
-      expect(zeCost).toBeLessThan(openaiCost);
+      expect(voyageCost).toBeCloseTo(155.44, 1);
+      expect(voyageCost).toBeLessThan(openaiCost);
     }
   });
 
@@ -93,7 +94,8 @@ describe('Layer 8 D1 — embedding cost model', () => {
 });
 
 describe('v0.41.31 — willEmbedSynchronously (embed-mode resolver)', () => {
-  // Mirrors sync.ts:2346 effectiveNoEmbed = v2 && !serial && !noEmbed ? true : noEmbed.
+  // Public compatibility contract: package.json exports ./embedding, so the
+  // original v2/serial call shape must remain both type- and runtime-safe.
   // Embed runs INLINE iff that resolves to false.
   test('v2 off → inline (legacy synchronous embed)', () => {
     expect(willEmbedSynchronously({ v2Enabled: false, serialFlag: false, noEmbed: false })).toBe('inline');
@@ -107,6 +109,14 @@ describe('v0.41.31 — willEmbedSynchronously (embed-mode resolver)', () => {
   test('--no-embed forces deferred regardless of v2/serial', () => {
     expect(willEmbedSynchronously({ v2Enabled: false, serialFlag: false, noEmbed: true })).toBe('deferred');
     expect(willEmbedSynchronously({ v2Enabled: true, serialFlag: true, noEmbed: true })).toBe('deferred');
+  });
+});
+
+describe('worker-capability-aware sync embed mode', () => {
+  test('defers only when the command boundary found a worker-backed defer path', () => {
+    expect(resolveWorkerBackedSyncEmbedMode({ deferEligible: false, noEmbed: false })).toBe('inline');
+    expect(resolveWorkerBackedSyncEmbedMode({ deferEligible: true, noEmbed: false })).toBe('deferred');
+    expect(resolveWorkerBackedSyncEmbedMode({ deferEligible: false, noEmbed: true })).toBe('deferred');
   });
 });
 

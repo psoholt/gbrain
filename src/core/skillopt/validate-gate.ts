@@ -20,14 +20,19 @@
  * which is cached (D11), so the effective cost ~1.3x not 3x.
  */
 
-import { runWithLimit, isMustAbortError } from '../worker-pool.ts';
+import { runWithLimit, type SettledItem } from '../worker-pool.ts';
+import { createHash } from 'node:crypto';
+import { withoutBudgetTracker } from '../ai/gateway.ts';
+import { isSkilloptMustAbort, SKILLOPT_HOOK_INFRA_ERROR, SKILLOPT_RUNTIME_EXCEEDED } from './must-abort.ts';
 import { runRollout, type RolloutOpts } from './rollout.ts';
 import { scoreTrajectory } from './score.ts';
-import type { BenchmarkTask, GateInput, GateResult, ScoredRollout } from './types.ts';
+import type { BenchmarkTask, GateInput, GateResult, RolloutBatchHook, RolloutPhase, ScoredRollout } from './types.ts';
 import { VALIDATION_EPSILON, VALIDATION_RUNS_PER_TASK } from './types.ts';
 import type { BrainEngine } from '../engine.ts';
+import type { OperationContext } from '../ops/contract.ts';
 
 export interface ValidateGateOpts extends Omit<GateInput, 'selSet'> {
+  operationContext?: OperationContext;
   selSet: BenchmarkTask[];
   engine: BrainEngine;
   targetModel: string;
@@ -42,11 +47,95 @@ export interface ValidateGateOpts extends Omit<GateInput, 'selSet'> {
    */
   runsPerTask?: number;
   abortSignal?: AbortSignal;
+  /**
+   * #4119 — wall-clock deadline (epoch ms) observed INSIDE the rollout loop:
+   * checked before every individual rollout, not just between orchestrator
+   * steps. A breach throws `skillopt_runtime_exceeded` (surfaced loudly, never
+   * swallowed as a score-0 task) so a long batch can't blow past
+   * --max-runtime by a whole gate's worth of rollouts.
+   */
+  deadlineMs?: number;
   /** Test seam — substitute rollout. */
   rolloutFn?: typeof runRollout;
   /** Test seam — substitute scoreTrajectory. */
   scoreFn?: typeof scoreTrajectory;
+  /** B1.3: when set, the whole batch goes to the hook in one call; rolloutFn/scoreFn are unused. */
+  rolloutHook?: RolloutBatchHook;
+  /** Hook request labels. Default phase 'sel_gate', epoch/step 0. */
+  phase?: RolloutPhase;
+  epoch?: number;
+  step?: number;
 }
+
+export { SKILLOPT_RUNTIME_EXCEEDED };
+
+interface PerTask {
+  task_id: string;
+  median: number;
+  runs: number[];
+  rollouts: ScoredRollout[];
+}
+
+/** setTimeout clamps longer delays to 1 ms; a cap beyond it relies on the post-call deadline check. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** One hook call for the whole batch; a malformed reply is an infra error, never a score. */
+async function hookBatch(opts: ValidateGateOpts, hook: RolloutBatchHook, runsPerTask: number): Promise<PerTask[]> {
+  const deadline = opts.deadlineMs;
+  if (deadline !== undefined && Date.now() > deadline) throw new Error(SKILLOPT_RUNTIME_EXCEEDED);
+  // The runtime cap bounds the batch: the hook gets a signal that fires at the
+  // deadline, and a batch still running then (or answered late) aborts the run.
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(opts.abortSignal?.reason);
+  if (opts.abortSignal?.aborted) onAbort();
+  else opts.abortSignal?.addEventListener('abort', onAbort, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = deadline === undefined || deadline - Date.now() > MAX_TIMER_MS ? null : new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(new Error(SKILLOPT_RUNTIME_EXCEEDED));
+      reject(new Error(SKILLOPT_RUNTIME_EXCEEDED));
+    }, Math.max(0, deadline - Date.now()));
+  });
+  const call = Promise.resolve().then(() => withoutBudgetTracker(() => hook({
+    phase: opts.phase ?? 'sel_gate',
+    skillText: opts.candidateSkillText,
+    skillSha256: createHash('sha256').update(opts.candidateSkillText).digest('hex'),
+    tasks: opts.selSet,
+    runsPerTask,
+    epoch: opts.epoch ?? 0,
+    step: opts.step ?? 0,
+  }, controller.signal)));
+  let rows: ScoredRollout[][];
+  try {
+    rows = await (expired ? Promise.race([call, expired]) : call);
+  } finally {
+    clearTimeout(timer);
+    opts.abortSignal?.removeEventListener('abort', onAbort);
+  }
+  if (deadline !== undefined && Date.now() > deadline) throw new Error(SKILLOPT_RUNTIME_EXCEEDED);
+  const needsTrajectory = opts.phase === 'train_forward';
+  const badRun = (r: ScoredRollout | undefined) => typeof r?.score !== 'number' || !(r.score >= 0 && r.score <= 1)
+    || (needsTrajectory && (typeof r.trajectory !== 'object' || r.trajectory === null));
+  if (!Array.isArray(rows) || rows.length !== opts.selSet.length || rows.some((r) => !Array.isArray(r) || r.length !== runsPerTask || r.some(badRun))) {
+    throw new Error(`${SKILLOPT_HOOK_INFRA_ERROR}: rollout hook returned a malformed batch for ${opts.phase ?? 'sel_gate'} (want ${opts.selSet.length} rows of ${runsPerTask} runs, each a score in [0,1]${needsTrajectory ? ' with a trajectory' : ''})`);
+  }
+  return opts.selSet.map((task, i) => {
+    const runs = rows[i]!.map((r) => r.score);
+    return { task_id: task.task_id, median: median(runs), runs, rollouts: rows[i]! };
+  });
+}
+function isRuntimeExceeded(e: unknown): boolean {
+  return e instanceof Error && e.message === SKILLOPT_RUNTIME_EXCEEDED;
+}
+/**
+ * #4741 — every task in a gate failed (dead target provider, e.g. a logged-out
+ * claude-cli child) / every rollout's judge errored (dead judge provider).
+ * Thrown instead of scoring the gate 0.000, so the orchestrator's catch-all
+ * ends the run `errored` with the first provider error as abort_detail.
+ */
+export const SKILLOPT_ALL_ROLLOUTS_FAILED = 'skillopt_all_rollouts_failed';
+export const SKILLOPT_ALL_JUDGE_ERRORS = 'skillopt_all_judge_errors';
+const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /**
  * Run the validation gate against a candidate skill. Returns GateResult
@@ -60,47 +149,65 @@ export async function runValidationGate(opts: ValidateGateOpts): Promise<GateRes
   // at 1 (a runsPerTask of 0 would silently produce an empty median).
   const runsPerTask = Math.max(1, opts.runsPerTask ?? VALIDATION_RUNS_PER_TASK);
 
-  interface PerTask {
-    task_id: string;
-    median: number;
-    runs: number[];
-    rollouts: ScoredRollout[];
-  }
-
   // Per sel-task, run N rollouts + N judges, take median.
-  const settled = await runWithLimit({
-    items: opts.selSet,
-    limit: concurrency,
-    fn: async (task: BenchmarkTask): Promise<PerTask> => {
-      const runs: number[] = [];
-      const rollouts: ScoredRollout[] = [];
-      for (let i = 0; i < runsPerTask; i++) {
-        const rolloutOpts: RolloutOpts = {
-          engine: opts.engine,
-          skillText: opts.candidateSkillText,
-          task,
-          targetModel: opts.targetModel,
-          abortSignal: opts.abortSignal,
-        };
-        const trajectory = await rolloutFn(rolloutOpts);
-        const scored: ScoredRollout = await scoreFn(trajectory, task.judge, {
-          judgeModel: opts.judgeModel,
-        });
-        runs.push(scored.score);
-        rollouts.push(scored);
-      }
-      return { task_id: task.task_id, median: median(runs), runs, rollouts };
-    },
-    signal: opts.abortSignal,
-  });
+  const settled: SettledItem<PerTask>[] = opts.rolloutHook
+    ? (await hookBatch(opts, opts.rolloutHook, runsPerTask)).map((value, idx) => ({ ok: true, value, idx }))
+    : await runWithLimit({
+      items: opts.selSet,
+      limit: concurrency,
+      fn: async (task: BenchmarkTask): Promise<PerTask> => {
+        const runs: number[] = [];
+        const rollouts: ScoredRollout[] = [];
+        for (let i = 0; i < runsPerTask; i++) {
+          // #4119: in-rollout-loop deadline — see ValidateGateOpts.deadlineMs.
+          if (opts.deadlineMs !== undefined && Date.now() > opts.deadlineMs) {
+            throw new Error(SKILLOPT_RUNTIME_EXCEEDED);
+          }
+          const rolloutOpts: RolloutOpts = {
+            operationContext: opts.operationContext,
+            engine: opts.engine,
+            skillText: opts.candidateSkillText,
+            task,
+            targetModel: opts.targetModel,
+            abortSignal: opts.abortSignal,
+          };
+          const trajectory = await rolloutFn(rolloutOpts);
+          const scored: ScoredRollout = await scoreFn(trajectory, task.judge, {
+            judgeModel: opts.judgeModel,
+          });
+          runs.push(scored.score);
+          rollouts.push(scored);
+        }
+        return { task_id: task.task_id, median: median(runs), runs, rollouts };
+      },
+      signal: opts.abortSignal,
+    });
 
-  // MUST-ABORT errors (budget exhaustion / no-pricing) are NOT scoring noise —
+  // MUST-ABORT errors (budget exhaustion / no-pricing / spend-policy refusals) are NOT scoring noise —
   // swallowing them as score=0 turns a pricing/cap crash into a fake "0/N" run
   // (the bug the SkillOpt eval surfaced: a Haiku run with --max-cost hit
   // no_pricing on every rollout and the whole gate reported a vacuous 0). Surface
   // them loudly so the caller aborts instead of recording a hollow measurement.
-  const aborter = settled.find((s) => s && !s.ok && isMustAbortError(s.error));
+  // #4119: a deadline breach is not scoring noise either — it must surface as
+  // the orchestrator's runtime-exceeded abort, never a fake 0-score task.
+  const aborter = settled.find(
+    (s) => s && !s.ok && (isSkilloptMustAbort(s.error) || isRuntimeExceeded(s.error)),
+  );
   if (aborter && !aborter.ok) throw aborter.error;
+
+  // #4741: a 100%-failed gate is not a measurement. Any plain (non-tagged)
+  // provider error — a logged-out claude-cli child, a dead endpoint — lands
+  // here as an ordinary !ok item; scoring all of them 0 let a dead provider
+  // finish the whole run as a plausible `no_improvement` / 0.000. Partial
+  // failure below keeps the pessimistic per-task 0 (scoring noise).
+  const failed = settled.filter((s) => s && !s.ok);
+  if (settled.length > 0 && failed.length === settled.length) {
+    const first = failed[0]!.ok ? undefined : failed[0]!.error;
+    throw new Error(
+      `${SKILLOPT_ALL_ROLLOUTS_FAILED}: every task in this gate failed (${failed.length}/${settled.length}); first error: ${errMsg(first)}`,
+      { cause: first },
+    );
+  }
 
   // SettledItem<TOut>[] — extract successful results; treat (non-abort) errors as
   // score=0 (pessimistic fallback consistent with the judge fail-open posture).
@@ -108,9 +215,18 @@ export async function runValidationGate(opts: ValidateGateOpts): Promise<GateRes
   // trajectories rather than fabricated zero-score entries).
   const perTaskMedians = settled.map((s, idx) => {
     if (s && s.ok) return { task_id: s.value.task_id, median: s.value.median, runs: s.value.runs };
-    return { task_id: opts.selSet[idx]!.task_id, median: 0, runs: [] };
+    return { task_id: opts.selSet[idx]!.task_id, median: 0, runs: [], error: errMsg(s.error) };
   });
   const scoredRollouts: ScoredRollout[] = settled.flatMap((s) => (s && s.ok) ? s.value.rollouts : []);
+  // #4741: same rule for the judge side. scoreLlm fails open per rollout
+  // (score 0 + judge_error) so one flaky judge call is noise; EVERY rollout
+  // carrying a judge_error is a dead judge provider, not a 0.000 skill.
+  // Rule/qrels judges never set judge_error, so only the LLM judge trips it.
+  if (scoredRollouts.length > 0 && scoredRollouts.every((r) => r.judge_error)) {
+    throw new Error(
+      `${SKILLOPT_ALL_JUDGE_ERRORS}: every rollout's judge failed (${scoredRollouts.length}/${scoredRollouts.length}); first error: ${scoredRollouts[0]!.judge_error}`,
+    );
+  }
   const selScore = perTaskMedians.length === 0
     ? 0
     : perTaskMedians.reduce((acc, r) => acc + r.median, 0) / perTaskMedians.length;
@@ -129,6 +245,7 @@ export async function runValidationGate(opts: ValidateGateOpts): Promise<GateRes
 }
 
 export interface ScoreOnTasksOpts {
+  operationContext?: OperationContext;
   engine: BrainEngine;
   skillText: string;
   tasks: BenchmarkTask[];
@@ -136,9 +253,42 @@ export interface ScoreOnTasksOpts {
   judgeModel?: string;
   /** Median-of-N runs per task. Defaults to `VALIDATION_RUNS_PER_TASK` (3). */
   runsPerTask?: number;
+  /** #4119 — in-rollout-loop deadline (epoch ms); see ValidateGateOpts. */
+  deadlineMs?: number;
   abortSignal?: AbortSignal;
   rolloutFn?: typeof runRollout;
   scoreFn?: typeof scoreTrajectory;
+  /** B1.3: score through a harness hook (one call for the batch). */
+  rolloutHook?: RolloutBatchHook;
+  /** Hook request label. Default 'test'. */
+  phase?: RolloutPhase;
+}
+
+/** Per-task medians plus their mean; a task whose rollout errored has median 0, no runs and its error. */
+export interface PerTaskScore {
+  score: number;
+  perTask: GateResult['perTaskMedians'];
+}
+
+/** scoreSkillOnTasks with the per-task rows (paired comparisons across arms need them). */
+export async function scoreSkillPerTask(opts: ScoreOnTasksOpts): Promise<PerTaskScore> {
+  const gate = await runValidationGate({
+    operationContext: opts.operationContext,
+    engine: opts.engine,
+    candidateSkillText: opts.skillText,
+    selSet: opts.tasks,
+    bestScore: -1,
+    targetModel: opts.targetModel,
+    phase: opts.phase ?? 'test',
+    ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
+    ...(opts.runsPerTask !== undefined ? { runsPerTask: opts.runsPerTask } : {}),
+    ...(opts.deadlineMs !== undefined ? { deadlineMs: opts.deadlineMs } : {}),
+    ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
+    ...(opts.rolloutFn ? { rolloutFn: opts.rolloutFn } : {}),
+    ...(opts.scoreFn ? { scoreFn: opts.scoreFn } : {}),
+    ...(opts.rolloutHook ? { rolloutHook: opts.rolloutHook } : {}),
+  });
+  return { score: gate.selScore, perTask: gate.perTaskMedians };
 }
 
 /**
@@ -146,23 +296,10 @@ export interface ScoreOnTasksOpts {
  * (`selScore`). The single primitive for "how good is this skill on these tasks?"
  * — used by the orchestrator's baseline + final-test eval, the held-out gate, and
  * the Track B eval harnesses, so they can't drift on scoring semantics. Thin
- * wrapper over `runValidationGate({ bestScore: -1 })` (any score "accepts"; we
- * only read `.selScore`).
+ * wrapper over `scoreSkillPerTask` (any score "accepts"; we only read the mean).
  */
 export async function scoreSkillOnTasks(opts: ScoreOnTasksOpts): Promise<number> {
-  const gate = await runValidationGate({
-    engine: opts.engine,
-    candidateSkillText: opts.skillText,
-    selSet: opts.tasks,
-    bestScore: -1,
-    targetModel: opts.targetModel,
-    ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
-    ...(opts.runsPerTask !== undefined ? { runsPerTask: opts.runsPerTask } : {}),
-    ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
-    ...(opts.rolloutFn ? { rolloutFn: opts.rolloutFn } : {}),
-    ...(opts.scoreFn ? { scoreFn: opts.scoreFn } : {}),
-  });
-  return gate.selScore;
+  return (await scoreSkillPerTask(opts)).score;
 }
 
 /** Pure median for an array of numbers. Returns 0 for empty array. */

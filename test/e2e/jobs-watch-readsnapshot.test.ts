@@ -12,7 +12,6 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { MinionQueue } from '../../src/core/minions/queue.ts';
 import { readSnapshot } from '../../src/commands/jobs-watch.ts';
 import { logLeasePressure } from '../../src/core/minions/lease-pressure-audit.ts';
-import { setOwnerBudget } from '../../src/core/minions/budget-tracker.ts';
 
 let engine: PGLiteEngine;
 let queue: MinionQueue;
@@ -59,13 +58,18 @@ describe('v0.41 jobs-watch readSnapshot E2E', () => {
     }
     // 2 dead jobs with classifiable errors.
     await engine.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, attempts_made, attempts_started, max_attempts, error_text, finished_at, updated_at)
-       VALUES ('subagent', 'default', 'dead', 1, 1, 1, 'rate lease "anthropic:messages" full (8/8)', now(), now()),
-              ('subagent', 'default', 'dead', 1, 1, 1, 'prompt is too long: 2M tokens', now(), now())`,
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, attempts_made, attempts_started, max_attempts, error_text, finished_at, updated_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'default', 'dead', 1, 1, 1, 'rate lease "anthropic:messages" full (8/8)', now(), now()),
+              ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'default', 'dead', 1, 1, 1, 'prompt is too long: 2M tokens', now(), now())`,
     );
     // One budget-bearing owner with cents.
     const budgetOwner = await queue.add('subagent', {}, {}, { allowProtectedSubmit: true });
-    await setOwnerBudget(engine, budgetOwner.id, 5.0);
+    await engine.executeRaw(
+      `UPDATE minion_jobs
+          SET budget_remaining_cents = 500, budget_owner_job_id = $1, budget_root_owner_id = $1
+        WHERE id = $1`,
+      [budgetOwner.id],
+    );
 
     const s = await readSnapshot(engine);
     // Queue health: 4 waiting from queue.add, +1 budget owner = 5 waiting.

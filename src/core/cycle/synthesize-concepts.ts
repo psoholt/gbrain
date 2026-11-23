@@ -14,24 +14,114 @@
 //      Haiku 3-check from extract_atoms decides "this atom is about
 //      concept X", it stamps the field).
 //   3. For each group with count ≥2: assign tier (T1/T2/T3/T4 by count).
-//   4. For T1/T2 groups: Sonnet call to produce a 1-paragraph narrative.
+//   4. Sort by tier, evidence count, and slug so the bounded LLM budget goes
+//      to the strongest groups deterministically.
+//   5. For T1/T2 groups: Sonnet call to produce a 1-paragraph narrative.
 //      For T3/T4: deterministic stub narrative.
-//   5. Write concept-typed pages.
+//   6. Write concept-typed pages with the synthesis mode made explicit.
 
-import type { BrainEngine } from '../engine.ts';
+import type { BrainEngine, PageSnapshot } from '../engine.ts';
+import { resolveModel } from '../model-config.ts';
 import type { PhaseResult } from '../cycle.ts';
 import type { ProgressReporter } from '../progress.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
-import { upsertExtractRollup } from '../extract/rollup-writer.ts';
-import { chat as gatewayChat } from '../ai/gateway.ts';
+import { providerHaltReason, upsertExtractRollup } from '../extract/rollup-writer.ts';
+import { chat as gatewayChat, isThinkingModel, THINKING_MODEL_MAX_OUTPUT_TOKENS } from '../ai/gateway.ts';
+import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
+import { canonicalLookup, type ModelPricing } from '../model-pricing.ts';
+import { priceFor, type PricingOverrides } from '../budget/reservation-cost.ts';
+import { loadPricingOverrides } from '../budget/budget-tracker.ts';
+import { pricingSetCommand } from '../budget/no-pricing.ts';
+import { createHash } from 'node:crypto';
+import { slugifySegment } from '../sync.ts';
+import { validatePageSlug } from '../ops/context.ts';
+import { privatePagesFilterFragment, strictestVisibility, type Visibility } from '../search/private-visibility.ts';
+import { maintenancePreflight } from '../persistence/prepared-maintenance.ts';
+import { derivedWriteThrough, reportDerivedWriteThrough } from './derived-write-through.ts';
+import { addSpellingRedirects, canonicalConceptStem, loadConceptRedirects, loadLiveConceptStems } from './concept-redirects.ts';
+import { conceptProvenanceCovers, conceptPublicationHold, stripFenceSections } from './concept-publication.ts';
+import { conceptWriter, type ConceptWrite } from './concept-writes.ts';
+import { heldConceptRebuild, keptReason, submitHeldConceptPurge, type ConceptRebuild, type RebuildKept } from '../persistence/concept-rebuild.ts';
+import { readPhaseConfigNumber, SYNTHESIZE_CONCEPTS_BUDGET_KEY, SYNTHESIZE_CONCEPTS_DEFAULT_BUDGET_USD } from './phase-config-values.ts';
+import { ConceptRetryBound, MAX_CONCEPT_ATTEMPTS } from './concept-retry-bound.ts';
+import { ConceptDriftSkips } from '../persistence/drift-conflicts.ts';
+import { throwIfAborted } from '../abort-check.ts';
 
-const DEFAULT_BUDGET_USD = 1.5;
+// Miss policy for the shared resolver (`priceFor`: operator overrides, the
+// claude-cli → Anthropic sibling, canonical rows): assume Sonnet-tier
+// pricing for a model nothing prices, and name it in the phase details
+// (`pricing_fallback_models`) plus one stderr line. Conservative and
+// non-throwing; keeps this default budget effective instead of letting an
+// unpriced model run unmetered. The rates are DERIVED from the canonical
+// table (never hand-copied — CLAUDE.md invariant); the literal pair only
+// fires if the Sonnet key itself ever leaves the table.
+const FALLBACK_PRICING: ModelPricing = canonicalLookup('anthropic:claude-sonnet-4-6') ?? {
+  input: 3.0,
+  output: 15.0,
+};
+/** The rate a narrative call meters at: the shared resolver, else the Sonnet fallback, naming each fallback model once. */
+function narrativePricing(model: string, overrides: PricingOverrides | undefined, fallbackModels: Set<string>, budgetUsd: number): ModelPricing {
+  const priced = priceFor(model, 'chat', overrides);
+  if (priced) return priced.pricing;
+  if (!fallbackModels.has(model)) {
+    fallbackModels.add(model);
+    console.error(`[synthesize_concepts] ${model} has no pricing; metering it at Sonnet-tier rates against the $${budgetUsd.toFixed(2)} phase budget. To meter its real price, look it up and register it: ${pricingSetCommand(model, 'chat')}`);
+  }
+  return FALLBACK_PRICING;
+}
+
+/** #4907: the run's named-key budget warnings (invalid stored budget, groups refused at the cap), each echoed once to stderr. */
+function budgetWarnings(configWarning: string | undefined, capped: number, budgetUsd: number): string[] {
+  const warnings = configWarning ? [configWarning] : [];
+  if (capped > 0) {
+    warnings.push(`${capped} LLM-eligible concept(s) got no model narrative because the $${budgetUsd.toFixed(2)} phase budget was reached; they retry next run. ` +
+      `Raise the cap: gbrain config set ${SYNTHESIZE_CONCEPTS_BUDGET_KEY} <usd>. Verify: gbrain config get ${SYNTHESIZE_CONCEPTS_BUDGET_KEY}`);
+  }
+  for (const warning of warnings) console.error(`[synthesize_concepts] ${warning}`);
+  return warnings;
+}
+
 const TIER_T1_MIN = 10;
 const TIER_T2_MIN = 5;
 const TIER_T3_MIN = 2;
+/**
+ * Output cap for the per-concept narrative. 500 sizes the *answer* (a
+ * 1-paragraph summary) and is ample for a non-reasoning model. It is NOT ample
+ * for a thinking-by-default model: reasoning bills as output and counts against
+ * max_tokens, so the budget is spent before any answer text is emitted — hosted
+ * DeepSeek returns empty content (→ `deterministicNarrative` ships a template
+ * stub as 'error_fallback'), while the native deepseek: recipe promotes the
+ * truncated reasoning_content into content (→ chain-of-thought persisted as
+ * the narrative with synthesis_mode 'llm'). This phase resolves at
+ * `tier: 'reasoning'`, so a thinking model here is the expected case.
+ */
+const DEFAULT_SYNTH_MAX_OUTPUT_TOKENS = 500;
+
+/**
+ * Narrative output cap for the resolved model. `isThinkingModel` is the
+ * gateway's shared predicate (name-matched Claude 5 OR recipe-declared
+ * `thinking_by_default`; unknown providers count as non-thinking), the same
+ * check think's maxOutputTokensFor and the subagent handler use. Thinking
+ * models get the gateway's verified THINKING_MODEL_MAX_OUTPUT_TOKENS rather
+ * than a phase-private number: a local 8000 contradicted it, and DeepSeek v4
+ * truncates at 8192-class caps — the reasoning budget was gone before any
+ * answer text.
+ */
+export function resolveSynthMaxOutputTokens(modelStr: string): number {
+  return isThinkingModel(modelStr) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_SYNTH_MAX_OUTPUT_TOKENS;
+}
 
 export interface SynthesizeConceptsOpts {
   brainDir?: string;
+  /**
+   * #4416: the cycle's resolved source scope (cycleSourceId in cycle.ts).
+   * Without it every write below falls through to the engine's `?? 'default'`
+   * literal, which misfiles (or, on the createVersion update path, kills the
+   * cycle) on any brain whose sole source is not named `default`: getPage's
+   * undefined-source path is source-agnostic, so the existence probe passes,
+   * then createVersion throws "page ... (source=default) not found".
+   */
+  sourceId?: string;
   dryRun?: boolean;
   yieldDuringPhase?: (() => Promise<void>) | undefined;
   /**
@@ -41,18 +131,35 @@ export interface SynthesizeConceptsOpts {
    * `heartbeat()`; cycle.ts owns start/finish.
    */
   progress?: ProgressReporter;
+  /**
+   * #7986: the cycle's abort signal (job timeout or cancel, lock loss). Handed to the model call and checked
+   * before each concept's spend and publication, so an aborted run publishes no further concept page.
+   */
+  signal?: AbortSignal;
   /** Test seam: alternative chat function. */
   _chat?: typeof gatewayChat;
   /** Test seam: skip DB query; cluster these atoms directly. */
-  _atoms?: Array<{ slug: string; concept_refs: string[]; body: string; title: string }>;
+  _atoms?: Array<{ slug: string; concept_refs: string[]; body: string; title: string; visibility?: Visibility; revision?: string }>;
 }
 
 interface AtomGroup {
   conceptSlug: string;
+  /** #4589: member atom slugs — the provenance edges are written from these. */
+  atomSlugs: string[];
   atomTitles: string[];
   atomBodies: string[];
+  /** #9653: each member's knowledge_revision when its body was read (a held concept's rebuild refuses if it moved). */
+  atomRevisions: Array<string | undefined>;
+  /** #5525: strictest effective visibility of the member atoms. */
+  visibility: Visibility;
   tier: 'T1' | 'T2' | 'T3' | 'T4';
 }
+
+type ConceptSynthesisMode =
+  | 'llm'
+  | 'deterministic_tier'
+  | 'budget_fallback'
+  | 'error_fallback';
 
 const SYNTH_PROMPT = `You write a 1-paragraph executive summary of a concept
 based on multiple atom-shaped insights that reference it.
@@ -60,6 +167,14 @@ based on multiple atom-shaped insights that reference it.
 Output ONLY the summary paragraph (3-5 sentences). No headers, no JSON,
 no preamble. Write in plain English, present-tense voice. Synthesize what
 the atoms collectively SAY about the concept; don't enumerate the atoms.`;
+
+/** #9653: the rebuild of a held concept tombstone, or null; a held concept kept hidden is added to `kept` with why. */
+async function conceptRebuildFor(engine: BrainEngine, sourceId: string, snapshot: PageSnapshot, group: AtomGroup, dryRun: boolean,
+  kept: RebuildKept[]): Promise<ConceptRebuild | null> {
+  const held = dryRun ? null : await heldConceptRebuild(engine, sourceId, snapshot, group.atomSlugs, group.atomRevisions, group.visibility);
+  if (held && 'kept' in held) kept.push(held.kept);
+  return held && 'rebuild' in held ? held.rebuild : null;
+}
 
 export async function runPhaseSynthesizeConcepts(
   engine: BrainEngine,
@@ -75,13 +190,20 @@ export async function runPhaseSynthesizeConcepts(
         slug: string;
         title: string;
         compiled_truth: string;
+        revision: string;
         frontmatter: { concepts?: string[]; imported_from?: string };
+        private: boolean;
       }>(
-        `SELECT slug, title, compiled_truth, frontmatter
+        // Codex P2: scoped to the cycle source — the provenance edges below
+        // are pinned to it, so a brain-global scan grouped same-slug atoms
+        // from OTHER sources into this source's concepts.
+        `SELECT slug, title, compiled_truth, knowledge_revision::text AS revision, frontmatter, NOT (${privatePagesFilterFragment('pages')}) AS private
            FROM pages
           WHERE type = 'atom'
+            AND source_id = $1
             AND deleted_at IS NULL
             AND (frontmatter->>'imported_from') IS NULL`,
+        [opts.sourceId ?? 'default'],
       );
       atoms = rows
         .filter((r) => Array.isArray(r.frontmatter?.concepts) && r.frontmatter.concepts.length > 0)
@@ -89,7 +211,9 @@ export async function runPhaseSynthesizeConcepts(
           slug: r.slug,
           title: r.title,
           body: r.compiled_truth,
+          revision: r.revision,
           concept_refs: r.frontmatter!.concepts!,
+          visibility: r.private ? 'private' as const : 'world' as const,
         }));
     } catch {
       // No atoms table or query failed — phase no-ops cleanly.
@@ -106,13 +230,18 @@ export async function runPhaseSynthesizeConcepts(
     };
   }
 
-  // 2. Group atoms by concept slug
-  const groups = new Map<string, { titles: string[]; bodies: string[] }>();
-  for (const atom of atoms) {
-    for (const conceptSlug of atom.concept_refs) {
-      const existing = groups.get(conceptSlug) ?? { titles: [], bodies: [] };
+  // 2. Group atoms by concept stem (#6161 human redirects, then #5965 spelling folds; see resolveAtomConceptStems); one atom counts once per concept.
+  const { atomStems, foldedSpellings } = await resolveAtomConceptStems(engine, opts.sourceId ?? 'default', atoms);
+  const groups = new Map<string, { slugs: string[]; titles: string[]; bodies: string[]; revisions: Array<string | undefined>; visibilities: Visibility[] }>();
+  for (const [i, atom] of atoms.entries()) {
+    for (const conceptSlug of atomStems[i]!) {
+      const existing = groups.get(conceptSlug) ?? { slugs: [], titles: [], bodies: [], revisions: [], visibilities: [] };
+      existing.slugs.push(atom.slug);
       existing.titles.push(atom.title);
       existing.bodies.push(atom.body);
+      existing.revisions.push(atom.revision);
+      // An atom with no recorded visibility is private (derived pages fail closed).
+      existing.visibilities.push(atom.visibility ?? 'private');
       groups.set(conceptSlug, existing);
     }
   }
@@ -126,8 +255,11 @@ export async function runPhaseSynthesizeConcepts(
       count >= TIER_T1_MIN ? 'T1' : count >= TIER_T2_MIN ? 'T2' : 'T3';
     atomGroups.push({
       conceptSlug,
+      atomSlugs: data.slugs,
       atomTitles: data.titles,
       atomBodies: data.bodies,
+      atomRevisions: data.revisions,
+      visibility: strictestVisibility(data.visibilities),
       tier,
     });
   }
@@ -142,12 +274,39 @@ export async function runPhaseSynthesizeConcepts(
     };
   }
 
+  // Spend the bounded LLM budget on the strongest concepts first, independent
+  // of Postgres/PGLite row encounter order. Stable slug ordering makes equal
+  // groups deterministic across engines and repeated runs.
+  const tierRank: Record<AtomGroup['tier'], number> = { T1: 0, T2: 1, T3: 2, T4: 3 };
+  atomGroups.sort((a, b) =>
+    tierRank[a.tier] - tierRank[b.tier] ||
+    b.atomTitles.length - a.atomTitles.length ||
+    a.conceptSlug.localeCompare(b.conceptSlug));
+
   // 4. Per group: synthesize narrative (LLM for T1/T2, deterministic for T3+)
   let conceptsWritten = 0;
   let estimatedSpendUsd = 0;
-  const budgetCap = DEFAULT_BUDGET_USD;
+  const budget = await readPhaseConfigNumber(engine, SYNTHESIZE_CONCEPTS_BUDGET_KEY);
+  const budgetCap = budget.value ?? SYNTHESIZE_CONCEPTS_DEFAULT_BUDGET_USD;
+  let budgetCapped = 0;
   const failures: Array<{ concept: string; error: string }> = [];
+  // #4589 provenance-link problems. Kept OUT of `failures`: that list means
+  // "the LLM call failed → template fallback" downstream (summary wording,
+  // rollup halt_delta / round_completed_delta), which a missing edge is not —
+  // the narrative was synthesized and persisted as-is. Warn-only.
+  const linkWarnings: Array<{ concept: string; warning: string }> = [];
+  // #3044 adoption: shared halt policy — auth/billing halt on the first
+  // hit, a rate_limit streak halts after 3 consecutive failures, a
+  // successful chat call resets the streak.
+  const llmHalt = createGlobalLlmHaltTracker();
+  let abortedGlobalError: GlobalLlmErrorClass | null = null;
   const tierCounts = { T1: 0, T2: 0, T3: 0, T4: 0 };
+  const synthesisModeCounts: Record<ConceptSynthesisMode, number> = {
+    llm: 0,
+    deterministic_tier: 0,
+    budget_fallback: 0,
+    error_fallback: 0,
+  };
 
   // v0.41.19.0 (T3): throttled yield helper. Fires `opts.yieldDuringPhase`
   // every 30s — cycle.ts threads `buildYieldDuringPhase(lock, outer)` so
@@ -169,15 +328,130 @@ export async function runPhaseSynthesizeConcepts(
     }
   }
 
+  // Honour the documented per-task routing. Without an explicit model this
+  // call inherits models.chat, so models.dream.synthesize (advertised in the
+  // routing table as tier.reasoning) had no effect on this path.
+  const synthModel = await resolveModel(engine, {
+    configKey: 'models.dream.synthesize',
+    tier: 'reasoning',
+    fallback: 'sonnet',
+  });
+  const synthMaxOutputTokens = resolveSynthMaxOutputTokens(synthModel);
+  // #5484: a managed brain refuses the legacy importFromContent writer. Claim
+  // maintenance authority before any model spend so a missing canonical owner
+  // fails fast; null on an unmanaged brain.
+  const maintenance = opts.dryRun ? null : await maintenancePreflight(engine, opts.sourceId ?? 'default', opts.brainDir);
+  const conceptFiles = await derivedWriteThrough(engine, 'synthesize_concepts', opts.sourceId ?? 'default', { managed: maintenance !== null, dryRun: opts.dryRun ?? false });
+  // Managed publication outcomes, kept out of `failures` (LLM fallback). A
+  // deferred concept moved under a concurrent writer and is retried next run;
+  // a held concept cannot be republished without losing canonical material.
+  const publicationDeferred: Array<{ concept: string; reason: string }> = [];
+  const publicationHeld: Array<{ concept: string; reason: string }> = [];
+  const publicationPending: Array<{ concept: string; reason: string }> = [];
+  const skippedHumanOwned: string[] = [];
+  const skippedDeleted: string[] = [];
+  const rebuilds: ConceptWrite[] = [];
+  const rebuildDeferred: Array<{ concept: string; reason: string }> = [];
+  const rebuildKept: RebuildKept[] = [];
+  const skippedUnchanged: string[] = [];
+  const provenanceRestored: string[] = [];
+  const rehashed: string[] = [];
+  const keptExistingNarrative: string[] = [];
+  const pricingOverrides = await loadPricingOverrides(engine);
+  const pricingFallbackModels = new Set<string>();
+  const retries = await ConceptRetryBound.load(engine); // #6260: bounded paid retries per member hash
+  const skippedRetryBound: string[] = [];
+  const driftSkips = await ConceptDriftSkips.load(engine, opts.sourceId ?? 'default', !!maintenance?.binding, !!opts.dryRun);
+  const skippedFileDrift = driftSkips.skipped;
+  const src = opts.sourceId ?? 'default';
+  const countWritten = () => {
+    conceptsWritten++;
+    // v0.41.19.0 (T4): one tick per concept group with running count.
+    opts.progress?.tick(1, `${conceptsWritten} concepts`);
+  };
+  const writer = conceptWriter({ engine, maintenance, sourceId: src, importSourceId: opts.sourceId, brainDir: opts.brainDir, writeThrough: conceptFiles !== null,
+    retries, publicationDeferred, publicationHeld, publicationPending, linkWarnings, written: countWritten });
+  // #7986: an aborted run publishes nothing more, but keeps the retry counters and the spend of the calls it finished.
+  const stopIfAborted = async (): Promise<void> => {
+    if (!opts.signal?.aborted) return;
+    if (!opts.dryRun) {
+      await retries.save(engine);
+      await upsertExtractRollup(engine, { kind: 'concepts', source_id: src, cost_delta: estimatedSpendUsd });
+    }
+    throwIfAborted(opts.signal, 'synthesize_concepts');
+  };
   for (const group of atomGroups) {
-    tierCounts[group.tier]++;
+    await stopIfAborted();
+    const conceptSlug = `concepts/${group.conceptSlug}`;
+    // A concept page this phase did not write belongs to a human (or another
+    // writer). Check before any spend; never replace its body.
+    const existingSnapshot = await engine.readPageSnapshot(conceptSlug, { sourceId: opts.sourceId ?? 'default', includeDeleted: true });
+    // #6161: a deleted concept is never resurrected, except (#9653) one hidden only by an input purge and carrying nothing
+    // stated: after the model call its tombstone is purged and a fresh page written from the current members (concept-rebuild.ts).
+    const rebuild = existingSnapshot?.page.deleted_at ? await conceptRebuildFor(engine, src, existingSnapshot, group, !!opts.dryRun, rebuildKept) : null;
+    if (existingSnapshot?.page.deleted_at && !rebuild) { skippedDeleted.push(conceptSlug); continue; }
+    const existing = rebuild ? null : existingSnapshot?.page ?? null;
+    if (existing && !String(existing.frontmatter?.synthesized_by ?? '').startsWith('synthesize_concepts')) {
+      skippedHumanOwned.push(conceptSlug);
+      continue;
+    }
+    // The narrative is a function of the member atoms' narrative (their
+    // `## Facts` / `## Takes` sections excluded, D-N3), their strictest
+    // visibility and the model. When none changed and the page holds a real
+    // narrative, there is nothing to spend or rewrite; a fallback page is retried,
+    // and so is one a chat_fallback_chain model wrote (hashed under that model).
+    const hashOf = (model: string, bodies: string[]): string => createHash('sha256')
+      .update(JSON.stringify([model, group.visibility, group.atomSlugs.map((s, i) => [s, group.atomTitles[i], bodies[i]])
+        .sort((a, b) => a[0].localeCompare(b[0]))]))
+      .digest('hex').slice(0, 16);
+    const narrativeBodies = group.atomBodies.map(stripFenceSections);
+    const hashFor = (model: string): string => hashOf(model, narrativeBodies);
+    // #7269: a T3 narrative is the deterministic template, which never calls the model, so its hash leaves the model out.
+    const hashModel = group.tier === 'T1' || group.tier === 'T2' ? synthModel : '';
+    const memberHash = hashFor(hashModel);
+    const priorMode = existing?.frontmatter?.synthesis_mode;
+    const realNarrative = priorMode === 'llm' || priorMode === 'deterministic_tier';
+    // #7269: rewriting a deterministic page to the template it already holds, at a visibility it already has, would
+    // publish nothing new (a page hashed with the model before the fix keeps its body and is not rewritten).
+    const priorVisibility: Visibility = existing?.frontmatter?.visibility === 'private' ? 'private' : 'world';
+    if ((existing?.frontmatter?.member_hash === memberHash && realNarrative)
+      || (hashModel === '' && priorMode === 'deterministic_tier' && strictestVisibility([group.visibility, priorVisibility]) === priorVisibility
+        && stripFenceSections(existing!.compiled_truth).trim() === deterministicNarrative(group).trim())) {
+      skippedUnchanged.push(conceptSlug);
+      // #7548: the cache skips the model, not the member provenance an unchanged concept may have lost.
+      if (!opts.dryRun && !await conceptProvenanceCovers(engine, src, conceptSlug, group.atomSlugs)) {
+        await writer.restoreProvenance({ concept: group.conceptSlug, conceptSlug, atomSlugs: group.atomSlugs, revision: existingSnapshot!.revision });
+        provenanceRestored.push(conceptSlug);
+      }
+      continue;
+    }
+    // #6643 (B1): a drifted concept would only add a conflict receipt per publication; checked live before any spend.
+    if (!rebuild && await driftSkips.skip(conceptSlug, existingSnapshot)) continue;
+    const held = existing && conceptPublicationHold(existing); // checked before any spend
+    if (held) { publicationHeld.push({ concept: group.conceptSlug, reason: held }); continue; }
+    // A page hashed by the pre-D-N3 formula (full atom bodies) whose inputs are
+    // provably unchanged keeps its narrative: only the hash is rewritten, no spend.
+    const grandfathered = realNarrative && existing?.frontmatter?.member_hash === hashOf(hashModel, group.atomBodies);
+    if (!grandfathered) tierCounts[group.tier]++;
     let narrative: string;
-    if (group.tier === 'T1' || group.tier === 'T2') {
+    let synthesisMode: ConceptSynthesisMode, unverifiedClaims: UnverifiedClaim[] = [];
+    let fallbackWriter: string | undefined;
+    if (grandfathered) {
+      narrative = stripFenceSections(existing!.compiled_truth);
+      synthesisMode = priorMode as ConceptSynthesisMode;
+      rehashed.push(conceptSlug);
+    } else if (group.tier === 'T1' || group.tier === 'T2') {
       if (estimatedSpendUsd >= budgetCap) {
         narrative = deterministicNarrative(group);
+        synthesisMode = 'budget_fallback';
+        budgetCapped++;
+      } else if (retries.exhausted(`${opts.sourceId ?? 'default'}:${conceptSlug}`, memberHash)) {
+        skippedRetryBound.push(conceptSlug);
+        continue;
       } else {
         try {
           const result = await chat({
+            model: synthModel,
             system: SYNTH_PROMPT,
             messages: [
               {
@@ -186,71 +460,135 @@ export async function runPhaseSynthesizeConcepts(
                   `Concept slug: ${group.conceptSlug}\n` +
                   `${group.atomTitles.length} atoms reference this concept.\n\n` +
                   `Sample atom titles:\n${group.atomTitles.slice(0, 10).map((t) => `  - ${t}`).join('\n')}\n\n` +
-                  `Sample atom bodies:\n${group.atomBodies
+                  `Sample atom bodies:\n${narrativeBodies
                     .slice(0, 5)
                     .map((b, i) => `${i + 1}. ${b.slice(0, 500)}`)
                     .join('\n\n')}`,
               },
             ],
-            maxTokens: 500,
+            maxTokens: synthMaxOutputTokens,
+            abortSignal: opts.signal,
           });
           // Post-await yield (T3): the LLM call is the main TTL hazard
           // codex flagged. Throttle inside maybeYield bounds the actual
           // refresh rate.
           await maybeYield();
-          // Sonnet at ~$3/M input + $15/M output
+          llmHalt.reset();
+          const pricing = narrativePricing(result.model, pricingOverrides, pricingFallbackModels, budgetCap);
           estimatedSpendUsd +=
-            (result.usage.input_tokens * 3.0 + result.usage.output_tokens * 15.0) / 1_000_000;
-          narrative = result.text.trim() || deterministicNarrative(group);
+            (result.usage.input_tokens * pricing.input +
+              result.usage.output_tokens * pricing.output) /
+            1_000_000;
+          const text = result.text.trim();
+          // #6260: a narrative stopped before the end never replaces a page or advances its member hash.
+          const stopped = result.stopReason === 'length' || result.stopReason === 'refusal' || result.stopReason === 'content_filter';
+          if (text && !stopped) {
+            ({ narrative, unverified: unverifiedClaims } = await groundConceptNarrative(engine, text, group));
+            synthesisMode = 'llm';
+            if (result.fallbackFrom) fallbackWriter = result.model;
+          } else {
+            failures.push({ concept: group.conceptSlug, error: stopped ? `output stopped before the end (stopReason=${result.stopReason})` : 'empty model response' });
+            narrative = deterministicNarrative(group);
+            synthesisMode = 'error_fallback';
+            retries.fail(`${opts.sourceId ?? 'default'}:${conceptSlug}`, memberHash);
+          }
         } catch (err) {
-          failures.push({
-            concept: group.conceptSlug,
-            error: err instanceof Error ? err.message : String(err),
-          });
+          await stopIfAborted();
+          const msg = err instanceof Error ? err.message : String(err);
+          // #3044 adoption: a whole-run LLM outage must not overwrite
+          // existing concept pages with error_fallback stub narratives.
+          // A halt decision stops the phase; a below-streak rate limit
+          // skips this group's write (the page stays intact for the next
+          // run); only non-global errors keep the per-item
+          // error_fallback behavior.
+          const decision = llmHalt.observe(err);
+          if (decision !== 'continue') {
+            abortedGlobalError = haltedClassOf(decision);
+            failures.push({
+              concept: group.conceptSlug,
+              error: `aborting phase: ${llmHalt.note()} (${msg})`,
+            });
+            break;
+          }
+          failures.push({ concept: group.conceptSlug, error: msg });
+          if (llmHalt.lastClass() === 'rate_limit') continue;
           narrative = deterministicNarrative(group);
+          synthesisMode = 'error_fallback';
+          retries.fail(`${opts.sourceId ?? 'default'}:${conceptSlug}`, memberHash);
         }
       }
     } else {
       narrative = deterministicNarrative(group);
+      synthesisMode = 'deterministic_tier';
     }
+    // Never replace an LLM narrative with a template stub; the next cycle retries.
+    if (priorMode === 'llm' && (synthesisMode === 'budget_fallback' || synthesisMode === 'error_fallback')) {
+      keptExistingNarrative.push(conceptSlug);
+      continue;
+    }
+    // #9653: a failed synthesis never rebuilds a held concept; it stays hidden and held for the next cycle.
+    if (rebuild && synthesisMode !== 'llm' && synthesisMode !== 'deterministic_tier') { rebuildDeferred.push({ concept: conceptSlug, reason: 'the synthesis did not produce a narrative; retried next run' }); continue; }
+    if (!grandfathered) synthesisModeCounts[synthesisMode]++;
 
+    await stopIfAborted();
     if (!opts.dryRun) {
-      const title = group.conceptSlug.split('/').pop() ?? group.conceptSlug;
-      await engine.putPage(`concepts/${title}`, {
-        title: title.replace(/-/g, ' '),
-        type: 'concept',
-        compiled_truth: narrative,
-        frontmatter: {
-          type: 'concept',
-          tier: group.tier,
-          mention_count: group.atomTitles.length,
-          composite_score: group.atomTitles.length,
-          synthesized_at: new Date().toISOString(),
-          synthesized_by: 'synthesize_concepts-v0.41',
-        },
-        timeline: '',
+      // #9653: managed, the tombstone's retention purge commits before the fresh page is queued; otherwise nothing more is written.
+      const purged = rebuild && maintenance ? await submitHeldConceptPurge(engine, maintenance, src, conceptSlug, rebuild) : true;
+      if (purged !== true) { rebuildDeferred.push({ concept: conceptSlug, reason: purged }); continue; }
+      // #5525: tighten-only — a concept already private stays private.
+      const prior = rebuild ? null : await engine.getPage(conceptSlug, { sourceId: src });
+      const visibility = strictestVisibility([group.visibility, prior?.frontmatter?.visibility === 'private' ? 'private' : 'world']);
+      // #2163: serialize to markdown and import via the canonical pipeline so
+      // the page is chunked (+ embedded when a provider is configured) —
+      // mirrors put_page's isAvailable('embedding') → noEmbed gate.
+      const synthesizedAt = grandfathered ? String(existing!.frontmatter.synthesized_at ?? new Date().toISOString()) : new Date().toISOString();
+      const synthesized = (pageVisibility: Visibility) => ({
+        tier: group.tier,
+        mention_count: group.atomTitles.length,
+        composite_score: group.atomTitles.length,
+        synthesis_mode: synthesisMode,
+        member_hash: fallbackWriter ? hashFor(fallbackWriter) : memberHash,
+        synthesized_at: synthesizedAt,
+        synthesized_by: 'synthesize_concepts-v0.41',
+        visibility: pageVisibility, ...(unverifiedClaims.length ? { unverified_claims: unverifiedClaims.map(c => ({ ...c, sources: ['member atoms'], detected_at: synthesizedAt.slice(0, 10) })) } : {}),
       });
-    }
-    conceptsWritten++;
-    // v0.41.19.0 (T4): one tick per concept group with running count.
-    opts.progress?.tick(1, `${conceptsWritten} concepts`);
+      // #5525: a world concept stays private until every member's provenance
+      // edge is durable, because a later private flip reaches it through them.
+      // GBRA-60: one whose edges already cover every member publishes once, at
+      // world, so a strict source never commits an intermediate private page.
+      const covered = !rebuild && visibility === 'world' && await conceptProvenanceCovers(engine, src, conceptSlug, group.atomSlugs);
+      const write: ConceptWrite = { concept: group.conceptSlug, conceptSlug, atomSlugs: group.atomSlugs, visibility, covered, synthesisMode, synthesized, narrative,
+        revision: rebuild ? null : existingSnapshot?.revision ?? null, baseline: existing?.compiled_truth ?? '', ...(rebuild ? { rebuild: maintenance ? { purgedMembers: rebuild.members } : rebuild } : {}) };
+      if (rebuild) rebuilds.push(write);
+      // GBRA-60: a managed run's concepts publish in batches (concept-writes.ts), each one publication group on Postgres.
+      await stopIfAborted();
+      await (maintenance ? writer.queue(write) : writer.publish(write));
+    } else countWritten();
 
     // v0.41.19.0 (T3): replaced bare per-iteration fire with throttled
     // helper. Same hook, same cycle-lock refresh effect, just at the
     // right cadence (30s instead of every-group).
     await maybeYield();
   }
+  await stopIfAborted();
+  if (maintenance) await writer.flush();
 
-  // v0.42 Wave B3: receipt + rollup for synthesize_concepts. Brain-global
-  // phase — uses 'default' source_id because concepts span sources. Receipt
-  // only fires when concepts were actually written; rollup always fires so
-  // doctor sees the phase ran.
-  if (!opts.dryRun && conceptsWritten > 0) {
+  // v0.42 Wave B3: receipt + rollup for synthesize_concepts. Receipt/rollup
+  // carry the cycle's resolved source (#4416, opts.sourceId); 'default'
+  // survives only as the fallback for legacy unscoped callers. Receipt only
+  // fires when concepts were actually written; rollup always fires so doctor
+  // sees the phase ran.
+  const driftActions = await driftSkips.finish();
+  const warnings = budgetWarnings(budget.warning, budgetCapped, budgetCap);
+  if (!opts.dryRun) await retries.save(engine);
+  // Managed brains skip the receipt page (a legacy putPage), like extract_atoms;
+  // the rollup row below still records the run for doctor.
+  if (!opts.dryRun && !maintenance && conceptsWritten > 0) {
     const runId = `concepts-${Date.now().toString(36)}`;
     try {
       await writeReceipt(engine, {
         kind: 'concepts',
-        source_id: 'default',
+        source_id: opts.sourceId ?? 'default',
         run_id: runId,
         round: 'single',
         extracted_at: new Date().toISOString(),
@@ -259,6 +597,8 @@ export async function runPhaseSynthesizeConcepts(
         summary:
           `Synthesized ${conceptsWritten} concepts ` +
           `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3}) ` +
+          `(llm=${synthesisModeCounts.llm} deterministic=${synthesisModeCounts.deterministic_tier} ` +
+          `budget_fallback=${synthesisModeCounts.budget_fallback} error_fallback=${synthesisModeCounts.error_fallback}) ` +
           `from ${atomGroups.length} groups across ${atoms.length} atoms.`,
       });
     } catch (err) {
@@ -268,32 +608,104 @@ export async function runPhaseSynthesizeConcepts(
   if (!opts.dryRun) {
     await upsertExtractRollup(engine, {
       kind: 'concepts',
-      source_id: 'default',
+      source_id: opts.sourceId ?? 'default',
       cost_delta: estimatedSpendUsd,
-      round_completed_delta: failures.length === 0 ? 1 : 0,
-      halt_delta: failures.length > 0 ? 1 : 0,
+      round_completed_delta: failures.length === 0 && publicationDeferred.length === 0 && publicationHeld.length === 0 && publicationPending.length === 0 ? 1 : 0,
+      halt_delta: failures.length > 0 ? 1 : 0, halt_reason: providerHaltReason(abortedGlobalError) ?? 'item_error',
     });
   }
 
-  return {
+  const rebuilt = rebuilds.filter(write => write.rebuilt).map(write => write.conceptSlug);
+  return reportDerivedWriteThrough({
     phase: 'synthesize_concepts',
-    status: failures.length > 0 ? 'warn' : 'ok',
+    status: failures.length > 0 || linkWarnings.length > 0 || publicationDeferred.length > 0 || publicationHeld.length > 0 || publicationPending.length > 0
+      || skippedFileDrift.length > 0 ? 'warn' : 'ok',
     duration_ms: 0,
     summary:
       `synthesize_concepts: ${conceptsWritten} concepts ` +
       `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3})` +
-      (failures.length > 0 ? ` (${failures.length} LLM-failed → template fallback)` : ''),
+      (failures.length > 0 ? ` (${failures.length} LLM-failed → template fallback)` : '') +
+      (budgetCapped > 0 ? ` (${budgetCapped} over the $${budgetCap.toFixed(2)} budget → template fallback)` : '') +
+      (linkWarnings.length > 0 ? ` (${linkWarnings.length} provenance-link warning(s))` : '') +
+      (rebuilt.length > 0 ? ` (${rebuilt.length} hidden by an input purge rebuilt)` : '') +
+      (rebuildDeferred.length > 0 ? ` (${rebuildDeferred.length} hidden by an input purge left hidden for the next run)` : '') +
+      (rebuildKept.length > 0 ? ` (${rebuildKept.length} hidden by an input purge kept hidden: ${rebuildKept.map(keptReason).join('; ')})` : '') +
+      (skippedHumanOwned.length > 0 ? ` (${skippedHumanOwned.length} human-owned page(s) left untouched)` : '') +
+      (skippedUnchanged.length > 0 ? ` (${skippedUnchanged.length} unchanged)` : '') +
+      (rehashed.length > 0 ? ` (${rehashed.length} rehashed without synthesis)` : '') +
+      (keptExistingNarrative.length > 0 ? ` (${keptExistingNarrative.length} existing narrative(s) kept)` : '') +
+      (skippedRetryBound.length > 0 ? ` (${skippedRetryBound.length} skipped after ${MAX_CONCEPT_ATTEMPTS} failed attempts on unchanged members)` : '') +
+      (publicationDeferred.length > 0 ? ` (${publicationDeferred.length} publication(s) deferred: page changed, retried next run)` : '') +
+      (publicationHeld.length > 0 ? ` (${publicationHeld.length} publication(s) held: existing page needs import/repair)` : '') +
+      (publicationPending.length > 0 ? ` (${publicationPending.length} publication(s) held by the writer (pending or contended), finished later or retried next run)` : '') +
+      (skippedFileDrift.length > 0 ? ` (${skippedFileDrift.length} skipped before synthesis: canonical file differs from the database; ${driftActions.join('; ')})` : ''),
     details: {
       concepts_written: conceptsWritten,
       tier_counts: tierCounts,
+      synthesis_mode_counts: synthesisModeCounts,
       groups_found: atomGroups.length,
       atoms_seen: atoms.length,
       failures,
+      link_warnings: linkWarnings,
+      warnings,
+      skipped_human_owned: skippedHumanOwned,
+      skipped_deleted: skippedDeleted,
+      rebuilt,
+      rebuild_deferred: rebuildDeferred,
+      rebuild_kept: rebuildKept,
+      skipped_unchanged: skippedUnchanged,
+      provenance_restored: provenanceRestored,
+      rehashed,
+      kept_existing_narrative: keptExistingNarrative,
+      skipped_retry_bound: skippedRetryBound,
+      skipped_file_drift: skippedFileDrift,
+      ...(driftActions.length ? { file_drift_next_actions: driftActions } : {}),
+      folded_spellings: foldedSpellings,
+      publication_deferred: publicationDeferred,
+      publication_held: publicationHeld,
+      publication_pending: publicationPending,
+      ...(abortedGlobalError ? { aborted_global_error: abortedGlobalError } : {}),
       estimated_spend_usd: estimatedSpendUsd,
       budget_usd: budgetCap,
+      pricing_fallback_models: [...pricingFallbackModels],
       dry_run: opts.dryRun ?? false,
     },
-  };
+  }, conceptFiles, 'concept');
+}
+
+/**
+ * Each atom's concept stems, one entry per atom: the ref's stem through the
+ * human redirects (#6161), then through the run's spelling folds (#5965:
+ * `network-effects` / `networkeffects` become one stem; the live page's
+ * spelling wins, else the most frequent, tie to the hyphenated one; two live
+ * spellings are left apart). The folds are reported, never written.
+ */
+async function resolveAtomConceptStems(engine: BrainEngine, sourceId: string, atoms: Array<{ concept_refs: string[] }>):
+  Promise<{ atomStems: Set<string>[]; foldedSpellings: Array<{ from: string; to: string }> }> {
+  const redirects = await loadConceptRedirects(engine, sourceId, conceptStemFor).catch(() => new Map<string, string>());
+  const afterHumanHop = atoms.map((atom) => new Set(atom.concept_refs.map(conceptStemFor).filter((s): s is string => s !== null).map((stem) => canonicalConceptStem(stem, redirects))));
+  const atomCounts = new Map<string, number>();
+  for (const stems of afterHumanHop) for (const stem of stems) atomCounts.set(stem, (atomCounts.get(stem) ?? 0) + 1);
+  const liveStems = await loadLiveConceptStems(engine, sourceId, conceptStemFor).catch(() => new Set<string>());
+  const foldedSpellings = addSpellingRedirects(redirects, atomCounts, liveStems);
+  return { atomStems: afterHumanHop.map((stems) => new Set([...stems].map((stem) => canonicalConceptStem(stem, redirects)))), foldedSpellings };
+}
+
+/**
+ * The concept an atom's concept ref names, as the stem of its `concepts/`
+ * slug. LLM refs vary in case, spacing and prefix ("Network Effects",
+ * "concepts/network-effects"); they all name `network-effects`. A ref with no
+ * valid slug is dropped.
+ */
+function conceptStemFor(ref: string): string | null {
+  const stem = slugifySegment(String(ref).trim().split('/').pop() ?? '');
+  if (!stem) return null;
+  try {
+    validatePageSlug(`concepts/${stem}`);
+  } catch {
+    return null;
+  }
+  return stem;
 }
 
 /**
@@ -311,4 +723,23 @@ function deterministicNarrative(group: AtomGroup): string {
       .map((t) => `  - ${t}`)
       .join('\n')}`
   );
+}
+
+/**
+ * Ground the narrative's quoted spans against the atom titles and bodies the
+ * prompt carried (quotes only: a concept narrative may count or compare).
+ * A claim unit with an unverified quote is removed from the narrative and
+ * kept in frontmatter `unverified_claims`. Kill switch: dream.quote_verify (default on).
+ */
+type UnverifiedClaim = { text: string; reason: string; detail: string };
+async function groundConceptNarrative(engine: BrainEngine, narrative: string, group: { atomTitles: string[]; atomBodies: string[] }):
+  Promise<{ narrative: string; unverified: UnverifiedClaim[] }> {
+  const { ALL_CLAIMS_QUARANTINED_BODY, dreamQuoteVerifyEnabled, groundSource, verifyBody } = await import('./synthesize-verify.ts');
+  if (!await dreamQuoteVerifyEnabled(engine)) return { narrative, unverified: [] };
+  const sources = [
+    groundSource('concept-atom-titles', group.atomTitles.slice(0, 10).join('\n'), { tolerant: true }),
+    ...group.atomBodies.slice(0, 5).map((b, i) => groundSource(`concept-atom-${i + 1}`, b.slice(0, 500), { tolerant: true })),
+  ];
+  const v = verifyBody(narrative, sources, { checks: 'quotes' });
+  return { narrative: v.body.trim() || ALL_CLAIMS_QUARANTINED_BODY, unverified: v.quarantined };
 }

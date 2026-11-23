@@ -13,9 +13,12 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import {
   ImageLoadError,
   loadImageInput,
+  DEFAULT_IMAGE_MAX_BYTES,
+  DEFAULT_REMOTE_IMAGE_MAX_BYTES,
 } from '../src/core/search/image-loader.ts';
 import { __setDnsLookupForTests } from '../src/core/ssrf-validate.ts';
 
@@ -53,7 +56,7 @@ describe('loadImageInput — local path', () => {
   test('loads a PNG file and sniffs MIME', async () => {
     const path = join(tmpRoot, 'test.png');
     writeFileSync(path, PNG_BYTES);
-    const result = await loadImageInput(path);
+    const result = await loadImageInput(path, { allowLocalPath: true });
     expect(result.contentType).toBe('image/png');
     expect(result.bytes.length).toBe(PNG_BYTES.length);
     expect(result.base64).toBe(PNG_BYTES.toString('base64'));
@@ -62,21 +65,21 @@ describe('loadImageInput — local path', () => {
   test('loads a JPEG file and sniffs MIME', async () => {
     const path = join(tmpRoot, 'test.jpg');
     writeFileSync(path, JPEG_BYTES);
-    const result = await loadImageInput(path);
+    const result = await loadImageInput(path, { allowLocalPath: true });
     expect(result.contentType).toBe('image/jpeg');
   });
 
   test('loads a WebP file and sniffs MIME', async () => {
     const path = join(tmpRoot, 'test.webp');
     writeFileSync(path, WEBP_BYTES);
-    const result = await loadImageInput(path);
+    const result = await loadImageInput(path, { allowLocalPath: true });
     expect(result.contentType).toBe('image/webp');
   });
 
   test('rejects unsupported format (GIF)', async () => {
     const path = join(tmpRoot, 'test.gif');
     writeFileSync(path, Buffer.from('GIF89a' + 'x'.repeat(100)));
-    const err = await loadImageInput(path).catch(e => e);
+    const err = await loadImageInput(path, { allowLocalPath: true }).catch(e => e);
     expect(err).toBeInstanceOf(ImageLoadError);
     expect(err.code).toBe('INVALID_FORMAT');
   });
@@ -85,7 +88,7 @@ describe('loadImageInput — local path', () => {
     const path = join(tmpRoot, 'huge.png');
     // 11MB file with PNG magic bytes
     writeFileSync(path, Buffer.concat([PNG_BYTES, Buffer.alloc(11 * 1024 * 1024)]));
-    const err = await loadImageInput(path).catch(e => e);
+    const err = await loadImageInput(path, { allowLocalPath: true }).catch(e => e);
     expect(err).toBeInstanceOf(ImageLoadError);
     expect(err.code).toBe('OVERSIZED');
   });
@@ -93,15 +96,26 @@ describe('loadImageInput — local path', () => {
   test('rejects file via custom (tighter) maxBytes', async () => {
     const path = join(tmpRoot, 'medium.png');
     writeFileSync(path, Buffer.concat([PNG_BYTES, Buffer.alloc(1024 * 1024)])); // 1MB
-    const err = await loadImageInput(path, { maxBytes: 500 * 1024 }).catch(e => e);
+    const err = await loadImageInput(path, { maxBytes: 500 * 1024, allowLocalPath: true }).catch(e => e);
     expect(err).toBeInstanceOf(ImageLoadError);
     expect(err.code).toBe('OVERSIZED');
   });
 
   test('NOT_FOUND on nonexistent path', async () => {
-    const err = await loadImageInput(join(tmpRoot, 'missing.png')).catch(e => e);
+    const err = await loadImageInput(join(tmpRoot, 'missing.png'), { allowLocalPath: true }).catch(e => e);
     expect(err).toBeInstanceOf(ImageLoadError);
     expect(err.code).toBe('NOT_FOUND');
+  });
+
+  test('refuses file:// URIs and absolute paths unless the caller opts in', async () => {
+    const path = join(tmpRoot, 'default-off.png');
+    writeFileSync(path, PNG_BYTES);
+    for (const input of [path, `file://${path}`]) {
+      const err = await loadImageInput(input).catch(e => e);
+      expect(err).toBeInstanceOf(ImageLoadError);
+      expect(err.code).toBe('INVALID_URL');
+      expect(err.message).not.toContain(path);
+    }
   });
 });
 
@@ -151,6 +165,7 @@ describe('loadImageInput — invalid input shapes', () => {
 });
 
 describe('loadImageInput — http(s) URL with SSRF defense', () => {
+  const originalFetch = globalThis.fetch;
   let stubAddrs: Map<string, Array<{ address: string; family: number }>>;
 
   beforeEach(() => {
@@ -164,6 +179,57 @@ describe('loadImageInput — http(s) URL with SSRF defense', () => {
       }
       return recs;
     }) as any);
+  });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  test('loads compressed PNG using the decoded body and preserves remote/local limits', async () => {
+    stubAddrs.set('images.example.test', [{ address: '8.8.8.8', family: 4 }]);
+    globalThis.fetch = (async () => new Response(new Uint8Array(gzipSync(PNG_BYTES)), {
+      headers: { 'content-encoding': 'gzip', 'content-type': 'image/png' },
+    })) as unknown as typeof fetch;
+    const image = await loadImageInput('https://images.example.test/image.png');
+    expect(image.bytes).toEqual(PNG_BYTES);
+    expect(image.contentType).toBe('image/png');
+    expect(DEFAULT_REMOTE_IMAGE_MAX_BYTES).toBe(2 * 1024 * 1024);
+    expect(DEFAULT_IMAGE_MAX_BYTES).toBe(10 * 1024 * 1024);
+
+    const compressed = new Uint8Array(gzipSync(Buffer.concat([PNG_BYTES, Buffer.alloc(DEFAULT_REMOTE_IMAGE_MAX_BYTES)])));
+    globalThis.fetch = (async () => new Response(compressed, { headers: { 'content-encoding': 'gzip' } })) as unknown as typeof fetch;
+    await expect(loadImageInput('https://images.example.test/image.png', { maxBytes: DEFAULT_REMOTE_IMAGE_MAX_BYTES }))
+      .rejects.toMatchObject({ code: 'OVERSIZED' });
+  });
+
+  test('a stalled image body retains the total timeout after headers arrive', async () => {
+    stubAddrs.set('images.example.test', [{ address: '8.8.8.8', family: 4 }]);
+    let cancelled = false;
+    globalThis.fetch = (async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(PNG_BYTES); },
+      cancel() { cancelled = true; },
+    }))) as unknown as typeof fetch;
+    await expect(loadImageInput('https://images.example.test/image.png', { timeoutMs: 20 }))
+      .rejects.toMatchObject({ code: 'TIMEOUT' });
+    expect(cancelled).toBe(true);
+  });
+
+  test('image error diagnostics exclude signed URLs, transport errors and HTTP reason text', async () => {
+    const url = 'https://images.example.test/private-document?signature=private-value';
+    stubAddrs.set('images.example.test', [{ address: '8.8.8.8', family: 4 }]);
+    globalThis.fetch = (async () => new Response(new ReadableStream())) as unknown as typeof fetch;
+    const timedOut = await loadImageInput(url, { timeoutMs: 20 }).catch(error => error);
+    expect(timedOut).toBeInstanceOf(ImageLoadError);
+    expect(timedOut.code).toBe('TIMEOUT');
+    expect(timedOut.message).not.toContain('private-');
+
+    globalThis.fetch = (async () => { throw new Error('TLS failure private-document private-value'); }) as unknown as typeof fetch;
+    const failed = await loadImageInput(url).catch(error => error);
+    expect(failed.code).toBe('FETCH_FAILED');
+    expect(failed.message).not.toContain('private-');
+
+    globalThis.fetch = (async () => new Response(null, { status: 400, statusText: 'private-document private-value' })) as unknown as typeof fetch;
+    const rejected = await loadImageInput(url).catch(error => error);
+    expect(rejected.code).toBe('FETCH_FAILED');
+    expect(rejected.message).toContain('400');
+    expect(rejected.message).not.toContain('private-');
   });
 
   test('rejects URL whose hostname resolves internal (DNS rebinding)', async () => {

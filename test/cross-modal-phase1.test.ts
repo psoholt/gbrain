@@ -65,6 +65,49 @@ describe('query-intent — suggestedModality regex (D6 + D14)', () => {
   }
 });
 
+describe('query-intent — suggestedModality is multilingual (CJK)', () => {
+  // Discrimination: `\b` is an ASCII word boundary, so the English bank can
+  // never match a Han/Kana query. Every positive below returns 'text' against
+  // the English-only patterns.
+  const cjkImagePhrasings = [
+    '找一下那张蓝色羽绒服的照片',   // verb + measure word + 的 + 照片
+    '小花笑的图片',                 // 的 + 图片
+    '那张截图',                     // measure word + 截图
+    '搜索去年的相片',               // verb + 的 + 相片
+    '找一下蓝色羽绒服照片',         // verb-initial, no possessive
+    '这件衣服长什么样',             // "what does X look like"
+    '幫我找那張截圖',               // traditional Chinese
+    '猫の写真を見せて',             // Japanese, particle の
+    '画像を探して',                 // Japanese, verb-final
+  ];
+
+  for (const query of cjkImagePhrasings) {
+    test(`CJK image phrasing: "${query}" → image`, () => {
+      expect(classifyQuery(query).suggestedModality).toBe('image');
+    });
+  }
+
+  const cjkTextPhrasings = [
+    '图书馆的开放时间',   // 图书馆 is not a visual noun
+    '图片压缩算法的原理', // visual noun with no request structure around it
+    '截图',               // bare visual noun — parity with bare "screenshot"
+    '这个项目的进展',
+    '影像科的报告在哪',   // 影像科 is a department, not a request for images
+    '写真集の出版年',     // Japanese, no request verb
+  ];
+
+  for (const query of cjkTextPhrasings) {
+    test(`CJK text phrasing: "${query}" → text`, () => {
+      expect(classifyQuery(query).suggestedModality).toBe('text');
+    });
+  }
+
+  test('English classification is unchanged by the CJK bank', () => {
+    expect(classifyQuery('show me photos of acme').suggestedModality).toBe('image');
+    expect(classifyQuery('who is acme corp').suggestedModality).toBe('text');
+  });
+});
+
 describe('isAmbiguousModalityQuery (Commit 4 prep)', () => {
   // Genuinely ambiguous = visual noun present + reference marker present BUT
   // CROSS_MODAL_PATTERNS doesn't catch it (otherwise regex already classified
@@ -136,7 +179,7 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     return resolveSearchMode({ mode: 'balanced' });
   }
 
-  test('KNOBS_HASH_VERSION is 11 (cross-modal still appended; 10→11 asymmetric input_type fix)', () => {
+  test('KNOBS_HASH_VERSION is 31 (cross-modal still appended; …; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256; 28→29 evb= expansion variant budget fold; 29→30 exact-title order #5889; 30→31 rrg=/rrgg=/ecf= rerank gate fold W3)', () => {
     // v0.35 ladder: 1→2 reranker, 2→3 floor_ratio. v0.36 piggybacks on v=3
     // with 7 cross-modal knobs + column/provider context. v0.40.4 (salem) +
     // v0.39 T21 (master) bump to v=4 for graph_signals + schema-pack fields.
@@ -145,8 +188,36 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     // T2: 6→7 title_boost. v0.42.3.0: 7→8 autocut. issue #1777: 8→9 archive/ demote.
     // v0.43: 9→10 relational recall arm. #1400: 10→11 query-side input_type
     // finally reaches asymmetric providers — pre-fix rows were keyed on
-    // document-side query vectors.
-    expect(KNOBS_HASH_VERSION).toBe(11);
+    // document-side query vectors. #2825: 11→12 hard-exclude fold (hx=).
+    // #3430: 13→14 compiled_truth boost no longer applies at detail=medium.
+    // 14→15: the resolved FTS configuration name (fts=) — a language switch
+    // plus `reindex-search-vector` must not keep serving pre-switch rows.
+    // #3515: 15→16 detail fold (det=).
+    // WP2/T3: 16→17 degradation-stamp epoch — pre-stamp cache rows must not
+    // claim a clean (undegraded) run they can't prove.
+    // #3621: 18→19 ack= autocut minKeep floor.
+    // 19→20 (#3002): pre-fusion pool floor (innerLimit widens the candidate
+    // pool for the same knobs). 20→21 (#895): recency DEFAULT_FALLBACK
+    // 0.5→0.3 reorders cached rows. Version-only invalidation, same release.
+    // 21→22 (mw2): result-stamp/injection epoch — #1663 exact-lookup
+    // injection, #3995 relational page-1 slot, #3783 keyword_hit, #4220
+    // status alter stored rows for identical knobs.
+    // 22→23 (#4352 follow-up): private-visibility posture fold (xp=) —
+    // replaces the wholesale cache skip for excludePrivate=true callers.
+    // 23→24 (#4358 residual): negative-offset requests could read/write the
+    // same cache row an offset=0 request shares.
+    // 24→25 (#3617): kof= (keyword AND→OR fallback knob) joins the key.
+    // 25→26: sal=/rec=/ipat= — salience/recency + intent_patterns fold (#4415).
+
+    // 27→28: compiledTruthBoost synthetic-row suppression (#4256/#3695) —
+    // version-only invalidation.
+    // 28→29: evb= expansion variant budget fold (ranker wave) — budget-weighted
+    // variant fusion reorders rows for identical knobs; null hashes as legacy.
+    // v=29 ALSO carries rrp= (relational rerank pin, R1) and kacf= (keyword-arm
+    // confidence floor, Phase E2 / Cat 13) — same unshipped epoch, no extra bump.
+    // 29→30 (#5889): exact-title-first title-arm order + weight-A remote
+    // title predicate reorder rows for identical knobs; version-only.
+    expect(KNOBS_HASH_VERSION).toBe(31);
   });
 
   test('flipping unified_multimodal changes the hash', () => {

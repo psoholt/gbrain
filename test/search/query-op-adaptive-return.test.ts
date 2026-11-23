@@ -12,10 +12,6 @@ import { operationsByName } from '../../src/core/operations.ts';
 describe('query op — adaptive_return agent surface', () => {
   const query = operationsByName['query'];
 
-  test('query op exists', () => {
-    expect(query).toBeDefined();
-  });
-
   test('adaptive_return is a boolean param on query', () => {
     const param = query.params?.adaptive_return as { type?: string; description?: string } | undefined;
     expect(param).toBeDefined();
@@ -25,9 +21,10 @@ describe('query op — adaptive_return agent surface', () => {
   test('description teaches the agent WHEN to use it (single-answer vs breadth)', () => {
     const desc = (query.params?.adaptive_return as { description?: string })?.description ?? '';
     // Must instruct the agent on both directions of the decision.
-    expect(desc.toLowerCase()).toContain('true when');
+    // When to set it: true for one answer; omit for breadth.
+    expect(desc.toLowerCase()).toContain('true for one answer');
     expect(desc.toLowerCase()).toContain('breadth');
     // Must reassure the safety contract so the agent isn't afraid to use it.
-    expect(desc.toLowerCase()).toContain('never returns empty');
+    expect(desc.toLowerCase()).toContain('never empty');
   });
 });

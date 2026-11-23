@@ -20,7 +20,11 @@ let backlinksCalls: Array<{ action: string; dir: string; dryRun: boolean | undef
 let syncCalls: Array<{ dryRun: boolean | undefined; noPull: boolean | undefined; noExtract: boolean | undefined; sourceId: string | undefined }> = [];
 let extractCalls: Array<{ mode: string; dir: string; slugs: string[] | undefined }> = [];
 let embedCalls: Array<{ stale: boolean | undefined; dryRun: boolean | undefined }> = [];
+// #4599: per-test overrides spread onto the mock's EmbedResult (e.g. reason: 'stall_timeout').
+let embedResultOverride: Record<string, unknown> = {};
 let orphansCalls: number = 0;
+let orphansOpts: Array<{ sourceId?: string } | undefined> = [];
+let schemaSuggestOpts: Array<{ sourceId?: string; dryRun?: boolean } | undefined> = [];
 
 // Mock lint
 mock.module('../../src/commands/lint.ts', () => ({
@@ -42,7 +46,7 @@ mock.module('../../src/commands/backlinks.ts', () => ({
   hasBacklink: () => false,
   buildBacklinkEntry: () => '',
   findBacklinkGaps: () => [],
-  fixBacklinkGaps: () => 0,
+  fixBacklinkGaps: async () => ({ fixed: 0, skipped: [] }),
   runBacklinks: async () => {},
 }));
 
@@ -91,6 +95,7 @@ mock.module('../../src/commands/embed.ts', () => ({
       total_chunks: 10,
       pages_processed: 3,
       dryRun: !!opts.dryRun,
+      ...embedResultOverride,
     };
   },
   runEmbed: async () => {},
@@ -98,8 +103,9 @@ mock.module('../../src/commands/embed.ts', () => ({
 
 // Mock orphans
 mock.module('../../src/commands/orphans.ts', () => ({
-  findOrphans: async () => {
+  findOrphans: async (_engine: any, opts?: { sourceId?: string }) => {
     orphansCalls++;
+    orphansOpts.push(opts);
     return {
       orphans: [],
       total_orphans: 1,
@@ -112,6 +118,14 @@ mock.module('../../src/commands/orphans.ts', () => ({
   shouldExclude: () => false,
   deriveDomain: () => 'root',
   formatOrphansText: () => '',
+}));
+
+// Mock schema-suggest
+mock.module('../../src/core/cycle/schema-suggest.ts', () => ({
+  runSchemaSuggestPhase: async (_engine: any, opts?: { sourceId?: string; dryRun?: boolean }) => {
+    schemaSuggestOpts.push(opts);
+    return { suggestions_emitted: 0, source_id: opts?.sourceId ?? 'default', skipped: false };
+  },
 }));
 
 // Import after mocks.
@@ -147,7 +161,10 @@ beforeEach(() => {
   syncCalls = [];
   extractCalls = [];
   embedCalls = [];
+  embedResultOverride = {};
   orphansCalls = 0;
+  orphansOpts = [];
+  schemaSuggestOpts = [];
 });
 
 // ─── dryRun propagation (regression guards) ────────────────────────
@@ -188,6 +205,15 @@ describe('runCycle — dryRun propagates to every phase', () => {
     expect(extractPhase?.status).toBe('skipped');
     expect(extractPhase?.details.reason).toBe('no_dry_run_support');
   });
+
+  test('dryRun skips the calibration trio — no LLM calls, no take_proposals/grade/profile writes (#4823)', async () => {
+    const report = await runCycle(sharedEngine,{ brainDir: '/tmp/brain', dryRun: true });
+    for (const name of ['propose_takes', 'grade_takes', 'calibration_profile'] as const) {
+      const phase = report.phases.find(p => p.phase === name);
+      expect(phase?.status).toBe('skipped');
+      expect(phase?.details.reason).toBe('no_dry_run_support');
+    }
+  });
 });
 
 // ─── Phase selection ──────────────────────────────────────────────
@@ -214,6 +240,22 @@ describe('runCycle — phase selection', () => {
     await runCycle(sharedEngine,{ brainDir: '/tmp/brain', phases: ['orphans'] });
     expect(orphansCalls).toBe(1);
     expect(syncCalls.length).toBe(0);
+  });
+
+  test('--phase orphans preserves explicit source scope', async () => {
+    await runCycle(sharedEngine, { brainDir: '/tmp/brain', phases: ['orphans'], sourceId: 'source-a' });
+    expect(orphansOpts.at(-1)).toEqual({ sourceId: 'source-a' });
+  });
+
+  test('fence_repair runs right after sync; a dry run previews the fences kind and a real run applies it (#6188)', async () => {
+    const dry = await runCycle(sharedEngine, { brainDir: '/tmp/brain', dryRun: true });
+    const names = dry.phases.map(p => p.phase);
+    expect(names.indexOf('fence_repair')).toBe(names.indexOf('sync') + 1);
+    expect(dry.phases.find(p => p.phase === 'fence_repair')?.details.mode).toBe('dry_run');
+    await truncateCycleLocks(sharedEngine);
+    const live = await runCycle(sharedEngine, { brainDir: '/tmp/brain', phases: ['fence_repair'] });
+    expect(live.phases).toHaveLength(1);
+    expect(live.phases[0]).toMatchObject({ phase: 'fence_repair', status: 'ok', details: { mode: 'apply' } });
   });
 });
 
@@ -245,6 +287,15 @@ describe('runCycle — cycle lock acquire/release semantics', () => {
     await runCycle(sharedEngine,{ brainDir: '/tmp/brain', phases: ['sync'] });
     const { rows } = await (sharedEngine as any).db.query('SELECT COUNT(*)::int AS n FROM gbrain_cycle_locks');
     expect(rows[0].n).toBe(0);
+  });
+
+  test('phases: [fence_repair] holds the cycle lock while it writes (#6188)', async () => {
+    let held = -1;
+    await runCycle(sharedEngine, { brainDir: '/tmp/brain', phases: ['fence_repair'], yieldBetweenPhases: async () => {
+      const { rows } = await (sharedEngine as any).db.query(`SELECT COUNT(*)::int AS n FROM gbrain_cycle_locks WHERE id = 'gbrain-cycle'`);
+      held = rows[0].n;
+    } });
+    expect(held).toBe(1);
   });
 });
 
@@ -284,12 +335,35 @@ describe('runCycle — cycle_already_running skip', () => {
     expect(report.status).not.toBe('skipped');
     expect(syncCalls.length).toBe(1); // cycle ran
   });
+
+  test('a held cycle lock expires 5 minutes out (crash recovery window)', async () => {
+    let ttlSeconds: number | null = null;
+    await runCycle(sharedEngine, {
+      brainDir: '/tmp/brain',
+      phases: ['lint'],
+      yieldBetweenPhases: async () => {
+        const { rows } = await (sharedEngine as any).db.query(
+          `SELECT EXTRACT(EPOCH FROM (ttl_expires_at - NOW()))::float AS s FROM gbrain_cycle_locks WHERE id = 'gbrain-cycle'`,
+        );
+        ttlSeconds = rows[0]?.s ?? null;
+      },
+    });
+    expect(ttlSeconds).not.toBeNull();
+    expect(ttlSeconds!).toBeGreaterThan(4 * 60);
+    expect(ttlSeconds!).toBeLessThanOrEqual(5 * 60);
+  });
 });
 
 // ─── Engine null path ─────────────────────────────────────────────
 
 describe('runCycle — engine = null (filesystem-only mode)', () => {
-  const lockFile = require('path').join(require('os').homedir(), '.gbrain', 'cycle.lock');
+  // Resolve the lock path the way production does (gbrainPath honors
+  // GBRAIN_HOME — which the test preload points at per-run scratch). The
+  // old homedir()-based literal wrote lock files into the operator's REAL
+  // ~/.gbrain and stopped matching the code's path once tests were
+  // home-isolated.
+  const { gbrainPath } = require('../../src/core/config.ts') as typeof import('../../src/core/config.ts');
+  const lockFile = gbrainPath('cycle.lock');
 
   afterEach(() => {
     if (existsSync(lockFile)) { try { unlinkSync(lockFile); } catch { /* */ } }
@@ -307,6 +381,7 @@ describe('runCycle — engine = null (filesystem-only mode)', () => {
     expect(syncPhase?.details.reason).toBe('no_database');
     const embedPhase = report.phases.find(p => p.phase === 'embed');
     expect(embedPhase?.status).toBe('skipped');
+    expect(report.phases.find(p => p.phase === 'fence_repair')?.details.reason).toBe('no_database');
     // syncCalls + embedCalls are empty because DB-required phases skipped.
     expect(syncCalls.length).toBe(0);
     expect(embedCalls.length).toBe(0);
@@ -329,6 +404,19 @@ describe('runCycle — engine = null (filesystem-only mode)', () => {
     // None of the filesystem phases ran because the lock blocked entry.
     expect(lintCalls.length).toBe(0);
     expect(backlinksCalls.length).toBe(0);
+  });
+
+  test('a live holder whose lock file is older than 5 minutes is treated as stale', async () => {
+    const { writeFileSync, mkdirSync, utimesSync } = require('fs');
+    const path = require('path');
+    mkdirSync(path.dirname(lockFile), { recursive: true });
+    writeFileSync(lockFile, `1\n${new Date().toISOString()}\n`);
+    const sixMinutesAgo = new Date(Date.now() - 6 * 60 * 1000);
+    utimesSync(lockFile, sixMinutesAgo, sixMinutesAgo);
+
+    const report = await runCycle(null, { brainDir: '/tmp/brain' });
+    expect(report.reason).not.toBe('cycle_already_running');
+    expect(lintCalls.length).toBe(1);
   });
 });
 
@@ -394,7 +482,16 @@ describe('runCycle — yieldBetweenPhases hook', () => {
     // v0.41.11.0: 20 phases (added `conversation_facts_backfill` between consolidate and propose_takes).
     // v0.41.39 (#1700) + v0.42.0.0: 22 phases (added `enrich_thin` AND `skillopt`
     // between conversation_facts_backfill and embed — both landed in this merge).
-    expect(hookCalls).toBe(22);
+    // #2653: 23 phases (added `drift` between calibration_profile and
+    // conversation_facts_backfill). #5876: 24 (added `chronicle` after drift).
+    // GBRA-40 Lane D: 25 (added `facts_drain` after chronicle).
+    // Temporal typed edges: 26 (added `edge_contradictions` after calibration_profile).
+    // C4 pinned questions: 27 (added `standing_questions` after drift).
+    // #6188: 28 (added `fence_repair` after sync). #6377: 29 (added `content_repair` after fence_repair).
+    // #6865: 30 (added `unindexed_files` after content_repair).
+    // GBRA-216: 31 (added `claim_conflicts` after edge_contradictions).
+    // GBRA-438: 32 (added `bookkeeping_gc` after purge).
+    expect(hookCalls).toBe(32);
   });
 
   test('hook exceptions do not abort the cycle', async () => {
@@ -409,7 +506,10 @@ describe('runCycle — yieldBetweenPhases hook', () => {
     // v0.39.0.0: 17 phases (T12 schema-suggest phase between orphans and purge).
     // v0.41.11.0: 20 phases (+extract_atoms, +synthesize_concepts, +conversation_facts_backfill).
     // v0.41.39 (#1700) + v0.42.0.0: 22 phases (+enrich_thin, +skillopt).
-    expect(report.phases.length).toBe(22);
+    // #2653: 23 phases (+drift). #5876: 24 (+chronicle). GBRA-40 Lane D: 25 (+facts_drain). Temporal typed edges: 26 (+edge_contradictions). C4: 27 (+standing_questions).
+    // #6188: 28 (+fence_repair). #6377: 29 (+content_repair). #6865: 30 (+unindexed_files).
+    // GBRA-216: 31 (+claim_conflicts). GBRA-438: 32 (+bookkeeping_gc).
+    expect(report.phases.length).toBe(32);
   });
 });
 
@@ -499,6 +599,42 @@ describe('runCycle — sourceId resolution (regression #475)', () => {
     expect(syncCalls.at(-1)?.sourceId).toBe('default');
   });
 
+  test('seeded sources row → orphans phase receives matching sourceId', async () => {
+    await (sharedEngine as any).db.query(
+      `INSERT INTO sources (id, name, local_path) VALUES ($1, $2, $3)`,
+      ['alpha', 'alpha', '/tmp/brain-2349-alpha'],
+    );
+    await runCycle(sharedEngine, { brainDir: '/tmp/brain-2349-alpha', phases: ['orphans'] });
+    expect(orphansOpts.at(-1)).toEqual({ sourceId: 'alpha' });
+  });
+
+  // schema-suggest (T12 cathedral phase) was never threaded through
+  // cycleSourceId — it silently fell back to 'default' for every source,
+  // the same bug class as #1586 (synthesize) and #2666 (patterns), just
+  // undiscovered for this phase. Pins the fix: the resolved per-source id
+  // must reach runSchemaSuggestPhase the same way it reaches orphans/sync.
+  test('seeded sources row → schema-suggest phase receives matching sourceId (not "default")', async () => {
+    await (sharedEngine as any).db.query(
+      `INSERT INTO sources (id, name, local_path) VALUES ($1, $2, $3)`,
+      ['bravo', 'bravo', '/tmp/brain-schema-suggest-bravo'],
+    );
+    await runCycle(sharedEngine, { brainDir: '/tmp/brain-schema-suggest-bravo', phases: ['schema-suggest'] });
+    expect(schemaSuggestOpts.at(-1)?.sourceId).toBe('bravo');
+  });
+
+  test('forceGlobalOrphans keeps orphans brain-wide even when brainDir maps to a source', async () => {
+    await (sharedEngine as any).db.query(
+      `INSERT INTO sources (id, name, local_path) VALUES ($1, $2, $3)`,
+      ['global-source', 'global-source', '/tmp/brain-2349-global'],
+    );
+    await runCycle(sharedEngine, {
+      brainDir: '/tmp/brain-2349-global',
+      phases: ['embed', 'orphans', 'purge'],
+      forceGlobalOrphans: true,
+    });
+    expect(orphansOpts.at(-1)).toEqual({});
+  });
+
   test('no matching sources row → performSync receives sourceId=undefined', async () => {
     await runCycle(sharedEngine, { brainDir: '/tmp/brain-475-b' });
     expect(syncCalls.at(-1)?.sourceId).toBeUndefined();
@@ -558,5 +694,95 @@ describe('runCycle — sourceId resolution (regression #475)', () => {
     );
     await runCycle(sharedEngine, { brainDir: '/tmp/brain-475-f' });
     expect(syncCalls.at(-1)?.sourceId).toBe('');
+  });
+});
+
+// ─── issue #2860: --once one-shot phase-enabled bypass (onceForPhase) ─
+//
+// CycleOpts.onceForPhase is deliberately typed as a single CyclePhase (not
+// a boolean) so the override can never leak to a phase other than the one
+// it names — even if a caller passes a wider `phases` array than the CLI
+// does (dream.ts always restricts to `phases: [phase]` when --once is
+// set). This exercises that boundary directly against runCycle, using the
+// real (unmocked) patterns.ts module — cheap because with zero reflections
+// seeded it never reaches an LLM call regardless of the enabled gate.
+describe('runCycle — onceForPhase bypasses only the named phase (issue #2860)', () => {
+  beforeEach(async () => {
+    await truncateCycleLocks(sharedEngine);
+    await sharedEngine.setConfig('dream.patterns.enabled', 'false');
+  });
+
+  afterEach(async () => {
+    // Restore default so later describe blocks in this file (which run
+    // patterns as part of the full ALL_PHASES cycle) aren't affected.
+    await sharedEngine.setConfig('dream.patterns.enabled', 'true');
+  });
+
+  test('onceForPhase matching the requested phase bypasses its disabled gate', async () => {
+    const report = await runCycle(sharedEngine, {
+      brainDir: '/tmp/brain-2860-a',
+      phases: ['patterns'],
+      onceForPhase: 'patterns',
+    });
+    const patternsResult = report.phases.find(p => p.phase === 'patterns');
+    // Bypassed 'disabled' → falls through to the next gate (no reflections
+    // seeded). If the override didn't work, this would read 'disabled'.
+    expect(patternsResult?.status).toBe('skipped');
+    expect((patternsResult?.details as { reason?: string })?.reason).toBe('insufficient_evidence');
+  });
+
+  test('onceForPhase naming a DIFFERENT phase does not leak the bypass', async () => {
+    const report = await runCycle(sharedEngine, {
+      brainDir: '/tmp/brain-2860-b',
+      phases: ['patterns'],
+      onceForPhase: 'synthesize', // mismatched — must NOT bypass patterns' gate
+    });
+    const patternsResult = report.phases.find(p => p.phase === 'patterns');
+    expect(patternsResult?.status).toBe('skipped');
+    expect((patternsResult?.details as { reason?: string })?.reason).toBe('disabled');
+  });
+
+  test('no onceForPhase set → unchanged behavior (still gated)', async () => {
+    const report = await runCycle(sharedEngine, {
+      brainDir: '/tmp/brain-2860-c',
+      phases: ['patterns'],
+    });
+    const patternsResult = report.phases.find(p => p.phase === 'patterns');
+    expect(patternsResult?.status).toBe('skipped');
+    expect((patternsResult?.details as { reason?: string })?.reason).toBe('disabled');
+  });
+
+  test('config is never written by the override', async () => {
+    await runCycle(sharedEngine, {
+      brainDir: '/tmp/brain-2860-d',
+      phases: ['patterns'],
+      onceForPhase: 'patterns',
+    });
+    expect(await sharedEngine.getConfig('dream.patterns.enabled')).toBe('false');
+  });
+});
+
+// ─── #4599: embed phase honours the stall watchdog's X6 contract ────
+// runEmbedCore never throws on a stall; it returns reason:'stall_timeout'
+// (embed-stall.ts). Every non-CLI consumer must convert that to a failure,
+// otherwise a nightly drain the watchdog aborted is reported as a healthy
+// embed phase and the dream/autopilot verdict never notices.
+
+describe('runCycle — embed phase fails on stall_timeout (#4599)', () => {
+  beforeEach(async () => {
+    await truncateCycleLocks(sharedEngine);
+  });
+
+  test("reason:'stall_timeout' from runEmbedCore yields a failed embed phase", async () => {
+    embedResultOverride = { reason: 'stall_timeout', failures: 1 };
+    const report = await runCycle(sharedEngine, { brainDir: '/tmp/brain' });
+    const embedPhase = report.phases.find(p => p.phase === 'embed');
+    expect(embedPhase?.status).toBe('fail');
+    expect(String(embedPhase?.error?.message)).toMatch(/stall_timeout/);
+  });
+
+  test('a normal result is still an ok embed phase', async () => {
+    const report = await runCycle(sharedEngine, { brainDir: '/tmp/brain' });
+    expect(report.phases.find(p => p.phase === 'embed')?.status).toBe('ok');
   });
 });

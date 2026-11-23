@@ -11,6 +11,13 @@
  * Claude with a series of personal-query phrasings, asserts the chosen
  * tool is in the v0.29 set. Cost ~$0.10/CI run on Haiku.
  *
+ * Each phrasing is one call at temperature 0 against a dated model snapshot,
+ * so the assertion pins the model's most likely tool choice for the
+ * descriptions. At the API default (1.0) a single call samples that choice:
+ * concept phrasings routed to `search` in 1-6 of 100 calls each, a ~12%
+ * chance per run that one of them fails with no description change. At 0
+ * every phrasing routed correctly in 100 of 100 calls.
+ *
  * Skips gracefully when ANTHROPIC_API_KEY is missing.
  *
  * Replaces the discarded `skills/{salience,anomalies,transcripts}/routing-eval.jsonl`
@@ -132,6 +139,7 @@ async function callClaudeWithTools(prompt: string): Promise<{ tool: string | nul
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 256,
+      temperature: 0,
       tools: TOOLS,
       messages: [
         {
@@ -155,6 +163,32 @@ describeIfKey('v0.29 — LLM routes personal queries to v0.29 ops, not query() /
       const { tool } = await callClaudeWithTools(prompt);
       expect(tool).not.toBeNull();
       expect(V029_TOOLS.has(tool!)).toBe(true);
+    }, 30_000);
+  }
+});
+
+// #2416 — concept/landscape questions must route to `query` (hybrid +
+// expansion), not `search` (cheap-hybrid, expansion off). This block is the
+// feature assertion for the #2416 description edits; the block above is the
+// regression guard (the new "prefer query for concept questions" copy must
+// NOT pull personal queries away from the salience ops).
+const CONCEPT_QUERY_PHRASINGS = [
+  'find all the companies doing offshore wind',
+  'the landscape of agent memory startups',
+  'every investor that focuses on climate tech',
+  'all the projects that use vector databases',
+  'everything about my fundraising strategy discussions',
+  'which portfolio companies have shipped AI features',
+  'the ecosystem of MCP server implementations',
+  'all the people that work on developer tools',
+];
+
+describeIfKey('#2416 — LLM routes concept/landscape questions to query, not search', () => {
+  for (const prompt of CONCEPT_QUERY_PHRASINGS) {
+    test(`routes "${prompt}" to query`, async () => {
+      const { tool } = await callClaudeWithTools(prompt);
+      expect(tool).not.toBeNull();
+      expect(tool).toBe('query');
     }, 30_000);
   }
 });

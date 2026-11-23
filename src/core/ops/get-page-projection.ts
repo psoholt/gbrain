@@ -1,0 +1,229 @@
+import type { Page } from '../types.ts';
+import { serializePageToMarkdown } from '../markdown.ts';
+import { isQuarantined, pageQuarantinedNotice, QUARANTINE_KEY } from '../quarantine.ts';
+import { hasScope } from '../scope.ts';
+import type { OperationContext } from './contract.ts';
+import { createAuditWriter } from '../audit/audit-writer.ts';
+import { MEMORY_CONFIRM_SCOPE } from '../trust/confirm.ts';
+import { renderTrustedText, type TrustFields } from '../eligibility/labels.ts';
+import { loadPageTrust } from '../eligibility/stamp.ts';
+import { resolveReadEligibility, type ReadEligibility } from '../eligibility/policy.ts';
+import { admitsTrust } from '../trust/tier.ts';
+import { rederiveHiddenSql } from '../eligibility/sql.ts';
+import { fenceTranscriptText, isQuotedPageType, neutralizeToolCalls, quotesTier } from '../search/transcript-quote.ts';
+
+/**
+ * #6259: how a get_page reader sees a page the content-quality gate hid as junk.
+ * `body_enveloped` (#5575 ENG-15): an untrusted reader authorized for
+ * quarantined content gets the body wrapped as external data.
+ */
+export interface QuarantinedView { reason: string; detail: string; assessed_at: string | null; body_omitted: boolean; body_enveloped?: true }
+
+/**
+ * Trusted local reads keep the body (with a notice); untrusted reads get no
+ * body unless a caller holding `admin` or `memory_confirm` (`reader.admin`)
+ * asks with `include_quarantined: true`, and then only inside the data envelope.
+ */
+export function quarantinedView(page: Pick<Page, 'frontmatter'>, reader: { remote: boolean; admin: boolean; includeQuarantined: boolean }): QuarantinedView | null {
+  const frontmatter = page.frontmatter as Record<string, unknown> | null;
+  if (!isQuarantined(frontmatter)) return null;
+  const marker = (frontmatter![QUARANTINE_KEY] ?? {}) as Record<string, unknown>;
+  return { reason: typeof marker.reason === 'string' ? marker.reason : 'unknown', detail: typeof marker.detail === 'string' ? marker.detail : '',
+    assessed_at: typeof marker.assessed_at === 'string' ? marker.assessed_at : null,
+    body_omitted: reader.remote && !(reader.admin && reader.includeQuarantined),
+    ...(reader.remote && reader.admin && reader.includeQuarantined ? { body_enveloped: true as const } : {}) };
+}
+
+const quarantinedReads = createAuditWriter<{ ts: string; slug: string; source_id: string; client_id: string; reason: string }>({ featureName: 'quarantined-reads' });
+
+
+/** get_page's read of a quarantined page: its view for this caller (null when not quarantined), with the safety notice emitted. */
+export function readQuarantined(ctx: Pick<OperationContext, 'remote' | 'auth' | 'emitNotice'>, page: Pick<Page, 'slug' | 'frontmatter' | 'source_id'>, includeQuarantined: boolean): QuarantinedView | null {
+  const scopes = ctx.auth?.scopes ?? [];
+  const authorized = hasScope(scopes, 'admin') || hasScope(scopes, MEMORY_CONFIRM_SCOPE);
+  const view = quarantinedView(page, { remote: ctx.remote !== false, admin: authorized, includeQuarantined });
+  if (view) ctx.emitNotice?.(pageQuarantinedNotice(page.slug, view, 'read'));
+  if (view?.body_enveloped) quarantinedReads.log({ slug: page.slug, source_id: page.source_id, client_id: ctx.auth?.clientId ?? '', reason: view.reason });
+  return view;
+}
+
+/**
+ * #6259 for history reads (get_versions, known_as_of): the quarantine view of each stored edition, null when neither the
+ * live page nor that edition is quarantined. A remote reader gets no body for such an edition, as get_page keeps the
+ * live body; the notice is emitted once per read.
+ */
+export function historyQuarantine(ctx: Pick<OperationContext, 'remote' | 'auth' | 'emitNotice'>, live: Pick<Page, 'slug' | 'frontmatter' | 'source_id'>): (frontmatter: Record<string, unknown> | null | undefined) => QuarantinedView | null {
+  let noticed = false;
+  return frontmatter => {
+    const page = isQuarantined(live.frontmatter as Record<string, unknown> | null) ? live : isQuarantined(frontmatter) ? { ...live, frontmatter: frontmatter! } : null;
+    if (!page) return null;
+    if (noticed) return quarantinedView(page, { remote: ctx.remote !== false, admin: false, includeQuarantined: false });
+    noticed = true;
+    return readQuarantined(ctx, page, false);
+  };
+}
+
+/**
+ * #8042: an untrusted reader gets a third-party page's body quoted (get_page, fetch); trusted local reads stay raw.
+ * GST-687: so is a page whose trust tier is below the owner's (an agent-written note; `trust` from pageTrustForRead).
+ */
+export function quotesBody(ctx: Pick<OperationContext, 'remote'>, page: Pick<Page, 'type'>, trust: Pick<TrustFields, 'trust_tier'> | undefined): boolean {
+  return ctx.remote !== false && (isQuotedPageType(page.type) || quotesTier(trust?.trust_tier));
+}
+
+/**
+ * #8384 (AN5): a remote read quoted only because the page's origin is unverified (`unknown`: saved before gbrain tracked
+ * trust, its source unclaimed) says, once per session, which owner command clears it. The quoting itself is unchanged.
+ */
+export function unverifiedOriginNotice(ctx: Pick<OperationContext, 'remote' | 'emitNotice'>, page: Pick<Page, 'type' | 'slug'>, trust: Pick<TrustFields, 'trust_tier'> | undefined): void {
+  if (ctx.remote === false || isQuotedPageType(page.type) || (trust?.trust_tier ?? 'unknown') !== 'unknown') return;
+  ctx.emitNotice?.({ code: 'quoted_unverified_origin', kind: 'info', dedupe_key: 'quoted_unverified_origin',
+    why: `${page.slug} is quoted as source material because its origin is unverified: it was saved before gbrain tracked trust and its source is not claimed. If these are the owner's own notes, the brain host's operator runs gbrain trust claim-sources (preview with gbrain trust claim-sources --dry-run --json); gbrain trust backfill classifies the rest. Until then such pages stay quoted.` });
+}
+
+/**
+ * GST-687: an untrusted reader's reading shapes of a third-party page (get_page compiled_truth, timeline and view 'read'
+ * windows; fetch text) carry its tool-call blocks summarized, as search does. The round-trip shapes (include_content,
+ * view 'markdown') and gbrain's own thin client keep the stored bytes inside the fence.
+ */
+export function neutralizesBody(ctx: Pick<OperationContext, 'remote' | 'thinClient'>, page: Pick<Page, 'type'>): boolean {
+  return ctx.remote !== false && ctx.thinClient !== true && isQuotedPageType(page.type);
+}
+
+/** Wraps quarantined text for an untrusted reader as external data (eligibility/labels.ts). */
+function enveloped(text: string, fields: TrustFields | undefined): string {
+  return text ? renderTrustedText(text, { trust_tier: 'external_untrusted', origin: fields?.origin ?? 'quarantined' }) : text;
+}
+
+/**
+ * #8377: a quoted page's title and frontmatter (#8384: and its tags) as an untrusted reader gets them, each string fenced
+ * as `slug`'s (frontmatter keys stay); with `quote` false, as stored. The round-trip `content` is fenced whole instead.
+ */
+export function quotedPageMeta(page: Pick<Page, 'slug' | 'title' | 'frontmatter'>, quote: boolean, tags: string[] = []): Pick<Page, 'title' | 'frontmatter'> & { tags: string[] } {
+  if (!quote) return { title: page.title, frontmatter: page.frontmatter, tags };
+  const fence = (value: unknown): unknown => typeof value === 'string' ? (value ? fenceTranscriptText(value, page.slug) : value)
+    : Array.isArray(value) ? value.map(fence)
+    : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, fence(v)])) : value;
+  return { title: fence(page.title) as string, frontmatter: fence(page.frontmatter ?? {}) as Page['frontmatter'], tags: fence(tags) as string[] };
+}
+
+export interface GetPageProjectionOpts {
+  revision: string;
+  tags: string[];
+  /** include_content: add the canonical serialized `content` field. */
+  includeContent: boolean;
+  /** content_only: only meaningful with includeContent; ignored without it. */
+  contentOnly: boolean;
+  resolved_slug?: string;
+  content_flag?: { reason: string; detail: string } | null;
+  /** include_timeline_entries (#5709): the page's timeline rows, read by the caller; present in both shapes. */
+  timeline_entries?: unknown;
+  /** A held source file (sync could not import it); present in both shapes so an editor sees it. */
+  file_held?: unknown;
+  /** GBRA-161 PR 2: the page's held facts or takes fence (`fence_absent`), each with its ask-the-user fix; present in both shapes. */
+  fence_held?: unknown;
+  /** #6259: the page is quarantined; `body_omitted` drops compiled_truth, timeline and `content`. */
+  quarantined?: QuarantinedView | null;
+  /** #5575 A6: the page's trust tier and short write origin. */
+  trust?: TrustFields;
+  /**
+   * #8042: the page's text is third-party and the reader untrusted: compiled_truth, timeline and `content` are fenced
+   * as quoted source material (text inside byte-exact; put_page removes the fences) and the response carries `quoted`.
+   */
+  quote?: boolean;
+  /**
+   * GST-687 (with `quote`): the reading shape carries tool-call blocks summarized. `includeContent` asks for the
+   * round-trip shape, which stays byte-exact inside the fence, unless `readingContent` (fetch's text is a reading shape).
+   */
+  neutralize?: boolean;
+  readingContent?: boolean;
+}
+
+/**
+ * Shape the get_page response from the reader-visible page body.
+ *
+ * #2225: `content` is the canonical serialized markdown (frontmatter +
+ * compiled_truth + `<!-- timeline -->` sentinel + timeline), built from the
+ * visible body so the privacy-fence strip applies to untrusted readers too.
+ * content_only returns just what a get→edit→put_page round trip needs (source_id
+ * and revision included, so the write goes back to the page that was read), without
+ * the duplicate compiled_truth / timeline / frontmatter the full shape carries
+ * next to `content` (a 30 KB page otherwise comes back as ~62 KB).
+ * Both shapes carry `chars` (#7180): the characters of page text the response
+ * holds (compiled_truth, timeline and `content`), so a caller can budget.
+ */
+export function projectGetPage(stored: Page, o: GetPageProjectionOpts) {
+  const { revision, tags, resolved_slug, content_flag, quarantined } = o;
+  const fence = (text: string) => (text ? fenceTranscriptText(text, stored.slug) : text);
+  const summarize = o.neutralize === true && (!o.includeContent || o.readingContent === true);
+  const plain = summarize ? { ...stored, compiled_truth: stored.compiled_truth && neutralizeToolCalls(stored.compiled_truth), timeline: stored.timeline && neutralizeToolCalls(stored.timeline) } : stored;
+  const { tags: shownTags, ...meta } = quotedPageMeta(stored, o.quote === true, tags);
+  const page = o.quote ? { ...plain, ...meta, compiled_truth: fence(plain.compiled_truth), timeline: fence(plain.timeline) } : stored;
+  const omitted = quarantined?.body_omitted === true;
+  const wrap = quarantined?.body_enveloped === true;
+  const visibleBody = omitted ? { ...page, compiled_truth: '', timeline: '' }
+    : wrap ? { ...page, compiled_truth: enveloped(page.compiled_truth, o.trust), timeline: enveloped(page.timeline, o.trust) } : page;
+  const markdown = () => o.quote ? fence(serializePageToMarkdown(plain, tags)) : serializePageToMarkdown(stored, tags);
+  const content = () => wrap ? enveloped(markdown(), o.trust) : markdown();
+  const extras = {
+    ...(quarantined ? { quarantined } : {}), ...(o.quote ? { quoted: 'transcript' as const } : {}),
+    ...(o.timeline_entries !== undefined ? { timeline_entries: o.timeline_entries } : {}),
+    ...(o.file_held !== undefined ? { file_held: o.file_held } : {}),
+    ...(o.fence_held !== undefined ? { fence_held: o.fence_held } : {}),
+    ...(resolved_slug ? { resolved_slug } : {}), ...(content_flag ? { content_flag } : {}),
+  };
+  if (o.includeContent && o.contentOnly) {
+    const deletedAt = visibleBody.deleted_at;
+    const text = omitted ? undefined : content();
+    return {
+      slug: visibleBody.slug,
+      source_id: visibleBody.source_id,
+      type: visibleBody.type,
+      title: visibleBody.title,
+      revision,
+      tags: shownTags,
+      ...(text === undefined ? {} : { content: text }),
+      chars: text?.length ?? 0,
+      ...(deletedAt ? { deleted_at: deletedAt } : {}),
+      ...extras,
+    };
+  }
+  const text = o.includeContent && !omitted ? content() : undefined;
+  return {
+    ...visibleBody,
+    revision,
+    tags: shownTags,
+    ...(text === undefined ? {} : { content: text }),
+    chars: (visibleBody.compiled_truth ?? '').length + (visibleBody.timeline ?? '').length + (text?.length ?? 0),
+    // #5575 A6: the reading shape carries the page's trust; the content_only round-trip shape stays minimal.
+    ...(o.trust ?? {}),
+    ...extras,
+  };
+}
+
+/**
+ * #5575 (A6, CEO-18, ENG-14): get_page and fetch read one page's trust once.
+ * Returns its label fields and the read eligibility (for the page's timeline
+ * rows), or null when the page sits below the effective read floor or a purge
+ * hid it for re-derivation (even with include_deleted), which the caller
+ * answers exactly like a missing page (no existence oracle).
+ */
+export async function pageTrustForRead(ctx: Pick<OperationContext, 'engine' | 'auth'>, page: Pick<Page, 'id'>, minTrust: unknown):
+  Promise<{ trust: TrustFields; eligibility: ReadEligibility } | null> {
+  const eligibility = await resolveReadEligibility(ctx, { minTrust });
+  const trust = (await loadPageTrust(ctx.engine, [{ page_id: page.id, slug: '' }]).catch(() => null))?.byId.get(page.id)
+    ?? { trust_tier: 'unknown' as const, origin: 'unrecorded' };
+  if (eligibility.floor && !admitsTrust(trust.trust_tier, eligibility.floor)) return null;
+  const [hidden] = await ctx.engine.executeRaw<{ n: number }>(
+    `SELECT count(*)::int AS n FROM pages p WHERE p.id = $1 AND NOT ${rederiveHiddenSql('pages', 'p')}`, [page.id]);
+  if (Number(hidden?.n) > 0) return null;
+  return { trust, eligibility };
+}
+
+/**
+ * fetch's `text`: get_page's round-trip `content`, so withheld for an unauthorized untrusted reader, enveloped for an authorized one (#6259, ENG-15),
+ * quoted with `quote` (#8042) and with tool-call blocks summarized with `neutralize` (GST-687: fetch is a reading shape).
+ */
+export function projectFetchText(visibleBody: Page, tags: string[], quarantined: QuarantinedView | null, trust?: TrustFields, quote = false, neutralize = false): string {
+  return projectGetPage(visibleBody, { revision: '', tags, includeContent: true, contentOnly: true, quarantined, trust, quote, neutralize, readingContent: true }).content ?? '';
+}

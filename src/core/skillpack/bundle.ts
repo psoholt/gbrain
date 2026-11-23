@@ -9,8 +9,10 @@
 
 import { existsSync, readFileSync, statSync, readdirSync } from 'fs';
 import { join, dirname, isAbsolute, resolve } from 'path';
+import { fileURLToPath } from 'url';
 
 import { parseMarkdown } from '../markdown.ts';
+import { gitChildEnv } from '../git-env.ts';
 
 export interface BundleManifest {
   name: string;
@@ -38,19 +40,45 @@ export class BundleError extends Error {
 /**
  * Walk up from `start` (default cwd) looking for an `openclaw.plugin.json`
  * sibling to `src/cli.ts`. That pair identifies a gbrain repo root.
+ *
+ * When no explicit `start` is given and the cwd walk fails (e.g. gbrain was
+ * installed globally via `bun install -g` and the user is in an unrelated
+ * directory, #1917), fall back to walking up from this module's own location
+ * and from the running entrypoint (`process.argv[1]`). Both resolve the
+ * bun-global layout (~/.bun/install/global/node_modules/gbrain/) and the
+ * in-repo compiled binary (bin/gbrain).
  */
-export function findGbrainRoot(start: string = process.cwd()): string | null {
-  let dir = resolve(start);
-  for (let i = 0; i < 10; i++) {
-    if (
-      existsSync(join(dir, 'openclaw.plugin.json')) &&
-      existsSync(join(dir, 'src', 'cli.ts'))
-    ) {
-      return dir;
+export function findGbrainRoot(start?: string): string | null {
+  const walkUp = (from: string): string | null => {
+    let dir = resolve(from);
+    for (let i = 0; i < 10; i++) {
+      if (
+        existsSync(join(dir, 'openclaw.plugin.json')) &&
+        existsSync(join(dir, 'src', 'cli.ts'))
+      ) {
+        return dir;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
     }
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
+    return null;
+  };
+
+  const found = walkUp(start ?? process.cwd());
+  if (found !== null || start !== undefined) return found;
+
+  const fallbacks: string[] = [];
+  try {
+    // Not a file:// URL inside a compiled binary; skip on error.
+    fallbacks.push(dirname(fileURLToPath(import.meta.url)));
+  } catch {
+    /* ignore */
+  }
+  if (process.argv[1]) fallbacks.push(dirname(resolve(process.argv[1])));
+  for (const candidate of fallbacks) {
+    const root = walkUp(candidate);
+    if (root !== null) return root;
   }
   return null;
 }
@@ -155,7 +183,108 @@ export interface EnumerateOptions {
   /** If set, scope enumeration to just this skill by its slug (last
    *  segment of `skills/<slug>`). Undefined enumerates everything. */
   skillSlug?: string;
+  /**
+   * Plural selection (mutually exclusive with `skillSlug`): scope
+   * enumeration to exactly these slugs. Every slug must resolve in the
+   * chosen `universe` or enumeration fails loudly naming the missing ones.
+   */
+  skillSlugs?: readonly string[];
+  /**
+   * Membership universe for slug resolution. 'openclaw' (default)
+   * validates against openclaw.plugin.json#skills — today's behavior.
+   * 'manifest' validates against skills/manifest.json, which also lists
+   * the plugin-lane addition skills that openclaw.plugin.json omits
+   * (the harness bridge needs those; verified 6 of 8 additions are
+   * absent from the openclaw manifest).
+   */
+  universe?: 'openclaw' | 'manifest';
   manifest: BundleManifest;
+}
+
+/**
+ * Skill paths (`skills/<slug>`) from skills/manifest.json — the 'manifest'
+ * universe. Entries carry `path` relative to skills/ (e.g. `query/SKILL.md`);
+ * the slug is the leading directory segment.
+ */
+function manifestUniverseSkillPaths(gbrainRoot: string): string[] {
+  // gbrainRoot is the detected gbrain repo root (findGbrainRoot) joined with
+  // literals, on the local CLI plane — no untrusted input.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  const manifestPath = join(gbrainRoot, 'skills', 'manifest.json');
+  if (!existsSync(manifestPath)) {
+    throw new BundleError(
+      `skills/manifest.json not found in ${gbrainRoot}`,
+      'manifest_not_found',
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+  } catch (err) {
+    throw new BundleError(
+      `skills/manifest.json: invalid JSON — ${(err as Error).message}`,
+      'manifest_malformed',
+    );
+  }
+  const skills = (parsed as { skills?: unknown }).skills;
+  if (!Array.isArray(skills)) {
+    throw new BundleError(
+      'skills/manifest.json: "skills" must be an array',
+      'manifest_malformed',
+    );
+  }
+  const paths: string[] = [];
+  for (const entry of skills) {
+    const p = (entry as { path?: unknown }).path;
+    if (typeof p !== 'string' || p.length === 0) continue;
+    const slug = p.split('/')[0];
+    // Relative path label built from the repo's own committed manifest —
+    // consumed under gbrainRoot only, no untrusted input.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    if (slug) paths.push(join('skills', slug));
+  }
+  return paths;
+}
+
+/**
+ * Resolve the skill paths an enumeration should cover, honoring the
+ * single/plural selectors and the membership universe. Fail-loud on any
+ * slug that doesn't resolve, naming the universe file so the error is
+ * actionable.
+ */
+function selectSkillPaths(opts: EnumerateOptions): string[] {
+  if (opts.skillSlug && opts.skillSlugs) {
+    // Programmer error at the call site, not a manifest problem — a plain
+    // Error keeps the BundleError code taxonomy pointing at real data issues.
+    throw new Error('enumerate: skillSlug and skillSlugs are mutually exclusive');
+  }
+  const universe = opts.universe ?? 'openclaw';
+  const universePaths =
+    universe === 'manifest' ? manifestUniverseSkillPaths(opts.gbrainRoot) : opts.manifest.skills;
+  const universeName =
+    universe === 'manifest' ? 'skills/manifest.json' : 'openclaw.plugin.json#skills';
+  if (opts.skillSlugs) {
+    const bySlug = new Map(universePaths.map(p => [pathSlug(p), p]));
+    const missing = opts.skillSlugs.filter(s => !bySlug.has(s));
+    if (missing.length > 0) {
+      throw new BundleError(
+        `Skill(s) not listed in ${universeName}: ${missing.join(', ')}`,
+        'skill_not_found',
+      );
+    }
+    return opts.skillSlugs.map(s => bySlug.get(s)!);
+  }
+  if (opts.skillSlug) {
+    const matches = universePaths.filter(p => pathSlug(p) === opts.skillSlug);
+    if (matches.length === 0) {
+      throw new BundleError(
+        `Skill '${opts.skillSlug}' is not listed in ${universeName}`,
+        'skill_not_found',
+      );
+    }
+    return matches;
+  }
+  return universePaths;
 }
 
 /**
@@ -164,19 +293,10 @@ export interface EnumerateOptions {
  * target-relative path.
  */
 export function enumerateBundle(opts: EnumerateOptions): BundleEntry[] {
-  const { gbrainRoot, skillSlug, manifest } = opts;
+  const { gbrainRoot, manifest } = opts;
   const entries: BundleEntry[] = [];
 
-  const skillsToIncludePaths = skillSlug
-    ? manifest.skills.filter(p => pathSlug(p) === skillSlug)
-    : manifest.skills;
-
-  if (skillSlug && skillsToIncludePaths.length === 0) {
-    throw new BundleError(
-      `Skill '${skillSlug}' is not listed in openclaw.plugin.json#skills`,
-      'skill_not_found',
-    );
-  }
+  const skillsToIncludePaths = selectSkillPaths(opts);
 
   for (const rel of skillsToIncludePaths) {
     const abs = join(gbrainRoot, rel);
@@ -241,7 +361,7 @@ export function changedSlugsSinceVersion(
 ): string[] | null {
   // Synchronously execute git via Bun.spawnSync to avoid the async overhead
   // and keep this callable from CLI dispatch without awaiting.
-  const { spawnSync } = require('child_process') as typeof import('child_process');
+  const { spawnSync } = require('../spawn.ts') as typeof import('../spawn.ts');
 
   // Probe git availability + repo state. `.git` may be a directory OR a file
   // (worktrees). Either is fine for `git log`.
@@ -255,7 +375,7 @@ export function changedSlugsSinceVersion(
     const probe = spawnSync(
       'git',
       ['-C', gbrainRoot, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`],
-      { encoding: 'utf-8' },
+      { env: gitChildEnv(), encoding: 'utf-8' },
     );
     if (probe.status !== 0) continue;
 
@@ -271,7 +391,7 @@ export function changedSlugsSinceVersion(
         '--',
         'skills/',
       ],
-      { encoding: 'utf-8' },
+      { env: gitChildEnv(), encoding: 'utf-8' },
     );
     if (log.status !== 0) return null;
 
@@ -440,19 +560,10 @@ export interface ScaffoldEntry {
  * Fail-loud on missing declared paired sources via `loadSkillSources`.
  */
 export function enumerateScaffoldEntries(opts: EnumerateOptions): ScaffoldEntry[] {
-  const { gbrainRoot, skillSlug, manifest } = opts;
+  const { gbrainRoot, manifest } = opts;
   const entries: ScaffoldEntry[] = [];
 
-  const skillsToIncludePaths = skillSlug
-    ? manifest.skills.filter(p => pathSlug(p) === skillSlug)
-    : manifest.skills;
-
-  if (skillSlug && skillsToIncludePaths.length === 0) {
-    throw new BundleError(
-      `Skill '${skillSlug}' is not listed in openclaw.plugin.json#skills`,
-      'skill_not_found',
-    );
-  }
+  const skillsToIncludePaths = selectSkillPaths(opts);
 
   // 1. Skill files — every file under `<gbrainRoot>/skills/<slug>/`.
   //    relWorkspaceTarget = `skills/<slug>/<rest>` (workspace-rooted).

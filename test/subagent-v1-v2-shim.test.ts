@@ -58,6 +58,24 @@ describe('adaptContentBlocksToChatBlocks (D5 — v1 Anthropic → v2 ChatBlock s
     ]);
   });
 
+  it('carries per-part providerMetadata through the shim (#4201 — replay must not strip it)', () => {
+    const sig = { google: { thoughtSignature: 'opaque-sig-xyz' } };
+    const blocks = [
+      { type: 'text', text: 'reasoned', providerMetadata: sig },
+      { type: 'tool-call', toolCallId: 'c9', toolName: 'search', input: { q: 'z' }, providerMetadata: sig },
+      { type: 'tool-result', toolCallId: 'c9', toolName: 'search', output: 'ok', providerMetadata: sig },
+    ];
+    const out = adaptContentBlocksToChatBlocks(blocks) as any[];
+    expect(out[0].providerMetadata).toEqual(sig);
+    expect(out[1].providerMetadata).toEqual(sig);
+    expect(out[2].providerMetadata).toEqual(sig);
+    // And absent metadata stays absent — no key invented.
+    const bare = adaptContentBlocksToChatBlocks([
+      { type: 'tool-call', toolCallId: 'c1', toolName: 'search', input: {} },
+    ]) as any[];
+    expect('providerMetadata' in bare[0]).toBe(false);
+  });
+
   it('adapts v1 Anthropic tool_use block → v2 tool-call', () => {
     // Anthropic shape: {type:'tool_use', id, name, input}
     // Gateway ChatBlock shape: {type:'tool-call', toolCallId, toolName, input}
@@ -151,6 +169,27 @@ describe('adaptContentBlocksToChatBlocks (D5 — v1 Anthropic → v2 ChatBlock s
     expect(out.length).toBe(1);
     expect(out[0].toolCallId).toBe('ok');
   });
+
+  // A crash-replayed reasoning-model tool loop must keep the OpenAI
+  // Responses API reasoning-item id (providerMetadata.openai.itemId) across
+  // resume the same way a tool-call's providerMetadata already does —
+  // otherwise the resumed job's next turn 400s the same way an un-echoed
+  // live turn does (see gateway-chat.test.ts's reasoning-item round trip
+  // suite for the live-turn half of this fix).
+  it('passes a reasoning block through with providerMetadata intact', () => {
+    const sig = { openai: { itemId: 'rs_abc123', reasoningEncryptedContent: 'opaque-blob' } };
+    const blocks = [{ type: 'reasoning', text: 'weighing the tradeoff...', providerMetadata: sig }];
+    expect(adaptContentBlocksToChatBlocks(blocks)).toEqual(blocks);
+  });
+
+  it('drops a reasoning block with a non-string text field (defensive)', () => {
+    const blocks = [
+      { type: 'reasoning', text: null },
+      { type: 'text', text: 'ok' },
+    ];
+    const out = adaptContentBlocksToChatBlocks(blocks) as any[];
+    expect(out).toEqual([{ type: 'text', text: 'ok' }]);
+  });
 });
 
 describe('loadPriorToolsV2 (D5 — synthesizes stable keys for v1 rows)', () => {
@@ -162,8 +201,8 @@ describe('loadPriorToolsV2 (D5 — synthesizes stable keys for v1 rows)', () => 
   it('uses gbrain_tool_use_id as stable key for v2 rows', async () => {
     // Seed a minion_jobs row + v2 tool execution.
     const job = await engine.executeRaw<{ id: number }>(
-      `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-       VALUES ('subagent', 'active', '{}'::jsonb, 'default', 0, now())
+      `INSERT INTO minion_jobs (submission_authority, name, status, data, queue, priority, created_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'active', '{}'::jsonb, 'default', 0, now())
        RETURNING id`,
     );
     const jobId = job[0].id;
@@ -185,8 +224,8 @@ describe('loadPriorToolsV2 (D5 — synthesizes stable keys for v1 rows)', () => 
 
   it('synthesizes a legacy-prefixed stable key for v1 rows (ordinal NULL, gbrain_tool_use_id NULL)', async () => {
     const job = await engine.executeRaw<{ id: number }>(
-      `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-       VALUES ('subagent', 'active', '{}'::jsonb, 'default', 0, now())
+      `INSERT INTO minion_jobs (submission_authority, name, status, data, queue, priority, created_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'active', '{}'::jsonb, 'default', 0, now())
        RETURNING id`,
     );
     const jobId = job[0].id;
@@ -204,8 +243,8 @@ describe('loadPriorToolsV2 (D5 — synthesizes stable keys for v1 rows)', () => 
 
   it('preserves status + error text for failed legacy rows', async () => {
     const job = await engine.executeRaw<{ id: number }>(
-      `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-       VALUES ('subagent', 'active', '{}'::jsonb, 'default', 0, now())
+      `INSERT INTO minion_jobs (submission_authority, name, status, data, queue, priority, created_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'active', '{}'::jsonb, 'default', 0, now())
        RETURNING id`,
     );
     const jobId = job[0].id;
@@ -226,8 +265,8 @@ describe('loadPriorToolsV2 (D5 — synthesizes stable keys for v1 rows)', () => 
     // gateway path). loadPriorToolsV2 must surface both keyed correctly
     // so the reconciler's Map<stableKey, outcome> sees both.
     const job = await engine.executeRaw<{ id: number }>(
-      `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-       VALUES ('subagent', 'active', '{}'::jsonb, 'default', 0, now())
+      `INSERT INTO minion_jobs (submission_authority, name, status, data, queue, priority, created_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'active', '{}'::jsonb, 'default', 0, now())
        RETURNING id`,
     );
     const jobId = job[0].id;
@@ -257,8 +296,8 @@ describe('loadPriorToolsV2 (D5 — synthesizes stable keys for v1 rows)', () => 
 
   it('ordering: rows return ORDER BY message_idx, ordinal, id (stable for replay)', async () => {
     const job = await engine.executeRaw<{ id: number }>(
-      `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-       VALUES ('subagent', 'active', '{}'::jsonb, 'default', 0, now())
+      `INSERT INTO minion_jobs (submission_authority, name, status, data, queue, priority, created_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'active', '{}'::jsonb, 'default', 0, now())
        RETURNING id`,
     );
     const jobId = job[0].id;

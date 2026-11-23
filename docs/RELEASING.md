@@ -16,30 +16,38 @@ Two equivalent paths:
   guards + typecheck, then 4-shard parallel unit + E2E against four pgvector
   containers plus a transaction-mode PgBouncer service (unit phase keeps
   `DATABASE_URL` unset; `--no-shard` for the legacy sequential flow). Stronger
-  than PR CI's 2-file Tier 1 set; closer to what nightly Tier 1 catches. Spins
+  than PR CI's four-file Tier 1 job; closer to what nightly Tier 1 catches. Spins
   up + tears down postgres automatically via `docker-compose.ci.yml`. Override
   the host port with `GBRAIN_CI_PG_PORT=5435 bun run ci:local` if 5434 collides.
-- `bun run ci:local:diff` runs only the E2E files matched by the diff selector
-  (`scripts/select-e2e.ts`), falling back to ALL E2E files on unmapped src/
-  paths or schema/skills/package.json changes. Fast iteration during a focused
-  branch.
+- `bun run ci:local:diff` checks a doc-only diff in seconds (gitleaks plus
+  `scripts/ci-doc-checks.sh`) and runs the full gate for any other diff: E2E
+  narrowing is retired (see docs/TESTING.md "E2E selection").
+- `bun run ci:ubicloud` (and `ci:ubicloud:diff`) runs the same lanes across ten
+  ephemeral Ubicloud VMs in about five minutes instead of one Docker host. Needs
+  `UBICLOUD_API_KEY` or `UBICLOUD_API_TOKEN`; see "Ubicloud fan-out" in
+  [docs/TESTING.md](TESTING.md).
 
 **Path B — manual lifecycle (still supported):**
 - `bun test` — unit tests (no database required)
-- Follow the "E2E test DB lifecycle" steps above to spin up the test DB,
-  run `bun run test:e2e`, then tear it down.
+- Follow the "E2E test DB lifecycle" steps in
+  [docs/TESTING.md](TESTING.md) to spin up the test DB, run
+  `bun run test:e2e`, then tear it down.
 
 Both must pass. Do not ship with failing E2E tests. Do not skip E2E tests.
 
-**Always run typecheck before pushing.** `bun test` (the bun runner)
-skips TypeScript type checking — it only enforces runtime behavior.
+**Always run typecheck before pushing.** Neither `bun test` (the bun runner)
+nor `bun run test` gates on types — `bun run test` is just
+`bash scripts/run-unit-parallel.sh` (the sharded unit runner; no typecheck,
+no shell pre-checks — see the test-tier table in [docs/TESTING.md](TESTING.md)).
 Three ways to actually gate on types:
 
-1. `bun run test` (npm script in `package.json`) — includes `bun run typecheck`
-   plus the four shell pre-checks (`check-jsonb-pattern.sh`,
-   `check-progress-to-stdout.sh`, `check-trailing-newline.sh`,
-   `check-wasm-embedded.sh`) before the runner. Use this mid-branch.
-2. `bun run typecheck` — `tsc --noEmit` standalone. Fast (~5s on this repo).
+1. `bun run verify` — runs the shell guard checks (privacy, jsonb, source-id,
+   progress-to-stdout, …) plus `bun run typecheck` in parallel
+   (`scripts/run-verify-parallel.sh`). Use this mid-branch.
+2. `bun run typecheck` — standalone TypeScript checking with native incremental
+   analysis in ignored `node_modules/.cache/gbrain-typecheck.tsbuildinfo`. Cold
+   checks still analyze the whole project; repeated checks reuse compiler state
+   while retaining input invalidation and diagnostics. See [Testing](TESTING.md).
 3. `bun run ci:local` — the full local CI gate from Path A.
 
 The trap is: writing a new test, running `bun test test/foo.test.ts`,
@@ -50,7 +58,192 @@ member of `PageType`). Run `bun run typecheck` once before push, even
 when only test files changed.
 
 
+## Generated artifacts
+
+`bun run regen:all` regenerates every generated artifact offline and keyless
+(schema bundles, error-code and agent-protocol blocks, harness reference, tool
+catalog, skills manifest, metric glossary, CLI flag registry, plugin tree and
+persona variants, structural-suites manifest, then `llms.txt`/`llms-full.txt`
+last) and lists the files it changed. Run it before pushing whenever a
+freshness gate could fail; a second run changes nothing. `bun run verify`
+runs the read-only half, `check:regen-all`, whose failure names each stale
+artifact and the same fix. Contract goldens (export surface, CLI goldens, SQL
+text) are behavior pins, so `regen:all` leaves them alone unless you pass
+`--goldens`, and each changed golden needs a reason in the PR body. Goldens
+that need Postgres are named in its output with their own command.
+
+## Nightly-red issues
+
+`.github/workflows/nightly-watch.yml` runs `scripts/nightly-issue.ts` after every
+scheduled workflow and keeps one issue per workflow titled `Nightly red: <workflow>`
+(label `nightly-red`). The issue body lists the failing job and step pairs, the
+first red run and the commits since the last green one, the `gh workflow run`
+re-check, and a "Next step for the agent" block plus a JSON block.
+
+- **Owner:** the agent on release duty owns every open `nightly-red` issue; Garry is
+  the escalation for owner-only actions (secrets, repository settings).
+- **Response within 24 hours:** a repair PR, or a row in
+  `.github/nightly-known-red.tsv` (job, failure signature, the owning TODOS.md entry,
+  a review-by date). The file holds at most 3 rows; fix one before adding another.
+  A matching cell keeps the issue open with the `known-red` label; a new failure in
+  the same job opens a new incident; a passed review-by date asks for a fix again.
+- **Closing:** nightly-watch closes the issue only when a later scheduled run is
+  green with complete evidence and every previously failing job executed. A
+  skipped job never closes it.
+- **Re-check after a fix:** `gh workflow run <workflow>.yml --ref master`, then
+  `gh workflow run nightly-watch.yml -f run_id=<that scheduled run id>` to preview
+  (`-f dry_run=true`) or apply the issue update.
+- **Dependency advisories:** pull requests block on `bun audit` only when they change
+  `bun.lock`, `admin/bun.lock`, `patches/` or a package.json dependency field, or
+  carry the `dependency-audit` label; pushes and the nightly run always block, so a
+  new upstream advisory shows up as one red nightly instead of every open PR.
+
+## Master-red issues
+
+nightly-watch keeps one `master-red` issue per workflow (`Master red: Test`,
+`Master red: E2E Tests`) for push-to-master runs; scheduled runs stay in
+`nightly-red`. The body names each failing job, every failing test file with
+its `bun run test:stress` reproduce line, and the suspect range (last green
+push SHA, first red SHA, merged PRs). Labels, close rules and recovery steps:
+[CI red runbook](ci-red-runbook.md#ci-issue-labels).
+
+- **Owner:** the agent on release duty owns every open `master-red` issue, as
+  for `nightly-red`; Garry is the escalation for owner-only actions.
+- **First response within 1 hour:** a comment or a linked repair PR. CI health
+  measures it; nothing enforces it.
+- **Response:** a repair PR whose body says `Fixes #<issue>`. Known-red rows
+  never apply to push runs. A master-red repair PR is fast-tracked when Garry
+  asks.
+- **Closing:** nightly-watch closes the issue on a green push run where every
+  previously failing job (E2E Tests: every failing test file) ran and passed
+  with complete evidence. Without a merged repair PR it opens `flake` issues.
+
+## Merge queue
+
+`test.yml` and `e2e.yml` carry `merge_group` triggers. They are inert until the
+merge queue is enabled for `master` in the repository settings; check with
+`gh api repos/garrytan/gbrain/rulesets` (or the branch protection page). Queue runs use
+the pull-request profile against the queued merge commit: primary native scope,
+the 2,500-write soak and the 10,001-page export scale; the E2E selector diffs the
+queued commit against `master`.
+
+- Without the queue, a release rebases onto the latest `origin/master` and re-runs
+  the full CI (`test.yml`, `e2e.yml`, persistence-validation) immediately before
+  merging, because a stale base can break master even when the PR was green.
+- With the queue on, `gh pr merge` only enqueues the PR. Wait until the PR is
+  actually merged (`gh pr view <n> --json state,mergedAt`) before tagging,
+  announcing or starting dependent work.
+
+## Releases per batch
+
+PRs no longer pick a version. A PR adds a changelog fragment and lands;
+a release PR, opened a few times a day, gives every fragment that reached
+master since the last release one version and writes all the stamps at once.
+`.gstack/ship-policy.json` turns this on (`changelog_fragments`,
+`merge: "direct"`), and gstack's /ship, receipt and land commands follow it.
+
+**How a PR lands.** Every PR, release PRs included, lands on master as one
+squashed commit whose subject is the PR title followed by `(#<number>)`, so
+`git log --oneline master` reads as a list of changes, with no
+"Merge pull request" lines and none of a branch's own housekeeping commits.
+The maintainer's merge step makes that commit; its body is the PR's
+summary lines, and everyone else who wrote commits on the branch is
+credited with a `Co-authored-by:` trailer. Only the landing squashes. A
+branch brings master in with a merge commit and is never rebased or
+force-pushed; `history: "merge-only"` in `.gstack/ship-policy.json` makes
+/ship refuse a plan that would. Write the PR title as the one line a
+reader of the log should see.
+
+**What a PR carries.**
+
+- `changelog.d/<branch-slug>.md`: the PR's CHANGELOG entry with no version
+  heading (bold one-line summary, then the itemized sections; voice rules
+  below). /ship writes it. Front matter may say
+  `important: security|regression|data-loss`, where regression means one in
+  a release that is on stable ("Daily stable check"); releases are PATCH
+  only, so `scripts/build-behavior-changes.ts` (in `check:regen-all`) refuses
+  a `bump:` line other than `patch` and any other `important:` class. Format:
+  [changelog.d/README.md](../changelog.d/README.md).
+- One `behavior-changes.d/<id>.md` file per new upgrade-notice row, named
+  in the fragment as `<!-- behavior-change: <id> -->`
+  ([behavior-changes.d/README.md](../behavior-changes.d/README.md)).
+- A `deprecations.d/<id>.md` record before removing or renaming anything
+  stable promises to keep
+  ([deprecations.d/README.md](../deprecations.d/README.md)).
+- Its own schema migrations, numbered master's latest + 1 when written.
+- Nothing else that carries a version: no edit to VERSION, the package.json
+  version, the plugin manifests, the BOOTSTRAP stamp, the plugin or template
+  trees, a released CHANGELOG section or a released `since:` row. The PR
+  title is plain words with no version in front.
+
+**The release PR.** The merge lane runs `gstack-release-stamp open`. On a
+fresh worktree of `origin/master` it sets VERSION to master's PATCH + 1,
+runs `bun scripts/release-restamp.ts --stamp-only <version>` (every required row
+of the CLAUDE.md "Version locations" table plus the plugin, variant and
+template stamp lines; no fetch, no merge, no commit) and
+`bun scripts/build-behavior-changes.ts`, which dates each pending
+`behavior-changes.d` marker with the new version, in the order the fold
+writes them, then folds every `changelog.d` fragment under one
+`## [<version>] - <date>` heading and deletes the fragments. It
+pushes `release/<version>` and opens the PR. The lane lands it with
+`gstack-ship-queue land --pr <n> --pin <head>`, which accepts only a head
+that is exactly the release stamp of master's tip. The release PR runs the
+cheap tier; release.yml's ci-gate waits for the full Test and E2E push runs
+on the release commit before anything publishes.
+
+**When releases happen.** At 00:00, 06:00, 12:00 and 18:00 UTC the merge
+lane opens a release when master holds at least one fragment and the last
+release is 4 hours old or more. It also opens one right after landing a PR
+whose fragment says `important:`, so an important fix is in a published
+release within about an hour and can go to the stable channel (see "Daily
+stable check").
+
+**What refuses a bad release.** gstack's land refuses a release head that
+changes anything but stamps, the CHANGELOG fold and `release_outputs` (here
+`src/core/behavior-changes.generated.ts`, which it regenerates and compares
+byte for byte). release.yml runs `bun scripts/check-behavior-since.ts --stamped`,
+which refuses a release commit that still holds a `changelog.d` fragment,
+a literal `since: 'TBD'` row or a stale behavior-change table, and fails
+closed when `.gstack/ship-policy.json` is missing or unparsable. A cancelled
+or skipped Test or E2E push run fails the gate with the `gh run rerun <id>`
+to run; the gate no longer follows to a later commit with the same VERSION,
+because between releases every master commit shares one, and a
+`workflow_dispatch` refuses unless master HEAD is the release commit.
+
+**Migration collisions.** Two open PRs can take the same migration number.
+GitHub then reports the second one conflicting (both edit the generated
+registry), and `check:schema-migration-order` fails on the merged tree.
+`bun run migrations:renumber` renumbers the branch's own migrations after
+master's latest (file name, export name and `version:` literal; the rest
+must be token-identical) and regenerates the registry, as step 5 of
+[Release restamp](#release-restamp) describes. That makes a new head, which
+needs a new full CI run. Migration numbers stay sequential for the reason
+given there.
+
+**Converting an open stamped PR.** A PR written before this switch still
+carries a version. `bun run release:unstamp` merges `origin/master`, puts
+every stamp back to master's version, moves the branch's CHANGELOG entry to
+`changelog.d/<branch-slug>.md` and its appended plain-text
+`BEHAVIOR_CHANGES` rows to `behavior-changes.d/` (with their markers),
+puts the notice file and its size-table row back to master's, and commits
+once. The moved rows have no `kind:` yet: add one to each before pushing
+(`bun run check:public-surface` refuses a new row without it). It refuses, with the fix, a branch with no entry of its own, one that
+edits a released CHANGELOG section, one that carries other PRs' entries (land
+or convert those first), and notice rows it can't move (rows without an id,
+rows whose text is a function, edits other than appending). Plain
+`release:restamp` refuses once master's policy says `merge: "direct"`.
+
+**Why notice rows are files.** Every PR used to append its row to the end of
+one array in `src/core/behavior-change-notice.ts`, which also raised that
+file's line in `scripts/module-size-limits.tsv`; those two lines were the
+second-largest source of master conflicts after the stamps. Rows in their
+own files, which the release never edits or deletes, touch neither line.
+
 ## CHANGELOG + VERSION are branch-scoped
+
+Under [releases per batch](#releases-per-batch) a PR writes only its
+`changelog.d` fragment; the voice rules below apply to that text, and the
+version and placement rules apply to the release PR.
 
 **VERSION and CHANGELOG describe what THIS branch adds vs master, not how we got
 here.** Every feature branch that ships gets its own version bump and CHANGELOG
@@ -63,8 +256,8 @@ in the plan file at `~/.claude/plans/`, not in the CHANGELOG. One unified entry
 per branch, covering what the branch added vs the base branch.
 
 **Never edit a CHANGELOG entry that already landed on master.** If master has
-v0.18.2 and your branch adds features, bump to the next version (v0.19.0, not
-editing master's v0.18.2). When merging master into your branch, master may
+v0.18.2.0 and your branch adds features, bump to the next PATCH version
+(v0.18.3.0, never MINOR) instead of editing master's v0.18.2.0. When merging master into your branch, master may
 bring new CHANGELOG entries above yours — push your entry above master's
 latest and verify:
 
@@ -95,6 +288,90 @@ If any answer is no, fix it before continuing.
 - Numbers that mean something to the user: TTHW, commands that timed out before, detection counts.
 - Upgrade instructions: `gbrain upgrade` + any manual step if needed.
 - Credit to external contributors when a community PR was incorporated.
+
+## Release restamp
+
+Under [releases per batch](#releases-per-batch) PRs do not restamp: the
+release PR stamps, and `release:restamp` refuses. Its renumbering runs on its
+own as `bun run migrations:renumber`, and `bun run release:unstamp` converts a
+PR stamped the old way. The steps below describe the shared machinery.
+
+`bun run release:restamp` makes a branch next-to-merge in one command. Run it
+when your PR is next in the merge line, not earlier: the merge coordinator
+merges one PR at a time, so restamping at that moment allocates the version
+and migration numbers without races. Preview first with `--dry-run`, which
+prints every planned edit, predicted merge conflict, migration renumbering
+and the commit it would make, and changes nothing.
+
+**Say to your agent:** *"Restamp this branch onto master, it's next to merge."*
+
+1. Refuses a dirty working tree (commit or `git stash -u` first) and a
+   failed fetch (offline: `git fetch origin master`, then rerun).
+2. Captures the branch's CHANGELOG entry (the sections above the newest entry
+   it shares with master; one entry per branch) and its migration inventory.
+3. Merges `origin/master` with a merge commit. Version-only hunks in the stamp
+   files, `CHANGELOG.md` and generated files (migration registry,
+   `migrations/records.json`, `llms*.txt`, plugin trees, the template repo,
+   `bun.lock`) resolve mechanically; any other conflict stops with the file
+   list.
+4. Sets VERSION to master's `MAJOR.MINOR.(PATCH+1).0` and rewrites every
+   required row of the CLAUDE.md "Version locations" table: VERSION,
+   `package.json`, the three plugin manifests, the BOOTSTRAP runbook stamp,
+   the CHANGELOG entry (re-stamped on top of master's entries with today's
+   date), branch-added TODOS lines naming the old version, and every
+   `since: 'TBD'` row in `src/core/behavior-change-notice.ts` (development
+   branches write their BEHAVIOR_CHANGES rows as TBD; the stamp gives them the
+   new version, and a restamp moves the branch's own rows from the old version).
+5. Renumbers the branch's own schema migrations (files `origin/master` does
+   not have) consecutively from master's latest + 1, in their original order.
+   It changes only the filename, the `export const v<NNN>` name and the
+   `version:` literal, and proves the rest of the file is token-identical.
+   Published migrations are never renumbered or edited; a branch file whose
+   payload matches a migration master already published under another number
+   (squash-merged or cherry-picked) stops with the `git rm` fix.
+6. Regenerates the migration registry, `migrations/records.json` (when the
+   branch has migrations), `bun.lock`, the bootstrap template repo and
+   everything `bun run regen:all` covers.
+7. Lists every line the branch added that still names an old migration number
+   (`v209`, `v209-name`, `migration 209`, `schema_version ... 209`,
+   `version: 209`) and stops: such a line may mean the moved migration or the
+   published one that now owns the number, so it is never rewritten. Edit each
+   line (an edited line is not listed again), or pass `--accept-references`
+   with `--continue` when a line means the published migration.
+8. Runs the drift checks (version stamps and CHANGELOG agree, bootstrap
+   stamp, plugin tree, template repo, migration registry and order, no
+   `since: 'TBD'` row left: `bun scripts/check-behavior-since.ts --stamped`, and every
+   master release heading still in CHANGELOG.md: `bun scripts/check-changelog-headings.ts`), commits
+   once as `v<new> chore(release): restamp onto master v<master>`, and prints
+   the old-to-new migration mapping with the collision-recovery steps, the
+   golden-regeneration reason for the PR body, the PR title and
+   `bun run verify`.
+
+Every stop prints what happened, why, and the fix, saves its state, and ends
+with `bun run release:restamp --continue` (after you fix it) or `--abort`
+(back to the pre-run commit). `--no-commit` leaves the restamp edits staged.
+A second run with nothing to change commits nothing. It renumbers source
+only and never touches a database: if you applied an old number locally,
+follow "Collision recovery" in [TESTING.md](TESTING.md#schema-migration-registry)
+(disposable DB: rebuild and replay; retained data: explicit `schema_version`
+reconciliation).
+
+**Why stamps are not derived at build time.** Several readers take the
+version from committed files with no build step: `bun install -g
+github:garrytan/gbrain` installs from source, `gbrain bootstrap status`
+compares the BOOTSTRAP runbook stamp with the installed binary, the plugin
+manifests and generated trees are published as committed, and `release.yml`
+fires on a VERSION change. A build-time value would leave those copies
+wrong, so the files stay stamped and one command rewrites them.
+
+**Why migration IDs stay sequential.** A brain records one integer,
+`schema_version`, and the runner applies every migration above it in order.
+A migration numbered at or below master's latest is skipped forever on
+current brains, which `check:schema-migration-order` rejects. Unordered IDs
+(timestamps, hashes) would need a per-migration applied-set table and a
+bookkeeping migration for every existing brain. Renumbering at merge time,
+serialized by the merge coordinator, keeps the counter correct with no
+schema change. Build on `release:restamp` rather than a second restamp tool.
 
 ## CHANGELOG voice + release-summary format
 
@@ -290,7 +567,8 @@ matter" with BrainBench-style before/after table, "what this means" closer, then
 
 Create a migration file at `skills/migrations/v[version].md` when a release
 includes changes that existing users need to act on. The auto-update agent
-reads these files post-upgrade (Section 17, Step 4) and executes them.
+reads these files post-upgrade (see `docs/guides/upgrades-auto-update.md`)
+and executes them.
 
 **You need a migration file when:**
 - New setup step that existing installs don't have (e.g., v0.5.0 added live sync,
@@ -342,9 +620,9 @@ canonical.
 
 ## Schema state tracking
 
-`~/.gbrain/update-state.json` tracks which recommended schema directories the user
-adopted, declined, or added custom. The auto-update agent (SKILLPACK Section 17)
-reads this during upgrades to suggest new schema additions without re-suggesting
+`~/.gbrain/upgrade-state.json` tracks which recommended schema directories the user
+adopted, declined, or added custom. The auto-update agent
+(`docs/guides/upgrades-auto-update.md`) reads this during upgrades to suggest new schema additions without re-suggesting
 things the user already declined. The setup skill writes the initial state during
 Phase C/E. Never modify a user's custom directories or re-suggest declined ones.
 
@@ -362,6 +640,378 @@ done
 
 If any SHA differs from what's in the workflow files, update the pin and version comment.
 
+## GitHub releases (binary assets + self-update) — #3521
+
+`.github/workflows/release.yml` publishes a GitHub release automatically for
+**every VERSION bump that lands on master** (trigger: push to master touching
+`VERSION`, plus `workflow_dispatch` for a manual first run or repair). No
+manual tag push is part of the ship flow — the workflow reads `VERSION` (the
+single source of truth), mints tag `v<VERSION>` at the pushed commit, titles
+the release the same, uses that version's `CHANGELOG.md` entry as the notes,
+opened by one line per folded changelog fragment with the pull request that
+added it (`scripts/changelog-entry.sh --pr-list`; falls back to a CHANGELOG
+link if the entry is missing), and attaches the compiled binaries. Every one is published as a
+pre-release; only the stable release is GitHub's "Latest" ([Which release GitHub
+calls Latest](#which-release-github-calls-latest)).
+
+The executable build job pins Bun 1.4.4, the first release with the Brotli fix
+for CVE-2026-111497 (#7373): a standalone binary embeds the Bun it was built
+with, so never pin a build below it. The job verifies the Darwin artifact with
+strict native `codesign` before publishing it. A source merge does not repair
+already-published bad binaries; an affected release needs its own explicitly
+approved recovery and asset verification. The template and plugin publishing
+jobs pin the same Bun version.
+
+### Release CI gate
+
+The `ci-gate` job (`scripts/release-gate.ts`) holds build, publication and the
+`latest-stable` move until the push-to-master runs of Test and E2E Tests both
+succeed on the release commit.
+
+- **Failed run:** nothing is published and the job fails with the run and the
+  master-red issue. When the failure is outside the release commit (a flake),
+  re-run the failed run, then re-run the Release run (`gh run rerun <release
+  run id>`), which gates the same commit; otherwise land the repair and open
+  the next release.
+- **Cancelled or skipped run:** nothing is published and the job fails with
+  `gh run rerun <id>`. Master push runs are keyed by commit, so a newer push
+  no longer cancels them; and between releases many master commits share one
+  VERSION, so the gate never follows to a later commit.
+- **Backfill:** `gh workflow run release.yml --ref master` gates and publishes
+  master HEAD's VERSION only while HEAD is the release commit (the
+  first-parent commit that last changed VERSION): between releases a later
+  commit carries the same VERSION with unreleased changes, so the gate then
+  refuses and names the re-run of the release commit's push Release run.
+  Other refs are refused.
+- The gate waits up to 110 minutes, then fails naming the re-run of the
+  Release run.
+- **Reused push run:** a push run that reused a passed full-suite run of its
+  exact tree ([master-push reuse](ci-event-parity.md#master-push-reuse))
+  publishes only with a readable `reuse.json` naming the same workflow, the
+  push head and a valid source run. The gate prints the reused run per
+  workflow and writes `test_reused_run_id` / `e2e_reused_run_id` (empty when
+  that workflow ran in full); the `ci-gate` job exposes both as outputs.
+
+### The `latest-stable` tag
+
+The **final step of the release job** force-advances the `latest-stable` tag to
+the gated release commit (`git push origin "+${RELEASE_SHA}:refs/tags/latest-stable"`).
+`latest-stable` is the alpha channel's ref: the alpha update check follows it,
+and so does anyone who pins it by hand. New users start on the `stable` tag
+instead ([Stable channel promotion](#stable-channel-promotion)): the README paste
+block, the `BOOTSTRAP_FOR_AGENTS.md` fetch URL and
+`bun install -g github:garrytan/gbrain#stable` name it (`INSTALL_REF` in
+`src/core/install-ref.ts`), and only the stable promotion moves it. Both refs
+move only to a release whose assets already published, so neither has a 404
+window. `scripts/check-bootstrap-tag.sh` and `bun run check:install-ref` keep the
+entry docs pinned to `INSTALL_REF` and refuse `latest-stable` there.
+
+Because it moves ONLY after binaries + provenance attestation have fully
+published, a half-built release never advances it. If the tag-advance step
+alone fails, re-advance by hand (a full workflow re-run would skip — the
+release already exists with all assets):
+
+```bash
+git push origin "+refs/tags/v<VERSION>^{commit}:refs/tags/latest-stable"
+```
+
+### Which release GitHub calls Latest
+
+release.yml publishes every batch release with `prerelease: true` and
+`make_latest: false`, so the Releases page and its Latest badge point at the
+release installs follow. Each promotion (`scripts/promote-stable.ts`, from the
+promote dispatch or the daily check) ends by marking the promoted release
+Latest and clearing its pre-release flag. A forward promotion also replaces its
+notes with a short summary of the behaviour changes since the previous stable
+(`upgradeSummary()` in `src/core/upgrade-summary.ts`, the same summary
+`gbrain post-upgrade` prints, left out when it alone would not fit), then every
+CHANGELOG entry since it, newest first; the oldest entries drop with a link to the full CHANGELOG once the notes would pass
+GitHub's 125,000-character limit. A rollback keeps the notes.
+
+A forward promotion never moves Latest to an older release than the one it
+marks now, because binaries released before this rule download
+`releases/latest` as their update. So during the changeover Latest stays on
+the newest release published before the rule, until stable passes it; that
+promotion sets Latest, and from then on Latest is stable. `backfill` should
+not be needed. A hand re-run of release.yml that would republish the current
+stable release as a pre-release refuses; upload missing assets with
+`gh release upload` instead.
+
+Nothing that installs or updates gbrain reads GitHub's Latest: `#stable` and
+`gbrain upgrade` follow the `stable` tag and its record; the alpha channel
+(binary self-update included) reads `VERSION` at `latest-stable` and fetches
+that exact release; the upgrade matrix counts pre-releases as releases; the
+macOS signature check resolves its tag from `latest-stable`. Anyone who
+downloads from `releases/latest` by hand now gets the stable release, about a
+day behind the newest. People who watch the repository for releases are still
+notified of pre-releases: GitHub has no setting to skip them.
+
+`scripts/release-channel.ts` handles GitHub release state outside a promotion;
+each command prints its plan and writes nothing without `--apply`:
+
+- `backfill`: every published release newer than the current stable becomes a
+  pre-release and the stable release becomes Latest with rolled-up notes. It is
+  also the repair when a promotion moved `stable` but could not mark it Latest
+  (the refusal names it).
+- `undo`: every pre-release goes back to a normal release and the newest release
+  becomes Latest, as before this rule. Revert the workflow change with it.
+- `preview-promotion [--version <v>]`: the release a promotion would make
+  Latest and the notes it would write.
+
+### Stable channel promotion
+
+The stable channel, the clients' default since GBRA-224, is a slower ref than
+`latest-stable` (the alpha channel): a release reaches it only after the
+production-shaped soak passed on its exact git tree. A
+maintainer promotes with `.github/workflows/promote-stable.yml`
+(`scripts/promote-stable.ts`), or the scheduled
+[daily stable check](#daily-stable-check) promotes by rule; manual promotions and
+rollbacks go through the same dispatch:
+
+```bash
+gh workflow run promote-stable.yml -f version=<VERSION> \
+  -f soak_run_url=https://github.com/<owner>/<repo>/actions/runs/<run id>
+```
+
+- **Refs.** `refs/tags/stable` is an annotated tag on the promoted release
+  commit, moved only by this workflow. Clients peel it (`refs/tags/stable^{}`)
+  and take the `v<VERSION>` tag on that commit. The same push commits the
+  evidence record `stable.json` (the tag fields plus `known_bad` and
+  `not_promotable`) to the
+  `stable-record` branch; clients read only that file and refuse a record
+  without its evidence (`stable_invalid`, `src/core/stable-channel.ts`).
+  `refs/tags/stable-v<VERSION>` is an immutable annotated record created on a
+  version's first promotion and never moved or deleted. Both carry the same
+  message: a title line (`gbrain`, then `stable channel: v<VERSION>`), then one
+  `key: value` line each for `version`, `commit`, `tree`, `soak_run`,
+  `scoreboard`, `matrix_run` (only when the promotion named one; `stable.json`
+  always has the key, `null` without one), `promoted_by`, `promoted_at` (UTC), `previous`
+  (`none` on the first promotion), `rollback` and `reason` (`-` when
+  empty).
+- **Inputs.** `version` (an existing `v<VERSION>` release tag),
+  `soak_run_url` (the soak's Actions run URL, optionally
+  `/attempts/<n>`), `matrix_run_url` (optional for a maintainer: a green
+  upgrade matrix run on this release, see below), `scoreboard_url` (optional,
+  defaults to the run URL),
+  `rollback` (default false), `reason` (required with rollback) and
+  `withdraw` (versions added to the carried-forward `known_bad` list;
+  clients on one are offered the current stable, even when older), and
+  `not_promotable` with `not_promotable_reason` and `not_promotable_fixed_in`,
+  and `not_promotable_remove` (see below).
+- **Not promotable.** A release can soak clean and still be bad, when the
+  evidence comes from outside the soak (a regression found on a large brain,
+  say). Record it so the daily check never soaks or promotes it: dispatch this
+  workflow for the current stable version and its own soak run (the re-record
+  path: no tag moves), with `not_promotable` set to the bad versions,
+  `not_promotable_reason` saying why and `not_promotable_fixed_in` naming the
+  newer release that fixes them. The list is carried forward on every later
+  record, and `promote()` refuses a release on it. Clients never read it, so
+  unlike `withdraw` it offers nobody a different release. To take a release
+  off the list (one listed by mistake), pass it in `not_promotable_remove` the
+  same way. A reason is at most 500 characters (link the evidence), and a
+  record larger than clients accept (64 KiB) is refused before anything is
+  pushed. Use `withdraw` only for a release that was stable, so its installs
+  move off it:
+
+  ```bash
+  gh workflow run promote-stable.yml -f version=<current stable> -f soak_run_url=<its soak run> \
+    -f not_promotable=<v1>,<v2> -f not_promotable_reason='<why>' -f not_promotable_fixed_in=<fix release>
+  ```
+- **Who.** Only an actor with the admin or maintain role; anyone else is
+  refused. The one exception is the scheduled daily check below.
+- **Soak run.** The run must belong to this repository, be completed with
+  conclusion `success`, and run the workflow file named by the
+  `STABLE_SOAK_WORKFLOW` repository variable (Settings → Secrets and
+  variables → Actions → Variables; a bare file name like `soak.yml` or the
+  full `.github/workflows/soak.yml` path). With the variable unset, every
+  promotion is refused.
+- **Upgrade matrix run.** When `matrix_run_url` is given, it must be a
+  completed run of `.github/workflows/upgrade-matrix.yml` from master's harness
+  (a schedule or dispatch run, not a pull request's), with the full from-version
+  set and no fault injection, whose `upgrade-matrix-receipt` artifact names this
+  release's tag, commit and tree and was written by that run's own commit, and
+  it must be green; a red or foreign run is refused
+  (`scripts/stable-matrix.ts` `judgeMatrixRun`). A maintainer may promote
+  without one, for example past an upgrade break the matrix found: the record
+  then says `matrix_run: null` and names the maintainer as `promoted_by`. A
+  scheduled promotion always names one.
+- **Published release.** The tag's `VERSION` file must say the version, and
+  its GitHub release must exist and not be a draft, so binary clients can
+  fetch the stable release.
+- **Exact tree.** The soak run's head commit must have the same git tree as
+  the release tag. A soak of another tree is refused with both trees and the
+  run's head commit, even when the version string matches; soak the release
+  itself, then promote that run.
+- **Ordering and rollback.** The version must be newer than the current
+  stable (numeric 3- or 4-part comparison). Promoting the current stable
+  again moves no tag: it writes `stable.json` when the published record does
+  not already name that release (see the backfill below), and is a no-op
+  refusal otherwise. `rollback=true` with a `reason` moves stable to an older
+  release, or back to one promoted before (its record tag already exists and
+  is kept; without rollback an existing record tag is refused).
+- **One atomic push.** The record tag, `stable` and the `stable-record`
+  branch land together or not at all, `stable` and `stable-record` leased on
+  the values the run read, so a concurrent move fails
+  the run instead of being overwritten and a failed push leaves nothing to
+  clean up before the re-run. The `promote-stable` concurrency group runs one promotion at a
+  time. The run's step summary lists the version, commit, tree, soak run,
+  scoreboard, previous stable and rollback reason.
+- **Record backfill (one time, GBRA-346).** Promotions made before this
+  script wrote the evidence record moved `stable` with no `stable.json`,
+  and a client that has the stable channel reads only the record, so it
+  would report `stable_missing`. The backfill is automatic on the first
+  scheduled run of the [daily stable check](#daily-stable-check) after the
+  channel client lands: when `stable.json` is missing or names another
+  commit than `stable`, that run writes the record for the current stable
+  and stops. The manual dispatch still works, for example to write the
+  record before the first release with the channel client publishes:
+
+  ```bash
+  git fetch --tags --force origin
+  git for-each-ref --format='%(contents)' refs/tags/stable   # version: and soak_run: lines
+  gh workflow run promote-stable.yml [--ref <branch with this script>] \
+    -f version=<that version> -f soak_run_url=<that soak_run>
+  ```
+
+  The run re-checks the release and the soak run, requires the tag message to
+  name the same release, tree and soak run, writes `stable.json` from it
+  (`known_bad` carried forward, `withdraw` accepted) and pushes only the
+  record branch, leasing `stable` unchanged. Running it from a branch before
+  the client merges is safe: older clients never read the record. A record
+  that already names the current stable makes the run a no-op refusal.
+  Every later promotion, manual or scheduled, writes the record itself.
+
+<a id="daily-stable-check"></a>
+### Daily stable check
+
+`.github/workflows/stable-daily.yml` (`scripts/stable-daily.ts`) runs at 05:17 and 13:17 UTC
+and keeps stable between one day and one week behind what matters:
+
+- **Reason first.** It acts only when a merged PR labelled `stable:important` is in a
+  published release but not in stable, or stable is more than 7 days old and
+  a newer release exists (the weekly floor). Otherwise it does nothing. The
+  merge lane sets the label at merge on a security fix, a data-loss fix or a
+  fix for a regression in a release that is on stable (on a train PR, the
+  train carries it); a label added after the merge counts too. Anything else,
+  a regression only alpha has or a fix that unblocks one setup included, rides
+  the weekly floor unless a maintainer promotes by hand. The rule: an
+  important fix reaches stable within a day once it passes the full gate and
+  soak; everything else rides a weekly cut; stable never sits more than seven
+  days behind gated changes on master. It finds those PRs with GitHub's
+  search, so the workflow's token needs `pull-requests: read`; each run logs
+  how many labelled PRs the search returned, and if the search sees no merged
+  PR at all the check stops red and names that permission.
+- **Soak first.** The candidate is the newest release newer than stable whose
+  commit is on master and whose exact tree passed a successful
+  `STABLE_SOAK_WORKFLOW` run with the integrity gates (`privacy_leaks`,
+  `read_errors`, `version_skew`, `residents_alive`, `session_refusals`)
+  passing in every cell; the latency gates stay record-only. The soak must be
+  the full default one: both the 65 ms and 2 ms cells, at least 2 hours each,
+  on the requested 600,000-page fixture, with privacy probes run and none
+  erroring, so a smaller smoke dispatch never qualifies. On the important-only path the candidate must contain the fix.
+  A release that was stable before (its `stable-v<version>` record tag exists,
+  so it was promoted and rolled back) or that `stable.json` lists in `known_bad`
+  or `not_promotable` is skipped, logged, and never promoted or soaked by the
+  schedule, on the important path and the weekly floor alike; a maintainer
+  re-promotes it by hand if it should return.
+  It is promoted through the same `promote()` as a manual promotion, so every
+  check above still applies and the record's `promoted_by` is
+  `schedule (.github/workflows/stable-daily.yml)` with the reason in `reason`.
+  With no qualifying soak it dispatches one soak on the newest release's tag
+  (never while another soak runs, and never after a soak on any newer release
+  failed to qualify: then a maintainer decides, and the check warns once stable
+  is past the weekly floor), and a later run promotes it.
+- **Upgrade matrix next.** The soaked candidate also needs a green
+  [upgrade matrix](ci-upgrade-matrix.md) run on its exact tag and tree: a
+  schedule or dispatch run of master's harness with the full from-version set
+  (which includes every stable release in the window), checked as under
+  "Upgrade matrix run" above and again by `promote()`, and recorded as
+  `matrix_run`. With no run yet it dispatches one on the candidate's tag
+  (`upgrade-matrix.yml` on master, `candidate=v<version>`), unless a matrix run
+  is active, and a later run promotes; when it dispatches a soak on the
+  newest release it dispatches the matrix on that release too. A red or
+  foreign run holds stable with a warning and is never re-dispatched by the
+  schedule: a maintainer fixes the break or promotes by hand.
+- **Upgrade breaks hold.** While the matrix's own break issue is open (the
+  one the nightly run opens with the `<!-- gbrain-upgrade-matrix:nightly -->`
+  marker; another issue with the `upgrade-break` label holds nothing), the
+  check holds stable, the weekly floor included, and dispatches nothing. The
+  one way past it on the schedule is a released `stable:important` fix whose
+  `changelog.d` fragment says `important: security` or `important: data-loss`,
+  on a candidate whose matrix run fails on no from-version the issue names
+  (its `red-from` line) and on nothing else; the record's `reason` names the
+  excused from-versions. Everything else waits for the nightly run to close
+  the issue, or for a maintainer's promotion.
+- **Who.** A schedule event runs only the workflow file as merged on the
+  default branch, so a scheduled run promotes by rule without a maintainer. A
+  manual dispatch defaults to `dry_run` (report only); `dry_run=false` needs an
+  admin or maintainer before it dispatches a soak or promotes. It shares the `promote-stable` concurrency group, so it
+  never races a manual promotion.
+- **Record first.** Before the reason check, when `stable.json` is missing or
+  names another commit than `stable`, it writes the record for the current
+  stable from the stable tag's message through the same re-promotion path as
+  the manual backfill (no tag moves; release, exact tree, soak run and leases
+  checked; `known_bad` carried forward) and stops; a dry run reports
+  `would: backfill the record for v<version>`. A record that already names
+  stable changes nothing. The kill switch and a rollback pause skip it.
+- **Stop it.** Set the repository variable `STABLE_AUTO_PROMOTE=off` (Settings →
+  Secrets and variables → Actions → Variables). It also pauses by itself while
+  the current stable record says `rollback: true`, until a maintainer promotes by
+  hand.
+- **Roll back.** Dispatch `promote-stable.yml` as a maintainer with `version` set to the
+  previous stable (`git tag --list 'stable-v*' --sort=-creatordate`, or the
+  record's `previous` field: `git show stable --no-patch`), `soak_run_url` set to the
+  soak run in that version's record tag, `rollback=true`, a `reason` and `withdraw`
+  set to the version you are rolling back from. `withdraw` puts it on the record's
+  `known_bad` list, so clients that already installed it are offered the previous
+  stable. Without it they stay on the bad release, because clients on stable never
+  downgrade on their own. The daily check stays paused until the next manual
+  promotion.
+
+### The `publish-template` job
+
+After the release job, a `publish-template` job force-pushes the rendered
+agent-workspace template repo (the GitHub "Use this template" door,
+`vars.TEMPLATE_REPO`, default `garrytan/gbrain-agent-template`) from CI only —
+no human pushes it by hand, so what adopters clone is exactly what this repo
+reviewed. It is guarded three ways: the release above fully published; the
+vendored tree `templates/bootstrap/template-repo/` exists (skip, never fail,
+if not); and the `TEMPLATE_REPO_PAT` secret is configured (skip if not).
+Before pushing, it regenerates the template tree
+(`bun run scripts/generate-template-repo.ts`) and byte-diffs it against the
+vendored copy — a mismatch fails the job; regenerate + commit the vendored
+tree (`scripts/check-bootstrap-templates.sh` runs the same diff offline in
+`bun run verify`).
+
+**`TEMPLATE_REPO_PAT` scope:** a fine-grained PAT with `contents: write` on
+the template repository ONLY — no other repositories, no other permissions.
+Configure it as a repo secret; when absent, template publishing is disabled
+and the job skips cleanly.
+
+Why every bump, not selective: the alpha update check reads `VERSION` at
+`latest-stable`, and binary self-update downloads that exact release
+(`src/core/binary-self-update.ts`). Any version without a release tells binary
+installs an upgrade exists that self-update cannot apply.
+
+Invariants:
+
+- **Asset names are a contract.** The build matrix's `artifact:` names must
+  equal what `expectedAssetName()` in `src/core/binary-self-update.ts`
+  returns (`gbrain-darwin-arm64`, `gbrain-linux-x64` today). Adding a
+  platform means updating BOTH plus the version job's completeness check;
+  `test/release-workflow.test.ts` pins all of it.
+- **Idempotent + self-repairing.** The version job skips when a release for
+  `v<VERSION>` already exists with all expected assets; a partial release
+  (tag but no release, or missing assets) is completed on re-run. Racing
+  master pushes queue via the `release` concurrency group — a skipped
+  intermediate version is fine, latest is what matters.
+- **Historical tags are never rewritten.** Old 3-segment versions keep their
+  history; every new 4-segment `VERSION` mints a fresh tag.
+- **Permissions stay scoped.** `contents: write` lives on the release job
+  only; everything else runs read-only.
+- **Never advance `latest-stable` on a partial release.** The tag moves only
+  as the final release-job step, after every asset has published. Manual
+  re-advances must point at a fully published `v<VERSION>` release.
 
 ## PR descriptions cover the whole branch
 
@@ -381,7 +1031,17 @@ to see what's actually in the PR before writing the body.
 
 ## Community PR wave process
 
-Never merge external PRs directly into master. Instead, use the "fix wave" workflow:
+Fix waves built from outside PR lists ended on 2026-11-01. Each outside PR is
+now triaged when it arrives, under the rules contributors see in
+[CONTRIBUTING.md](../CONTRIBUTING.md#how-an-outside-pull-request-is-handled):
+documentation people read may be merged as it is after a text read of every
+link, command and install step; a small, plainly correct fix (under about 40
+lines, not counting tests) is rebuilt on current master with credit, at most one
+small PR a day; anything else is read as a report and rebuilt only when it has
+proof and matters. Outside code is never checked out, run or merged. A rebuild
+PR lists the outside PR on a `Supersedes #N` line so the
+[closeout](#fix-wave-closeout) closes it with a link. The steps below are the
+older batch procedure; steps 4 to 7 still apply to any rebuild PR.
 
 1. **Categorize** — group PRs by theme (bug fixes, features, infra, docs)
 2. **Deduplicate** — if two PRs fix the same thing, pick the one that changes fewer
@@ -390,11 +1050,30 @@ Never merge external PRs directly into master. Instead, use the "fix wave" workf
    or manually re-implement the best fixes from each PR. Do NOT merge PR branches directly —
    read the diff, understand the fix, and write it yourself if needed.
 4. **Test the wave** — verify with `bun test && bun run test:e2e` (full E2E lifecycle).
-   Every fix in the wave must have test coverage.
-5. **Close with context** — every closed PR gets a comment explaining why and what (if
+   Every fix in the wave must have test coverage. Run
+   `bun run audit:contributors <base>..<collector-head> --prs <manifest>` to re-prove,
+   per merged change and per open PR (trial-merged), that its tests fail with its product
+   hunks reversed; the tool pins the PR heads into `prs.pinned.json` so a rerun tests the
+   same code, and its Markdown table keeps mechanical results apart from your verdicts
+   (see [Contributor audit](TESTING.md#contributor-audit)). Paste the table into the wave
+   PR body.
+5. **Security review** — run `bun run wave-security-scan <base>..<collector-head>` over the
+   collector branch (the repeatable mechanical sweep). It ALARMS on newly-introduced
+   obfuscation/eval in code, secrets found by gitleaks **with the test/skills allowlist
+   stripped**, and any committed `admin/dist` change (the bundle-backdoor artifact); new
+   outbound endpoints, spawns, env reads, and dependency changes print as context. Exit 1
+   means "eyeball before shipping," not "unsafe" — read the ALARM rows and the context lists,
+   and confirm each is benign. Link the result (or a one-line "clean") in the wave PR body.
+   This is the standard's teeth: a wave PR body that claims "security reviewed" must have run
+   this. It is a net, not a proof — a human still reads the diffs.
+6. **Close with context** — every closed PR gets a comment explaining why and what (if
    anything) supersedes it. Contributors did real work; respect that with clear communication
-   and thank them.
-6. **Ship as one PR** — single PR to master with all attributions preserved via
+   and thank them. In the wave PR body, put each folded-in contributor PR on a
+   `Supersedes #N` line and each fixed issue on a `Fixes #N` line: when the wave merges,
+   the [fix-wave closeout](#fix-wave-closeout) closes those PRs with a thank-you comment and
+   GitHub closes the issues. Write `Addresses #N` or `Refs #N` for anything only partly
+   done, so it stays open. Close declined or duplicate PRs by hand, with the reason.
+7. **Ship as one PR** — single PR to master with all attributions preserved via
    `Co-Authored-By:` trailers. Include a summary of what merged and what closed.
 
 **Community PR guardrails:**
@@ -402,6 +1081,72 @@ Never merge external PRs directly into master. Instead, use the "fix wave" workf
   promotional material (README intro, CHANGELOG voice, skill templates).
 - Never auto-merge PRs that remove YC references or "neutralize" the founder perspective.
 - Preserve contributor attribution in commit messages.
+
+### Fix-wave gate
+
+`.github/workflows/fix-wave-gate.yml` (job `contributor-gate`) fails every PR into
+master unless its head repository is `garrytan/gbrain` or the `maintainer-override`
+label counts. Only maintainers can push to `garrytan/gbrain`, so GBRA thread PRs
+(`capy/*`) and `garrytan/*` branches pass; fork PRs fail whatever their branch is
+called. When a contributor PR opens, a second job posts one comment with the same
+text as the failure: how outside PRs are handled (documentation merged as it is
+after a text read, small correct fixes rebuilt with credit, everything else read as
+a report and rebuilt with credit when taken, `Contributed by @handle` plus a
+`Co-Authored-By:` trailer), the proof a larger change needs, who the open-PR limit
+applies to, and a link to CONTRIBUTING.md "How an outside pull request is handled".
+
+The workflow uses `pull_request_target`, so the workflow and
+`scripts/fix-wave-gate.ts` always come from the default branch: a PR that edits
+either cannot change its own result. It reads only the event payload and the PR
+timeline, never PR code, with `permissions: {}` at the top, `pull-requests: read`
+for the gate and `pull-requests: write` only for the comment job. A null head
+repository (deleted fork) fails closed. The check re-runs on `opened`, `edited`,
+`reopened`, `synchronize`, `labeled` and `unlabeled`.
+
+**`maintainer-override` label.** Who: a human on `MAINTAINERS` in
+`scripts/fix-wave-gate.ts` (starts as `garrytan`; changing it is a reviewed PR to
+master). When: only for a PR a maintainer has decided may land from its fork, such as
+an outside documentation change or a PR a maintainer opened from a fork; record the reason in a PR comment. How it
+is checked: the label counts only when the most recent `labeled` timeline event for it
+was made by an allowlisted `User`; bots (`capy-ai[bot]`, `github-actions[bot]`, any
+`[bot]` login) never qualify, and removing the label fails the PR again. Audit: the run
+log prints a `notice` naming who applied the label, when, and the timeline event id,
+and the step summary repeats it.
+
+**Turning it on (repository settings, maintainer only).** The guard is active only
+after this step; until then the check is advisory. Settings → Rules → Rulesets (or
+Settings → Branches → the `master` protection rule) → Require status checks to pass →
+add `contributor-gate` with GitHub Actions as the source → save. The check must have
+run once on any PR before GitHub offers it in the picker.
+
+**Residual risk.** A same-repo branch (`capy/*` or `garrytan/*`) that carries
+contributor commits passes by design. Keeping contributor work inside a revised fix
+wave on those branches stays a policy rule, enforced by review, not by this check.
+
+### Fix-wave closeout
+
+`.github/workflows/fix-wave-closeout.yml` (job `close-superseded`) runs when a PR
+into master closes. If it merged and its head repository is `garrytan/gbrain`,
+`scripts/fix-wave-closeout.ts` reads the merged PR's body and closes every open pull
+request named on a `Supersedes #N` line (`Supersedes #5085`, `- Supersedes #5089,
+#5096 and #5107`, `**Supersedes:** #5113`). Only the list right after the keyword
+counts, so `Supersedes #5140, which conflicts with #5000` closes #5140 alone. Each
+closed PR gets one comment, keyed by `<!-- fix-wave-closeout -->`, that thanks the
+contributor, links the wave, and says the work landed with credit when the wave body
+contains `Contributed by @<their handle>`. Numbers that are issues or already-closed
+PRs are skipped. A failed close is a warning in the run log, and the step summary
+lists every number with what happened to it. One run closes at most 50 PRs.
+
+Issues need nothing extra: `Fixes #N` in the same body closes them through GitHub.
+Before this workflow, contributor PRs stayed open after their wave merged, which is
+most of why the open-PR count grew. To preview a body locally without writing
+anything, save the event payload and run
+`bun scripts/fix-wave-closeout.ts --event <payload.json> --dry-run`.
+
+Like the gate, it uses `pull_request_target`: the workflow and script come from the
+default branch, it sparse-checks-out only the script, and it never checks out or
+runs PR code. Permissions are `{}` at the top and `contents: read` plus
+`pull-requests: write` for the one job.
 
 ## Checking out PRs from garrytan-agents
 
@@ -433,3 +1178,35 @@ flipping the repo-wide "send secrets to fork PRs" toggle, both broaden
 secret distribution to every fork PR from that account or any fork. Moving
 the branch keeps secret scope tight to just the one PR being shipped.
 
+## ClawHub bundle plugin publish (manual)
+
+`openclaw.plugin.json` makes this repository a ClawHub bundle plugin (see
+[docs/mcp/OPENCLAW.md](mcp/OPENCLAW.md)). Publishing a new version to ClawHub is
+a manual step outside `release.yml`, run from a clean checkout of the release
+tag by an owner with an authenticated `clawhub` CLI:
+
+```bash
+bun run prepublish:clawhub   # bun run build:all: bin/gbrain-darwin-arm64 + bin/gbrain-linux-x64
+bun run publish:clawhub      # clawhub package publish . --family bundle-plugin
+```
+
+`build:all` compiles only those two targets; the full binary matrix ships
+through the GitHub release job above. `gbrain upgrade` never runs
+`clawhub update gbrain` (#8464): that command updates a ClawHub *skill* named
+gbrain from any publisher, and we publish none, so it would install someone
+else's package.
+
+## Plugin dist tree (codex/claude lanes)
+
+The committed `plugin/` and `plugin-variants/` trees embed the VERSION stamp
+(the variants' generated plugin manifests carry it too), so a release bump
+drifts them. After bumping VERSION/package.json, run `bun run
+scripts/generate-plugin-tree.ts --out plugin --variants-out plugin-variants`
+and stage `plugin/` + `plugin-variants/` + `skills/plugin-lanes.json`.
+`scripts/check-plugin-tree.sh` (in `bun run verify`) and the release
+`publish-codex-plugin` job both fail on drift.
+
+When personas change in `skills/plugin-lanes.json#personas`, also hand-edit
+`.claude-plugin/marketplace.json`: the variant entries must match the
+personas block exactly (`test/codex-plugin-manifest.test.ts` pins the
+mapping, so a persona added without a marketplace entry fails the suite).

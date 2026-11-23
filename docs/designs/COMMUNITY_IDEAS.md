@@ -110,7 +110,10 @@ these are the densest source of real bugs in the whole backlog.
   *(A footgun that bites contributors of this very repo.)*
 - **dim-aware embed write target** (#1263, @DmitryBMsk) — **OPEN, high.** `upsertChunks`
   always writes the legacy `embedding vector(1536)` column, so brains on an alternate
-  column (`embedding_ze halfvec(2560)`) fail with dim-mismatch on every write.
+  column (`embedding_retired_provider halfvec(2560)`) fail with dim-mismatch on every write.
+  The column label is redacted; the dimensions and attribution are unchanged. The
+  original label is retained at this path in revision
+  `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29`.
 - **Oversized chunks silently unembedded** (#1675, @lubos-buracinsky) — **OPEN, high.**
   The code chunker emits giant literals/template strings whole; the embedder rejects
   them and they vanish from semantic search. Cap chunk size so they stay embeddable.
@@ -154,10 +157,11 @@ these are the densest source of real bugs in the whole backlog.
   `aliases:`), first-H1-title, and basename fallback resolution (path-equality-only gives
   ~5.5% edge recall on real vaults). Master shipped global-basename (#1388); the alias/
   title fallbacks are the still-novel part.
-- **Schema-pack-aware link extraction** (#1547, @billy-armstrong) — **OPEN, high.** The
-  link extractor's `DIR_PATTERN` is a frozen 16-prefix const that ignores pack-declared
-  `path_prefixes`, so default-pack installs silently lose wikilinks to `person/`,
-  `writing/`, `wiki/*`. Resolve prefixes from the active pack.
+- **Schema-pack-aware link extraction** (#1547, @billy-armstrong) — **RESOLVED via #2576.**
+  The extractor no longer gates on the frozen `DIR_PATTERN` whitelist: any dir-shaped
+  path produces a candidate and the persist paths' page-existence checks decide, so
+  pack-declared directories (`person/`, `writing/`, `wiki/*`, `ops/`) link without a
+  prefix registry.
 - **DB-source extraction** (#1539, @afshaker) — **OPEN, high.** The cycle's extract phase
   only walks the filesystem, so DB-resident pages (imported transcripts, remote-DB brains)
   never get links/timeline and `brain_score` is capped. Thread `source:'db'`.

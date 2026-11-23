@@ -1,10 +1,13 @@
 ---
 name: briefing
+version: 1.3.0
 description: Compile daily briefing with meeting context, active deals, and citation tracking
 triggers:
   - "daily briefing"
   - "morning briefing"
   - "what's happening today"
+  - "brain pulse"
+  - "pre-briefing pull"
 tools:
   - search
   - query
@@ -29,9 +32,45 @@ Compile a daily briefing from brain context.
 - The briefing is read-only: no brain pages are created or modified unless the user explicitly requests it.
 - Stale alerts surface pages relevant to today's context, not just all stale pages.
 
-## Phases
+## Pre-Briefing Context Pull
 
-0. **Hot memory pulse (v0.32).** Before composing anything else, run:
+Run these BEFORE composing the briefing sections. All four pulls are read-only.
+
+0a. **Salience scan.** Surface pages with high emotional or activity salience:
+
+   ```bash
+   gbrain salience --days 7
+   ```
+
+   Returns pages ranked by emotional weight and recent activity. Fold the top
+   5-10 into the briefing under a "High-Salience Pages" section — these are the
+   entities and topics that are emotionally or operationally hot right now. Use
+   this to prioritize which meetings/deals/people get the most briefing depth.
+
+0b. **Anomaly detection.** Surface statistical anomalies in the brain:
+
+   ```bash
+   gbrain anomalies
+   ```
+
+   Defaults to today against a 30-day baseline; widen with
+   `--lookback-days N` or lower the threshold with `--sigma 2`. Flags cohorts
+   (by tag, by type) whose activity broke from their normal cadence — sudden
+   spikes in mentions or pages updating far off their usual rhythm. Add hits to
+   an "Anomalies" section after the brain pulse.
+
+0c. **Personal recall.** Check stored personal facts and preferences before
+   composing:
+
+   ```bash
+   gbrain recall --query "current priorities and preferences" --json
+   ```
+
+   Use recall to pull personal context — dietary preferences, communication
+   preferences, prior commitments or promises made. This prevents the briefing
+   from contradicting things the user has previously stated or decided.
+
+0d. **Hot memory pulse (v0.32).** Before composing anything else, run:
 
    ```bash
    gbrain recall --since-last-run --supersessions --pending --rollup --json
@@ -54,6 +93,22 @@ Compile a daily briefing from brain context.
    explicitly — cron doesn't start in your repo-root cwd, so dotfile resolution
    may miss the right source. Thin-client installs (`gbrain init --mcp-only`)
    route through the remote brain transparently.
+
+0e. **Open loops (when google sources exist).** Pull who is waiting on the
+   user and what they promised:
+
+   ```bash
+   gbrain waiting --json
+   ```
+
+   Fold the top counterparties (what's owed, due dates, evidence quotes,
+   deep links) into the ACTION ITEMS section — these are real loop rows, not
+   inferred follow-ups, so they outrank prose heuristics. `waiting` refuses
+   on stale google sources (no successful sync in 24h) and names the exact
+   fix — that's by design: run the sync it names, then retry (see
+   `skills/google-loops/SKILL.md`).
+
+## Phases
 
 1. **Today's meetings.** For each meeting on the calendar:
    - Search gbrain for each participant by name
@@ -80,14 +135,19 @@ Before generating any briefing, load context from gbrain systematically.
 ### Before a meeting
 
 For every attendee on the calendar invite:
-- `gbrain search "<attendee name>"` -- find their brain page
+- Find their brain page by an exact match only: `gbrain whois <email> --json`,
+  then `gbrain whois "<name>" --json` when the address has no match; exactly
+  one match counts ([identity rule](../conventions/brain-first.md#identity-exact-match)).
+  A search's top hit is not the attendee.
 - `gbrain get <slug>` -- load compiled truth, recent timeline, relationship context
-- If no page exists, note the gap ("No brain page for Sarah Chen -- consider enrichment")
+- If no page exists, note the gap ("No brain page for alice-example -- consider enrichment")
 
 ### Before an email reply
 
 Before drafting or triaging any email:
-- `gbrain search "<sender name>"` -- load sender context
+- Resolve the sender with `gbrain whois <address> --json` (exact email, title
+  or alias; [identity rule](../conventions/brain-first.md#identity-exact-match)); no
+  match, or an ambiguous one, means an unknown sender, not the nearest known contact
 - Read their compiled truth to understand who they are, what they care about, and
   your relationship history. This turns a cold reply into an informed one.
 
@@ -97,7 +157,7 @@ Run these queries to populate the briefing sections:
 - `gbrain query "active deals status"` -- deal pipeline snapshot
 - `gbrain query "meetings this week"` -- recent meeting pages with insights
 - `gbrain query "pending commitments follow-ups"` -- open threads and action items
-- `gbrain search --type person --sort updated --limit 10` -- people in play
+- `gbrain list --type person --sort updated_desc --limit 10` -- people in play
 
 ## Output Format
 
@@ -134,6 +194,14 @@ mentioned must have a back-link from their page. See `skills/_brain-filing-rules
 When presenting facts from brain pages, include inline citations:
 - "Jane is CTO of Acme [Source: people/jane-doe, updated 2026-04-01]"
 - This lets the user trace any claim back to the brain page and assess freshness
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain waiting` refuses on stale data: run the sync command it names (or tell the user to, when it needs the brain host), then retry. Do not build the "waiting on you" section from stale mail.
+- `recall` / `query` sections come back empty with a degraded notice: write "the brain is searching keywords only right now" in that section instead of "nothing happened".
+- One section's source fails (`rate_limited`, `timeout`): ship the rest of the briefing and name the missing section; never silently drop it.
 
 ## Anti-Patterns
 

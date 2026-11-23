@@ -18,18 +18,41 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
+import { importFromContent } from '../../src/core/import-file.ts';
+import { serializeMarkdown } from '../../src/core/markdown.ts';
 
 let engine: PGLiteEngine;
+let chunkEmbedDim = 0;
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
+  const dim = await (engine as any).db.query(
+    `SELECT atttypmod FROM pg_attribute
+       WHERE attrelid = 'content_chunks'::regclass AND attname = 'embedding'`,
+  );
+  chunkEmbedDim = (dim.rows[0] as { atttypmod: number }).atttypmod;
 });
 
 afterAll(async () => {
   await engine.disconnect();
 });
+
+async function importFixture(slug: string, sourceId: string, title: string, body: string, frontmatter: Record<string, unknown>, embeddingIndex?: number) {
+  const result = await importFromContent(engine, slug,
+    serializeMarkdown(frontmatter, body, '', { type: 'person', title, tags: [] }),
+    { sourceId, noEmbed: true, forceRechunk: true });
+  expect(result.status).toBe('imported');
+  if (embeddingIndex !== undefined) {
+    // The index is built by the real importer. Only its test vector is
+    // synthetic, preserving the existing deterministic source-ranking probe.
+    const embedding = Array.from({ length: chunkEmbedDim }, (_, i) => i === embeddingIndex ? 1 : 0);
+    await engine.executeRaw(`UPDATE content_chunks SET embedding = $1::vector
+      WHERE page_id IN (SELECT id FROM pages WHERE source_id = $2 AND slug = $3)`,
+    [`[${embedding}]`, sourceId, slug]);
+  }
+}
 
 beforeEach(async () => {
   await resetPgliteState(engine);
@@ -40,50 +63,23 @@ beforeEach(async () => {
   );
   // Seed one person page in each source. Same slug intentionally —
   // proves the composite (source_id, slug) key is honored, not just slug.
-  // upsertChunks is needed because searchKeyword scans content_chunks, not
-  // pages.compiled_truth directly. Each page gets one chunk that mirrors
-  // its compiled_truth so search-by-keyword has something to find.
-  await engine.putPage('people/alice', {
-    type: 'person',
-    title: 'Alice Source-A',
-    compiled_truth: 'Alice works on widgets in source A. Important context here.',
-    timeline: '',
-    frontmatter: {},
-  }, { sourceId: 'default' });
-  await engine.upsertChunks('people/alice', [{
-    chunk_index: 0,
-    chunk_text: 'Alice works on widgets in source A. Important context here.',
-    chunk_source: 'compiled_truth',
-    token_count: 12,
-  }], { sourceId: 'default' });
+  // Real imports build current safe chunks for the remote operation controls.
+  await importFixture('people/alice', 'default', 'Alice Source-A',
+    'Alice works on widgets in source A. Important context here.', {
+      message_id: '<source-a@example.com>',
+      thread_id: 'thread-source-a',
+      subject: 'Source A exact subject',
+    }, 0);
 
-  await engine.putPage('people/alice', {
-    type: 'person',
-    title: 'Alice Source-B',
-    compiled_truth: 'Alice works on gadgets in source B. Important context here.',
-    timeline: '',
-    frontmatter: {},
-  }, { sourceId: 'src-b' });
-  await engine.upsertChunks('people/alice', [{
-    chunk_index: 0,
-    chunk_text: 'Alice works on gadgets in source B. Important context here.',
-    chunk_source: 'compiled_truth',
-    token_count: 12,
-  }], { sourceId: 'src-b' });
+  await importFixture('people/alice', 'src-b', 'Alice Source-B',
+    'Alice works on gadgets in source B. Important context here.', {
+      message_id: '<source-b@example.com>',
+      thread_id: 'thread-source-b',
+      subject: 'Source B exact subject',
+    }, 1);
 
-  await engine.putPage('people/bob', {
-    type: 'person',
-    title: 'Bob Source-B Only',
-    compiled_truth: 'Bob lives only in source B. Important context here.',
-    timeline: '',
-    frontmatter: {},
-  }, { sourceId: 'src-b' });
-  await engine.upsertChunks('people/bob', [{
-    chunk_index: 0,
-    chunk_text: 'Bob lives only in source B. Important context here.',
-    chunk_source: 'compiled_truth',
-    token_count: 11,
-  }], { sourceId: 'src-b' });
+  await importFixture('people/bob', 'src-b', 'Bob Source-B Only',
+    'Bob lives only in source B. Important context here.', {});
 });
 
 describe('v0.34.1 source-isolation regression (#861)', () => {
@@ -95,6 +91,9 @@ describe('v0.34.1 source-isolation regression (#861)', () => {
     expect(results.length).toBeGreaterThan(0);
     for (const r of results) {
       expect(r.source_id).toBe('default');
+      expect(r.message_id).toBe('<source-a@example.com>');
+      expect(r.thread_id).toBe('thread-source-a');
+      expect(r.source_subject).toBe('Source A exact subject');
     }
   });
 
@@ -103,6 +102,9 @@ describe('v0.34.1 source-isolation regression (#861)', () => {
     expect(results.length).toBeGreaterThan(0);
     for (const r of results) {
       expect(r.source_id).toBe('src-b');
+      expect(r.message_id).toBe('<source-b@example.com>');
+      expect(r.thread_id).toBe('thread-source-b');
+      expect(r.source_subject).toBe('Source B exact subject');
     }
   });
 
@@ -170,16 +172,32 @@ describe('v0.34.1 source-isolation regression (#861)', () => {
   });
 
   test('searchVector with sourceId filters HNSW candidate pool', async () => {
-    // No real embeddings on the test pages; the WHERE cc.embedding IS NOT NULL
-    // gate filters them out. We assert the contract via an empty result
-    // rather than a positive match: with sourceId set, the SQL still runs
-    // (no type or undefined-column errors).
-    const synth = new Float32Array(1536).fill(0.01);
-    const results = await engine.searchVector(synth, { sourceId: 'src-b' });
-    // Either empty (no embeddings) or all from src-b. Both prove the
-    // filter is wired without a runtime error.
-    for (const r of results) {
-      expect(r.source_id).toBe('src-b');
+    const fixtures = [
+      {
+        sourceId: 'default', embeddingIndex: 0,
+        message_id: '<source-a@example.com>', thread_id: 'thread-source-a',
+        source_subject: 'Source A exact subject',
+      },
+      {
+        sourceId: 'src-b', embeddingIndex: 1,
+        message_id: '<source-b@example.com>', thread_id: 'thread-source-b',
+        source_subject: 'Source B exact subject',
+      },
+    ];
+
+    for (const fixture of fixtures) {
+      const synth = Float32Array.from(
+        { length: chunkEmbedDim },
+        (_, i) => i === fixture.embeddingIndex ? 1 : 0,
+      );
+      const results = await engine.searchVector(synth, { sourceId: fixture.sourceId });
+      expect(results.length).toBeGreaterThan(0);
+      for (const r of results) {
+        expect(r.source_id).toBe(fixture.sourceId);
+        expect(r.message_id).toBe(fixture.message_id);
+        expect(r.thread_id).toBe(fixture.thread_id);
+        expect(r.source_subject).toBe(fixture.source_subject);
+      }
     }
   });
 
@@ -263,5 +281,7 @@ describe('v0.34.1 source-isolation regression (#861)', () => {
     for (const r of rows) {
       expect(r.source_id).toBe('default');
     }
+    await expect(searchOp!.handler(ctx as any, { query: 'Important context', source_id: 'src-b' }))
+      .rejects.toMatchObject({ code: 'permission_denied' });
   });
 });

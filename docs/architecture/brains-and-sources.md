@@ -19,18 +19,18 @@ need to understand both of them, or queries misroute silently.
 A **brain** is one database — PGLite file, self-hosted Postgres, or Supabase.
 Each brain has:
 - Its own `pages` table, `chunks` table, `embeddings`, etc.
-- Its own OAuth surface if served over HTTP MCP (v0.19+, PR 2).
+- Its own OAuth surface if served over HTTP MCP.
 - Its own separate lifecycle, backup, access control.
 
 Brains are enumerated by:
 - **host** — your default brain, configured in `~/.gbrain/config.json`.
 - **mounts** — additional brains registered in `~/.gbrain/mounts.json` via
-  `gbrain mounts add <id>` (v0.19+).
+  `gbrain mounts add <id>`.
 
 Routing: `--brain <id>`, `GBRAIN_BRAIN_ID`, `.gbrain-mount` dotfile, or
 longest-path match against registered mount paths. Falls back to `host`.
 
-### Sources (the repo axis, v0.18.0+)
+### Sources (the repo axis)
 
 A **source** is a named content repo *inside* one brain. Every `pages` row
 carries a `source_id`. Slugs are unique per source, not globally.
@@ -40,6 +40,35 @@ AND under `source=gstack` — they're different pages.
 
 Routing: `--source <id>`, `GBRAIN_SOURCE`, `.gbrain-source` dotfile, or
 registered `local_path` match in the `sources` table.
+
+A few commands have their own `--source` option for provenance:
+`timeline-add`, `ontology-add`, `takes add|update|supersede` and the raw-data
+operations. On those, `--source` is the provenance value (a slug, URL or
+source name) and never picks the repo, on a local brain, through a running
+`gbrain serve` or on a thin client. The write goes to the source that
+`GBRAIN_SOURCE`, `.gbrain-source` or the defaults select, and the JSON result
+names it in `source_id`.
+
+### Git is the parent of a source with a checkout
+
+Most sources are a Git checkout (`local_path`) plus the pages gbrain derived
+from it. The files are the record people read, review and clone; the
+database is an index that gbrain can rebuild from them. How tightly the
+database follows Git depends on the source:
+
+| Source | Where the record is | How the database follows |
+|---|---|---|
+| Checkout, mixed (the default) | The files in Git | Sync imports what is committed (or the working tree when asked). A write publishes the file and its database row together (managed) or the row first (classic), and the Git commit follows later (a background Git effect once Git durability is on). When the two disagree, sync keeps the database version or holds the page for review. |
+| Checkout, strict (`canonical: git`, opt-in per source) | Git commits | Every write is committed to Git before its row. Sync indexes committed blobs only, and Git wins. Private pages, `storage.db_only` directories and ignored paths are declared database-only. |
+| Read-only mirror (`gbrain sources mirror-readonly`) | The upstream repository | Sync imports; gbrain never writes into the checkout. |
+| No checkout (connector sources, database-only sources) | The database | Nothing to derive from; back up the database. |
+
+Scripts, crons and people that write files in a checkout commit them with
+`gbrain git commit-push -- <paths>`, which takes the same writer lock. To make
+a source strict, or to see how far its database is from Git, read
+[git-canonical sources](../guides/git-canonical.md); `gbrain sources git-gap <id>`
+is the read-only check, and doctor's `db_ahead_of_git` and `git_index_lag`
+report it brain-wide.
 
 ### When does each axis move?
 
@@ -142,7 +171,7 @@ Use this topology when:
 
 You're senior enough to sit across multiple teams. You maintain your personal
 brain (with N sources inside) AND mount several work team brains. Each team
-brain is itself a multi-source brain in the v0.18.0 sense — organized
+brain is itself a multi-source brain — organized
 internally however the team owner chose.
 
 ```
@@ -181,7 +210,7 @@ Use this topology when:
 - You need latent-space federation (agent decides when to query across
   brains), not SQL federation.
 
-Cross-brain queries are **not deterministic** in v0.19. The agent sees the
+Cross-brain queries are **not deterministic**. The agent sees the
 brain list and re-queries as needed. That's the feature — it keeps debugging
 sane and access control clean.
 
@@ -201,6 +230,22 @@ WHICH BRAIN (DB)?                    WHICH SOURCE (repo in DB)?
 
 Both axes follow the same layered pattern on purpose. If you know one, you
 know the other.
+
+One addition on the source axis for remote (MCP/OAuth) callers: a client
+registered with federated reads carries `ctx.auth.allowedSources` — an
+ARRAY of readable sources that takes precedence over the scalar
+`ctx.sourceId` on every read path (`sourceScopeOpts(ctx)` in the
+operations layer). Local CLI callers never set it; the scalar chain above
+is the whole story for them.
+
+One guard on tier 2 for the MCP stdio lane: a harness-launched `gbrain serve`
+checks a well-formed `GBRAIN_SOURCE` against the `sources` table at startup
+and exits with the offending value and the fix when it names no active
+(non-archived) source, instead of serving a scope that holds zero pages while
+every health check stays green. Unset, `__all__`, and malformed values keep
+their normal handling, and a transient database error never blocks startup.
+The CLI env tier fails the same way (`assertSourceExists` in
+`src/core/source-resolver.ts`).
 
 ---
 
@@ -234,9 +279,139 @@ know the other.
   source. The flags are for when you want to query across the boundary
   deliberately.
 
+## Entity identity across sources
+
+**The identity key for a page is `(source_id, slug)`.** Slugs are only
+unique per source, so `people/alice` in your `wiki` source and
+`people/alice-chen` in a mounted team source are, by default, two unrelated
+pages — even when they describe the same person. Nothing merges them
+automatically.
+
+When they ARE the same entity, say so explicitly with the manual-only
+identity ops (no auto-matching, no name-similarity heuristics):
+
+```
+gbrain entity-identity-link   --entity-id alice-chen --slug people/alice --source-id wiki
+gbrain entity-identity-link   --entity-id alice-chen --slug people/alice-chen --source-id team-brain --canonical
+gbrain entity-identity-list   --entity-id alice-chen
+gbrain entity-identity-unlink --entity-id alice-chen --slug people/alice --source-id wiki
+```
+
+Members live in the `entity_identities` table (one identity per page;
+re-linking moves the page; at most one canonical member per group). The
+write ops are local-only. Retrieval-side union — `get_links` /
+`get_backlinks` merging edges from a page's identity co-members — is gated
+by the `entity_identity.union` config key (default off) and never widens a
+federated caller's source grant.
+
+`gbrain dedupe` proposes such groups from shared ids and names and links
+one only when you confirm it (`gbrain dedupe confirm <group-id>`; `gbrain
+dedupe reject <group-id>` records "different people or companies"). Those rows carry
+`established_by: dedupe:confirm`; the decision behind them lives in
+`.gbrain/identity/<decision-id>.md` in the default source's repository (or
+in the `entity_identity_reviews` table when it has none), so a
+rebuilt database keeps it. The file names each member's source and slug, so a
+cross-source decision writes them into the default source's repository; there,
+a group with a page in an owner-only source is refused. `rank_entities` and enrichment tiering count a
+confirmed group once; hand-made groups count as before.
+
+Companies link without a confirm when the evidence is strong: each sync links
+the cross-source company groups its changed pages belong to when the group is
+`clean`, its pages share a LinkedIn company page or their own site's domain,
+and no two name different countries. Those rows carry `established_by:
+dedupe:auto`, live in the database only (sync and `gbrain dedupe reconcile`
+rebuild them from the pages and decisions), and count once like confirmed
+ones. A folder source without git links on each sync too, so a brain with no
+repository links them as it syncs; pages written by `gbrain import`, `put_page` or
+`capture` link at the next sync or reconcile. A linked page can be moved into another
+group by hand but not unlinked by hand: reject it instead. `gbrain dedupe reject <identity>` removes one and keeps the pair apart;
+the decision keeps a fingerprint (a hash of each page's name and ids, never
+the values), so a renamed or moved page is still kept apart. People are
+never linked automatically.
+
+## Cross-source link edges
+
+Wikilink and markdown-link edges stay inside one source by default. When a
+page in source A links a target that exists only in source B (typically via
+`link_resolution.global_basename`), the edge is NOT written; instead the drop
+is counted so graph sparsity is observable — `gbrain extract links --source db`
+and `gbrain extract --stale` print `Skipped N cross-source candidate(s)` (JSON:
+`skipped_cross_source`), and the serve sweep records it as `cross_source_link`
+in its skip ledger.
+
+To write those edges, opt in:
+
+```
+gbrain config set link_resolution.cross_source true   # or env GBRAIN_LINK_RESOLUTION_CROSS_SOURCE=1
+gbrain extract links --source db                      # re-extract once; --stale will not revisit stamped pages
+```
+
+Without the flag, an isolated (`federated=false`) source only writes edges
+whose both endpoints live in that source; a federated source may also link
+into the configured default source (`sources.default`) and follow an
+explicit `[[source:slug]]` reference. With the flag on, a target that exists
+only in other sources resolves to the lexicographically smallest source id,
+so repeated extracts converge on the same row.
+
+Every automatic writer applies that one policy: `put_page` and `capture`
+(link preparation), the managed stale pass, the source reconciliation sweep
+and `extract links --source db`. A local write resolves a cross-source
+wikilink only under `link_resolution.cross_source` or from a federated origin
+source; the drops it counts come back in the write receipt as
+`auto_links.skipped_cross_source`. An outbound edge always originates in the
+page's own source (canonical attendance, which points at the person, is the
+one edge whose far endpoint may live elsewhere), and a derived edge records
+whether its reference was authored qualified (`links.resolution_type`:
+`qualified` for `[[source:slug]]`, `unqualified` otherwise). The read side is
+unchanged: a federated caller's source grant still scopes both endpoints of
+every link read, and the entity card confines an untrusted caller's edges to
+the card's own source.
+
+## What confines remote callers (and what does not)
+
+When a brain is served to remote agents (HTTP MCP, stdio MCP treated as
+remote), these are the enforcement surfaces — everything on this list is
+fail-closed and tested:
+
+- **Source isolation** — every read resolves through the source-scope ladder
+  (federated grant array > scalar source floor > nothing). A caller without a
+  grant for a source cannot read its pages, chunks, or edges.
+- **Facts visibility** — facts carry `private`/`world` visibility; remote
+  callers see `world` only, except the brain owner's `recall`.
+- **Takes holders** — per-token allow-lists (`gbrain auth permissions <token>
+  set-takes-holders ...`) scope which held takes a remote caller sees.
+- **Write-side slug fences** — a client bound to slug prefixes can only write
+  under them, and only a small fenced allow-list of write operations
+  (`put_page`, `add_link`, `add_timeline_entry`, …) is available to
+  slug-bound clients; every other non-read operation is refused (fail-closed:
+  a write op added later is denied until it is fenced and allow-listed).
+
+Backlink-count ranking applies the caller's read policy to the result page,
+each contributing referrer, and any independent edge-origin page before
+counting. Graph enrichment uses the same source and page-visibility policy.
+
+**Page-level `visibility: private` is enforced for remote callers by default.**
+The exact frontmatter value `private` hides that concrete page row;
+`visibility: local`, absent visibility, and other values do not, except on
+derived pages: an extracted atom or synthesized concept with no `visibility`
+is private, an atom whose origin page is private is hidden, and so is a
+synthesized concept built from a private atom or from an atom whose origin is
+private, even after a rename moved that origin. Trusted local CLI callers
+retain access, and so does a credential bound to the brain owner
+(`gbrain access owner set <member>`). Operator settings can opt out of private-page
+filtering, so source grants remain an independent boundary: keep content in an
+ungranted source when remote callers must have no access to that source.
+Every designation, who reads it and when to use it:
+[access designations](../guides/access-designations.md).
+
 ## Further reading
 
-- v0.18.0 CHANGELOG — introduced `sources` primitive.
-- v0.19.0 CHANGELOG (TBD after PR 0+1+2 ship) — introduces `mounts`.
-- `docs/mounts/publishing-a-team-brain.md` (PR 2) — how to be the brain
-  publisher, not just the subscriber.
+- [`topologies.md`](./topologies.md) — where the DB lives (operator recipes
+  for each deployment shape).
+- [`git-canonical.md`](../guides/git-canonical.md) — strict sources: Git
+  first, the database derived from the commits, and how to convert or roll
+  back a source.
+- [`multi-source-brains.md`](../guides/multi-source-brains.md) — adding,
+  scoping and hosting sources, and narrowing one request with `source_ids`.
+- `skills/conventions/brain-routing.md` — the agent-facing decision table.
+- `CHANGELOG.md` — release history for the `sources` and `mounts` primitives.

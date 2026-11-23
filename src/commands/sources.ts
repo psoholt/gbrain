@@ -7,7 +7,9 @@
  * full story.
  *
  * Subcommands:
- *   gbrain sources add <id> --path <path> [--name <display>] [--federated|--no-federated]
+ *   gbrain sources add <id> --path <path> [--name <display>] [--federated|--no-federated] [--force]
+ *                               --path must be a git-initialized repo (files committed,
+ *                               not just present) — #2707. --force skips the check.
  *   gbrain sources list [--json]
  *   gbrain sources remove <id> [--yes] [--dry-run] [--keep-storage]
  *   gbrain sources rename <id> <new-name>
@@ -16,6 +18,14 @@
  *   gbrain sources detach        — remove .gbrain-source from CWD
  *   gbrain sources federate <id>   — sources.config.federated = true
  *   gbrain sources unfederate <id> — sources.config.federated = false
+ *   gbrain sources mirror-readonly|mirror-writable <id> — sources.config.mirror_read_only (#5409)
+ *   gbrain sources refresh <id> — drained worktree-wide ff-only refresh on a managed brain (F0)
+ *   gbrain sources git-reconcile [<id>...] — idempotent publish/fast-forward of every source checkout (sources-git-reconcile.ts)
+ *   gbrain sources git-gap <id> — read-only census of the database against the commit at HEAD (sources-git-gap.ts)
+ *   gbrain sources reindex <id> --from-git — a strict source's re-derive from Git, preview then apply (sources-reindex.ts)
+ *   gbrain sources canonical <id> --to git|mixed — convert a source to git-canonical or back, preview then apply (sources-canonical.ts)
+ *   gbrain sources push [<id>|--path <dir>] — scan-gated add→commit→pull→push
+ *                               (agent-bootstrap; core in src/core/workspace-push.ts)
  *
  * NOT in scope for Step 6 (deferred per plan):
  *   - import-from-github (needs SSRF + clone integration)
@@ -36,14 +46,21 @@ import {
   purgeExpiredSources,
   formatImpact,
   formatSoftDelete,
+  clientsReferencingSource,
+  formatClientReferentsBlock,
   SOFT_DELETE_TTL_HOURS,
 } from '../core/destructive-guard.ts';
 import {
   addSource as opsAddSource,
   recloneIfMissing,
+  defaultCloneDir,
   SourceOpError,
   type SourceRow as OpsSourceRow,
 } from '../core/sources-ops.ts';
+import { isValidRepoName } from '../core/github-source.ts';
+import { ALL_GOOGLE_SERVICES, DEFAULT_CALENDAR_ID } from '../core/google/types.ts';
+import { defaultGoogleAddTuning, parseGoogleAddFlag, preflightGoogleAccess } from './sources-google-flags.ts';
+import { noGrantFloorNext, reportAddOutcome } from './sources-add-next.ts';
 import {
   resolveSourceWithTier,
   SOURCE_TIER_NAMES,
@@ -51,19 +68,29 @@ import {
 import {
   loadAllSources,
   parseSourceConfig,
+  normalizeSourceConfig,
   isSourceFederated,
+  sourceFederationState,
   type SourceRow as LoadedSourceRow,
 } from '../core/sources-load.ts';
+import { sqlQueryForEngine } from '../core/sql-query.ts';
+import { preflightOauthClientColumns } from './auth.ts';
+import { deleteSourceRow } from '../core/source-delete.ts';
+import { USAGE_EXIT_CODE } from '../core/exit-codes.ts';
+import { isSyncStrategy } from '../core/sync.ts';
+import { pullStrategyOf } from '../core/git-remote.ts';
+import { isValidSourceId } from '../core/source-id.ts';
+import { opError } from '../core/ops/contract.ts';
 
 // ── Validation ──────────────────────────────────────────────
 
-// Shared with source-resolver.ts — canonical shape.
-const SOURCE_ID_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
-
 function validateSourceId(id: string): void {
-  if (!SOURCE_ID_RE.test(id)) {
-    throw new Error(
+  if (!isValidSourceId(id)) {
+    throw opError(
+      'invalid_params',
       `Invalid source id "${id}". Must be 1-32 lowercase alnum chars with optional interior hyphens (e.g. "wiki", "yc-media").`,
+      'Use 1-32 lowercase letters, digits and interior hyphens, for example: gbrain sources attach wiki. gbrain sources list shows the existing ids.',
+      { fix: { argv: ['gbrain', 'sources', 'list', '--json'], consent: [], actor: 'agent', requires_exclusive: false, why: 'Lists the existing source ids to attach to.' } },
     );
   }
 }
@@ -85,8 +112,12 @@ interface SourceListEntry {
   name: string;
   local_path: string | null;
   federated: boolean;
+  mirror_read_only: boolean;
+  strategy: 'markdown' | 'code' | 'auto' | null;
+  pull_strategy: 'rebase' | 'merge';
   page_count: number;
   last_sync_at: string | null;
+  archived: boolean;
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -107,7 +138,7 @@ async function fetchSource(engine: BrainEngine, id: string): Promise<SourceRow |
 
 async function countPages(engine: BrainEngine, sourceId: string): Promise<number> {
   const rows = await engine.executeRaw<{ n: number }>(
-    `SELECT COUNT(*)::int AS n FROM pages WHERE source_id = $1`,
+    `SELECT COUNT(*)::int AS n FROM pages WHERE source_id = $1 AND deleted_at IS NULL`,
     [sourceId],
   );
   return rows[0]?.n ?? 0;
@@ -116,11 +147,22 @@ async function countPages(engine: BrainEngine, sourceId: string): Promise<number
 // ── Subcommand: add ─────────────────────────────────────────
 
 async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
+  const apiKind = args.includes('--kind') ? args[args.indexOf('--kind') + 1] : undefined;
+  if (args[0] && (apiKind === 'meetings' || apiKind === 'slack' || apiKind === 'imessage' || apiKind === 'apple-contacts')) return (await import('./sources-add-api.ts')).runApiSourceAdd(engine, args);
   const id = args[0];
   if (!id) {
     console.error(
-      'Usage: gbrain sources add <id> [--path <path> | --url <https-url>] ' +
-        '[--name <display>] [--federated|--no-federated] [--clone-dir <path>]',
+      'Usage: gbrain sources add <id> [--path <path> | --url <https-url> | --kind github|google|meetings|slack|imessage|apple-contacts] ' +
+        '[--name <display>] [--federated|--no-federated] [--clone-dir <path>] [--force] [--json]\n' +
+        '       github kind: [--token-env <env>] [--scope auto|repos] ' +
+        '[--repos owner/name,...] [--dir <path>] ' +
+        '[--app-id <n> --app-pem <path>] [--app-install <n>]\n' +
+        '       google kind: --account <email> [--services gmail,calendar,contacts] ' +
+        '[--history-days <n>] [--future-days <n>] [--loops-exclude-labels <a,b>] [--contacts-dir <dir>] [--calendar-id <id>] [--dir <path>]   (connect first: gbrain google connect)\n' +
+        '                    [--access vault|command|env] [--token-command "<cmd>"] [--token-env <VAR>]   (non-vault Google access: gog/gcloud/gateway)\n' +
+        '                    [--access gbrainio] [--gbrainio-command <path>]   (Gmail read through a gbrain.io terminal)\n' +
+        '                    [--private-senders-file <path>]   (threads with these addresses or @domains become owner-only pages)\n' +
+        '       apple-contacts kind: --helper-host <host> --token-file <0600 json> [--helper-port <port>] [--proxy socks5h://host:port] [--contacts-dir <dir>] [--record git|database] [--dir <path>]',
     );
     process.exit(2);
   }
@@ -132,6 +174,25 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   let cloneDir: string | undefined;
   let patFile: string | undefined;
   let noHarden = false;
+  let force = false;
+  let json = false;
+  // v0.46 github-kind flags.
+  let ghKind = false;
+  let ghTokenEnv: string | undefined;
+  let ghScope: 'auto' | 'repos' = 'auto';
+  let ghRepos: string[] = [];
+  let ghDir: string | undefined;
+  let ghAppId: number | undefined;
+  let ghAppPem: string | undefined;
+  let ghAppInstall: number | undefined;
+  // v0.47 google-kind flags.
+  let gKind = false;
+  let gAccount: string | undefined;
+  let gAccess: string | undefined;
+  let gTokenCommand: string | undefined;
+  let gTokenEnv: string | undefined;
+  let gServices: string[] = ['gmail', 'calendar', 'contacts'];
+  const gTuning = defaultGoogleAddTuning();
 
   for (let i = 1; i < args.length; i++) {
     const a = args[i];
@@ -143,6 +204,76 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
     if (a === '--clone-dir') { cloneDir = args[++i]; continue; }
     if (a === '--pat-file') { patFile = args[++i]; continue; }
     if (a === '--no-harden') { noHarden = true; continue; }
+    if (a === '--force') { force = true; continue; }
+    if (a === '--json') { json = true; continue; }
+    if (a === '--kind') {
+      const kind = args[++i];
+      if (kind === 'github') {
+        ghKind = true;
+      } else if (kind === 'google') {
+        gKind = true;
+      } else {
+        console.error(`Unknown source kind: ${kind}. Supported: "github", "google".`);
+        process.exit(2);
+      }
+      continue;
+    }
+    if (a === '--account') { gAccount = args[++i]?.trim().toLowerCase(); continue; }
+    if (a === '--access') { gAccess = args[++i]?.trim().toLowerCase(); continue; }
+    if (a === '--token-command') { gTokenCommand = args[++i]; continue; }
+    if (a === '--token-env') {
+      // Shared by BOTH kinds: github reads its API token from this env var;
+      // google's env access mode reads an access token from it. Parsed once
+      // and routed by kind so neither parse shadows the other.
+      const v = args[++i]?.trim();
+      gTokenEnv = v;
+      ghTokenEnv = v;
+      continue;
+    }
+    if (a === '--services') {
+      gServices = (args[++i] ?? '')
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+      continue;
+    }
+    if (parseGoogleAddFlag(a, args[i + 1], gTuning)) { i++; continue; }
+    if (a === '--scope') {
+      const scope = args[++i];
+      if (scope !== 'auto' && scope !== 'repos') {
+        console.error(`--scope must be "auto" or "repos".`);
+        process.exit(2);
+      }
+      ghScope = scope;
+      continue;
+    }
+    if (a === '--repos') {
+      ghRepos = (args[++i] ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      continue;
+    }
+    if (a === '--dir') { ghDir = args[++i]; continue; }
+    if (a === '--app-id') {
+      const v = Number(args[++i]);
+      if (!Number.isInteger(v) || v <= 0) {
+        console.error('--app-id must be a positive integer.');
+        process.exit(2);
+      }
+      ghAppId = v;
+      continue;
+    }
+    if (a === '--app-pem') { ghAppPem = args[++i]; continue; }
+    if (a === '--app-install') {
+      const v = Number(args[++i]);
+      if (!Number.isInteger(v) || v <= 0) {
+        console.error('--app-install must be a positive integer.');
+        process.exit(2);
+      }
+      ghAppInstall = v;
+      continue;
+    }
     console.error(`Unknown flag: ${a}`);
     process.exit(2);
   }
@@ -150,6 +281,81 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   if (remoteUrl && localPath) {
     console.error('Error: --url and --path are mutually exclusive (--url manages its own clone path).');
     process.exit(2);
+  }
+  if (ghKind && (remoteUrl || localPath)) {
+    console.error('Error: --kind github is mutually exclusive with --url and --path.');
+    process.exit(2);
+  }
+  if (gKind && (remoteUrl || localPath || ghKind)) {
+    console.error('Error: --kind google is mutually exclusive with --url, --path, and --kind github.');
+    process.exit(2);
+  }
+  if (gKind && !gAccount) {
+    console.error(
+      'Error: --kind google requires --account <email> (a connected Google account).\n' +
+        'Connect one first: gbrain google connect',
+    );
+    process.exit(2);
+  }
+  if (gKind) {
+    const bad = gServices.filter((s) => !(ALL_GOOGLE_SERVICES as readonly string[]).includes(s));
+    if (bad.length > 0) {
+      console.error(`Error: unknown --services entries: ${bad.join(', ')}. Valid: gmail, calendar, contacts`);
+      process.exit(2);
+    }
+    // Duplicate-account guard: a second source for the same account AND the
+    // same services would duplicate every page/loop in federated reads and
+    // coalesce the two sources' loops_extract jobs. Warn loudly (not refuse —
+    // split-window setups are conceivable) so the duplication is a choice,
+    // not a surprise. Scoped to OVERLAPPING services: a second source for the
+    // same account that syncs a DIFFERENT slice (e.g. a secondary calendar
+    // via --calendar-id, or calendar-only next to gmail-only) is the
+    // supported topology, not duplication.
+    try {
+      const dupRows = await engine.executeRaw<{ id: string; config: unknown }>(
+        `SELECT id, config FROM sources WHERE archived IS NOT TRUE`,
+        [],
+      );
+      let overlapNote = '';
+      const dup = dupRows.find((r) => {
+        const c = typeof r.config === 'string' ? (JSON.parse(r.config) as Record<string, unknown>) : ((r.config ?? {}) as Record<string, unknown>);
+        if (c.kind !== 'google' || c.g_account !== gAccount) return false;
+        const existingServices =
+          typeof c.g_services === 'string'
+            ? c.g_services.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+            : ['gmail', 'calendar', 'contacts'];
+        let overlap = gServices.filter((s) => existingServices.includes(s));
+        // Two calendar sources pointing at DIFFERENT calendars never collide —
+        // one calendar per source is how secondary calendars are ingested.
+        const existingCal =
+          typeof c.g_calendar_id === 'string' && c.g_calendar_id.trim() ? c.g_calendar_id.trim() : DEFAULT_CALENDAR_ID;
+        if (existingCal !== gTuning.calendarId) overlap = overlap.filter((s) => s !== 'calendar');
+        if (overlap.length === 0) return false;
+        overlapNote = overlap.join(', ');
+        return true;
+      });
+      if (dup) {
+        console.error(
+          `Warning: source "${dup.id}" already syncs ${gAccount} (${overlapNote}) — a second source for the same account and services duplicates its pages and loops in federated reads.`,
+        );
+      }
+    } catch { /* preflight is best-effort */ }
+    await preflightGoogleAccess({ access: gAccess, tokenCommand: gTokenCommand, tokenEnv: gTokenEnv, account: gAccount!,
+      services: args.includes('--services') ? gServices : null, tuning: gTuning });
+  }
+  if (ghKind && ghScope === 'repos' && ghRepos.length === 0) {
+    console.error('Error: --scope repos requires --repos owner/name,owner/name.');
+    process.exit(2);
+  }
+  if (ghKind && ((ghAppId === undefined) !== (ghAppPem === undefined))) {
+    console.error('Error: --app-id and --app-pem must be provided together.');
+    process.exit(2);
+  }
+  for (const r of ghRepos) {
+    if (!isValidRepoName(r)) {
+      console.error(`Invalid --repos entry: "${r}". Expected owner/name with no dot segments.`);
+      process.exit(2);
+    }
   }
 
   // Throw on SourceOpError; cli.ts wraps every command in a try/catch that
@@ -162,6 +368,37 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
     remoteUrl,
     federated,
     cloneDir,
+    force,
+    ...(ghKind
+      ? {
+          github: {
+            tokenEnv: ghTokenEnv ?? 'GH_TOKEN',
+            // gh_handle / gh_involvement are reserved config keys (written
+            // as inert defaults, ignored by the sync).
+            handle: '',
+            scope: ghScope,
+            repos: ghRepos,
+            dir: ghDir ?? defaultCloneDir(`${id}-github`),
+            involvement: true,
+            appId: ghAppId,
+            appPemPath: ghAppPem,
+            appInstallId: ghAppInstall,
+          },
+        }
+      : {}),
+    ...(gKind
+      ? {
+          google: {
+            account: gAccount!,
+            services: gAccess === 'gbrainio' ? ['gmail'] : gServices,
+            ...gTuning,
+            dir: ghDir ?? defaultCloneDir(`${id}-google`),
+            access: (gAccess ?? 'vault') as 'vault' | 'command' | 'env' | 'gbrainio',
+            tokenCommand: gTokenCommand,
+            tokenEnv: gTokenEnv,
+          },
+        }
+      : {}),
   });
 
   // Topology A discovery: if the just-added source carries a brain-resident
@@ -176,15 +413,22 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
     : created.local_path
       ? ` → ${created.local_path}`
       : '';
-  console.log(
+  const say = json ? console.error : console.log;
+  say(
     `Created source "${id}"${displayName && displayName !== id ? ` (name: ${displayName})` : ''}${tail}`,
   );
   if (finalRemoteUrl) {
-    console.log(`  clone path: ${created.local_path}`);
+    say(`  clone path: ${created.local_path}`);
   }
-  console.log(
+  say(
     `  federated: ${fed}${fed ? ' — appears in cross-source default search' : ' — only searched when explicitly named via --source'}`,
   );
+  const notices = await reportAddOutcome({ id, chosen: ghKind || gKind ? true : federated, federated: fed, path: finalRemoteUrl || ghKind || gKind ? null : created.local_path, json, say });
+  const next = !fed && federated === null ? await noGrantFloorNext(engine, id).catch(() => null) : null;
+  if (next) say(`  next: ${next.command} — ${next.why}`);
+  if (ghKind || gKind) {
+    say(`  sync: run \`gbrain sync --source ${id}\` once; after its first sync, autopilot keeps it synced on the autopilot interval.`);
+  }
 
   // v0.42.44 — auto-harden managed clones for git durability the moment a brain
   // repo is added with a PAT. Best-effort: NEVER fail `add` if hardening fails.
@@ -215,6 +459,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
       console.error(`         Run \`gbrain sources harden ${id}\` to retry.`);
     }
   }
+  if (json) console.log(JSON.stringify({ id, name: created.name, local_path: created.local_path, remote_url: finalRemoteUrl ?? null, federated: fed, ...(next ? { next } : {}), ...(notices ? { notices } : {}) }));
 }
 
 /**
@@ -311,6 +556,135 @@ function deriveBrainId(created: OpsSourceRow, localPath: string): string {
   return `path:${createHash('sha256').update(localPath).digest('hex').slice(0, 16)}`;
 }
 
+// ── Subcommand: push (agent-bootstrap D6/G6/G8/G14) ─────────
+//
+// `gbrain sources push [<id>|--path <dir>]` — scan-gated add→commit→pull→push
+// of a workspace repo. The heavy lifting (single-flight lock, deny-glob
+// backstop, secret scan, commit-first-then-pull ordering, remote-privacy
+// refusal, push-status.json) lives in src/core/workspace-push.ts; this
+// wrapper only parses args, resolves <id> → local_path, and maps statuses
+// to exit codes:
+//   0  pushed / skipped (push already in flight — clean single-flight skip)
+//   5  blocked (secrets / tracked deny-glob / the commits it would push) or refused (unverified remote)
+//   1  pull conflict / push failure / other error
+
+async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
+  let id: string | undefined;
+  let path: string | undefined;
+  let branch: string | undefined;
+  let message: string | undefined;
+  let allowUnverified = false;
+  let json = false;
+  let scanTimeout: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--path') { path = args[++i]; continue; }
+    if (a === '--scan-timeout') { scanTimeout = args[++i] ?? ''; continue; }
+    if (a === '--branch') { branch = args[++i]; continue; }
+    if (a === '--message') { message = args[++i]; continue; }
+    if (a === '--allow-unverified-remote') { allowUnverified = true; continue; }
+    if (a === '--json') { json = true; continue; }
+    if (!a.startsWith('--') && !id) { id = a; continue; }
+    console.error(`Unknown flag: ${a}`);
+    process.exit(2);
+  }
+
+  if ((!id && !path) || (id && path) || (scanTimeout !== undefined && !/^[1-9]\d{0,5}$/.test(scanTimeout))) {
+    console.error('Usage: gbrain sources push [<id> | --path <dir>] [--branch <b>] [--message <m>] [--allow-unverified-remote] [--scan-timeout <seconds>] [--json]');
+    process.exit(2);
+  }
+
+  let dir = path;
+  let pullStrategy: 'rebase' | 'merge' = 'rebase';
+  if (id) {
+    const src = await fetchSource(engine, id);
+    if (!src) {
+      console.error(`Source "${id}" not found.`);
+      process.exit(4);
+    }
+    if (!src.local_path) {
+      console.error(`Source "${id}" has no local_path — nothing to push.`);
+      process.exit(1);
+    }
+    dir = src.local_path;
+    pullStrategy = pullStrategyOf(parseConfig(src.config));
+  }
+
+  const { workspacePush, formatBlockedSecrets } = await import('../core/workspace-push.ts');
+  const { SCAN_ALLOW_FILENAME } = await import('../core/secret-scan.ts');
+  const res = await workspacePush({
+    dir: dir!,
+    branch,
+    pullStrategy,
+    commitMessage: message,
+    allowUnverifiedRemote: allowUnverified,
+    ...(scanTimeout ? { scanTimeoutMs: Number(scanTimeout) * 1000 } : {}),
+    logger: (l) => console.error(`[gbrain] ${l}`),
+  });
+
+  if (json) console.log(JSON.stringify(res, null, 2));
+
+  switch (res.status) {
+    case 'skipped_in_flight':
+      // G14/A5: the second concurrent caller exits 0 — nothing went wrong.
+      if (!json) console.log(`skipped: push in flight (pid ${res.lockHolderPid ?? 'unknown'})`);
+      return;
+    case 'pushed':
+      if (!json) {
+        console.log(
+          `Pushed ${res.repoRoot} → origin/${res.branch}` +
+            (res.committed ? ' (new commit)' : ' (no new commit; pushed pending state)'),
+        );
+        for (const p of res.excludedUntracked ?? []) {
+          console.log(`  excluded (deny list, still on disk): ${p}`);
+        }
+      }
+      return;
+    case 'blocked_secrets':
+      if (!json) {
+        for (const line of formatBlockedSecrets(res.findings ?? [])) console.error(line);
+      }
+      process.exit(5);
+      break;
+    case 'blocked_tracked_deny':
+      if (!json) {
+        console.error('PUSH BLOCKED — tracked file(s) match the deny list:');
+        for (const p of res.denyMatches ?? []) console.error(`  ${p}`);
+        console.error('Remove from the index first: git rm --cached <path>');
+      }
+      process.exit(5);
+      break;
+    case 'blocked_unscannable':
+      if (!json) {
+        console.error('PUSH BLOCKED — staged file(s) the secret scan could not read (fail-closed):');
+        for (const p of res.unscannable ?? []) console.error(`  ${p}`);
+        console.error(
+          'Remove from the index (git rm --cached <path>), keep it under the scan ceiling, ' +
+            `or allowlist it in ${SCAN_ALLOW_FILENAME}.`,
+        );
+      }
+      process.exit(5);
+      break;
+    case 'refused_visibility':
+      if (!json) {
+        console.error(`PUSH REFUSED: ${res.reason}`);
+      }
+      process.exit(5);
+      break;
+    case 'blocked_history':
+      if (!json) {
+        console.error(`Error [${res.code}]: ${res.reason?.replace(/^\S+: /, '')}`);
+        if (res.suggestion) console.error(`Fix: ${res.suggestion}`);
+      }
+      process.exit(5);
+      break;
+    default:
+      if (!json) console.error(`push failed (${res.status}): ${res.reason ?? 'unknown error'}`);
+      process.exit(1);
+  }
+}
+
 // ── Subcommand: list ────────────────────────────────────────
 
 async function runList(engine: BrainEngine, args: string[]): Promise<void> {
@@ -329,8 +703,12 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
       name: r.name,
       local_path: r.local_path,
       federated: isFederated(r.config),
+      mirror_read_only: parseConfig(r.config).mirror_read_only === true,
+      strategy: isSyncStrategy(parseConfig(r.config).strategy) ? parseConfig(r.config).strategy as 'markdown' | 'code' | 'auto' : null,
+      pull_strategy: pullStrategyOf(parseConfig(r.config)),
       page_count: pageCount,
       last_sync_at: r.last_sync_at ? new Date(r.last_sync_at).toISOString() : null,
+      archived: r.archived === true,
     });
   }
 
@@ -342,8 +720,14 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
   // Human-readable table.
   console.log('SOURCES');
   console.log('───────');
-  for (const e of entries) {
-    const fedMark = e.federated ? 'federated' : (e as any).archived ? '⚠ archived' : 'isolated';
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    // Explicit `federated: false` (`sources unfederate`) fully isolates a
+    // source's reads in both directions; an absent key ('unset') only keeps
+    // it out of OTHER anchors' reads — its own unqualified reads still widen
+    // outward (see sourceFederationState). Collapsing both to "isolated"
+    // overstates what an unset flag does.
+    const fedMark = e.archived ? '⚠ archived' : sourceFederationState(rows[i].config);
     const pathStr = e.local_path ?? '(no local path)';
     const sync = e.last_sync_at ? `last sync ${e.last_sync_at}` : 'never synced';
     console.log(`  ${e.id.padEnd(20)}  ${fedMark.padEnd(12)}  ${String(e.page_count).padStart(6)} pages  ${sync}`);
@@ -363,12 +747,11 @@ async function runRemove(engine: BrainEngine, args: string[]): Promise<void> {
   const yes = args.includes('--yes');
   const dryRun = args.includes('--dry-run');
   const confirmDestructive = args.includes('--confirm-destructive');
-  const _keepStorage = args.includes('--keep-storage');
-  void _keepStorage;
+  const keepStorage = args.includes('--keep-storage');
 
   if (id === 'default') {
     console.error('Error: cannot remove the "default" source (it backs the pre-v0.17 brain).');
-    process.exit(3);
+    process.exit(USAGE_EXIT_CODE);
   }
 
   const src = await fetchSource(engine, id);
@@ -379,8 +762,12 @@ async function runRemove(engine: BrainEngine, args: string[]): Promise<void> {
 
   // v0.26.5: Impact preview + destructive guard
   const impact = await assessDestructiveImpact(engine, id);
+  const appleContacts = parseConfig(src.config).kind === 'apple-contacts';
   if (impact) {
     console.log(formatImpact(impact));
+    if (appleContacts) console.log(`  ${await (await import('../core/apple-contacts/person-facts.ts')).countPersonFacts(engine, id)} company, job title and group row(s) on person pages are retired first.`);
+    const ownedFiles = await (await import('../core/owned-folder/remove.ts')).previewOwnedRemoval(engine, id);
+    if (ownedFiles) console.log(`  ${ownedFiles} chat-day file(s) in .gbrain-owned/${id}/ ${keepStorage ? 'stay (--keep-storage)' : 'are removed in one commit; the remote history still holds what was pushed'}.`);
 
     if (dryRun) {
       console.log('(dry-run; no side effects)');
@@ -400,19 +787,64 @@ async function runRemove(engine: BrainEngine, args: string[]): Promise<void> {
     }
   }
 
-  // v0.42.44 — tear down durability scaffolding BEFORE the row is deleted (we
-  // need the path/label while it still exists). Best-effort; tolerates missing
-  // repo/cron/credential independently.
+  // PR6 D5b: FK-RESTRICT pre-check — a referenced source refuses with revoke
+  // guidance, never a raw FK violation.
+  const referents = await clientsReferencingSource(engine, id);
+  if (referents.length > 0) {
+    console.error(formatClientReferentsBlock(id, referents));
+    process.exit(5);
+  }
+
+  // cathedral-6 (F1): the row DELETE commits FIRST — atomically with an in-tx
+  // referents re-check — and external teardown (unharden: git scaffolding /
+  // cron / credential) runs only AFTER the commit. Pre-fix the teardown ran
+  // before the DELETE, so a registration racing between the pre-check and the
+  // DELETE failed the FK AFTER scaffolding was already destroyed. The in-tx
+  // re-check uses a column-preflighted statement shape (25P02: no
+  // catch-and-retry degrade inside a tx; missing table ⇒ empty column set ⇒
+  // no FK ⇒ skip); the FK constraint itself is the backstop for a
+  // registration committing between the re-check and the DELETE.
+  // GST-3022: an owned-folder source's files leave its folder in one commit first (Git is the parent); a failure keeps the row.
+  class SourceReferencedError extends Error {}
+  try {
+    await (await import('../core/owned-folder/remove.ts')).removeOwnedFolderThen(engine, id, { keep: keepStorage }, () => engine.transaction(async (tx) => {
+      const cols = await preflightOauthClientColumns(sqlQueryForEngine(tx));
+      if (cols.has('source_id')) {
+        // PHYSICAL count (no deleted_at filter): the FK ignores soft-deletion.
+        const rows = await tx.executeRaw<{ n: string }>(
+          `SELECT COUNT(*)::text AS n FROM oauth_clients WHERE source_id = $1`,
+          [id],
+        );
+        if (Number(rows[0]?.n ?? 0) > 0) throw new SourceReferencedError();
+      }
+      await deleteSourceRow(tx, id);
+    }));
+  } catch (e) {
+    const code = typeof e === 'object' && e !== null && 'code' in e ? String((e as { code?: unknown }).code) : '';
+    if (e instanceof SourceReferencedError || code === '23503') {
+      const raced = await clientsReferencingSource(engine, id);
+      console.error(formatClientReferentsBlock(id, raced.length > 0 ? raced : referents));
+      process.exit(5);
+    }
+    throw e;
+  }
+
+  const pageCount = impact?.pageCount ?? 0;
+  console.log(`Removed source "${id}" (${pageCount} pages + dependent rows cascaded).`);
+
+  // v0.42.44 — durability-scaffolding teardown, POST-COMMIT as of cathedral-6
+  // (the path/label were captured from `src` before the delete). Best-effort;
+  // on failure the DB row is already gone — print exactly what remains so the
+  // operator can sweep the residue (doctor also surfaces it).
   try {
     const { unhardenBrainRepo } = await import('../core/brain-repo-durability.ts');
     await unhardenBrainRepo({ repoPath: src.local_path ?? '', sourceId: id, logger: (l) => console.error(l) });
   } catch (e) {
-    console.error(`[gbrain] durability teardown skipped (non-fatal): ${(e as Error).message}`);
+    console.error(
+      `[gbrain] source row "${id}" is deleted, but durability teardown failed (non-fatal): ${(e as Error).message}. ` +
+      `Residue may remain${src.local_path ? ` at ${src.local_path}` : ''} (git hardening / cron entry / stored credential) — \`gbrain doctor\` surfaces it.`,
+    );
   }
-
-  await engine.executeRaw(`DELETE FROM sources WHERE id = $1`, [id]);
-  const pageCount = impact?.pageCount ?? 0;
-  console.log(`Removed source "${id}" (${pageCount} pages + dependent rows cascaded).`);
 }
 
 // ── Subcommand: archive (soft-delete) ───────────────────────
@@ -479,6 +911,7 @@ async function runSetCrMode(engine: BrainEngine, args: string[]): Promise<void> 
   } else {
     console.log(`Set source "${id}" contextual_retrieval_mode = ${mode}.`);
   }
+  console.log((await import('./config/contextual-mode-hint.ts')).contextualModeHint(id));
 }
 
 async function runArchive(engine: BrainEngine, args: string[]): Promise<void> {
@@ -490,7 +923,7 @@ async function runArchive(engine: BrainEngine, args: string[]): Promise<void> {
 
   if (id === 'default') {
     console.error('Error: cannot archive the "default" source.');
-    process.exit(3);
+    process.exit(USAGE_EXIT_CODE);
   }
 
   // Show impact preview
@@ -502,6 +935,19 @@ async function runArchive(engine: BrainEngine, args: string[]): Promise<void> {
 
   const result = await softDeleteSource(engine, id);
   if (!result) {
+    // #2792: softDeleteSource returns null both for "not found" (handled by
+    // the impact check above) and for "already archived" (UPDATE matched no
+    // `archived = false` row). Distinguish them: already-archived is a
+    // friendly idempotent no-op, not a reasonless failure.
+    const rows = await engine.executeRaw<{ archived: boolean }>(
+      `SELECT archived FROM sources WHERE id = $1`,
+      [id],
+    );
+    if (rows[0]?.archived) {
+      console.log(`Source "${id}" is already archived — nothing to do.`);
+      console.log(`  'gbrain sources archived' shows its purge expiry; 'gbrain sources restore ${id}' un-archives it.`);
+      return;
+    }
     console.error(`Failed to archive source "${id}".`);
     process.exit(4);
   }
@@ -527,6 +973,9 @@ async function runRestore(engine: BrainEngine, args: string[]): Promise<void> {
 
   console.log(`Source "${id}" restored. ${noFederate ? 'Not re-federated.' : 'Re-federated.'}`);
   console.log(`All pages, chunks, and embeddings are intact.`);
+  const exposure = await import('../core/access/federation-exposure.ts');
+  const exposed = await exposure.remotePagesFederationExposesOrWarn(engine, id, !noFederate && id !== 'default' && isFederated((await fetchSource(engine, id))?.config));
+  if (exposed) console.error(exposure.pagesExposedLines(id, exposed).join('\n'));
 
   // T4 (eng-review): if the source has a remote_url AND its clone dir was
   // autopurged (e.g. operator rm -rf'd $GBRAIN_HOME/clones/), re-clone
@@ -576,17 +1025,30 @@ async function runPurge(engine: BrainEngine, args: string[]): Promise<void> {
       process.exit(5);
     }
 
-    await engine.executeRaw(`DELETE FROM sources WHERE id = $1`, [id]);
+    // PR6 D5b: FK-RESTRICT pre-check — refuse with revoke guidance instead of
+    // letting the raw FK violation surface from the DELETE.
+    const referents = await clientsReferencingSource(engine, id);
+    if (referents.length > 0) {
+      console.error(formatClientReferentsBlock(id, referents));
+      process.exit(5);
+    }
+
+    await (await import('../core/owned-folder/remove.ts')).removeOwnedFolderThen(engine, id, {}, () => deleteSourceRow(engine, id));
     console.log(`Permanently deleted source "${id}" (${impact.pageCount} pages cascaded).`);
     return;
   }
 
   // No id: purge all expired archives
-  const purged = await purgeExpiredSources(engine);
-  if (purged.length === 0) {
+  const { purged, blocked } = await purgeExpiredSources(engine);
+  if (purged.length === 0 && blocked.length === 0) {
     console.log('No expired archives to purge.');
   } else {
-    console.log(`Purged ${purged.length} expired archive(s): ${purged.join(', ')}`);
+    if (purged.length > 0) {
+      console.log(`Purged ${purged.length} expired archive(s): ${purged.join(', ')}`);
+    }
+    for (const b of blocked) {
+      console.log(`Blocked: ${b.id} — ${b.reason}`);
+    }
   }
 }
 
@@ -679,7 +1141,7 @@ function runDetach(): void {
 // ── Subcommand: federate / unfederate ───────────────────────
 
 async function runFederate(engine: BrainEngine, args: string[], value: boolean): Promise<void> {
-  const id = args[0];
+  const id = args.find(a => !a.startsWith('-')), json = args.includes('--json'), say = json ? console.error : console.log;
   if (!id) {
     console.error(`Usage: gbrain sources ${value ? 'federate' : 'unfederate'} <id>`);
     process.exit(2);
@@ -689,14 +1151,26 @@ async function runFederate(engine: BrainEngine, args: string[], value: boolean):
     console.error(`Source "${id}" not found.`);
     process.exit(4);
   }
-  const config = parseConfig(src.config);
-  config.federated = value;
-  await engine.executeRaw(
-    `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
-    [JSON.stringify(config), id],
-  );
-  console.log(`Source "${id}" is now ${value ? 'federated (appears in cross-source default search)' : 'isolated (only searched when explicitly named)'}.`);
-
+  // GST-1113: the mark check and the config write hold the source row, so a concurrent --attest-sources mark commits
+  // before (and federate refuses) or after (and sees federated, so it refuses), never between them.
+  const wasFederated = await engine.transaction(async tx => {
+    const [row] = await tx.executeRaw<{ config: unknown }>('SELECT config FROM sources WHERE id = $1 FOR UPDATE', [id]);
+    if (value) await (await import('../core/access/attest-sources.ts')).assertNotScopeSource(tx, id);
+    const config = parseConfig(row?.config ?? src.config), before = isFederated(config);
+    config.federated = value;
+    await tx.executeRaw(
+      `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
+      [JSON.stringify(normalizeSourceConfig(config)), id],
+    );
+    return before;
+  });
+  say(`Source "${id}" is now ${value ? 'federated (appears in cross-source default search)' : 'isolated (only searched when explicitly named)'}.`);
+  if (value && !wasFederated) for (const line of await (await import('../core/grants/shared-exposure.ts')).federateReaderLines(engine, id)) say(line); // GST-2898
+  const exposure = await import('../core/access/federation-exposure.ts');
+  const exposed = await exposure.remotePagesFederationExposesOrWarn(engine, id, value && id !== 'default' && !wasFederated);
+  if (exposed) console.error(exposure.pagesExposedLines(id, exposed).join('\n'));
+  const keys = value ? [] : await (await import('./access-serves.ts')).keysStillReadingNotice(engine, id, say);
+  if (json) console.log(JSON.stringify({ id, federated: value, ...(exposed ? { pages_exposed: exposed } : {}), ...(keys.length ? { keys_still_reading: keys } : {}) }));
   // v0.40 D19: auto-submit embed-backfill when coverage < 100%. Federation
   // flip is a moment when the user explicitly opted into seeing this source
   // in default search; un-embedded chunks would hide content from the very
@@ -705,7 +1179,6 @@ async function runFederate(engine: BrainEngine, args: string[], value: boolean):
   try {
     const { isFederatedV2Enabled } = await import('../core/feature-flags.ts');
     if (!(await isFederatedV2Enabled(engine))) return;
-
     const { loadAllSources } = await import('../core/sources-load.ts');
     const { computeAllSourceMetrics } = await import('../core/source-health.ts');
     const sources = await loadAllSources(engine, { includeArchived: false });
@@ -717,12 +1190,18 @@ async function runFederate(engine: BrainEngine, args: string[], value: boolean):
     const sub = await submitEmbedBackfill(engine, id, { reason: 'federation_flip' });
     if (sub.status === 'submitted') {
       const missing = m.total_chunks - m.embedded_chunks;
-      console.log(`  → embed-backfill job ${sub.jobId} queued for missing ${missing} chunks.`);
+      say(`  → embed-backfill job ${sub.jobId} queued for missing ${missing} chunks.`);
     } else if (sub.status === 'cooldown') {
-      console.log(`  → embed-backfill skipped (cooldown). Manually trigger with: gbrain jobs submit embed-backfill --params '{"sourceId":"${id}"}'`);
+      say(`  → embed-backfill skipped (cooldown). Manually trigger with: gbrain jobs submit embed-backfill --params '{"sourceId":"${id}"}'`);
     } else if (sub.status === 'spend_capped') {
-      console.log(`  → embed-backfill skipped (24h spend cap $${sub.spendCapUsd} reached for this source).`);
-    }
+      say(`  → embed-backfill skipped (24h spend cap $${sub.spendCapUsd} reached for this source).`);
+    } else if (sub.status === 'no_worker_surface') {
+      if (await (await import('../core/embedding-disabled.ts')).embeddingsDisabled(engine)) say('  → embed-backfill not queued: embedding is disabled on this brain (keyless by choice; keyword search works).'); else say(`  → embed-backfill not queued (${sub.engineKind} has no recognized persistent worker); run: gbrain embed --stale --source ${id}`);
+    } else if (sub.status === 'stalled') {
+      say(`  → embed-backfill not queued: the last ${sub.failures} runs failed on the same blocked pages with nothing embedded. See: gbrain doctor --only embed_backfill_stalled`);
+    } else if (sub.status === 'embedding_disabled') {
+      say('  → embed-backfill not queued: embedding is disabled on this brain (keyless by choice; keyword search works).');
+    } else { sub satisfies never; }
   } catch (err) {
     // Federation flip already succeeded; embed-backfill is a follow-up nicety.
     console.error(`  → embed-backfill submission failed (flip succeeded): ${err instanceof Error ? err.message : String(err)}`);
@@ -730,11 +1209,20 @@ async function runFederate(engine: BrainEngine, args: string[], value: boolean):
 }
 
 // ── v0.40 sources status (D12) ──────────────────────────────
-async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
-  const json = args.includes('--json');
+async function runStatus(engine: BrainEngine, rawArgs: string[]): Promise<void> {
+  const { parseListingFlags } = await import('../core/bounded-listing-cli.ts');
+  const { request, rest: args } = parseListingFlags(rawArgs.filter(arg => arg !== '--holds'), 'gbrain sources status');
+  const paged = rawArgs.some(arg => /^--(limit|cursor)(=|$)/.test(arg));
+  const json = args.includes('--json'), only = args.find((arg, i) => !arg.startsWith('-') && args[i - 1] !== '--limit');
+  if (request.cursor !== undefined && !only) {
+    throw opError('invalid_params', '--cursor pages the held files of one source.', 'Rerun with the id of the source the cursor came from right after status, keeping the same --limit.');
+  }
+  const holdListing = paged ? { mode: 'page' as const, request } : rawArgs.includes('--holds') || request.limit === null ? { mode: 'all' as const } : { mode: 'summary' as const };
   const { loadAllSources } = await import('../core/sources-load.ts');
   const { computeAllSourceMetrics } = await import('../core/source-health.ts');
-  const sources = await loadAllSources(engine, { includeArchived: false });
+  const statusView = await import('../core/persistence/connector-status.ts');
+  const sources = (await loadAllSources(engine, { includeArchived: false })).filter(source => !only || source.id === only);
+  if (only && !sources.length) throw statusView.statusSourceNotFound(only);
   if (sources.length === 0) {
     if (json) {
       console.log(JSON.stringify({ schema_version: 1, sources: [] }, null, 2));
@@ -746,6 +1234,10 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
   // Local CLI on the trusted host: probe the live commit hash so a quiet,
   // caught-up source reports lag 0 instead of growing wall-clock (v0.41.32.0).
   const metrics = await computeAllSourceMetrics(engine, sources, { probeContent: true });
+  const { readCompanyBrainSourceStatus } = await import('../core/company-brain/status.ts');
+  const ingestion = new Map(await Promise.all(sources.map(async source =>
+    [source.id, Object.hasOwn(parseSourceConfig(source.config), 'company_brain')
+      ? await readCompanyBrainSourceStatus(engine, source.id) : null] as const)));
 
   // #1950: a source holding a live (non-TTL-expired) per-source sync lock is
   // actively syncing RIGHT NOW. Without this it printed "idle" while a sync
@@ -760,18 +1252,44 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
     }),
   );
 
+  const connectors = await statusView.readConnectorSourceStatuses(engine, sources.map(source => source.id));
+  const gitHolds = await statusView.readGitHoldStatuses(engine, sources.map(source => source.id));
+  const drainMod = await import('../core/persistence/sync-drain.ts');
+  const backlog = new Map((await drainMod.readManagedSyncBacklog(engine).catch(() => [])).map(b => [b.source_id, b]));
+  const sharedSkillsView = await import('../core/shared-skills/source-opt-out.ts');
+  const sharedSkills = new Map(await Promise.all(sources.map(async source => [source.id, await sharedSkillsView.readSharedSkillsSourceView(engine, source.id).catch(() => null)] as const)));
+  const uncommittedView = await import('../core/fence-repair/uncommitted.ts');
+  const uncommitted = await uncommittedView.uncommittedFenceRepairsBySource(engine, sources.map(source => source.id));
+  // #6317 (B4): whether managed sync data moves, beside sync_running (a live lock is not progress); the writer-status command rides along.
+  const movementView = await import('../core/persistence/sync-movement.ts');
+  const movement = new Map((await movementView.readSourceMovement(engine, { sourceIds: sources.map(source => source.id) }).catch(() => [])).map(m => [m.source_id, m]));
+  const upstreamView = await import('../core/sync-upstream-rewrite.ts'), upstream = new Map((await upstreamView.readUpstreamDivergences(engine, sources.map(source => source.id))).map(u => [u.source_id, upstreamView.renderUpstreamDivergence(u)])); const watermarkView = await import('../core/persistence/applied-watermark.ts'), watermarks = new Map(await Promise.all(sources.map(async source => [source.id, await watermarkView.readAppliedWatermark(engine, source.id).catch(() => null)] as const)));
+  const publishOff = new Set(await (await import('../core/persistence/worktree-refresh.ts')).publishOptedOut(engine, sources.map(source => source.id)));
+  const pagesView = await import('../core/owned-folder/status.ts'), pagesIn = await pagesView.readPagesIn(engine, sources.map(source => source.id)).catch(() => new Map<string, never>());
   if (json) {
     const enriched = metrics.map((m) => ({
       ...m,
+      ...(publishOff.has(m.source_id) ? { auto_reconcile: false } : {}),
       sync_running: syncRunning.has(m.source_id),
       sync_holder: syncRunning.get(m.source_id) ?? null,
+      ...(ingestion.get(m.source_id) ? { ingestion: ingestion.get(m.source_id) } : {}),
+      ...(connectors.get(m.source_id) ? { connector: connectors.get(m.source_id) } : {}), ...(pagesIn.get(m.source_id) ? { pages_in: pagesIn.get(m.source_id) } : {}),
+      ...(backlog.get(m.source_id) ? { managed_backlog: backlog.get(m.source_id) } : {}),
+      ...(movement.get(m.source_id) ? { data_moving: movement.get(m.source_id)!.data_moving, not_moving_since: movement.get(m.source_id)!.not_moving_since,
+        movement_state: movement.get(m.source_id)!.movement_state, movement: movement.get(m.source_id) } : {}),
+      ...(gitHolds.get(m.source_id) ? { git_holds: statusView.gitHoldStatusJson(m.source_id, gitHolds.get(m.source_id)!, holdListing) } : {}), ...(upstream.get(m.source_id) ? { upstream: upstream.get(m.source_id) } : {}),
+      ...(sharedSkills.get(m.source_id) ? { shared_skills: sharedSkills.get(m.source_id) } : {}),
+      ...(uncommitted.get(m.source_id) ? { fence_repairs_uncommitted: uncommitted.get(m.source_id) } : {}), ...(watermarks.get(m.source_id) ? { watermark: watermarks.get(m.source_id) } : {}),
     }));
-    console.log(JSON.stringify({ schema_version: 1, sources: enriched }, null, 2));
+    console.log(JSON.stringify((await import('../core/read-heartbeat.ts')).withReadMeta({ schema_version: 1, sources: enriched }), null, 2));
     return;
   }
 
   // Human-readable table: SOURCE | LAG | EMBED | BACKFILL | FAILS | QUEUE | PAGES | LAST SYNC
   console.log('SOURCES — health');
+  for (const [sourceId, status] of ingestion) {
+    if (status) console.log(`  ${sourceId}: company ingestion ${status.state}${status.phase ? ` (${status.phase})` : ''}${status.receipt_id ? `, receipt ${status.receipt_id}` : ''}`);
+  }
   console.log('────────────────');
   console.log(
     `  ${'SOURCE'.padEnd(20)}  ${'LAG'.padEnd(8)}  ${'EMBED'.padEnd(7)}  ${'BACKFILL'.padEnd(9)}  ${'FAILS'.padEnd(6)}  ${'QUEUE'.padEnd(6)}  ${'PAGES'.padStart(8)}  LAST SYNC`,
@@ -799,12 +1317,22 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
     console.log(`  ${m.source_id.padEnd(20)}  ${lag.padEnd(8)}  ${embed.padEnd(7)}  ${backfill.padEnd(9)}  ${fails.padEnd(6)}  ${queue.padEnd(6)}  ${pages.padStart(8)}  ${sync}`);
   }
   console.log('');
+  for (const [sourceId, status] of connectors) for (const line of statusView.connectorStatusLines(sourceId, status)) console.log(line);
+  for (const [sourceId, p] of pagesIn) console.log(pagesView.pagesInLine(sourceId, p));
+  for (const [sourceId, status] of gitHolds) for (const line of statusView.gitHoldStatusLines(sourceId, status)) console.log(line);
+  for (const b of backlog.values()) console.log(`  ${drainMod.formatManagedSyncBacklog(b)}`);
+  for (const m of movement.values()) { const line = movementView.formatSourceMovement(m); if (line) console.log(`  ${line}`); } for (const w of watermarks.values()) if (w) console.log(`  ${watermarkView.formatAppliedWatermark(w)}`);
+  for (const [sourceId, notices] of uncommitted) for (const line of uncommittedView.uncommittedFenceRepairLines(sourceId, notices)) console.log(line);
+  for (const id of publishOff) console.log(`  ${id}: automatic publishing is off (sources.auto_reconcile.source.${id} false): git-reconcile and refresh never push its local commits; sync goes on`);
+  for (const view of sharedSkills.values()) if (view && (only || view.configured === false || view.parked)) for (const line of sharedSkillsView.sharedSkillsStatusLines(view)) console.log(`  ${line}`);
   for (const m of metrics) {
     const warns: string[] = [];
     if (!m.local_path) warns.push('no local_path');
     // #1950: don't cry "never synced" while a sync lock is live — it's syncing now.
     if (m.lag_seconds === null && !syncRunning.has(m.source_id)) {
-      warns.push(`never synced — run \`gbrain sync --source ${m.source_id}\``);
+      const { syncContentDirectory } = await import('../core/sync-applicability.ts');
+      const owned = await syncContentDirectory(engine, { sourceId: m.source_id }).catch(() => null);
+      if (!owned) warns.push(`never synced — run \`gbrain sync --source ${m.source_id}\``);
     }
     if (m.embed_coverage_pct < 95 && m.total_chunks > 100) {
       warns.push(`${(100 - m.embed_coverage_pct).toFixed(1)}% un-embedded — run \`gbrain embed --stale --source ${m.source_id}\``);
@@ -826,6 +1354,17 @@ function formatLag(seconds: number): string {
 }
 
 // ── v0.40 sources webhook (D8) ──────────────────────────────
+// Hoisted so both runWebhook's `case '--help'` and the top-level nested-help
+// guard in runSources (`sources webhook --help`, `sources webhook <sub>
+// --help`) print the identical text without dispatching into runWebhook.
+const SOURCES_WEBHOOK_HELP = `Usage: gbrain sources webhook <subcommand> <source-id> [options]
+
+Subcommands:
+  set <id>    [--secret VAL] [--github-repo owner/name]   One-time reveal
+  show <id>                                                Metadata only
+  rotate <id>                                              New secret, reveal
+  clear <id>                                               Remove webhook config`;
+
 async function runWebhook(engine: BrainEngine, args: string[]): Promise<void> {
   const sub = args[0];
   const rest = args.slice(1);
@@ -837,13 +1376,7 @@ async function runWebhook(engine: BrainEngine, args: string[]): Promise<void> {
     case undefined:
     case '--help':
     case '-h':
-      console.log(`Usage: gbrain sources webhook <subcommand> <source-id> [options]
-
-Subcommands:
-  set <id>    [--secret VAL] [--github-repo owner/name]   One-time reveal
-  show <id>                                                Metadata only
-  rotate <id>                                              New secret, reveal
-  clear <id>                                               Remove webhook config`);
+      console.log(SOURCES_WEBHOOK_HELP);
       return;
     default:
       console.error(`Unknown webhook subcommand: ${sub}`);
@@ -864,11 +1397,15 @@ async function runWebhookSet(engine: BrainEngine, args: string[]): Promise<void>
   }
   const explicitSecret = args.find((a, i) => args[i - 1] === '--secret');
   const githubRepo = args.find((a, i) => args[i - 1] === '--github-repo');
-  if (!githubRepo) {
+  const srcCfg = parseConfig(src.config);
+  const isGitHubKind = srcCfg.kind === 'github';
+  // v0.46: github-kind sources span many repos, so --github-repo is optional
+  // for them (the webhook secret alone gates item-refresh events).
+  if (!githubRepo && !isGitHubKind) {
     console.error('--github-repo owner/name is required (e.g. "Garry-s-List/zion-brain")');
     process.exit(2);
   }
-  if (!/^[\w.-]+\/[\w.-]+$/.test(githubRepo)) {
+  if (githubRepo && !/^[\w.-]+\/[\w.-]+$/.test(githubRepo)) {
     console.error(`Invalid --github-repo format: "${githubRepo}". Expected "owner/name".`);
     process.exit(2);
   }
@@ -877,21 +1414,27 @@ async function runWebhookSet(engine: BrainEngine, args: string[]): Promise<void>
   const secret = explicitSecret ?? randomBytes(32).toString('hex');
   const cfg = parseConfig(src.config);
   cfg.webhook_secret = secret;
-  cfg.github_repo = githubRepo;
+  if (githubRepo) cfg.github_repo = githubRepo;
   await engine.executeRaw(
     `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
-    [JSON.stringify(cfg), id],
+    [JSON.stringify(normalizeSourceConfig(cfg)), id],
   );
 
   console.log(`Webhook configured for source "${id}":`);
-  console.log(`  github_repo:    ${githubRepo}`);
-  console.log(`  webhook_secret: ${secret}`);
+  if (githubRepo) console.log(`  github_repo:    ${githubRepo}`);
+  console.log('  webhook_secret: (shown once below)');
   console.log('');
   console.log('--- Paste this into GitHub repo settings → Webhooks → Add webhook ---');
   console.log('  Payload URL:  <your gbrain serve --http URL>/webhooks/github');
   console.log('  Content type: application/json');
   console.log(`  Secret:       ${secret}`);
-  console.log('  Events:       Just the push event');
+  console.log(
+    isGitHubKind
+      ? '  Events:       Issues, pull requests, issue comments, PR reviews,\n' +
+        '                 PR review comments, labels, milestones, assignees,\n' +
+        '                 check runs, check suites, workflow runs'
+      : '  Events:       Just the push event',
+  );
   console.log('  Active:       checked');
   console.log('');
   console.log('⚠ This secret is shown ONCE. Save it now; subsequent `gbrain sources webhook show` will NOT display it.');
@@ -936,7 +1479,7 @@ async function runWebhookRotate(engine: BrainEngine, args: string[]): Promise<vo
   cfg.webhook_secret = secret;
   await engine.executeRaw(
     `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
-    [JSON.stringify(cfg), id],
+    [JSON.stringify(normalizeSourceConfig(cfg)), id],
   );
   console.log(`New webhook secret for source "${id}":`);
   console.log(`  ${secret}`);
@@ -960,7 +1503,7 @@ async function runWebhookClear(engine: BrainEngine, args: string[]): Promise<voi
   delete cfg.github_repo;
   await engine.executeRaw(
     `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
-    [JSON.stringify(cfg), id],
+    [JSON.stringify(normalizeSourceConfig(cfg)), id],
   );
   console.log(`Webhook configuration cleared for source "${id}".`);
 }
@@ -985,7 +1528,7 @@ async function runTrackedBranch(engine: BrainEngine, args: string[]): Promise<vo
     cfg.tracked_branch = setArg;
     await engine.executeRaw(
       `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
-      [JSON.stringify(cfg), id],
+      [JSON.stringify(normalizeSourceConfig(cfg)), id],
     );
     console.log(`Tracked branch for source "${id}" set to "${setArg}".`);
     return;
@@ -996,12 +1539,12 @@ async function runTrackedBranch(engine: BrainEngine, args: string[]): Promise<vo
       process.exit(1);
     }
     try {
-      const { execFileSync } = await import('node:child_process');
+      const { execFileSync } = await import('../core/spawn.ts');
       const branch = execFileSync('git', ['-C', src.local_path, 'rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' }).trim();
       cfg.tracked_branch = branch;
       await engine.executeRaw(
         `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
-        [JSON.stringify(cfg), id],
+        [JSON.stringify(normalizeSourceConfig(cfg)), id],
       );
       console.log(`Detected branch "${branch}" for source "${id}"; persisted to config.tracked_branch.`);
     } catch (e) {
@@ -1134,7 +1677,8 @@ async function runAudit(engine: BrainEngine, args: string[]): Promise<void> {
         continue;
       }
       if (stat.isDirectory()) {
-        if (pruneDir(entry, dir)) continue;
+        // pruneDir returns true = descend, false = prune (see core/sync.ts).
+        if (!pruneDir(entry, dir)) continue;
         walk(full);
       } else if (entry.endsWith('.md')) {
         files.push(full);
@@ -1164,7 +1708,8 @@ async function runAudit(engine: BrainEngine, args: string[]): Promise<void> {
   // frontmatter.type and estimates per-page segment count from body
   // bytes. Estimated per-segment Sonnet cost is a rough heuristic
   // (~2000 in + 500 out tokens at $3/MTok in + $15/MTok out ≈ $0.013).
-  const FACTS_BACKFILL_ALLOWED = ['conversation', 'meeting', 'slack', 'email'];
+  // Single source of truth for the conversation-facts type allowlist.
+  const { ALLOWED_TYPES: FACTS_BACKFILL_ALLOWED } = await import('../core/facts/conversation-types.ts');
   const FACTS_BACKFILL_CHARS_PER_SEGMENT = 6500; // matches SEGMENT_TEXT_CHAR_LIMIT
   const FACTS_BACKFILL_USD_PER_SEGMENT = 0.013;
   let factsBackfillPages = 0;
@@ -1208,7 +1753,7 @@ async function runAudit(engine: BrainEngine, args: string[]): Promise<void> {
     }
     // Facts-backfill estimator: counts pages matching allowed types.
     const fmType = (parsed.frontmatter?.type as string | undefined) ?? null;
-    if (fmType && FACTS_BACKFILL_ALLOWED.includes(fmType)) {
+    if (fmType && (FACTS_BACKFILL_ALLOWED as readonly string[]).includes(fmType)) {
       factsBackfillPages++;
       const totalBytes = sanity.bytes;
       const segmentsEstimate = Math.max(
@@ -1294,19 +1839,69 @@ async function runAudit(engine: BrainEngine, args: string[]): Promise<void> {
 
 // ── Dispatcher ──────────────────────────────────────────────
 
-// v0.40.6.0: my duplicate `runStatus` (line ~895 pre-resolution) was
-// removed during the v0.40.5 merge. Master's source-health.ts-backed
-// runStatus at line ~582 is a strict superset (adds lag / embed coverage
-// / failed-job count / queue depth columns). The `buildSyncStatusReport`
-// + `printSyncStatusReport` exports from src/commands/sync.ts remain
-// available as a library API for callers who want the v0.40.6.0-specific
-// shape (used by test/e2e/sync-status-pglite.test.ts as the IRON RULE
-// regression).
-
 export async function runSources(engine: BrainEngine, args: string[]): Promise<void> {
   const sub = args[0];
   const rest = args.slice(1);
+  if (sub === 'reconcile') {
+    const { runReconcileCli } = await import('./source-reconcile.ts');
+    return runReconcileCli(rest, engine);
+  }
+  if (sub === 'inspect') {
+    const { runCompanyBrainInspection } = await import('./company-brain-inspect.ts');
+    return runCompanyBrainInspection(rest);
+  }
+  if (sub === 'connect') {
+    const { runCompanyBrainConnect } = await import('./company-brain-connect.ts');
+    return runCompanyBrainConnect(rest, async () => engine);
+  }
+  if (sub === 'demo' && rest[0] === 'company-brain') {
+    const { runCompanyBrainDemoCli } = await import('./company-brain-demo.ts');
+    return runCompanyBrainDemoCli(rest.slice(1));
+  }
+  if (sub === 'writer') {
+    const { runPersistenceAdminCli } = await import('./persistence-admin.ts');
+    return runPersistenceAdminCli('writer', rest, engine);
+  }
 
+  // Help guards run BEFORE the subcommand switch below (mirrors jobs.ts
+  // src/commands/jobs.ts:462-471 — help checked first-position, then any
+  // position, before any subcommand body runs). cli.ts routes bare `sources
+  // --help` here with a placeholder engine (SELF_HELP_WITHOUT_ENGINE): the
+  // second check is why that's safe — without it, `sources <sub> --help`
+  // would fall through to <sub>'s own handler instead of printing help,
+  // which crashes for engine-touching subcommands (the placeholder engine
+  // is not a real one) and, for engine-free subcommands like `detach`
+  // (unlinks .gbrain-source with no engine involved at all), would silently
+  // perform the destructive action instead of showing usage.
+  if (!sub || sub === '--help' || sub === '-h') {
+    printHelp();
+    return;
+  }
+  if (rest.includes('--help') || rest.includes('-h')) {
+    // webhook is the one sources subcommand that ships its own detailed
+    // --help (set/show/rotate/clear, in SOURCES_WEBHOOK_HELP) — print that
+    // instead of the general list so `sources webhook --help` and `sources
+    // webhook <sub> --help` reach it. Do NOT dispatch into runWebhook: that
+    // would let e.g. `sources webhook set x --help` fall through to
+    // runWebhookSet, the same destructive-dispatch class this guard exists
+    // to prevent for the rest of sources' subcommands.
+    if (sub === 'webhook') {
+      console.log(SOURCES_WEBHOOK_HELP);
+      return;
+    }
+    if (sub === 'shared-skills') {
+      console.log((await import('./sources-shared-skills.ts')).SOURCES_SHARED_SKILLS_HELP);
+      return;
+    }
+    printHelp();
+    return;
+  }
+
+  // #5673: `set-path --clear` is a connector-path clear, not a managed rebind.
+  if (['add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(sub) && !(sub === 'set-path' && rest.includes('--clear'))) {
+    const { runConnectedSourceLifecycle } = await import('./sources-lifecycle.ts');
+    if (await runConnectedSourceLifecycle(engine, args)) return;
+  }
   switch (sub) {
     case 'add':        return runAdd(engine, rest);
     case 'list':       return runList(engine, rest);
@@ -1317,6 +1912,19 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'detach':     runDetach(); return;
     case 'federate':   return runFederate(engine, rest, true);
     case 'unfederate': return runFederate(engine, rest, false);
+    case 'mirror-readonly': case 'mirror-writable': return (await import('./sources-mirror.ts')).runMirrorMode(engine, rest, sub === 'mirror-readonly');
+    case 'record-origin': return (await import('./sources-record-origin.ts')).runRecordOrigin(engine, rest);
+    case 'set-strategy': return (await import('./sources-strategy.ts')).runSetStrategy(engine, rest);
+    case 'set-pull-strategy': return (await import('./sources-pull-strategy.ts')).runSetPullStrategy(engine, rest);
+    case 'set-sync':   return (await import('./sources-sync-enabled.ts')).runSetSync(engine, rest);
+    case 'rebind':     return (await import('./sources-rebind.ts')).runRebind(engine, rest);
+    case 'refresh':    return (await import('./sources-refresh.ts')).runSourcesRefresh(engine, rest);
+    case 'git-reconcile': return (await import('./sources-git-reconcile.ts')).runSourcesReconcile(engine, rest);
+    case 'git-gap':    return (await import('./sources-git-gap.ts')).runSourcesGitGap(engine, rest);
+    case 'host-repo':  return (await import('./sources-host-repo.ts')).runHostRepo(engine, rest);
+    case 'guard':      return (await import('./sources-guard.ts')).runSourcesGuard(engine, rest);
+    case 'reindex':    return (await import('./sources-reindex.ts')).runSourcesReindex(engine, rest);
+    case 'canonical':  return (await import('./sources-canonical.ts')).runSourcesCanonical(engine, rest);
     case 'archive':    return runArchive(engine, rest);
     case 'restore':    return runRestore(engine, rest);
     case 'purge':      return runPurge(engine, rest);
@@ -1333,16 +1941,26 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'tracked-branch': return runTrackedBranch(engine, rest);
     // v0.40.3.0 contextual retrieval (from master)
     case 'set-cr-mode': return runSetCrMode(engine, rest);
+    case 'set-calendar': return (await import('./sources-set-calendar.ts')).runSetCalendar(engine, rest);
+    case 'set-trust':  { const { runSetTrust } = await import('./sources-trust.ts'); return runSetTrust(engine, rest); }
+    case 'writers':    { const { runSourcesWriters } = await import('./sources-writers.ts'); return runSourcesWriters(engine, rest); }
+    // #4739 non-destructive local_path pointer repair
+    case 'set-path':   { const { runSetPath } = await import('./sources-set-path.ts'); return runSetPath(engine, rest); }
+    case 'shared-skills': { const { runSourcesSharedSkills } = await import('./sources-shared-skills.ts'); return runSourcesSharedSkills(engine, rest); }
+    case 'retry-held': { const { runRetryHeld } = await import('./sources-retry-held.ts'); return runRetryHeld(engine, rest); }
+    case 'resolve-path': { const { runResolvePath } = await import('./sources-resolve-path.ts'); return runResolvePath(engine, rest); }
+    case 'reset-upstream': { const { runResetUpstream } = await import('./sources-reset-upstream.ts'); return runResetUpstream(engine, rest); }
     case 'audit':      return runAudit(engine, rest);
+    // v0.46 github-source demo (offline, privacy-clean fixtures)
+    case 'demo':       { const { runSourcesDemo } = await import('./sources-demo.ts'); return runSourcesDemo(engine, rest); }
     // v0.42.44 brain-repo git durability
     case 'harden':     { const { runHarden } = await import('./sources-harden.ts'); return runHarden(engine, rest); }
     case 'pull':       { const { runPull } = await import('./sources-harden.ts'); return runPull(engine, rest); }
+    // agent-bootstrap: scan-gated workspace push
+    case 'push':       return runPush(engine, rest);
     case 'unharden':   { const { runUnharden } = await import('./sources-harden.ts'); return runUnharden(engine, rest); }
-    case undefined:
-    case '--help':
-    case '-h':
-      printHelp();
-      return;
+    // undefined / --help / -h are handled by the guards above, before this
+    // switch is ever reached — no case needed here.
     default:
       console.error(`Unknown sources subcommand: ${sub}`);
       printHelp();
@@ -1351,23 +1969,37 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
 }
 
 function printHelp(): void {
-  console.log(`gbrain sources — manage multi-source brain configuration (v0.26.5)
+  console.log(`gbrain sources — manage multi-source brain configuration
 
 Subcommands:
-  add <id> --path <p> [--name <n>] [--federated|--no-federated]
-                                    Register a new source.
+  inspect <path> [--profile company-brain] [--json] [--out <file>]
+                                    Preview committed company Markdown without a database or source edits.
+  connect <path> --brain <id> --source <id> [--profile company-brain] [--yes] [--json]
+                                    Preview, approve, import and verify a new company source; --plan <file> reuses a saved inspection.
+  demo company-brain [--json]        Run a fictional company through the real import and graph pipeline offline.
+  add <id> --path <p> [--name <n>] [--federated|--no-federated] [--force] [--json]
+                                    Register a new source. --path must be a git repo
+                                    with committed files; --force registers a plain directory (sync imports it without Git).
   list [--json]                     List registered sources with page counts.
+  writer status|movement|claim|activate|transfer  Inspect ownership, prove data moves, activate or transfer (see writer --help).
+  reconcile <id> <slug> --brain <id> Preview or apply a guarded file/database repair (see reconcile --help).
   remove <id> [--confirm-destructive] [--dry-run]
                                     Permanently delete a source and all its data.
                                     Shows impact preview. Requires --confirm-destructive
                                     when the source has data (pages/chunks/embeddings).
   archive <id>                      Soft-delete: hide from search, preserve data for ${SOFT_DELETE_TTL_HOURS}h.
   restore <id> [--no-federate]      Un-archive a soft-deleted source.
-  status [--json]                   v0.40.3.0 — read-only per-source dashboard:
+  status [<id>] [--json]            v0.40.3.0 — read-only per-source dashboard:
                                     last sync, staleness, page count,
-                                    embedding coverage, unacked failures.
+                                    embedding coverage, unacked failures, held files
+                                    (each Git hold with its code, line, key and
+                                    next command; recent blocked-cursor conversions).
+                                    <id> filters to that source.
                                     --json emits {schema_version:1, ...} on
-                                    stdout for monitoring pipelines.
+                                    stdout for monitoring pipelines; git_holds
+                                    lists counts per code with one example and
+                                    10 items (--holds: every item; --limit <n>
+                                    [--cursor <c>]: one page, by path).
   archived [--json]                 List soft-deleted sources and their expiry.
   purge [<id>] [--confirm-destructive]
                                     Permanently delete archived sources.
@@ -1382,13 +2014,68 @@ Subcommands:
                                     brain_default/seed_default). Run this
                                     before destructive ops to verify you're
                                     targeting the brain you think you are.
+  demo github [--dir <path>] [--limit <n>]
+                                    Offline demo of the github source kind:
+                                    render privacy-clean fixture pages via the
+                                    real render functions. No token/network/
+                                    brain needed. See docs/guides/github-source.md.
   federate <id>                     Make source appear in cross-source default search.
   unfederate <id>                   Isolate source from default search.
+  mirror-readonly <id> [--dry-run]  Read-only mirror (#5409): page and fact writes skip its checkout.
+  mirror-writable <id> [--dry-run]  Undo mirror-readonly. --dry-run previews either and writes nothing.
+  record-origin <id>... --remote|--local [--apply] [--json]
+                                    Record who added older URL sources (doctor url_source_origin); preview unless --apply.
+  set-strategy <id> <markdown|code|auto>  Persist the sync strategy every sync of the source uses (PR #5955).
+  set-pull-strategy <id> <rebase|merge>   How pulls reconcile local commits with origin (#5429); default rebase.
+  set-sync <id> <on|off> [--dry-run] [--expect <on|off>]   Include or exclude the source from automatic sync (config.syncEnabled).
+  rebind <id> [--yes]                                     Record a changed push destination for an iMessage source's folder (preview first).
+  host-repo <id> --dir <path> [--push-remote <url>] [--dry-run | --expect <plan_hash>]
+                                    Managed brains: host an empty source in a new bare repository with a gbrain-owned worktree; it becomes git-canonical.
+  guard <id> [--install [--mode enforce] | --uninstall | --status] [--json]
+                                    Managed brains, owner host: the commit guard on the source's worktree only.
+  refresh <id> [--dry-run] [--wait-drain <s>] [--fetch-timeout-ms <ms>] [--resume|--abandon] [--json]
+                                    Managed brains: drain writes to the source's worktree, fast-forward
+                                    it to its upstream (git merge --ff-only) and sync every source bound
+                                    to it. --dry-run fetches and previews only.
+  git-reconcile [<id>...] [--dry-run] [--wait <s>] [--json]
+                                    Bring every source checkout level with its upstream: publish local
+                                    commits (merged in memory, secret-scanned) and fast-forward; in sync
+                                    is a no-op. Safe to run concurrently and repeatedly.
+  git-gap <id> [--sample <n>] [--json]
+                                    Read-only: how far the database is from the commit at HEAD, page by page.
+  reindex <id> --from-git [--dry-run | --apply --expect <hash>] [--json]
+                                    Strict source: preview, then apply, the full pass where Git wins.
+  canonical <id> --to git|mixed [--dry-run | --apply --expect <hash>] [--json]
+                                    Managed brains: convert the source to git-canonical (or back), preview first.
   set-cr-mode <id> <none|title|per_chunk_synopsis>
                                     Per-source contextual retrieval mode
                                     override (v0.40.3.0). Pass "unset" or
                                     "default" to clear (NULL falls through
                                     to the global search.mode bundle).
+  set-calendar <id> <calendar-id> [--yes]  Point a Google source at another calendar (ids: gbrain google calendars).
+  set-trust <id> <tier>|--clear     Trust default for this source's sync and import (operator_curated or lower).
+  writers <id> [--add|--remove <w>] [--clear] [--json]  Who may write a guest source (set one up: gbrain guests init).
+  set-path <id> <path> [--force]    Repair a source's local_path pointer
+                                    (DB column only, never touches disk).
+                                    --force skips the overlapping-path guard.
+                                    Rejects a missing source or a path that
+                                    doesn't exist. See gbrain doctor's
+                                    default_source_local_path check.
+  retry-held <id> [--unindexed] [--dry-run] [--json]
+                                    Re-attempt a connector source's held items, or re-screen a Git source's held files, on its next sync.
+                                    Runs nothing now. Most Git holds re-screen by themselves (file changed or deleted, newer gbrain); fix
+                                    frontmatter holds with gbrain repair frontmatter --source <id>; preview fence holds (invalid_fence) with gbrain repair fences --source <id>.
+                                    --unindexed instead schedules committed files with no page and no hold (doctor unindexed_files).
+  resolve-path <id> <path...> [--stdin] [--json]
+                                    Read-only: the slug, skip, hold, page and search state gbrain gives each file path (for landing checks).
+  reset-upstream <id> --expect-local <sha> --expect-upstream <sha> [--dry-run] [--json]  After an upstream force-push (upstream_rewritten): back up HEAD, reset to upstream.
+  shared-skills <id> on|off|status [--json]
+                                    Opt a source out of (or back into) shared-skills adoption; status explains its effective policy.
+  set-path <id> --clear             Clear a connector source's (google, github)
+                                    stale local_path, or any source's relative one.
+  webhook <set|show|rotate|clear> <id> [options]
+                                    v0.40 — per-source webhook secret management.
+                                    Run 'sources webhook --help' for subcommand detail.
   harden <id|--all> [--pat-file <p>] [--branch <b>] [--no-cron] [--no-verify] [--dry-run] [--json]
                                     v0.42.44 — make a brain repo durable: local
                                     auto-push hook, committed commit-push helper,
@@ -1397,6 +2084,27 @@ Subcommands:
   pull <id> | --path <dir> [--branch <b>]
                                     Divergence-safe rebase-pull (skip-on-dirty).
                                     --path is DB-free (the harden cron's entry).
+  push <id> | --path <dir> [--branch <b>] [--message <m>]
+       [--allow-unverified-remote] [--scan-timeout <s>] [--json]
+                                    Scan-gated add→commit→pull→push of a workspace
+                                    repo; every commit it pushes is scanned
+                                    (--scan-timeout: the scan's budget, default
+                                    300 s). Blocks on secret-scan findings (override
+                                    per finding via .gbrain-scan-allow) and on
+                                    tracked deny-list files (*.pglite, .env*,
+                                    *.pem, *.key, .gbrain/**). Refuses remotes not
+                                    verifiably private — verified via REST, falling
+                                    back to pure git protocol where gh is blocked
+                                    (cloud proxies); private verdicts cached 1h.
+                                    Unverified-remote overrides (self-hosted git
+                                    you trust; every use warns loudly): the flag
+                                    above, GBRAIN_ALLOW_UNVERIFIED_REMOTE=1, or
+                                    "gbrain config set push.allow_unverified_remote
+                                    true" (file-plane — reaches detached hook
+                                    children). Single-flight (a concurrent push
+                                    exits 0 as "skipped"); pushes even on a clean
+                                    tree. Writes per-root status under
+                                    ~/.gbrain/bootstrap/.
   unharden <id>                     Remove durability cron/hook/credential wiring.
 
 Source id: [a-z0-9-]{1,32}. Immutable citation key.

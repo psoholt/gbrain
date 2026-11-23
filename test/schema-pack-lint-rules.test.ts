@@ -332,13 +332,17 @@ describe('runAllLintRules — composition', () => {
 });
 
 describe('rule registry shape', () => {
-  it('ALL_LINT_RULES contains 12 rules', () => {
+  it('ALL_LINT_RULES contains 16 rules', () => {
     // v0.41.37.0 #1569 added link_regex_catastrophic_backtrack (file-plane).
-    expect(ALL_LINT_RULES.length).toBe(12);
+    // Five-issue fix wave added stored_type_is_alias + stored_type_undeclared
+    // (both data-plane — they audit the pages corpus against the pack).
+    // Temporal typed edges added link_types_temporal (file-plane).
+    // Declared single-value relations added link_types_cardinality (file-plane).
+    expect(ALL_LINT_RULES.length).toBe(16);
   });
 
-  it('FILE_PLANE_LINT_RULES excludes the 2 DB-aware rules', () => {
-    expect(FILE_PLANE_LINT_RULES.length).toBe(10);
+  it('FILE_PLANE_LINT_RULES excludes the 4 DB-aware rules', () => {
+    expect(FILE_PLANE_LINT_RULES.length).toBe(12);
     expect(FILE_PLANE_LINT_RULES.every((r) => !r.planeAware)).toBe(true);
   });
 

@@ -1,10 +1,10 @@
-<!-- skillpack-version: 0.7.0 -->
 <!-- source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/GBRAIN_SKILLPACK.md -->
 # GBrain Skillpack: Reference Architecture for AI Agents
 
 This is a reference architecture for how a production AI agent uses gbrain as its
 knowledge backbone. Based on patterns from a real deployment with 14,700+ brain
-files, 40+ skills, and 20+ cron jobs running continuously.
+files, the 50+ bundled skills (`skills/manifest.json`), and 20+ cron jobs running
+continuously.
 
 **The memex vision, realized.** Vannevar Bush imagined a device where an individual
 stores everything, mechanized so it may be consulted with exceeding speed. GBrain is
@@ -22,9 +22,10 @@ The foundational read-write loop and data model.
 | Guide | What It Covers |
 |-------|---------------|
 | [The Brain-Agent Loop](guides/brain-agent-loop.md) | The read-write cycle that makes the brain compound over time |
-| [Entity Detection](guides/entity-detection.md) | Run it on every message. Capture original thinking + entity mentions |
+| [Entity Detection](guides/entity-detection.md) | After opt-in, capture original thinking + entity mentions; paid enrichment is separate |
 | [The Originals Folder](guides/originals-folder.md) | Capturing WHAT YOU THINK, not just what you found |
 | [Brain-First Lookup](guides/brain-first-lookup.md) | Check the brain before calling any external API |
+| [Push-Based Context](guides/push-context.md) | volunteer_context: the brain volunteers relevant pages instead of waiting to be asked |
 | [Compiled Truth + Timeline](guides/compiled-truth.md) | Above the line: current synthesis. Below: append-only evidence |
 | [Source Attribution](guides/source-attribution.md) | Every fact needs a citation. Format and hierarchy |
 
@@ -49,23 +50,25 @@ Running a production brain.
 | Guide | What It Covers |
 |-------|---------------|
 | [Reference Cron Schedule](guides/cron-schedule.md) | 20+ recurring jobs, quiet hours, dream cycle |
-| [Cron via Minions](../skills/conventions/cron-via-minions.md) | Why scheduled work runs as Minion jobs, not `agentTurn`. Auto-applied by v0.11.0 migration for built-in handlers; host-specific handlers use the plugin contract below. |
+| [Call gbrain through one wrapper](guides/cron-schedule.md#calling-gbrain-unattended) | Cron, workspace scripts and hooks: `GBRAIN_HOME`, logged stderr, exit codes, clean stdout, timeouts, env files |
+| [Scripts and the managed checkout](guides/shared-checkout-git.md#scripts-and-the-managed-checkout) | Write through gbrain, scheduled `sources refresh`, history rewrites, gitignored paths |
+| [Cron via Minions](../skills/conventions/cron-via-minions.md) | Why scheduled work runs as Minion jobs, not `agentTurn`. Built-in handlers are rewritten by the `v0_11_0` migration orchestrator (`gbrain apply-migrations`); host-specific handlers use the plugin contract below. |
 | [Plugin Handlers](guides/plugin-handlers.md) | Registering host-specific Minion handlers via code (no data-file exec surface). |
-| [Minions fix](guides/minions-fix.md) | Repairing a half-migrated v0.11.0 install. |
-| [Shell jobs (v0.14.0+)](guides/minions-shell-jobs.md) | Move deterministic crons (API fetch, token refresh, scrape+write) off the LLM gateway. Zero tokens per fire, ~60% gateway headroom. Follow `skills/migrations/v0.14.0.md` for the adoption playbook. |
+| [Minions fix](guides/minions-fix.md) | Repairing a half-migrated Minions install. |
+| [Shell jobs](guides/minions-shell-jobs.md) | Move deterministic crons (API fetch, token refresh, scrape+write) off the LLM gateway. Zero tokens per fire, ~60% gateway headroom. Follow `skills/migrations/v0.14.0.md` for the adoption playbook. |
 | [Quiet Hours & Timezone](guides/quiet-hours.md) | Hold notifications during sleep, timezone-aware delivery |
 | [Executive Assistant Pattern](guides/executive-assistant.md) | Email triage, meeting prep, scheduling |
 | [Operational Disciplines](guides/operational-disciplines.md) | Signal detection, brain-first, sync-after-write, heartbeat, dream cycle |
 | [Skill Development Cycle](guides/skill-development.md) | 5-step cycle: concept, prototype, evaluate, codify, cron |
 
-**Subagent routing (v0.11.0+):** agents that dispatch background work should route through
+**Subagent routing:** agents that dispatch background work should route through
 `skills/conventions/subagent-routing.md` — it reads `~/.gbrain/preferences.json#minion_mode`
-and branches between native subagents and Minion jobs. The v0.11.0 migration auto-injects
-a marker into AGENTS.md pointing at this convention.
+and branches between native subagents and Minion jobs. The `v0_11_0` migration orchestrator
+injects a marker into AGENTS.md pointing at this convention.
 
-**Cron routing (v0.11.0+):** scheduled work goes through Minions, not OpenClaw's `agentTurn`.
-See `skills/conventions/cron-via-minions.md` for the rewrite pattern. The v0.11.0 migration
-auto-rewrites entries whose handler is a gbrain builtin; host-specific handlers (e.g.
+**Cron routing:** scheduled work goes through Minions, not OpenClaw's `agentTurn`.
+See `skills/conventions/cron-via-minions.md` for the rewrite pattern. The `v0_11_0` migration
+orchestrator rewrites entries whose handler is a gbrain builtin; host-specific handlers (e.g.
 `ea-inbox-sweep`) need a code-level registration per `docs/guides/plugin-handlers.md`.
 
 ## Architecture
@@ -99,6 +102,7 @@ Keeping it running and up to date.
 
 | Guide | What It Covers |
 |-------|---------------|
+| [Agent Bootstrap](guides/bootstrap.md) | The paste-in install: `gbrain bootstrap`, hooks, `bootstrap verify`, keyless mode |
 | [Upgrades & Auto-Update](guides/upgrades-auto-update.md) | check-update, agent notifications, migration files |
 | [Live Sync](guides/live-sync.md) | Keep the index current: cron, --watch, webhook approaches |
 
@@ -109,7 +113,7 @@ data sources to populate it:
 
 | Guide | What It Covers |
 |-------|---------------|
-| [Cold Start](../skills/cold-start/SKILL.md) | Day-one bootstrapping: contacts, calendar, email, conversations, social, archives. Uses ClawVisor for safe credential handling — agents never hold raw API keys. |
+| [Cold Start](../skills/cold-start/SKILL.md) | Day-one bootstrapping: contacts, calendar, email, conversations, social, archives. Google data comes through gbrain's own connector (`gbrain google setup`), a Google Takeout export, or a credential gateway the host already has, so agents never hold raw OAuth tokens or API keys. |
 | [Ask User](../skills/ask-user/SKILL.md) | Choice-gate pattern for human input at decision points. Used by cold-start and other skills. |
 
 ---

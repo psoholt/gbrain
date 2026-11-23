@@ -16,6 +16,7 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import { BUILTIN_PATTERNS } from '../core/conversation-parser/builtins.ts';
+import { readConversationBodyForParsing } from '../core/conversation-parser/body.ts';
 import { parseConversation } from '../core/conversation-parser/parse.ts';
 import type { BrainEngine } from '../core/engine.ts';
 
@@ -162,7 +163,7 @@ async function runScan(
     );
     process.exit(2);
   }
-  const page = await engine.getPage(slug);
+  const page = await engine.getPage(slug); // gbrain-allow-unscoped-getpage: read-only scan CLI with no source parameter; first-match semantics documented
   if (!page) {
     process.stderr.write(
       `[conversation-parser scan] page not found: ${slug}\n`,
@@ -170,8 +171,7 @@ async function runScan(
     process.exit(2);
   }
 
-  // Concatenate compiled_truth + timeline (matches the real parser's body shape).
-  const body = `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`.trim();
+  const body = await readConversationBodyForParsing(engine, page);
 
   const result = parseConversation(body, { page, diagnostic: true });
 
@@ -187,6 +187,9 @@ async function runScan(
           message_count: result.messages.length,
           unmatched_line_count: result.unmatched_line_count,
           timezone_warning: result.timezone_warning,
+          // undefined on healthy pages → JSON.stringify drops the key (byte-identical).
+          date_fallback_count: result.date_fallback_count,
+          unrecognized_headings: result.unrecognized_headings,
           first_3_messages: result.messages.slice(0, 3).map((m) => ({
             speaker: m.speaker,
             timestamp: m.timestamp,
@@ -211,6 +214,12 @@ async function runScan(
         : '') +
       (result.timezone_warning
         ? `  timezone_warning: ${result.timezone_warning}\n`
+        : '') +
+      (result.date_fallback_count
+        ? `  date_fallbacks: ${result.date_fallback_count} — anchor date(s) could not be rebuilt (e.g. a localized month); those messages inherit the previous timestamp\n`
+        : '') +
+      (result.unrecognized_headings
+        ? `  unrecognized_headings: [${result.unrecognized_headings.join(', ')}] — folded into the previous turn; speaker attribution may be wrong (#4136)\n`
         : ''),
   );
   if (result.messages.length > 0) {

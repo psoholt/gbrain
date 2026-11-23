@@ -72,8 +72,10 @@ import { ensureWellFormed } from './text-safe.ts';
  *
  * This is the NUL-only primitive. For anything serialized into a `::jsonb` cast,
  * prefer `sanitizeForJsonb` below — NUL alone does not protect against the lone
- * surrogate that aborts a jsonb batch (#2011). Exported only as the building
- * block for `sanitizeForJsonb`; don't reach for it directly on a jsonb path.
+ * surrogate that aborts a jsonb batch (#2011). Exported as the building block
+ * for `sanitizeForJsonb`, and for the page write path, which removes U+0000
+ * alone and keeps every other character as written (persistence/page-input.ts,
+ * GST-3170); don't reach for it directly on any other jsonb path.
  */
 export const stripNul = (s: string): string => (s.includes('\0') ? s.replace(/\0/g, '') : s);
 
@@ -86,6 +88,18 @@ export const stripNul = (s: string): string => (s.includes('\0') ? s.replace(/\0
  * free-prose body columns, NEVER on identity/security fields (see NUL POLICY).
  */
 export const sanitizeForJsonb = (s: string): string => ensureWellFormed(stripNul(s));
+
+/**
+ * Null-safe free-prose sanitizer for plain TEXT / TEXT[] columns (title,
+ * compiled_truth, timeline, chunk_text). Same NUL + lone-surrogate cleanup as
+ * `sanitizeForJsonb` — a raw 0x00 in a page body otherwise aborts the INSERT
+ * with `invalid byte sequence for encoding "UTF8": 0x00` (Postgres text cannot
+ * store NUL), and a lone surrogate is likewise rejected. Passes null/undefined
+ * through unchanged so nullable columns keep their semantics. Same policy as
+ * sanitizeForJsonb: free-prose body only, NEVER identity/security fields.
+ */
+export const sanitizeText = <T extends string | null | undefined>(s: T): T =>
+  (typeof s === 'string' ? (sanitizeForJsonb(s) as T) : s);
 
 /** One links row, keys === the jsonb_to_recordset column list. */
 export interface LinkRow {
@@ -100,6 +114,7 @@ export interface LinkRow {
   to_source_id: string;
   origin_source_id: string;
   link_kind: string | null;
+  resolution_type: string | null;
 }
 
 /** One timeline row, keys === the jsonb_to_recordset column list. */
@@ -141,6 +156,7 @@ export function buildLinkRows(links: LinkBatchInput[]): LinkRow[] {
     to_source_id: l.to_source_id || 'default',
     origin_source_id: l.origin_source_id || 'default',
     link_kind: l.link_kind ?? null,
+    resolution_type: l.resolution_type ?? null,
   }));
 }
 
@@ -182,4 +198,34 @@ export function buildTakeRows(rowsIn: TakeBatchInput[]): { rows: TakeRow[]; weig
     };
   });
   return { rows, weightClamped };
+}
+
+/** Rows per encoded batch of a page-scale chunk write (A3). */
+export const ROW_BATCH_MAX_ROWS = 500;
+/** UTF-8 bytes per encoded batch, measured on the batch's own JSON document. */
+export const ROW_BATCH_MAX_BYTES = 16 * 1024 ** 2;
+
+/**
+ * Encode `items` as JSON array documents for `jsonb_to_recordset`, one batch at
+ * a time, each at most ROW_BATCH_MAX_ROWS rows and ROW_BATCH_MAX_BYTES bytes (a
+ * single larger row travels alone). Only the batch being built is held as
+ * JSON, so a page's statement size and staging memory stay bounded whatever
+ * the page size. `maxBytes` lowers the byte bound (segmented-page staging
+ * uses STAGE_BATCH_BYTES, 4 MiB on PGLite).
+ */
+export function* jsonRowBatches<T>(items: Iterable<T>, encode: (item: T) => unknown, maxBytes = ROW_BATCH_MAX_BYTES): Generator<string> {
+  let rows: string[] = [];
+  let bytes = 2;
+  for (const item of items) {
+    const row = JSON.stringify(encode(item));
+    const size = Buffer.byteLength(row) + 1;
+    if (rows.length > 0 && (rows.length === ROW_BATCH_MAX_ROWS || bytes + size > maxBytes)) {
+      yield `[${rows.join(',')}]`;
+      rows = [];
+      bytes = 2;
+    }
+    rows.push(row);
+    bytes += size;
+  }
+  if (rows.length > 0) yield `[${rows.join(',')}]`;
 }

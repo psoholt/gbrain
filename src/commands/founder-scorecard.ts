@@ -27,7 +27,7 @@
  *       ...
  *     ],
  *     red_flags: [
- *       { kind: 'regression',        metric, text },
+ *       { kind: 'regression',        metric, text },   // text: "<metric> fell N% (...)", or "rose N%" for a lower-is-better metric
  *       { kind: 'narrative_drift',                text },
  *       { kind: 'missed_prediction',              text },
  *     ],
@@ -125,7 +125,9 @@ export function computeFounderScorecard(args: {
     const latest = series[series.length - 1].value!;
     const prior = series[series.length - 2].value!;
     if (prior === 0) continue;
-    const delta = (latest - prior) / prior;
+    // abs() denominator, as in detectRegressions: a loss shrinking from -100000
+    // to -50000 is +50% (up), not -50%.
+    const delta = (latest - prior) / Math.abs(prior);
     const dir: 'up' | 'down' | 'flat' =
       Math.abs(delta) < 0.01 ? 'flat' : (delta > 0 ? 'up' : 'down');
     growth.push({ metric, direction: dir, latest_delta_pct: delta });
@@ -141,7 +143,7 @@ export function computeFounderScorecard(args: {
     redFlags.push({
       kind: 'regression',
       metric: r.metric,
-      text: `${r.metric} fell ${pct}% (${r.from_date} → ${r.to_date})`,
+      text: `${r.metric} ${r.delta_pct > 0 ? 'rose' : 'fell'} ${pct}% (${r.from_date} → ${r.to_date})`,
     });
   }
   if (drift_score !== null && drift_score >= driftRedFlag) {
@@ -207,6 +209,7 @@ Examples:
 `;
 
 function parseArgs(args: string[]): RunOpts | { help: true } | { error: string } {
+  if (args[0] === '--help' || args[0] === '-h') return { help: true };
   if (args[0] !== 'scorecard') {
     return { error: `Unknown founder subcommand: ${args[0] ?? '(none)'}. Did you mean "founder scorecard"?` };
   }
@@ -277,6 +280,7 @@ export async function runFounder(engine: BrainEngine, args: string[]): Promise<v
     const points: TrajectoryPoint[] = trajWire.points.map(p => ({
       fact_id: p.fact_id,
       valid_from: new Date(p.valid_from),
+      valid_until: null,
       metric: p.metric,
       value: p.value,
       unit: p.unit,
@@ -305,6 +309,8 @@ export async function runFounder(engine: BrainEngine, args: string[]): Promise<v
       kind: 'metric',
       since: windowSince,
       until: windowUntil,
+      // Fail-closed trust: local CLI must say so explicitly.
+      remote: false,
     });
     let takes: Take[] = [];
     try {

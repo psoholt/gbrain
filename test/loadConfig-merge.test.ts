@@ -5,16 +5,22 @@
 // actually flips the runtime gate even when the file plane is silent.
 
 import { describe, expect, test } from 'bun:test';
-import { loadConfigWithEngine, type GBrainConfig } from '../src/core/config.ts';
+import { loadConfigWithEngine, DB_MERGED_PROVIDER_KEY_FIELDS, type GBrainConfig } from '../src/core/config.ts';
+import { FILE_PLANE_API_KEYS } from '../src/commands/config.ts';
+import { adaptiveReturnFromConfig } from '../src/core/search/return-policy.ts';
 
 interface FakeEngine {
   getConfig(key: string): Promise<string | null | undefined>;
+  listConfigKeys?(prefix: string): Promise<string[]>;
 }
 
 function makeEngine(map: Record<string, string | null | undefined>): FakeEngine {
   return {
     async getConfig(key: string) {
       return map[key];
+    },
+    async listConfigKeys(prefix: string) {
+      return Object.keys(map).filter(key => key.startsWith(prefix));
     },
   };
 }
@@ -90,6 +96,31 @@ describe('loadConfigWithEngine (Phase 4 / F3)', () => {
     expect(merged?.embedding_multimodal).toBe(true);
     // DB fills in for ocr
     expect(merged?.embedding_image_ocr).toBe(true);
+  });
+
+  test('DB provider_base_urls.<provider> fills the gateway base URL map', async () => {
+    const base: GBrainConfig = { engine: 'pglite' };
+    const engine = makeEngine({
+      'provider_base_urls.llama-server-reranker': 'http://127.0.0.1:8091/v1',
+    });
+    const merged = await loadConfigWithEngine(engine, base);
+    expect(merged?.provider_base_urls?.['llama-server-reranker']).toBe('http://127.0.0.1:8091/v1');
+  });
+
+  test('provider_base_urls merge is per-provider: file value wins and DB fills siblings', async () => {
+    const base: GBrainConfig = {
+      engine: 'pglite',
+      provider_base_urls: {
+        'llama-server-reranker': 'http://file.example/v1',
+      },
+    };
+    const engine = makeEngine({
+      'provider_base_urls.llama-server-reranker': 'http://db.example/v1',
+      'provider_base_urls.openrouter': 'http://openrouter.example/v1',
+    });
+    const merged = await loadConfigWithEngine(engine, base);
+    expect(merged?.provider_base_urls?.['llama-server-reranker']).toBe('http://file.example/v1');
+    expect(merged?.provider_base_urls?.openrouter).toBe('http://openrouter.example/v1');
   });
 
   test('engine.getConfig throwing is non-fatal — file/env config still returned', async () => {
@@ -178,7 +209,7 @@ describe('loadConfigWithEngine (Phase 4 / F3)', () => {
   // dream.* — adding env shadows is a separate PR (out of scope for the
   // fix wave). These tests pin that contract.
   describe('dream.* DB-plane merge (v0.41.2.1)', () => {
-    test('DB value fills in for all 5 dream.synthesize.* keys when base unset', async () => {
+    test('DB value fills in for dream.synthesize.* keys when base unset', async () => {
       const base: GBrainConfig = { engine: 'pglite' };
       const engine = makeEngine({
         'dream.synthesize.session_corpus_dir': '/tmp/sessions',
@@ -186,6 +217,8 @@ describe('loadConfigWithEngine (Phase 4 / F3)', () => {
         'dream.synthesize.verdict_model': 'anthropic:claude-haiku-4-5',
         'dream.synthesize.max_prompt_tokens': '180000',
         'dream.synthesize.max_chunks_per_transcript': '32',
+        'dream.synthesize.subagent_timeout_ms': '600000',
+        'dream.synthesize.subagent_wait_timeout_ms': '900000',
       });
       const merged = await loadConfigWithEngine(engine, base);
       expect(merged?.dream?.synthesize?.session_corpus_dir).toBe('/tmp/sessions');
@@ -193,6 +226,8 @@ describe('loadConfigWithEngine (Phase 4 / F3)', () => {
       expect(merged?.dream?.synthesize?.verdict_model).toBe('anthropic:claude-haiku-4-5');
       expect(merged?.dream?.synthesize?.max_prompt_tokens).toBe(180000);
       expect(merged?.dream?.synthesize?.max_chunks_per_transcript).toBe(32);
+      expect(merged?.dream?.synthesize?.subagent_timeout_ms).toBe(600000);
+      expect(merged?.dream?.synthesize?.subagent_wait_timeout_ms).toBe(900000);
     });
 
     test('DB value fills in for both dream.patterns.* keys when base unset', async () => {
@@ -297,5 +332,384 @@ describe('loadConfigWithEngine (Phase 4 / F3)', () => {
       expect(merged?.dream).toBeUndefined();
       expect(merged?.engine).toBe('pglite');
     });
+  });
+
+  // #1475 — `eval.capture` and `eval.scrub_pii` are accepted by
+  // `gbrain config set` (KNOWN_CONFIG_KEYS) and read back by `gbrain config
+  // get` (which queries engine.getConfig directly), but had no DB-merge
+  // branch here. The runtime gate reads the MERGED config
+  // (isEvalCaptureEnabled(ctx.config) in operations.ts), so the write landed,
+  // read back as `true`, and changed nothing — capture stayed off unless
+  // GBRAIN_CONTRIBUTOR_MODE=1 was also exported.
+  describe('eval.* DB-plane merge (#1475)', () => {
+    test('DB eval.capture=true fills in when the file plane is silent', async () => {
+      const base: GBrainConfig = { engine: 'pglite' };
+      const engine = makeEngine({ 'eval.capture': 'true' });
+      const merged = await loadConfigWithEngine(engine, base);
+      expect(merged?.eval?.capture).toBe(true);
+    });
+
+    test('DB eval.capture=false fills in too — the opt-out has to reach the runtime as well', async () => {
+      const base: GBrainConfig = { engine: 'pglite' };
+      const engine = makeEngine({ 'eval.capture': 'false' });
+      const merged = await loadConfigWithEngine(engine, base);
+      expect(merged?.eval?.capture).toBe(false);
+    });
+
+    test('file plane wins over DB (precedence file > DB, same as every other key here)', async () => {
+      const base: GBrainConfig = { engine: 'pglite', eval: { capture: false } };
+      const engine = makeEngine({ 'eval.capture': 'true' });
+      const merged = await loadConfigWithEngine(engine, base);
+      expect(merged?.eval?.capture).toBe(false);
+    });
+
+    test('eval.scrub_pii merges independently of capture', async () => {
+      const base: GBrainConfig = { engine: 'pglite' };
+      const engine = makeEngine({ 'eval.scrub_pii': 'false' });
+      const merged = await loadConfigWithEngine(engine, base);
+      expect(merged?.eval?.scrub_pii).toBe(false);
+      expect(merged?.eval?.capture).toBeUndefined();
+    });
+
+    test('an unrecognised boolean is treated as unset, not as false', async () => {
+      // The privacy-relevant case. `config set` stores whatever it is handed,
+      // and the shared dbBool helper maps every non-empty non-'true' value to
+      // FALSE — so `gbrain config set eval.scrub_pii TRUE` would arrive here
+      // as "scrubbing off". Before this merge branch existed those values were
+      // inert; adopting the loose helper would newly activate that footgun.
+      for (const bad of ['TRUE', 'True', '1', 'yes', 'tru', 'off', ' true']) {
+        const merged = await loadConfigWithEngine(
+          makeEngine({ 'eval.scrub_pii': bad, 'eval.capture': bad }),
+          { engine: 'pglite' },
+        );
+        expect(merged?.eval, `"${bad}" must not produce an eval container`).toBeUndefined();
+      }
+      // Control: the two values that ARE recognised still come through, so the
+      // strictness above cannot be satisfied by ignoring the keys entirely.
+      const on = await loadConfigWithEngine(makeEngine({ 'eval.scrub_pii': 'true' }), { engine: 'pglite' });
+      expect(on?.eval?.scrub_pii).toBe(true);
+      const off = await loadConfigWithEngine(makeEngine({ 'eval.scrub_pii': 'false' }), { engine: 'pglite' });
+      expect(off?.eval?.scrub_pii).toBe(false);
+    });
+
+    test('no eval.* keys leaves cfg.eval undefined (no spurious container)', async () => {
+      const base: GBrainConfig = { engine: 'pglite' };
+      const merged = await loadConfigWithEngine(makeEngine({ embedding_multimodal: 'true' }), base);
+      expect(merged?.eval).toBeUndefined();
+    });
+
+    test('engine.getConfig throwing leaves eval.* unset (non-fatal)', async () => {
+      const base: GBrainConfig = { engine: 'pglite' };
+      const engine: FakeEngine = {
+        async getConfig() {
+          throw new Error('config table missing');
+        },
+      };
+      const merged = await loadConfigWithEngine(engine, base);
+      expect(merged?.eval).toBeUndefined();
+    });
+  });
+
+  // #2119-class read-side merge (also #2137/#4297): DB-plane values that
+  // `gbrain config set` accepted for years, `config get` echoed back, and
+  // NOTHING read. Provider credentials, chat/expansion model pins, the chat
+  // fallback chain, and flat cycle.* now sparse-merge with env > file > DB
+  // precedence. embedding_model/embedding_dimensions stay file-plane-only
+  // forever (#4287 plane-split safety).
+  describe('#2119 read-side: provider keys / models / chain / cycle.*', () => {
+    test('drift guard: every FILE_PLANE_API_KEYS credential participates in the DB read-side merge', () => {
+      // The write side routes these to ~/.gbrain/config.json; the read side
+      // must still honor a DB row for each (pre-routing writes, direct
+      // engine.setConfig, remote setups). A key added to one list but not
+      // the other reopens the silent-no-op class.
+      for (const key of FILE_PLANE_API_KEYS) {
+        expect(
+          (DB_MERGED_PROVIDER_KEY_FIELDS as readonly string[]).includes(key),
+          `${key} is file-plane-routed but missing from DB_MERGED_PROVIDER_KEY_FIELDS`,
+        ).toBe(true);
+      }
+    });
+
+    test('every provider key field fills from DB when file/env are silent', async () => {
+      const rows: Record<string, string> = {};
+      for (const field of DB_MERGED_PROVIDER_KEY_FIELDS) rows[field] = `db-${field}`;
+      const merged = await loadConfigWithEngine(makeEngine(rows), { engine: 'pglite' });
+      for (const field of DB_MERGED_PROVIDER_KEY_FIELDS) {
+        expect((merged as Record<string, unknown> | null)?.[field], field).toBe(`db-${field}`);
+      }
+    });
+
+    test('file plane wins over DB for credentials (env is folded into the base by loadConfig)', async () => {
+      const base: GBrainConfig = { engine: 'pglite', anthropic_api_key: 'sk-file' };
+      const merged = await loadConfigWithEngine(
+        makeEngine({ anthropic_api_key: 'sk-db', openai_api_key: 'sk-db-openai' }),
+        base,
+      );
+      expect(merged?.anthropic_api_key).toBe('sk-file');
+      // sibling with no file value still fills from DB
+      expect(merged?.openai_api_key).toBe('sk-db-openai');
+    });
+
+    test('chat_model / expansion_model fill from DB and respect file precedence', async () => {
+      const filled = await loadConfigWithEngine(
+        makeEngine({ chat_model: 'anthropic:claude-sonnet-4-6', expansion_model: 'anthropic:claude-haiku-4-5' }),
+        { engine: 'pglite' },
+      );
+      expect(filled?.chat_model).toBe('anthropic:claude-sonnet-4-6');
+      expect(filled?.expansion_model).toBe('anthropic:claude-haiku-4-5');
+
+      const filePinned = await loadConfigWithEngine(
+        makeEngine({ chat_model: 'openai:gpt-5' }),
+        { engine: 'pglite', chat_model: 'anthropic:claude-sonnet-4-6' },
+      );
+      expect(filePinned?.chat_model).toBe('anthropic:claude-sonnet-4-6');
+    });
+
+    test('empty/null DB strings never clobber (dbStr contract holds for the new fields)', async () => {
+      const merged = await loadConfigWithEngine(
+        makeEngine({ anthropic_api_key: '', chat_model: null, expansion_model: undefined }),
+        { engine: 'pglite' },
+      );
+      expect(merged?.anthropic_api_key).toBeUndefined();
+      expect(merged?.chat_model).toBeUndefined();
+      expect(merged?.expansion_model).toBeUndefined();
+    });
+
+    test('chat_fallback_chain: comma form parses like the env var', async () => {
+      const merged = await loadConfigWithEngine(
+        makeEngine({ chat_fallback_chain: ' anthropic:claude-sonnet-4-6 , openai:gpt-5 ,' }),
+        { engine: 'pglite' },
+      );
+      expect(merged?.chat_fallback_chain).toEqual(['anthropic:claude-sonnet-4-6', 'openai:gpt-5']);
+    });
+
+    test('chat_fallback_chain: JSON string-array form parses too', async () => {
+      const merged = await loadConfigWithEngine(
+        makeEngine({ chat_fallback_chain: '["anthropic:claude-sonnet-4-6","openai:gpt-5"]' }),
+        { engine: 'pglite' },
+      );
+      expect(merged?.chat_fallback_chain).toEqual(['anthropic:claude-sonnet-4-6', 'openai:gpt-5']);
+    });
+
+    test('chat_fallback_chain: malformed JSON / non-string-array / empty values stay unset', async () => {
+      for (const bad of ['[not json', '[1,2]', '[]', '', ' , ,']) {
+        const merged = await loadConfigWithEngine(
+          makeEngine({ chat_fallback_chain: bad }),
+          { engine: 'pglite' },
+        );
+        expect(merged?.chat_fallback_chain, `"${bad}" must not produce a chain`).toBeUndefined();
+      }
+    });
+
+    test('chat_fallback_chain: file plane wins over DB', async () => {
+      const merged = await loadConfigWithEngine(
+        makeEngine({ chat_fallback_chain: 'openai:gpt-5' }),
+        { engine: 'pglite', chat_fallback_chain: ['anthropic:claude-sonnet-4-6'] },
+      );
+      expect(merged?.chat_fallback_chain).toEqual(['anthropic:claude-sonnet-4-6']);
+    });
+
+    test('cycle.*: DB leaves land as a flat map keyed by the path under the prefix', async () => {
+      const merged = await loadConfigWithEngine(
+        makeEngine({
+          'cycle.extract_atoms.budget_usd': '0.55',
+          'cycle.skillopt.enabled': 'true',
+        }),
+        { engine: 'pglite' },
+      );
+      expect(merged?.cycle).toEqual({
+        'extract_atoms.budget_usd': '0.55',
+        'skillopt.enabled': 'true',
+      });
+    });
+
+    test('cycle.*: file plane wins per leaf; DB fills siblings', async () => {
+      const merged = await loadConfigWithEngine(
+        makeEngine({
+          'cycle.extract_atoms.budget_usd': '9.99',
+          'cycle.grade_takes.budget_usd': '0.10',
+        }),
+        { engine: 'pglite', cycle: { 'extract_atoms.budget_usd': '0.30' } },
+      );
+      expect(merged?.cycle?.['extract_atoms.budget_usd']).toBe('0.30');
+      expect(merged?.cycle?.['grade_takes.budget_usd']).toBe('0.10');
+    });
+
+    test('cycle.*: no keys → cfg.cycle stays undefined (no spurious container)', async () => {
+      const merged = await loadConfigWithEngine(makeEngine({}), { engine: 'pglite' });
+      expect(merged?.cycle).toBeUndefined();
+    });
+
+    test('cycle.*: engine without listConfigKeys degrades to no merge (older engine shims)', async () => {
+      const engine: FakeEngine = {
+        async getConfig() { return undefined; },
+        // no listConfigKeys
+      };
+      const merged = await loadConfigWithEngine(engine, { engine: 'pglite' });
+      expect(merged?.cycle).toBeUndefined();
+    });
+
+    test('NEVER merged: embedding_model / embedding_dimensions DB rows stay invisible (#4287 plane-split safety)', async () => {
+      // `config set` hard-refuses these keys, but a stale DB row from an old
+      // release (or a direct engine.setConfig) could still exist. Merging it
+      // would resurrect the split-brain footgun: initSchema sizes the vector
+      // column from file/env BEFORE this merge runs.
+      const merged = await loadConfigWithEngine(
+        makeEngine({
+          embedding_model: 'openai:text-embedding-3-small',
+          embedding_dimensions: '1536',
+          anthropic_api_key: 'sk-db', // control: merge itself ran
+        }),
+        { engine: 'pglite' },
+      );
+      expect(merged?.embedding_model).toBeUndefined();
+      expect(merged?.embedding_dimensions).toBeUndefined();
+      expect(merged?.anthropic_api_key).toBe('sk-db');
+    });
+
+    test('engine.getConfig throwing leaves all #2119 fields unset (non-fatal)', async () => {
+      const engine: FakeEngine = {
+        async getConfig() { throw new Error('config table missing'); },
+        async listConfigKeys() { throw new Error('config table missing'); },
+      };
+      const merged = await loadConfigWithEngine(engine, { engine: 'pglite' });
+      expect(merged?.anthropic_api_key).toBeUndefined();
+      expect(merged?.chat_model).toBeUndefined();
+      expect(merged?.chat_fallback_chain).toBeUndefined();
+      expect(merged?.cycle).toBeUndefined();
+    });
+  });
+
+  // #4702 — content_sanity.disabled_patterns is a REAL config key: without
+  // this DB-plane resolution, `gbrain config set content_sanity.disabled_patterns`
+  // wrote a row nothing ever read while every sibling knob resolved
+  // env > file > DB.
+  describe('#4702 content_sanity.disabled_patterns DB-plane resolution', () => {
+    test('comma-separated DB value resolves to a string array', async () => {
+      const engine = makeEngine({
+        'content_sanity.disabled_patterns': 'access_denied, error_title',
+      });
+      const merged = await loadConfigWithEngine(engine, { engine: 'pglite' });
+      expect(merged?.content_sanity?.disabled_patterns).toEqual(['access_denied', 'error_title']);
+    });
+
+    test('JSON-array DB value resolves to a string array', async () => {
+      const engine = makeEngine({
+        'content_sanity.disabled_patterns': '["access_denied"]',
+      });
+      const merged = await loadConfigWithEngine(engine, { engine: 'pglite' });
+      expect(merged?.content_sanity?.disabled_patterns).toEqual(['access_denied']);
+    });
+
+    test('file plane wins over the DB value (same precedence as sibling knobs)', async () => {
+      const base: GBrainConfig = {
+        engine: 'pglite',
+        content_sanity: { disabled_patterns: ['error_title'] },
+      };
+      const engine = makeEngine({
+        'content_sanity.disabled_patterns': 'access_denied',
+      });
+      const merged = await loadConfigWithEngine(engine, base);
+      expect(merged?.content_sanity?.disabled_patterns).toEqual(['error_title']);
+    });
+
+    // Ship-review gap: the DB-plane parser's lenient arms. A hand-typed value
+    // must still land (never throw, never silently disable the knob), and
+    // nothing that is not a string may ever be accepted as a pattern name.
+    test('malformed JSON falls back to the comma parse instead of throwing or dropping the value', async () => {
+      const engine = makeEngine({
+        'content_sanity.disabled_patterns': '[access_denied',
+      });
+      const merged = await loadConfigWithEngine(engine, { engine: 'pglite' });
+      // Pinned current behavior: the unparseable text is taken verbatim as one
+      // comma-separated entry (harmless — it matches no pattern id), rather
+      // than disabling the knob or crashing config load.
+      expect(merged?.content_sanity?.disabled_patterns).toEqual(['[access_denied']);
+    });
+
+    test('a JSON array keeps only its string elements (numbers / null are not pattern names)', async () => {
+      const engine = makeEngine({
+        'content_sanity.disabled_patterns': '["a", 1, null]',
+      });
+      const merged = await loadConfigWithEngine(engine, { engine: 'pglite' });
+      expect(merged?.content_sanity?.disabled_patterns).toEqual(['a']);
+    });
+
+    test('a JSON object element is never accepted as a pattern name', async () => {
+      const engine = makeEngine({
+        'content_sanity.disabled_patterns': '["access_denied", {"name": "error_title"}, ["error_title"]]',
+      });
+      const merged = await loadConfigWithEngine(engine, { engine: 'pglite' });
+      expect(merged?.content_sanity?.disabled_patterns).toEqual(['access_denied']);
+    });
+
+    test('an empty DB value is treated as unset (no disabled_patterns, no content_sanity container)', async () => {
+      const engine = makeEngine({
+        'content_sanity.disabled_patterns': '',
+      });
+      const merged = await loadConfigWithEngine(engine, { engine: 'pglite' });
+      expect(merged?.content_sanity?.disabled_patterns).toBeUndefined();
+      expect(merged?.content_sanity).toBeUndefined();
+    });
+
+    test('a whitespace-and-commas value resolves to an EMPTY list (set, but disables nothing)', async () => {
+      const engine = makeEngine({
+        'content_sanity.disabled_patterns': ' , ,',
+      });
+      const merged = await loadConfigWithEngine(engine, { engine: 'pglite' });
+      expect(merged?.content_sanity?.disabled_patterns).toEqual([]);
+    });
+  });
+});
+
+// #4605 — `search.adaptive_return*` are registered DB-plane keys (E5a) and the
+// 0.48.0.0 notes call them "now a real knob", but loadConfigWithEngine never
+// nested a search.* row, and hybrid.ts feeds adaptiveReturnFromConfig(cfg)
+// with THIS merged object — so `gbrain config set search.adaptive_return true`
+// was accepted, stored, echoed by `config get`, and never read. Same class and
+// same shape as the #1475 eval.* merge above (strict bool, file > DB, no
+// spurious container).
+describe('search.adaptive_return* DB-plane merge (#4605)', () => {
+  test('DB rows reach adaptiveReturnFromConfig', async () => {
+    const engine = makeEngine({
+      'search.adaptive_return': 'true',
+      'search.adaptive_return_entity_max': '1',
+      'search.adaptive_return_other_max': '7',
+      'search.adaptive_return_min_keep': '2',
+    });
+    const merged = await loadConfigWithEngine(engine, { engine: 'pglite' });
+    expect(adaptiveReturnFromConfig(merged as Record<string, unknown> | null)).toEqual({
+      enabled: true,
+      entityMax: 1,
+      otherMax: 7,
+      minKeep: 2,
+    });
+  });
+
+  test('false reaches the runtime too (explicit opt-out), and the caps merge independently', async () => {
+    const merged = await loadConfigWithEngine(
+      makeEngine({ 'search.adaptive_return': 'false', 'search.adaptive_return_entity_max': '3' }),
+      { engine: 'pglite' },
+    );
+    expect(merged?.search).toEqual({ adaptive_return: false, adaptive_return_entity_max: 3 });
+  });
+
+  test('file plane wins over DB', async () => {
+    const base: GBrainConfig = { engine: 'pglite', search: { adaptive_return: false, adaptive_return_entity_max: 9 } };
+    const merged = await loadConfigWithEngine(
+      makeEngine({ 'search.adaptive_return': 'true', 'search.adaptive_return_entity_max': '1' }),
+      base,
+    );
+    expect(merged?.search).toEqual({ adaptive_return: false, adaptive_return_entity_max: 9 });
+  });
+
+  test('unrecognised bool / non-numeric cap are treated as unset; no keys → no container', async () => {
+    const junk = await loadConfigWithEngine(
+      makeEngine({ 'search.adaptive_return': 'TRUE', 'search.adaptive_return_other_max': 'lots' }),
+      { engine: 'pglite' },
+    );
+    expect(junk?.search).toBeUndefined();
+    const none = await loadConfigWithEngine(makeEngine({ embedding_multimodal: 'true' }), { engine: 'pglite' });
+    expect(none?.search).toBeUndefined();
   });
 });

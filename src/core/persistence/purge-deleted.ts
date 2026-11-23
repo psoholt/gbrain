@@ -1,0 +1,603 @@
+import { randomUUID } from 'node:crypto';
+import type { BrainEngine } from '../engine.ts';
+import { assertPurgeAge } from '../engine-errors.ts';
+import { loadConfig } from '../config.ts';
+import type { OperationContext } from '../ops/contract.ts';
+import { requireConsent, type ConsentRequest } from '../consent.ts';
+import { managedPersistenceEnabled } from './ownership.ts';
+import { requestPrincipalForContext, submitPageMutation } from './page-mutations.ts';
+import { readOutstandingRoom } from './journal.ts';
+import { isWriteCapacityWait } from './admission-retry.ts';
+import { readBackgroundPauseShare, resolveAdmissionOrigin } from './admission-origin.ts';
+import { withBeliefBatch } from '../belief/ledger.ts';
+import { markBeliefCommits } from '../belief/append.ts';
+import { linkStreamSlugs, redactExpiredPageJournal } from './page-purge.ts';
+import { identityDowngradePurgeHold } from '../sync-identity-downgrades.ts';
+import { atomRetirementPurgeHold } from './atom-retirement-hold.ts';
+import { derivedRetirementPurgeHold } from './derived-retirement-hold.ts';
+import { faultPoint } from './fault-points.ts';
+import { clearDerivedOriginParks, DERIVED_ORIGIN_PARKED_CODE, derivedOriginPurgeHold, pruneOwedPurges, readDerivedOriginParks, readOwedPurges, recordOwedPurge, releaseStaleHolds, type DerivedOriginPark } from './derived-origin-hold.ts';
+import type { CarryForecast } from '../repair/origin-carry.ts';
+import { writerOnboardingPreflight } from './onboarding.ts';
+import { clearPurgePark, isParked, notePurgeSourceWriter, PURGE_PARK_LIMIT, purgeParkKey, prunePurgeParks, readPurgeParks, recordPurgeFailure, type PurgePark } from './purge-parks.ts';
+import { ItemRun, type ItemFailure } from '../item-failure.ts';
+import { readUnreviewedSyncTombstones, syncDeleteHeld } from './sync-delete-tombstones.ts';
+
+/**
+ * #9653: concept tombstones the automatic purges keep, whatever their age: a concept hidden only because one of its
+ * inputs was purged, whose needs_rederive mark is still open (hideDerivedRows keeps `marked_at` equal to the
+ * `deleted_at` it set). A concept a person or a sync deleted has no such mark and expires on time; the consented and
+ * explicit purges remove a kept one.
+ */
+async function readRederiveHeldConcepts(engine: Pick<BrainEngine, 'executeRaw'>): Promise<number[]> {
+  const rows = await engine.executeRaw<{ id: number | string }>(`SELECT p.id FROM pages p WHERE p.deleted_at IS NOT NULL AND p.type = 'concept'
+    AND EXISTS (SELECT 1 FROM needs_rederive n WHERE n.derived_table = 'pages' AND n.derived_id = p.id::text AND n.marked_at = p.deleted_at)`);
+  return rows.map(row => Number(row.id));
+}
+
+/**
+ * #9653: the preview lines for the concepts an input purge hid: how many the next concept synthesis rebuilds, and one
+ * line per concept it keeps hidden with the reason (concept-rebuild.ts). `removes` (an explicit purge) says it purges
+ * the expired ones instead.
+ */
+export function rebuildNote(rebuild: PurgeSelection['rebuild'], removes = false): string {
+  if (!rebuild.held.length) return '';
+  const kept = new Set(rebuild.kept.map(k => `${k.source_id}/${k.slug}`));
+  const next = rebuild.held.filter(c => !kept.has(`${c.source_id}/${c.slug}`));
+  return [`${rebuild.held.length} concept(s) hidden by an input purge are kept out of the automatic purge.`,
+    ...(next.length ? [`${next.length} of them are rebuilt by the next concept synthesis that still finds at least two members for them (one with fewer stays hidden until an explicit purge): ${next.slice(0, 20).map(c => `${c.source_id}/${c.slug}`).join(', ')}${next.length > 20 ? ` and ${next.length - 20} more` : ''}.`] : []),
+    ...rebuild.kept.slice(0, 20).map(keptReason), ...(rebuild.kept.length > 20 ? [`...and ${rebuild.kept.length - 20} more kept hidden`] : []),
+    ...(removes ? ['This purge removes any of them listed above instead.'] : [])].join('\n');
+}
+
+import { scrubPurgedSlugs } from '../feedback/store.ts';
+import { keptReason, readHeldConcepts, type RebuildKept } from './concept-rebuild.ts';
+import { scrubPurgedNameStores } from './purge-name-stores.ts';
+import { pageSecretOccurrences, scrubPurgedSlugHolds, scrubPurgedSlugStores } from './purge-slug-stores.ts';
+import { expireGonePageFacts } from '../facts/gone-page-facts.ts';
+import { declarePersistenceProtocol } from './protocol.ts';
+import { maintenanceTransaction } from './attribution.ts';
+import { maintenancePublishWaitMs } from './maintenance-wait.ts';
+import { DreamWriteDeferralPass, pendingRequestId, writeStatusCommand, DREAM_WRITE_DEFERRED_CODE } from '../cycle/dream-write-deferral.ts';
+
+/** A tombstone that moved under a concurrent writer; the next run retries it. */
+const DEFERRAL_CODES = new Set(['revision_conflict', 'page_not_found', 'page_identity_changed']);
+
+/** #9742: a purge accepted and still pending after its publish wait commits on its own later; it is not a failure. */
+const pendingPurgeReason = (requestId: string) =>
+  `Accepted and still pending after the publish wait (request_id ${requestId}); it commits on its own, so it is not a failure (${writeStatusCommand(requestId)}).`;
+
+export interface DeletedPagePurge {
+  slugs: string[];
+  count: number;
+  /** Every expired tombstone not purged this run, with its reason. On an unmanaged brain: the belief-ledger expiry's failed and parked tombstones. */
+  blocked: Array<{ source_id: string; slug: string; reason: string; code: string | null; binding_state?: string }>;
+  /**
+   * Tombstones restored, changed or removed by a concurrent writer; retried next run. On a manual run with
+   * dream.write_deferral.enabled=false, also each purge accepted and still pending (in `blocked`, code `write_pending`, with its request id).
+   */
+  deferred: number;
+  /** Operational failures (owner, binding, storage, protocol); on an unmanaged brain, recorded tombstones whose delete failed (retried next run). */
+  failed: number;
+  /** #6741 C: tombstones not submitted because their source's writer is not active (in `blocked`, code `writer_not_active`). */
+  inactive: number;
+  /** #6741 C: tombstones not submitted after PURGE_PARK_LIMIT failures (in `blocked`, code `purge_parked`); doctor purge_parked_pages names them. */
+  parked: number;
+  /**
+   * #6884: tombstones not submitted because the writer's outstanding-request capacity was in use (in `blocked`, code
+   * `write_capacity_deferred`); the next run submits them. Never a failure and never a park.
+   */
+  capacity_deferred: number;
+  /** #7130: managed sync tombstones with no live twin an automatic purge kept (in `blocked`, code `sync_delete_unreviewed`). */
+  held: number;
+  /**
+   * W3 (#7587), manual runs too since #9742. Tombstones not purged because an accepted purge of their source was still
+   * pending after its wait (in `blocked`, code `dream_write_deferred`); never a failure. `deferral` names the receipts.
+   */
+  write_deferred?: number;
+  deferral?: DreamWriteDeferralPass;
+  /**
+   * GST-2689: expired origins kept because a page derived from them could not be labelled private before the row went
+   * (in `blocked`, code `derived_origin_parked`); doctor derived_origin_parked names each with the page that blocks it.
+   */
+  origin_parked?: number;
+  /** Present when `failed > 0`, so the caller cannot report success. */
+  error?: { class: string; code: string; message: string };
+}
+
+/**
+ * D6 (#6114): the one consent request for a manual hard purge, used by
+ * `gbrain pages purge-deleted` and by the `purge_deleted_pages` op (reached
+ * through `gbrain call`), so no manual entry point purges without it. The
+ * approved command is always the gated `pages purge-deleted --yes`. The
+ * autopilot purge phase calls `purgeDeletedPagesCoordinated` directly, with `automatic` (#7130).
+ */
+export function purgeConsentRequest(count: number, olderThanHours: number, json: boolean, args: readonly string[], retryParked = false, parked = 0, syncUnreviewed = 0): ConsentRequest {
+  const retry = retryParked ? ['--retry-parked'] : [];
+  const retried = retryParked && parked > 0 ? `, including ${parked} parked page(s) retried once more` : '';
+  const sync = syncUnreviewed > 0 ? `; ${syncUnreviewed} of them were deleted by a managed sync, not a person, and no live page has their content` : '';
+  return {
+    command: 'pages purge-deleted', effects: ['destructive'], actor: 'agent',
+    what: `Permanently purge ${count} soft-deleted page(s)${retried}${sync}`,
+    why: 'A hard purge removes soft-deleted pages, their chunks and links, from every source of this brain.',
+    risk: 'Purged pages cannot be restored with `gbrain restore`; they can only come back from a backup.',
+    user_message: `Permanently delete ${count} page(s) soft-deleted more than ${olderThanHours}h ago${retried}, across every source in this brain${sync}? They cannot be restored afterwards; only a backup brings them back.`,
+    argv: ['gbrain', 'pages', 'purge-deleted', '--older-than', `${olderThanHours}h`, ...retry, ...(json ? ['--json'] : []), '--yes'],
+    preview_argv: ['gbrain', 'pages', 'purge-deleted', '--older-than', `${olderThanHours}h`, ...retry, '--dry-run', '--json'],
+    args,
+  };
+}
+
+/** The `purge_deleted_pages` op (`gbrain call`): the D6 consent first (`yes` is `--yes`); an empty purge set needs none. */
+export async function consentedPurgeDeletedPages(engine: BrainEngine, olderThanHours: number, yes: boolean) {
+  const forecast = await (await import('../repair/origin-carry.ts')).forecastCarry(engine, olderThanHours);
+  const preview = await selectPurgeCandidates(engine, olderThanHours, { forecast });
+  if (preview.count === 0) return { status: 'purged', count: 0, slugs: [] };
+  await requireConsent(purgeConsentRequest(preview.count, olderThanHours, false, yes ? ['--yes'] : [], false, 0, preview.sync_unreviewed));
+  const result = await purgeDeletedPagesCoordinated(engine, olderThanHours, { release: forecast.release.map(origin => origin.id), only: notHeld(forecast) });
+  return { status: result.failed ? 'partial' : 'purged', count: result.count, slugs: result.slugs, ...(result.blocked.length ? { blocked: result.blocked } : {}) };
+}
+
+/** GST-2689: the run purges no origin its preview left out as held, even when the blocker clears in between. */
+export function notHeld(forecast: CarryForecast): PurgeFilter {
+  const held = new Set(forecast.hold.map(origin => `${origin.source_id}/${origin.slug}`));
+  return page => !held.has(`${page.source_id}/${page.slug}`);
+}
+
+/** An expired tombstone of a source the belief ledger records (unmanaged brain), in scan order, with its live failure record. */
+interface RecordedTombstone { id: number; source_id: string; slug: string; deleted_us: string; key: string; park?: PurgePark }
+
+async function recordedTombstones(engine: BrainEngine, hours: string, released: readonly number[] = []): Promise<RecordedTombstone[]> {
+  const rows = await engine.executeRaw<{ id: number; source_id: string; slug: string; deleted_us: string }>(`SELECT p.id, p.source_id, p.slug,
+      floor(extract(epoch FROM p.deleted_at)*1000000)::bigint::text AS deleted_us FROM pages p
+    WHERE p.deleted_at IS NOT NULL AND p.deleted_at < now() - ($1 || ' hours')::interval AND ${identityDowngradePurgeHold('p')} AND ${atomRetirementPurgeHold('p')} AND ${derivedRetirementPurgeHold('p')} AND (${derivedOriginPurgeHold('p')} OR p.id = ANY($2::int[]))
+      AND EXISTS (SELECT 1 FROM belief_events e WHERE e.source_id = p.source_id AND e.subject_kind = 'coverage')
+    ORDER BY p.deleted_at ASC, p.source_id ASC, p.slug ASC`, [hours, [...released]]);
+  const parks = rows.length ? await readPurgeParks(engine) : new Map<string, PurgePark>();
+  return rows.map(row => {
+    const key = purgeParkKey(row.source_id, row.slug, row.deleted_us);
+    const park = parks.get(key);
+    return { ...row, id: Number(row.id), key, ...(park ? { park } : {}) };
+  });
+}
+
+const parkedReason = (park: PurgePark) =>
+  `Parked after ${park.failures} failed purges (last: ${park.code ?? 'error'}: ${park.reason}); retry once with gbrain pages purge-deleted --retry-parked.`;
+
+interface RecordedExpiry { slugs: string[]; exclude: number[]; blocked: DeletedPagePurge['blocked']; failed: number; parked: number; reparked: DerivedOriginPark[] }
+
+/**
+ * W1 (BELIEF_LEDGER.md 6.5): on an unmanaged brain, each expired tombstone of a source the belief ledger records is
+ * removed under its page key inside a belief batch, which appends `page.expired` (retention, never a purge: no
+ * tombstone, nothing redacted) and a `link.retracted` for each link the delete cascades away, in its own stream. The bulk delete then takes the rest.
+ *
+ * GBRA-130 A-49: each tombstone is its own transaction and its own item. A failure stops the run only when it is
+ * run-scoped or ItemRun's breaker finds it systemic; otherwise the tombstone is reported and kept out of the bulk
+ * delete (`exclude`). A content failure counts toward the shared purge park (purge-parks.ts), so after
+ * PURGE_PARK_LIMIT failures it is parked and skipped, like the managed purge's; a transient one is retried next run.
+ */
+async function expireRecordedTombstones(engine: BrainEngine, olderThanHours: number, retryParked: boolean, held: ReadonlySet<number>, only?: PurgeFilter): Promise<RecordedExpiry> {
+  assertPurgeAge(olderThanHours);
+  const hours = String(Math.floor(olderThanHours));
+  const { parkUncarriedInPurge } = await import('../repair/origin-carry.ts');
+  await prunePurgeParks(engine);
+  const run = new ItemRun('purge.recorded_tombstones');
+  const out: RecordedExpiry = { slugs: [], exclude: [], blocked: [], failed: 0, parked: 0, reparked: [] };
+  const failures: Array<{ row: RecordedTombstone; failure: ItemFailure }> = [];
+  for (const row of await recordedTombstones(engine, hours)) {
+    if (held.has(row.id)) continue;
+    if (only && !only(row)) { out.exclude.push(row.id); continue; }
+    if (isParked(row.park) && !retryParked) {
+      out.parked++;
+      out.exclude.push(row.id);
+      out.blocked.push({ source_id: row.source_id, slug: row.slug, code: 'purge_parked', reason: parkedReason(row.park) });
+      continue;
+    }
+    try {
+      const publicationId = randomUUID(), report = { appended: 0 };
+      const deleted = await maintenanceTransaction(engine, async tx => {
+        await declarePersistenceProtocol(tx);
+        const slugs = [...new Set([row.slug, ...await linkStreamSlugs(tx, row.source_id, row.id)])].sort();
+        await tx.lockPageKeys(slugs.map(slug => ({ sourceId: row.source_id, slug })));
+        return withBeliefBatch(tx, { sourceId: row.source_id, slugs, publicationId, op: 'purge_deleted_pages', hardDeleteEvent: 'page.expired', report },
+          async () => {
+            out.reparked.push(...await parkUncarriedInPurge(tx, [row.id]));
+            const secrets = await pageSecretOccurrences(tx, [row.id]);
+            const gone = await tx.executeRaw<{ source_id: string; slug: string; deleted_at: string }>(`DELETE FROM pages WHERE id = $1 AND deleted_at IS NOT NULL AND deleted_at < now() - ($2 || ' hours')::interval AND ${identityDowngradePurgeHold('pages')} AND ${atomRetirementPurgeHold('pages')} AND ${derivedRetirementPurgeHold('pages')} AND ${derivedOriginPurgeHold('pages')} RETURNING source_id, slug, deleted_at::text AS deleted_at`,
+              [row.id, hours]);
+            await expireGonePageFacts(tx, gone);
+            if (gone.length > 0) {
+              await scrubPurgedSlugs(tx, row.source_id, [row.slug]);
+              await scrubPurgedNameStores(tx, row.source_id, [row.slug]);
+              await scrubPurgedSlugStores(tx, row.source_id, [row.slug], { secretOccurrences: secrets.map(o => o.id) });
+              await scrubPurgedSlugHolds(tx, row.source_id, [{ slug: row.slug, deletedAt: gone[0].deleted_at }]);
+              await redactExpiredPageJournal(tx, row.source_id, [row.slug]);
+            }
+            return gone.length > 0;
+          });
+      });
+      run.succeed();
+      if (report.appended) await markBeliefCommits(engine, [publicationId]).catch(() => undefined);
+      if (deleted) out.slugs.push(row.slug);
+      if (row.park) await clearPurgePark(engine, row.key);
+    } catch (error) {
+      const failure = run.fail(`${row.source_id}/${row.slug}`, error);
+      failures.push({ row, failure });
+      out.failed++;
+      out.exclude.push(row.id);
+      out.blocked.push({ source_id: row.source_id, slug: row.slug, code: failure.code,
+        reason: `${failure.message}; ${failure.class === 'content'
+          ? `parked after ${PURGE_PARK_LIMIT} failed purges (gbrain doctor: purge_parked_pages), then retried once with gbrain pages purge-deleted --retry-parked`
+          : 'retried on the next run'}` });
+    }
+  }
+  if (!run.systemic()) {
+    for (const { row, failure } of failures) {
+      if (failure.class === 'content') await recordPurgeFailure(engine, { source_id: row.source_id, slug: row.slug, deleted_us: row.deleted_us, code: failure.code, reason: failure.message });
+    }
+  }
+  return out;
+}
+
+/** One expired tombstone a managed purge submits, in scan order; `park` is its live failure record, if any. */
+export interface PurgeCandidate { source_id: string; slug: string; cutoff: string; deleted_us: string; key: string; park?: PurgePark; sync_unreviewed?: true }
+
+/**
+ * #6741 C: what a purge with these options would do, read-only. The one eligibility selector behind the
+ * `pages purge-deleted` dry-run preview, its consent request, the `purge_deleted_pages` op and the real purge (the
+ * CLI, the cycle phase and the Minion job), so the preview, the consent and the run cannot disagree. The
+ * `--older-than` cutoff, the #6729 rename-recovery hold (identityDowngradePurgeHold) and the #7013 restorable-atom hold
+ * (atomRetirementPurgeHold) apply to every page, parked
+ * or not, so `retryParked` retries only parked pages the cutoff selects and never a held page.
+ */
+export interface PurgeSelection {
+  managed: boolean;
+  count: number;
+  slugs: string[];
+  /** Unmanaged only: the engine's preview rows. */
+  pages?: Array<{ slug: string; source_id: string; deleted_at: Date }>;
+  candidates: PurgeCandidate[];
+  /** Tombstones not submitted: their source's writer needs recovery (`writer_not_active`) or they are parked (`purge_parked`). */
+  blocked: DeletedPagePurge['blocked'];
+  /** Every parked tombstone the cutoff selects; `retried` when `retryParked` puts it back among the candidates. */
+  parked: Array<{ source_id: string; slug: string; failures: number; code: string | null; retried: boolean }>;
+  inactive: number;
+  /** #7130 `automatic`: managed sync tombstones with no live twin kept out of the candidates (in `blocked`, code `sync_delete_unreviewed`). */
+  held: number;
+  /** #7130: how many candidates are managed sync tombstones with no live twin (the manual preview and consent name them). */
+  sync_unreviewed: number;
+  /** Per source in the scan: whether its writer passed the owner verification (the park rearm reads it). */
+  writers: Record<string, boolean>;
+  /** GST-2689: the candidates that are parked origins the run's carry releases first (`forecast.release`). */
+  released_origins: Array<{ source_id: string; slug: string }>;
+  /** #9653: the concepts an input purge hid, which an automatic purge keeps, and those the next synthesis will not rebuild, with why. */
+  rebuild: { held: Array<{ source_id: string; slug: string }>; kept: RebuildKept[] };
+}
+
+/**
+ * What keeps an expired tombstone of page `page` (source `source`) out of every managed purge: an archived source, or the
+ * rename-recovery, restorable-atom, derived-retirement or derived-origin hold; `released` (an SQL int[]) lifts the
+ * derived-origin hold for the parked origins a manual purge's preview counts as released.
+ */
+export function purgeHoldsSql(page: string, source: string, released?: string): string {
+  const origin = released ? `(${derivedOriginPurgeHold(page)} OR ${page}.id = ANY(${released}))` : derivedOriginPurgeHold(page);
+  return `NOT ${source}.archived AND ${identityDowngradePurgeHold(page)} AND ${atomRetirementPurgeHold(page)} AND ${derivedRetirementPurgeHold(page)} AND ${origin}`;
+}
+
+/**
+ * GST-2689 `forecast` (repair/origin-carry.ts forecastCarry; the consented manual purge's preview and consent): the
+ * selection the run makes once its carry has run, so it counts the parked origins the carry releases and leaves out the
+ * origins it parks; the run itself reads the parks as they are.
+ */
+export async function selectPurgeCandidates(engine: BrainEngine, olderThanHours: number, opts: { retryParked?: boolean; automatic?: boolean; forecast?: CarryForecast; model?: boolean } = {}): Promise<PurgeSelection> {
+  assertPurgeAge(olderThanHours);
+  const release = (opts.forecast?.release ?? []).map(origin => origin.id), hold = (opts.forecast?.hold ?? []).map(origin => origin.id);
+  if (!await managedPersistenceEnabled(engine)) {
+    const parked = (await recordedTombstones(engine, String(Math.floor(olderThanHours)), release))
+      .filter((row): row is RecordedTombstone & { park: PurgePark } => isParked(row.park));
+    const skipped = new Set(opts.retryParked ? [] : parked.map(row => row.id));
+    const unreviewed = (await readUnreviewedSyncTombstones(engine, olderThanHours)).filter(row => !skipped.has(row.id));
+    const kept = opts.automatic ? unreviewed : [];
+    const excludeIds = [...skipped, ...kept.map(row => row.id), ...hold, ...opts.automatic ? await readRederiveHeldConcepts(engine) : []];
+    const preview = await engine.purgeDeletedPages(olderThanHours, { dryRun: true, excludeIds });
+    // The engine's preview keeps every parked origin; the ones the run frees are read here under the purge's other holds.
+    const released = release.length ? (await engine.executeRaw<{ slug: string; source_id: string; deleted_at: Date | string }>(`SELECT p.slug, p.source_id, p.deleted_at FROM pages p
+      WHERE p.id = ANY($1::int[]) AND p.id <> ALL($2::int[]) AND p.deleted_at IS NOT NULL AND p.deleted_at < now() - ($3 || ' hours')::interval
+        AND ${identityDowngradePurgeHold('p')} AND ${atomRetirementPurgeHold('p')} AND ${derivedRetirementPurgeHold('p')}`,
+      [release, excludeIds, String(Math.max(0, Math.floor(olderThanHours)))])).map(row => ({ slug: row.slug, source_id: row.source_id, deleted_at: new Date(row.deleted_at) }))
+      .filter(row => !(preview.pages ?? []).some(page => page.source_id === row.source_id && page.slug === row.slug)) : [];
+    const pages = [...(preview.pages ?? []), ...released].sort((a, b) => a.deleted_at.getTime() - b.deleted_at.getTime() || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    const held = kept.filter(row => row.expired);
+    return { managed: false, count: pages.length, slugs: pages.map(page => page.slug), pages, candidates: [], released_origins: released.map(({ source_id, slug }) => ({ source_id, slug })),
+      blocked: [...(opts.retryParked ? [] : parked.map(row => ({ source_id: row.source_id, slug: row.slug, code: 'purge_parked', reason: parkedReason(row.park) }))),
+        ...held.map(row => syncDeleteHeld(row, olderThanHours))],
+      parked: parked.map(row => ({ source_id: row.source_id, slug: row.slug, failures: row.park.failures, code: row.park.code, retried: opts.retryParked === true })),
+      inactive: 0, held: held.length, sync_unreviewed: opts.automatic ? 0 : unreviewed.filter(row => row.expired).length, writers: {}, rebuild: await readHeldConcepts(engine, opts.model ?? true) };
+  }
+  const hours = Math.max(0, Math.floor(olderThanHours));
+  const rows = await engine.executeRaw<{ id: number | string; source_id: string; slug: string; cutoff: string; deleted_us: string }>(
+    `SELECT p.id, p.source_id, p.slug, (now() - ($1 || ' hours')::interval)::text AS cutoff,
+      floor(extract(epoch FROM p.deleted_at)*1000000)::bigint::text AS deleted_us FROM pages p JOIN sources s ON s.id = p.source_id
+      WHERE p.deleted_at IS NOT NULL AND p.deleted_at < now() - ($1 || ' hours')::interval AND ${purgeHoldsSql('p', 's', '$2::int[]')} AND p.id <> ALL($3::int[])
+      ORDER BY p.deleted_at ASC, p.source_id ASC, p.slug ASC`, [String(hours), release, hold]);
+  const states = new Map<string, { state: string; physical_error?: string }>();
+  if (rows.length) for (const source of (await writerOnboardingPreflight(engine)).sources) states.set(source.source_id, source);
+  const parks = rows.length ? await readPurgeParks(engine) : new Map<string, PurgePark>();
+  const unreviewed = new Set(rows.length ? (await readUnreviewedSyncTombstones(engine, hours)).map(row => row.id) : []);
+  const rederive = new Set(rows.length && opts.automatic ? await readRederiveHeldConcepts(engine) : []);
+  const selection: PurgeSelection = { managed: true, count: 0, slugs: [], candidates: [], blocked: [], parked: [], inactive: 0, held: 0, sync_unreviewed: 0, writers: {}, released_origins: [],
+    rebuild: await readHeldConcepts(engine, opts.model ?? true) };
+  for (const { id, ...row } of rows) {
+    const writer = states.get(row.source_id);
+    const active = writer?.state !== 'recovery_required';
+    selection.writers[row.source_id] = active;
+    if (!active) {
+      selection.inactive++;
+      selection.blocked.push({ source_id: row.source_id, slug: row.slug, code: 'writer_not_active', binding_state: writer!.state,
+        reason: `Source ${row.source_id}'s writer is ${writer!.state}${writer!.physical_error ? ` (${writer!.physical_error})` : ''}, so the purge submitted nothing; it resumes once gbrain sources writer status --source ${row.source_id} shows the writer ready.` });
+      continue;
+    }
+    if (rederive.has(Number(id))) continue;
+    const syncUnreviewed = unreviewed.has(Number(id));
+    if (syncUnreviewed && opts.automatic) {
+      selection.held++;
+      selection.blocked.push(syncDeleteHeld(row, hours));
+      continue;
+    }
+    const key = purgeParkKey(row.source_id, row.slug, row.deleted_us);
+    // A record marked while the writer was not active is dropped by this run (the rearm), so it does not count here.
+    const park = parks.get(key)?.inactive_seen ? undefined : parks.get(key);
+    if (isParked(park)) {
+      selection.parked.push({ source_id: row.source_id, slug: row.slug, failures: park.failures, code: park.code, retried: opts.retryParked === true });
+      if (!opts.retryParked) {
+        selection.blocked.push({ source_id: row.source_id, slug: row.slug, code: 'purge_parked', reason: parkedReason(park) });
+        continue;
+      }
+    }
+    if (syncUnreviewed) selection.sync_unreviewed++;
+    if (release.includes(Number(id))) selection.released_origins.push({ source_id: row.source_id, slug: row.slug });
+    selection.candidates.push({ ...row, key, ...(park ? { park } : {}), ...(syncUnreviewed ? { sync_unreviewed: true as const } : {}) });
+  }
+  selection.count = selection.candidates.length;
+  selection.slugs = selection.candidates.map(candidate => candidate.slug);
+  return selection;
+}
+
+/**
+ * #6741 C: the cycle purge phase's status: a coordinator failure fails it; a source in recovery, a parked page or a capacity deferral (#6884) warns,
+ * and so does an unmanaged recorded tombstone whose delete failed (GBRA-130 A-49: `failed` without `error`).
+ */
+export function purgePhaseStatus(result: DeletedPagePurge): 'ok' | 'warn' | 'fail' {
+  return result.error ? 'fail' : result.inactive || result.parked || result.capacity_deferred || result.failed || result.held || result.write_deferred || result.origin_parked ? 'warn' : 'ok';
+}
+
+/** The purge phase summary's note on the pages it did not submit (empty when there are none). */
+export function purgePhaseNote(result: DeletedPagePurge): string {
+  const parts = [result.inactive ? `${result.inactive} waiting on a writer in recovery` : '', !result.error && result.failed ? `${result.failed} failed (see details)` : '',
+    result.parked ? `${result.parked} parked (gbrain doctor: purge_parked_pages)` : '',
+    result.capacity_deferred ? `${result.capacity_deferred} deferred to the next run (write capacity in use)` : '',
+    result.held ? `${result.held} deleted by a managed sync held for review (gbrain pages purge-deleted --dry-run; purge with --yes or restore each)` : '',
+    result.write_deferred ? `${result.write_deferred} deferred: an accepted purge is still publishing (gbrain doctor: dream_write_deferred)` : '',
+    result.origin_parked ? `${result.origin_parked} kept: a page derived from each could not be labelled private (gbrain doctor: derived_origin_parked)` : ''].filter(Boolean);
+  return parts.length ? ` (${parts.join(', ')})` : '';
+}
+
+/**
+ * #5405: hard-delete tombstones older than the recovery window. An unmanaged
+ * brain keeps the engine's bulk delete. A managed brain refuses that bulk
+ * delete, so each expired tombstone is purged through the coordinator with the
+ * trusted-local `delete_page --purge` protocol, bound to the tombstone's
+ * revision. Pages in archived sources are left to the source-lifecycle purge.
+ * A tombstone that cannot be purged is reported, never forced.
+ *
+ * #6741 C: each attempt is a new permanent request id, so the selection
+ * (selectPurgeCandidates) submits nothing for a source whose writer needs
+ * recovery and skips a tombstone that failed PURGE_PARK_LIMIT times (parked,
+ * purge-parks.ts); `retryParked` (`gbrain pages purge-deleted --retry-parked`)
+ * gives each parked tombstone the cutoff selects one more attempt.
+ *
+ * #6884: the run submits only while the writer has outstanding-request room
+ * (at the background pause line for a background run), so a large backlog
+ * no longer turns into thousands of `queue_capacity` failures and parks
+ * ahead of interactive writes; the rest is `capacity_deferred` to the next run.
+ *
+ * #7130: `automatic` (the cycle purge phase and the `purge` job, which run without consent) keeps every tombstone a
+ * managed sync made unless a live page of its source has the same content (sync-delete-tombstones.ts); it is
+ * reported `held` (code `sync_delete_unreviewed`). The consented manual purge leaves `automatic` unset.
+ *
+ * GST-2689: every run first labels private the pages an expired origin is the only privacy of (repair/origin-carry.ts);
+ * an origin it could not carry is parked and kept by every path below (code `derived_origin_parked`).
+ */
+/** Limits a purge to pages the caller already showed the person (`gbrain maintain --purge --expect`). */
+export type PurgeFilter = (page: { source_id: string; slug: string }) => boolean;
+
+export async function purgeDeletedPagesCoordinated(engine: BrainEngine, olderThanHours: number, opts: { retryParked?: boolean; automatic?: boolean; only?: PurgeFilter; release?: readonly number[] } = {}): Promise<DeletedPagePurge> {
+  // Refuse an age that is not a finite number of hours, 0 or more, before the carry, the recorded-tombstone expiry or
+  // any other step runs: a negative or NaN age used to clamp to 0 there and hard-delete every recorded tombstone even
+  // though the engine purge itself refuses it (engine-errors.ts PurgeAgeError).
+  assertPurgeAge(olderThanHours);
+  const { release = [], ...purge } = opts;
+  // GST-2766: an owner purge a park held is recorded apart from the park, so the carry clearing the park never drops it.
+  await releaseStaleHolds(engine);
+  for (const park of await readDerivedOriginParks(engine)) if (park.held_request_id) await recordOwedPurge(engine, park.page_id, park.held_request_id);
+  await pruneOwedPurges(engine);
+  const owed = new Set((await readOwedPurges(engine)).map(record => record.page_id));
+  const carried = await (await import('../repair/origin-carry.ts')).carryPrivateBeforePurge(engine, olderThanHours);
+  const origins = originParked(carried.parks);
+  // GST-2689: a consented manual purge releases now the parked origins its preview counted, once their carry landed.
+  await clearDerivedOriginParks(engine, carried.unparked.filter(origin => release.includes(origin.id)).map(origin => origin.id));
+  await faultPoint('purge:after_carry');
+  const result = await purgeExpired(engine, olderThanHours, { ...purge, owed });
+  const reparked = new Set(result.blocked.filter(b => b.code === DERIVED_ORIGIN_PARKED_CODE).map(b => `${b.source_id}/${b.slug}`));
+  await clearDerivedOriginParks(engine, carried.unparked.filter(origin => !reparked.has(`${origin.source_id}/${origin.slug}`)).map(origin => origin.id));
+  const parked = origins.length + (result.origin_parked ?? 0);
+  return parked ? { ...result, blocked: [...origins, ...result.blocked], origin_parked: parked } : result;
+}
+
+function originParked(parks: DerivedOriginPark[]): DeletedPagePurge['blocked'] {
+  return parks.map(park => ({ source_id: park.source_id, slug: park.slug, code: DERIVED_ORIGIN_PARKED_CODE,
+    reason: `Kept: ${park.blocking_slug ?? 'a page derived from it'} is private only through this page and could not be labelled private (${park.code ?? 'error'}: ${park.reason}); `
+      + 'the next purge tries again once the cause is fixed (gbrain doctor: derived_origin_parked).' }));
+}
+
+/**
+ * GST-2766, a brain without managed persistence: each expired page an owner purge is owed for (held, then released), under
+ * the purge's other holds, goes through the coordinator as that explicit purge, so it writes the purge tombstones the
+ * bulk expiry does not. A failure is reported and retried by the next run.
+ */
+async function purgeOwedPages(engine: BrainEngine, config: OperationContext['config'], olderThanHours: number, ids: readonly number[], only?: PurgeFilter) {
+  const out = { slugs: [] as string[], blocked: [] as DeletedPagePurge['blocked'], failed: 0, reparked: [] as DerivedOriginPark[] };
+  if (!ids.length) return out;
+  const rows = await engine.executeRaw<{ id: number; source_id: string; slug: string }>(`SELECT p.id, p.source_id, p.slug FROM pages p WHERE p.id = ANY($1::int[])
+    AND p.deleted_at IS NOT NULL AND p.deleted_at < now() - ($2 || ' hours')::interval AND ${identityDowngradePurgeHold('p')} AND ${atomRetirementPurgeHold('p')}
+    AND ${derivedRetirementPurgeHold('p')} AND ${derivedOriginPurgeHold('p')} ORDER BY p.deleted_at, p.id`, [[...ids], String(Math.max(0, Math.floor(olderThanHours)))]);
+  for (const row of rows) {
+    if (only && !only(row)) continue;
+    try {
+      const ctx: OperationContext = { engine, config, remote: false, sourceId: row.source_id, dryRun: false, logger: { info() {}, warn() {}, error() {} } };
+      const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
+      if (!snapshot?.page.deleted_at) continue;
+      const purged = await submitPageMutation(ctx, { operation: 'delete_page', waitMs: maintenancePublishWaitMs(), params: { slug: row.slug, source_id: row.source_id,
+        purge: true, expected_revision: snapshot.revision, request_id: randomUUID() } });
+      if ((purged.purge_held as { code?: unknown } | undefined)?.code === DERIVED_ORIGIN_PARKED_CODE) {
+        out.reparked.push(...(await readDerivedOriginParks(engine)).filter(park => park.page_id === Number(row.id)));
+        continue;
+      }
+      if (purged.status === 'purged') out.slugs.push(row.slug);
+    } catch (error) {
+      const pending = pendingRequestId(error);
+      if (pending) {
+        out.blocked.push({ source_id: row.source_id, slug: row.slug, code: 'write_pending', reason: pendingPurgeReason(pending) });
+        continue;
+      }
+      out.failed++;
+      out.blocked.push({ source_id: row.source_id, slug: row.slug, code: typeof (error as { code?: unknown })?.code === 'string' ? (error as { code: string }).code : null,
+        reason: `${error instanceof Error ? error.message : String(error)}; retried on the next run` });
+    }
+  }
+  return out;
+}
+
+async function purgeExpired(engine: BrainEngine, olderThanHours: number, opts: { retryParked?: boolean; automatic?: boolean; only?: PurgeFilter; owed?: ReadonlySet<number> }): Promise<DeletedPagePurge> {
+  const { parkUncarriedInPurge } = await import('../repair/origin-carry.ts');
+  const config = loadConfig() ?? { engine: engine.kind };
+  if (!await managedPersistenceEnabled(engine)) {
+    // #7130: a brain deactivated after managed syncs keeps their tombstones' records and receipts, so the hold applies here too.
+    const kept = opts.automatic ? await readUnreviewedSyncTombstones(engine, olderThanHours) : [];
+    // GST-2766: a page an owner purge is owed for is left out of both expiries and purged as that purge, tombstones included.
+    const owed = [...opts.owed ?? []].filter(id => !kept.some(row => row.id === id));
+    const rederive = opts.automatic ? await readRederiveHeldConcepts(engine) : [];
+    const recorded = await expireRecordedTombstones(engine, olderThanHours, opts.retryParked === true, new Set([...kept.map(row => row.id), ...owed, ...rederive]), opts.only);
+    const exclude = [...recorded.exclude, ...kept.map(row => row.id), ...owed, ...rederive];
+    const reparked = [...recorded.reparked];
+    const result = await maintenanceTransaction(engine, async tx => {
+      await declarePersistenceProtocol(tx);
+      const unlisted = opts.only ? (await tx.executeRaw<{ id: number; source_id: string; slug: string }>(
+        `SELECT id, source_id, slug FROM pages WHERE deleted_at IS NOT NULL AND deleted_at < now() - ($1 || ' hours')::interval`,
+        [String(Math.max(0, Math.floor(olderThanHours)))])).filter(page => !opts.only!(page)).map(page => Number(page.id)) : [];
+      const excludeIds = [...exclude, ...unlisted];
+      const skip = new Set(excludeIds);
+      const expiring = await tx.executeRaw<{ id: number }>(`SELECT id FROM pages WHERE deleted_at IS NOT NULL AND deleted_at < now() - ($1 || ' hours')::interval`,
+        [String(Math.max(0, Math.floor(olderThanHours)))]);
+      // GST-2689: the recheck parks, in this transaction, each origin a page written after the carry still depends on; the delete's hold skips it.
+      reparked.push(...await parkUncarriedInPurge(tx, expiring.map(page => Number(page.id)).filter(id => !skip.has(id))));
+      const purged = await tx.purgeDeletedPages(olderThanHours, excludeIds.length ? { excludeIds } : undefined);
+      const bySource = new Map<string, string[]>();
+      for (const page of purged.pages ?? []) bySource.set(page.source_id, [...bySource.get(page.source_id) ?? [], page.slug]);
+      for (const [sourceId, slugs] of bySource) await redactExpiredPageJournal(tx, sourceId, slugs);
+      return purged;
+    });
+    const owner = await purgeOwedPages(engine, config, olderThanHours, owed, opts.only);
+    reparked.push(...owner.reparked);
+    const held = kept.filter(row => row.expired);
+    return { slugs: [...recorded.slugs, ...result.slugs, ...owner.slugs], count: recorded.slugs.length + result.count + owner.slugs.length,
+      blocked: [...originParked(reparked), ...recorded.blocked, ...owner.blocked, ...held.map(row => syncDeleteHeld(row, olderThanHours))],
+      deferred: 0, failed: recorded.failed + owner.failed, inactive: 0, parked: recorded.parked, capacity_deferred: 0, held: held.length, ...(reparked.length ? { origin_parked: reparked.length } : {}) };
+  }
+  // W3 (#7587): a run reconciles the purges an earlier run left pending before it selects or submits anything; #9742: a
+  // consented manual run defers a still-pending purge the same way instead of counting it failed.
+  const deferral = await DreamWriteDeferralPass.start(engine, 'purge', true);
+  const selection = await selectPurgeCandidates(engine, olderThanHours, opts);
+  for (const [sourceId, active] of Object.entries(selection.writers)) await notePurgeSourceWriter(engine, sourceId, active);
+  await prunePurgeParks(engine);
+  const slugs: string[] = [];
+  const blocked: DeletedPagePurge['blocked'] = [...selection.blocked];
+  let deferred = 0, failed = 0, capacityDeferred = 0;
+  const reparked: DerivedOriginPark[] = [];
+  const reconciledFailures = new Set<string>();
+  for (const entry of deferral?.reconcile.failed ?? []) {
+    const [source_id, ...rest] = entry.subject.split('/');
+    const slug = rest.join('/');
+    reconciledFailures.add(entry.subject);
+    const candidate = selection.candidates.find(row => row.source_id === source_id && row.slug === slug);
+    blocked.push({ source_id: source_id!, slug, code: entry.code, reason: `The purge an earlier run left pending (request_id ${entry.request_id}) ended with ${entry.code}: ${entry.message}` });
+    if (DEFERRAL_CODES.has(entry.code)) { deferred++; continue; }
+    failed++;
+    if (candidate) await recordPurgeFailure(engine, { source_id: candidate.source_id, slug: candidate.slug, deleted_us: candidate.deleted_us, code: entry.code, reason: entry.message });
+  }
+  const share = resolveAdmissionOrigin() === 'background' ? await readBackgroundPauseShare(engine) : 1;
+  let principal: Awaited<ReturnType<typeof requestPrincipalForContext>> | undefined;
+  for (const [index, row] of selection.candidates.entries()) {
+    const deferRest = (reason: string) => {
+      for (const rest of selection.candidates.slice(index)) blocked.push({ source_id: rest.source_id, slug: rest.slug, code: 'write_capacity_deferred', reason });
+      capacityDeferred = selection.candidates.length - index;
+    };
+    const held = deferral?.hold(row.source_id);
+    if (held) {
+      blocked.push({ source_id: row.source_id, slug: row.slug, code: DREAM_WRITE_DEFERRED_CODE,
+        reason: `Not submitted: an accepted purge in source ${row.source_id} (request_id ${held.request_id}) is still pending; the next run reconciles it first (${writeStatusCommand(held.request_id)}).` });
+      continue;
+    }
+    // Reported above with its receipt's failure; the next run re-validates and submits it again.
+    if (reconciledFailures.has(`${row.source_id}/${row.slug}`)) continue;
+    if (opts.only && !opts.only(row)) continue;
+    try {
+      const ctx: OperationContext = { engine, config, remote: false, sourceId: row.source_id, dryRun: false,
+        logger: { info() {}, warn() {}, error() {} } };
+      principal ??= await requestPrincipalForContext(ctx);
+      const room = await readOutstandingRoom(engine, principal, share);
+      if (room.room <= 0) {
+        deferRest(`Not submitted: ${room.used} ${room.scope} outstanding write requests are in use, and this run submits only below ${room.limit}${share < 1 ? ` (a background run stops at ${Math.round(share * 100)}% of the cap, persistence.capacity.background_pause_pct)` : ''}; the next run submits it.`);
+        break;
+      }
+      const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
+      if (!snapshot?.page.deleted_at) continue;
+      // Restored and deleted again since the scan: its recovery window restarted.
+      if (new Date(snapshot.page.deleted_at).getTime() >= new Date(row.cutoff).getTime()) { deferred++; continue; }
+      const purged = await submitPageMutation(ctx, { operation: 'delete_page', waitMs: maintenancePublishWaitMs(), params: { slug: row.slug, source_id: row.source_id,
+        purge: true, ...(opts.owed?.has(Number(snapshot.page.id)) ? {} : { retention: true }), expected_revision: snapshot.revision, request_id: randomUUID() } });
+      if ((purged.purge_held as { code?: unknown } | undefined)?.code === DERIVED_ORIGIN_PARKED_CODE) {
+        reparked.push(...await readDerivedOriginParks(engine).then(parks => parks.filter(park => park.page_id === Number(snapshot.page.id))));
+        continue;
+      }
+      slugs.push(row.slug);
+      if (row.park) await clearPurgePark(engine, row.key);
+    } catch (error) {
+      if (isWriteCapacityWait(error)) { deferRest(`Not submitted: ${error.message}; the next run submits it.`); break; }
+      const entry = principal ? await deferral?.defer(error, { sourceId: row.source_id, subject: `${row.source_id}/${row.slug}`, principal }) : null;
+      if (entry) {
+        blocked.push({ source_id: row.source_id, slug: row.slug, code: DREAM_WRITE_DEFERRED_CODE,
+          reason: `Accepted and still pending after the publish wait (request_id ${entry.request_id}); the next run reconciles it before submitting more in this source (${writeStatusCommand(entry.request_id)}).` });
+        continue;
+      }
+      const pending = opts.automatic ? null : pendingRequestId(error);
+      if (pending) {
+        deferred++;
+        blocked.push({ source_id: row.source_id, slug: row.slug, code: 'write_pending', reason: pendingPurgeReason(pending) });
+        continue;
+      }
+      const code = typeof (error as { code?: unknown })?.code === 'string' ? (error as { code: string }).code : null;
+      const reason = error instanceof Error ? error.message : String(error);
+      if (code && DEFERRAL_CODES.has(code)) deferred++;
+      else { failed++; await recordPurgeFailure(engine, { source_id: row.source_id, slug: row.slug, deleted_us: row.deleted_us, code, reason }); }
+      blocked.push({ source_id: row.source_id, slug: row.slug, code, reason });
+    }
+  }
+  const failures = blocked.filter(b => !b.code || !DEFERRAL_CODES.has(b.code) && b.code !== 'writer_not_active' && b.code !== 'purge_parked' && b.code !== 'write_capacity_deferred' && b.code !== 'sync_delete_unreviewed' && b.code !== DREAM_WRITE_DEFERRED_CODE && b.code !== 'write_pending');
+  const error = failed > 0 ? { class: 'ManagedPurgeFailed', code: 'managed_purge_failed',
+    message: `${failed} expired page(s) could not be purged through the coordinator: ${failures.slice(0, 3)
+      .map(b => `${b.source_id}/${b.slug}: ${b.reason}`).join('; ')}` } : undefined;
+  const parked = selection.parked.filter(park => !park.retried).length;
+  return { slugs, count: slugs.length, blocked: [...originParked(reparked), ...blocked], deferred, failed, inactive: selection.inactive, parked, capacity_deferred: capacityDeferred, held: selection.held,
+    ...(reparked.length ? { origin_parked: reparked.length } : {}), ...(deferral ? { write_deferred: deferral.skipped, deferral } : {}), ...(error ? { error } : {}) };
+}

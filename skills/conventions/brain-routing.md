@@ -26,6 +26,10 @@ Bare `gbrain query "X"` routes to the default brain's default source. That
 is the right answer 90% of the time. Don't cross the boundary without a
 reason.
 
+A remote `not_found` or a short result may be a page whose `readable_by` or folder rule excludes
+this credential or the audience it acts for: check `whoami` (`access.applied`) before telling the user there are no notes.
+On a brain that serves several people (`gbrain access serves`), a connection bound to a member (`whoami` names it) already reads as the person asking; an unbound one is refused `requester_scope_required` (after a 14-day grace noticed in `_meta.access.requester_scope`): relay its fix to the user.
+
 ## When to switch brain
 
 Switch brain (`--brain <id>`) when:
@@ -58,7 +62,7 @@ Do NOT switch brain when:
 | 3 | `dotfile` | `.gbrain-source` file in CWD or any ancestor directory |
 | 4 | `local_path` | A registered source whose `local_path` contains CWD (longest prefix wins) |
 | 5 | `brain_default` | Brain-level `sources.default` config key (explicit user intent) |
-| 5.5 | `sole_non_default` | When tiers 1–5 missed AND exactly one registered source has a `local_path` AND isn't `'default'`, auto-route to it. Fires a one-time stderr nudge per CLI invocation. Suppress with `GBRAIN_NO_SOLE_NON_DEFAULT_NUDGE=1`. |
+| 5.5 | `sole_non_default` | When tiers 1–5 missed AND exactly one registered source has a `local_path` AND isn't `'default'` AND the `'default'` source holds no active pages (the emptiness guard: a non-empty `'default'` suppresses the flip — resolution falls through to `seed_default` with a one-line stderr notice naming both sides), auto-route to it. Fires a one-time stderr nudge per CLI invocation. Suppress both notices with `GBRAIN_NO_SOLE_NON_DEFAULT_NUDGE=1`. |
 | 6 | `seed_default` | Literal `'default'` (always exists post-migration v16) |
 
 **v0.41.13 tier 5.5 (`sole_non_default`):** added for single-source brains
@@ -71,7 +75,8 @@ still fall through to `seed_default` and require explicit `--source`.
 
 Placement AFTER `brain_default` is deliberate: a user who explicitly set
 `sources.default` via `gbrain sources default <id>` has stated intent that
-wins over the auto-route. Archived sources are excluded from the count.
+wins over the auto-route. Archived sources and the storage shelf (the `storage`
+source, which only the storage verbs write) are excluded from the count.
 
 **v0.37.7.0 tooling:**
 
@@ -84,7 +89,8 @@ wins over the auto-route. Archived sources are excluded from the count.
 CLI commands honoring this chain: `gbrain sync`, `gbrain import`,
 `gbrain search`, `gbrain extract` (via `--source-id <id>` since
 `--source` is the fs|db data-source axis), `gbrain graph-query`
-(via `--include-foreign` for cross-source traversal).
+(`--source` scopes the walk; `--include-foreign` widens it to every
+source).
 
 **Trust boundary (v0.34.1.0):** the resolver is CLI-layer only.
 Operations.ts handlers do NOT read `.gbrain-source` or

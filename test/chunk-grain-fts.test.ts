@@ -1,3 +1,4 @@
+import { installFixtureChunks } from './helpers/page-projection.ts';
 /**
  * v0.20.0 Cathedral II Layer 3 (1b) — chunk-grain FTS.
  *
@@ -20,6 +21,24 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { MIGRATIONS } from '../src/core/migrate.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
+
+// ONE engine for the whole file (was three describe-scoped engines = three
+// full PGLite boots for 11 tests). Each data-bearing describe resets state
+// in its own beforeAll and re-seeds — required, not just hygiene: the
+// 'refactor' corpus of the searchKeyword describe would otherwise pollute
+// the searchKeywordChunks describe's expectations.
+let engine: PGLiteEngine;
+
+beforeAll(async () => {
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+});
+
+afterAll(async () => {
+  await engine.disconnect();
+}, 30_000);
 
 describe('Cathedral II v28 migration — search_vector backfill', () => {
   test('v28 migration exists in registry', () => {
@@ -44,12 +63,8 @@ describe('Cathedral II v28 migration — search_vector backfill', () => {
 });
 
 describe('Cathedral II Layer 3 — searchKeyword external contract', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = new PGLiteEngine();
-    await engine.connect({});
-    await engine.initSchema();
+    await resetPgliteState(engine);
 
     // Two pages, each with multiple chunks that match "refactor" so we can
     // verify the dedup pass returns one chunk per page. upsertChunks fires
@@ -60,7 +75,7 @@ describe('Cathedral II Layer 3 — searchKeyword external contract', () => {
       compiled_truth: 'placeholder',
       timeline: '',
     });
-    await engine.upsertChunks('guides/refactor-large-fns', [
+    await installFixtureChunks(engine, 'guides/refactor-large-fns', [
       { chunk_index: 0, chunk_text: 'First, refactor the function into smaller units.', chunk_source: 'compiled_truth' },
       { chunk_index: 1, chunk_text: 'Then refactor further using extract-method patterns.', chunk_source: 'compiled_truth' },
     ]);
@@ -70,7 +85,7 @@ describe('Cathedral II Layer 3 — searchKeyword external contract', () => {
       compiled_truth: 'placeholder',
       timeline: '',
     });
-    await engine.upsertChunks('guides/refactor-patterns', [
+    await installFixtureChunks(engine, 'guides/refactor-patterns', [
       { chunk_index: 0, chunk_text: 'The strangler-fig refactor is the safest approach.', chunk_source: 'compiled_truth' },
       { chunk_index: 1, chunk_text: 'Refactor incrementally; never boil the ocean at once.', chunk_source: 'compiled_truth' },
     ]);
@@ -81,14 +96,10 @@ describe('Cathedral II Layer 3 — searchKeyword external contract', () => {
       compiled_truth: 'placeholder',
       timeline: '',
     });
-    await engine.upsertChunks('guides/unrelated', [
+    await installFixtureChunks(engine, 'guides/unrelated', [
       { chunk_index: 0, chunk_text: 'Ship to production on a Tuesday, never a Friday.', chunk_source: 'compiled_truth' },
     ]);
   });
-
-  afterAll(async () => {
-    await engine.disconnect();
-  }, 30_000);
 
   test('returns one row per matched page (dedup to best chunk per page)', async () => {
     const results = await engine.searchKeyword('refactor');
@@ -121,12 +132,8 @@ describe('Cathedral II Layer 3 — searchKeyword external contract', () => {
 });
 
 describe('Cathedral II Layer 3 — searchKeywordChunks (internal primitive)', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = new PGLiteEngine();
-    await engine.connect({});
-    await engine.initSchema();
+    await resetPgliteState(engine);
 
     // Page with multiple matching chunks so chunk-grain results can
     // return two chunks from the same page (no dedup).
@@ -136,16 +143,12 @@ describe('Cathedral II Layer 3 — searchKeywordChunks (internal primitive)', ()
       compiled_truth: 'placeholder',
       timeline: '',
     });
-    await engine.upsertChunks('guides/multi-chunk', [
+    await installFixtureChunks(engine, 'guides/multi-chunk', [
       { chunk_index: 0, chunk_text: 'refactor is a core engineering practice.', chunk_source: 'compiled_truth' },
       { chunk_index: 1, chunk_text: 'refactor safely using characterization tests.', chunk_source: 'compiled_truth' },
       { chunk_index: 2, chunk_text: 'refactor tools can automate common patterns.', chunk_source: 'compiled_truth' },
     ]);
   });
-
-  afterAll(async () => {
-    await engine.disconnect();
-  }, 30_000);
 
   test('does not dedup: can return multiple chunks from the same page', async () => {
     const results = await engine.searchKeywordChunks('refactor', { limit: 20 });
@@ -174,12 +177,8 @@ describe('Cathedral II Layer 3 — searchKeywordChunks (internal primitive)', ()
 });
 
 describe('Cathedral II Layer 3 — doc-comment weight precedence (A4 foundation)', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = new PGLiteEngine();
-    await engine.connect({});
-    await engine.initSchema();
+    await resetPgliteState(engine);
 
     // Two pages, each with one chunk. Alpha's chunk has the target term
     // 'hexagon' in its doc_comment (weight A); Beta's chunk has it in
@@ -191,7 +190,7 @@ describe('Cathedral II Layer 3 — doc-comment weight precedence (A4 foundation)
       compiled_truth: 'placeholder',
       timeline: '',
     });
-    await engine.upsertChunks('pages/alpha', [
+    await installFixtureChunks(engine, 'pages/alpha', [
       { chunk_index: 0, chunk_text: 'Some boilerplate text without the term.', chunk_source: 'compiled_truth' },
     ]);
     await engine.putPage('pages/beta', {
@@ -200,7 +199,7 @@ describe('Cathedral II Layer 3 — doc-comment weight precedence (A4 foundation)
       compiled_truth: 'placeholder',
       timeline: '',
     });
-    await engine.upsertChunks('pages/beta', [
+    await installFixtureChunks(engine, 'pages/beta', [
       { chunk_index: 0, chunk_text: 'The hexagon term appears only inside body text here.', chunk_source: 'compiled_truth' },
     ]);
 
@@ -216,10 +215,6 @@ describe('Cathedral II Layer 3 — doc-comment weight precedence (A4 foundation)
       ['pages/alpha'],
     );
   });
-
-  afterAll(async () => {
-    await engine.disconnect();
-  }, 30_000);
 
   test('doc-comment match outranks body-text match on the same term', async () => {
     const results = await engine.searchKeyword('hexagon');

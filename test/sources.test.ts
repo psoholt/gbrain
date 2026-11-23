@@ -6,7 +6,11 @@
  * shape, validation, and flag parsing.
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { mkdtempSync, mkdirSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { execFileSync } from 'child_process';
+import { join } from 'path';
 import { runSources } from '../src/commands/sources.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
@@ -31,6 +35,7 @@ function makeStub(rowsByPattern: Record<string, unknown[]> = {}): {
     for (const [pattern, rows] of Object.entries(rowsByPattern)) {
       if (sql.includes(pattern)) return rows as never;
     }
+    if (sql.includes('FROM persistence_brain')) return [{ enabled: false }] as never; // #6482: the strict mode reader needs one well-formed unmanaged row.
     return [] as never;
   };
 
@@ -42,7 +47,10 @@ function makeStub(rowsByPattern: Record<string, unknown[]> = {}): {
   const engine = {
     kind: 'pglite' as const,
     executeRaw,
+    // The strict mode reader is a typed method; it answers from the same fake rows as executeRaw.
+    readManagedModeRows: () => executeRaw('SELECT enabled FROM persistence_brain WHERE singleton=1'),
     setConfig,
+    transaction: async (fn: (tx: BrainEngine) => Promise<unknown>) => fn(engine),
     // Unused methods throw if called accidentally during these tests.
     getConfig: async () => null,
   } as unknown as BrainEngine;
@@ -91,7 +99,7 @@ describe('sources add', () => {
     await expect(runSources(engine, ['add', long, '--path', '/tmp/x'])).rejects.toThrow(/Invalid source id/);
   });
 
-  test('inserts a valid source with defaults (federated unset → isolated)', async () => {
+  test('inserts a valid source with defaults (a single-user brain federates it, GST-2732)', async () => {
     const { engine, calls } = makeStub({
       'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at': [{
         id: 'gstack',
@@ -109,7 +117,8 @@ describe('sources add', () => {
     expect(insert!.params[0]).toBe('gstack');
     expect(insert!.params[1]).toBe('gstack'); // name defaults to id
     expect(insert!.params[2]).toBe('/tmp/gstack');
-    expect(insert!.params[3]).toBe('{}'); // federated unset → empty config
+    // A shared brain keeps the old unset default: test/sources-add-default-search.test.ts.
+    expect(insert!.params[3]).toBe('{"federated":true}');
   });
 
   test('--federated sets config.federated = true', async () => {
@@ -158,6 +167,49 @@ describe('sources add', () => {
   });
 });
 
+// ── add — #2707 git-repo validation (CLI wiring) ───────────────
+//
+// Uses a REAL on-disk temp dir (unlike the fake-path tests above) so the
+// core addSource git check actually runs; the stub engine still fakes the
+// DB round-trip. Confirms --force parses through to opsAddSource.
+
+describe('sources add — #2707 --force flag wiring', () => {
+  let plainDir: string;
+
+  beforeEach(() => {
+    plainDir = mkdtempSync(join(tmpdir(), 'gbrain-sources-cli-2707-'));
+    // GST-2732: a folder outside any repository registers as plain; the refusal is for a repository with nothing committed.
+    execFileSync('git', ['-C', plainDir, 'init', '-q']);
+  });
+  afterEach(() => {
+    rmSync(plainDir, { recursive: true, force: true });
+  });
+
+  test('rejects a git repository with nothing committed by default', async () => {
+    const { engine } = makeStub();
+    await expect(runSources(engine, ['add', 'cli-plain', '--path', plainDir]))
+      .rejects.toThrow(/not a git repository/);
+  });
+
+  test('--force registers the same directory anyway', async () => {
+    const { engine, calls } = makeStub({
+      'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at': [{
+        id: 'cli-forced',
+        name: 'cli-forced',
+        local_path: plainDir,
+        last_commit: null,
+        last_sync_at: null,
+        config: '{}',
+        created_at: new Date(),
+      }],
+    });
+    await runSources(engine, ['add', 'cli-forced', '--path', plainDir, '--force']);
+    const insert = calls.find(c => c.sql.includes('INSERT INTO sources'));
+    expect(insert).toBeDefined();
+    expect(insert!.params[2]).toBe(plainDir);
+  });
+});
+
 // ── list ────────────────────────────────────────────────────
 
 describe('sources list', () => {
@@ -172,6 +224,51 @@ describe('sources list', () => {
     const select = calls.find(c => c.sql.includes('ORDER BY (id = \'default\') DESC'));
     expect(select).toBeDefined();
   });
+
+  test('counts only visible pages', async () => {
+    const { engine, calls } = makeStub({
+      'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at': [
+        { id: 'default', name: 'default', local_path: null, last_commit: null, last_sync_at: null, config: '{"federated":true}', created_at: new Date() },
+      ],
+      'COUNT(*)::int AS n FROM pages': [{ n: 1 }],
+    });
+
+    await runSources(engine, ['list']);
+
+    const count = calls.find(c => c.sql.includes('COUNT(*)::int AS n FROM pages'));
+    expect(count?.sql).toContain('deleted_at IS NULL');
+  });
+
+  test('distinguishes explicit false / absent key / explicit true in the human-readable label', async () => {
+    const { engine } = makeStub({
+      'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at': [
+        { id: 'wiki', name: 'wiki', local_path: '/tmp/wiki', last_commit: null, last_sync_at: null, config: '{"federated":true}', created_at: new Date() },
+        { id: 'yc-media', name: 'yc-media', local_path: '/tmp/yc', last_commit: null, last_sync_at: null, config: '{"federated":false}', created_at: new Date() },
+        { id: 'gstack', name: 'gstack', local_path: '/tmp/gstack', last_commit: null, last_sync_at: null, config: '{}', created_at: new Date() },
+      ],
+      'COUNT(*)::int AS n FROM pages': [{ n: 0 }],
+    });
+    const lines: string[] = [];
+    const logSpy = spyOn(console, 'log').mockImplementation((...a: unknown[]) => { lines.push(a.map(String).join(' ')); });
+    try {
+      await runSources(engine, ['list']);
+    } finally {
+      logSpy.mockRestore();
+    }
+    const wikiLine = lines.find(l => l.includes('wiki'))!;
+    const ycLine = lines.find(l => l.includes('yc-media'))!;
+    const gstackLine = lines.find(l => l.includes('gstack'))!;
+    // Explicit `federated: true` — unchanged.
+    expect(wikiLine).toContain('federated');
+    // Explicit `federated: false` (`sources unfederate`) — fully isolated.
+    expect(ycLine).toContain('isolated');
+    // Absent key (bare `sources add`, config={}) is NOT the same as explicit
+    // false: it doesn't appear in others' federated reads, but its own
+    // unqualified reads still widen outward (#1434/#2561/#2928). The label
+    // must say something other than "isolated", which overstates it.
+    expect(gstackLine).not.toContain('isolated');
+    expect(gstackLine).toContain('unset');
+  });
 });
 
 // ── remove ──────────────────────────────────────────────────
@@ -180,7 +277,7 @@ describe('sources remove', () => {
   test("refuses to remove the 'default' source", async () => {
     const { engine } = makeStub();
     const code = await withExitCapture(() => runSources(engine, ['remove', 'default', '--yes']));
-    expect(code).toBe(3);
+    expect(code).toBe(2); // agent contract v1 A3: invalid input exits 2 (3 is confirmation_required)
   });
 
   test('refuses without --yes', async () => {

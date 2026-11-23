@@ -28,17 +28,29 @@
  *      (excluding the OpenAI canonical fast-path recipe).
  */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import {
   configureGateway,
   resetGateway,
   embed,
   splitByTokenBudget,
+  capBatchItems,
   isTokenLimitError,
   __setEmbedTransportForTests,
   __getShrinkStateForTests,
 } from '../../src/core/ai/gateway.ts';
 import { AIConfigError, AITransientError } from '../../src/core/ai/errors.ts';
+import { __setTestRecipesForTests } from '../../src/core/ai/recipes/index.ts';
+import type { Recipe } from '../../src/core/ai/types.ts';
+
+// The last test in this file leaves the gateway configured with a remote
+// provider + fake key and a REAL embed transport. Without a final reset,
+// that config leaks into whichever test file the shard runs next — the
+// first downstream embed then makes a live HTTP call (broke master shard 6
+// when #3022's new test file reshuffled shard composition). The bunfig
+// legacy-embedding preload only re-applies its default when the gateway is
+// UNCONFIGURED, so a configured-but-stale slot survives file boundaries.
+afterAll(() => resetGateway());
 
 // --------- Test helpers ---------
 
@@ -81,6 +93,31 @@ function configureGoogle(): void {
     embedding_model: 'google:gemini-embedding-001',
     embedding_dimensions: 768,
     env: { GOOGLE_GENERATIVE_AI_API_KEY: 'fake' },
+  });
+}
+
+// A recipe that declares an embedding touchpoint but omits every batch cap.
+// Every shipped recipe now declares one (google gained max_batch_tokens), so
+// the startup warning is exercised against this synthetic cap-less recipe —
+// injected into the registry only for the duration of the test that needs it.
+const CAPLESS_RECIPE: Recipe = {
+  id: 'synthetic-capless',
+  name: 'Synthetic cap-less (test fixture)',
+  tier: 'openai-compat',
+  implementation: 'openai-compatible',
+  touchpoints: {
+    embedding: {
+      models: ['synthetic-embed-1'],
+      default_dims: 768,
+    },
+  },
+};
+
+function configureCapless(): void {
+  configureGateway({
+    embedding_model: 'synthetic-capless:synthetic-embed-1',
+    embedding_dimensions: 768,
+    env: {},
   });
 }
 
@@ -139,6 +176,41 @@ describe('splitByTokenBudget (pure helper)', () => {
     const texts = ['a'.repeat(40_000)];
     expect(splitByTokenBudget(texts, 96_000, 0)).toEqual(splitByTokenBudget(texts, 96_000, 4));
     expect(splitByTokenBudget(texts, 96_000, -1)).toEqual(splitByTokenBudget(texts, 96_000, 4));
+  });
+});
+
+describe('capBatchItems (hard COUNT cap helper)', () => {
+  test('batch at or under the cap is returned as a single batch (no copy of contents)', () => {
+    const texts = ['a', 'b', 'c'];
+    expect(capBatchItems(texts, 3)).toEqual([texts]);
+    expect(capBatchItems(texts, 10)).toEqual([texts]);
+  });
+
+  test('oversized batch splits into chunks of at most maxItems', () => {
+    const texts = Array.from({ length: 100 }, (_, i) => `t${i}`);
+    const result = capBatchItems(texts, 32);
+    expect(result.map(b => b.length)).toEqual([32, 32, 32, 4]);
+    expect(result.every(b => b.length <= 32)).toBe(true);
+  });
+
+  test('exact multiple splits evenly with no trailing empty batch', () => {
+    const texts = Array.from({ length: 64 }, (_, i) => `t${i}`);
+    expect(capBatchItems(texts, 32).map(b => b.length)).toEqual([32, 32]);
+  });
+
+  test('order is preserved across the split (concatenation round-trips)', () => {
+    const texts = Array.from({ length: 70 }, (_, i) => `t${i}`);
+    expect(capBatchItems(texts, 32).flat()).toEqual(texts);
+  });
+
+  test('maxItems <= 0 is a no-op (single batch) — never produces empty/infinite batches', () => {
+    const texts = ['a', 'b', 'c'];
+    expect(capBatchItems(texts, 0)).toEqual([texts]);
+    expect(capBatchItems(texts, -5)).toEqual([texts]);
+  });
+
+  test('empty input returns a single empty batch', () => {
+    expect(capBatchItems([], 32)).toEqual([[]]);
   });
 });
 
@@ -384,20 +456,22 @@ describe('startup warning for recipes missing max_batch_tokens', () => {
   beforeEach(() => resetGateway());
 
   test('configured missing-cap recipe warns once; unrelated recipes stay quiet', () => {
+    __setTestRecipesForTests([CAPLESS_RECIPE]);
     const warnings: string[] = [];
     const original = console.warn;
     console.warn = (msg: string) => warnings.push(String(msg));
     try {
       configureOpenAI();
       expect(warnings.length).toBe(0);
-      configureGoogle();
+      configureCapless();
       const firstCallCount = warnings.length;
-      // Reconfigure: the warning should NOT re-fire for the same recipes
+      // Reconfigure: the warning should NOT re-fire for the same recipe
       // within one process (we already told the operator).
-      configureGoogle();
+      configureCapless();
       expect(warnings.length).toBe(firstCallCount);
     } finally {
       console.warn = original;
+      __setTestRecipesForTests([]);
     }
 
     // The warning text should match the documented contract.
@@ -406,11 +480,12 @@ describe('startup warning for recipes missing max_batch_tokens', () => {
     );
     expect(contractMatch.length).toBe(1);
 
-    // Voyage declares max_batch_tokens → suppressed. OpenAI is the
-    // canonical fast-path recipe → also suppressed by id. Both must be
-    // absent from the warnings.
+    // Voyage + google declare max_batch_tokens → suppressed. OpenAI is the
+    // canonical fast-path recipe → also suppressed by id. Only the synthetic
+    // cap-less recipe warns.
     expect(warnings.find(w => w.includes('"voyage"'))).toBeUndefined();
     expect(warnings.find(w => w.includes('"openai"'))).toBeUndefined();
-    expect(warnings.find(w => w.includes('"google"'))).toBeDefined();
+    expect(warnings.find(w => w.includes('"google"'))).toBeUndefined();
+    expect(warnings.find(w => w.includes('"synthetic-capless"'))).toBeDefined();
   });
 });

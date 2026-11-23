@@ -7,10 +7,13 @@
 
 import { listRecipes, getRecipe } from '../core/ai/recipes/index.ts';
 import { configureGateway, embedOne, isAvailable as gwIsAvailable, chat as gwChat } from '../core/ai/gateway.ts';
+import { buildGatewayConfig } from '../core/ai/build-gateway-config.ts';
 import { probeOllama, probeLMStudio } from '../core/ai/probes.ts';
 import { loadConfig } from '../core/config.ts';
 import { AIConfigError, AITransientError } from '../core/ai/errors.ts';
+import { lookupEmbeddingPrice } from '../core/embedding-pricing.ts';
 import type { Recipe } from '../core/ai/types.ts';
+import { FAILED_EXIT_CODE } from '../core/exit-codes.ts';
 
 const SCHEMA_VERSION = 1;
 
@@ -29,25 +32,55 @@ interface ProviderOption {
   tier: 'native' | 'openai-compat';
   pros: string[];
   cons: string[];
+
 }
 
 function configureFromEnv(): void {
   const config = loadConfig();
-  configureGateway({
-    embedding_model: config?.embedding_model,
-    embedding_dimensions: config?.embedding_dimensions,
-    expansion_model: config?.expansion_model,
-    chat_model: config?.chat_model,
-    chat_fallback_chain: config?.chat_fallback_chain,
-    base_urls: config?.provider_base_urls,
-    env: { ...process.env },
-  });
+  if (config) {
+    configureGateway(buildGatewayConfig(config));
+    return;
+  }
+  configureGateway({ env: { ...process.env } });
 }
 
 export function envReady(recipe: Recipe, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (recipe.authPresent) return recipe.authPresent(env);
   const required = recipe.auth_env?.required ?? [];
   if (required.length === 0) return true; // e.g. local Ollama
   return required.every(k => !!env[k]);
+}
+
+export function formatEnvOutput(recipe: Recipe, env: NodeJS.ProcessEnv = process.env): string {
+  const lines: string[] = [];
+  lines.push(`${recipe.name} (${recipe.id})`);
+  lines.push('');
+  const required = recipe.auth_env?.required ?? [];
+  const optional = recipe.auth_env?.optional ?? [];
+  if (required.length > 0) {
+    lines.push('Required:');
+    for (const k of required) {
+      lines.push(`  ${k.padEnd(32)} ${env[k] ? '✓ set' : '✗ not set'}`);
+    }
+  } else {
+    lines.push('Required: (none)');
+  }
+  if (optional.length > 0) {
+    lines.push('');
+    lines.push('Optional:');
+    for (const k of optional) {
+      lines.push(`  ${k.padEnd(32)} ${env[k] ? '✓ set' : '✗ not set'}`);
+    }
+  }
+  if (recipe.auth_env?.setup_url) {
+    lines.push('');
+    lines.push(`Setup: ${recipe.auth_env.setup_url}`);
+  }
+  if (recipe.setup_hint) {
+    lines.push('');
+    lines.push(recipe.setup_hint);
+  }
+  return lines.join('\n');
 }
 
 /**
@@ -67,8 +100,8 @@ export function formatRecipeTable(recipes: Recipe[], env: NodeJS.ProcessEnv = pr
   // in test/providers.test.ts. Auto-widening keeps the contract — every row's
   // id is followed by at least one space — without per-recipe column tuning.
   const idCol = Math.max(14, ...recipes.map(r => r.id.length + 1));
-  const totalWidth = idCol + 18 + 8 + 8 + 8 + 16; // tier+embed+expand+chat+status
-  rows.push('PROVIDER'.padEnd(idCol) + 'TIER'.padEnd(18) + 'EMBED'.padEnd(8) + 'EXPAND'.padEnd(8) + 'CHAT'.padEnd(8) + 'STATUS');
+  const totalWidth = idCol + 18 + 8 + 8 + 8 + 8 + 8 + 16; // tier+embed+expand+chat+rerank+decide+status
+  rows.push('PROVIDER'.padEnd(idCol) + 'TIER'.padEnd(18) + 'EMBED'.padEnd(8) + 'EXPAND'.padEnd(8) + 'CHAT'.padEnd(8) + 'RERANK'.padEnd(8) + 'DECIDE'.padEnd(8) + 'STATUS');
   rows.push('-'.repeat(totalWidth));
   for (const r of recipes) {
     const hasEmbed = !!r.touchpoints.embedding && (r.touchpoints.embedding.models.length > 0);
@@ -82,6 +115,8 @@ export function formatRecipeTable(recipes: Recipe[], env: NodeJS.ProcessEnv = pr
       (hasEmbed ? 'yes' : '—').padEnd(8) +
       (hasExpand ? 'yes' : '—').padEnd(8) +
       (hasChat ? 'yes' : '—').padEnd(8) +
+      (r.touchpoints.reranker ? 'yes' : '—').padEnd(8) +
+      (r.touchpoints.decide ? 'yes' : '—').padEnd(8) +
       status,
     );
   }
@@ -129,14 +164,19 @@ EXAMPLES
   gbrain providers list
   gbrain providers test --model openai:text-embedding-3-large
   gbrain providers test --touchpoint chat --model anthropic:claude-haiku-4-5
-  gbrain providers test --touchpoint chat --model deepseek:deepseek-chat
+  gbrain providers test --touchpoint chat --model deepseek:deepseek-v4-flash
   gbrain providers env ollama
   gbrain providers explain --json
 `);
 }
 
 function runList(_args: string[]): void {
-  console.log(formatRecipeTable(listRecipes()));
+  // Same env the gateway actually sees (file-plane keys folded in), not bare
+  // process.env — keeps this table's STATUS column honest with what
+  // `providers test` (and the real init/gateway path) would report.
+  const cfg = loadConfig();
+  const env = cfg ? buildGatewayConfig(cfg).env : process.env;
+  console.log(formatRecipeTable(listRecipes(), env));
 }
 
 async function runTest(args: string[]): Promise<void> {
@@ -163,8 +203,18 @@ async function runTest(args: string[]): Promise<void> {
     // the divergence at the top of the test so the recovery experience
     // doesn't repeat the bug-reporter's "providers test ✓ but import still
     // broken" trap.
+    //
+    // #2863: `cfg` is lifted out of the try block (not just used for the
+    // warning) so the configureGateway calls below can reuse it. Before this
+    // fix, the --model override only forwarded embedding_model/chat_model +
+    // env, dropping config.provider_base_urls entirely — a probe against a
+    // custom endpoint (e.g. a regional DashScope base URL) would silently
+    // fall back to the recipe's hardcoded default endpoint and fail with a
+    // misleading "Incorrect API key" error even though the key was valid for
+    // the configured endpoint.
+    let cfg: ReturnType<typeof loadConfig> | null = null;
     try {
-      const cfg = loadConfig();
+      cfg = loadConfig();
       const configuredModel = tpArg === 'embedding' ? cfg?.embedding_model : cfg?.chat_model;
       if (!configuredModel) {
         console.error(
@@ -180,17 +230,28 @@ async function runTest(args: string[]): Promise<void> {
       }
     } catch { /* loadConfig throws when no brain configured — first-time install path; the no-config branch above handles it. */ }
 
+    // Reuse the SAME resolver the production path uses (buildGatewayConfig —
+    // also used by cli.ts#connectEngine and init-embed-check.ts) so the probe
+    // sees the identical base_urls / provider_chat_options / folded API keys
+    // that a real `gbrain import`/`gbrain query` call would. Only the
+    // touchpoint's model (+ embedding dims) is overridden on top, so an
+    // isolated `--model` probe still targets exactly the requested model —
+    // it just resolves that model's endpoint the way the brain actually
+    // would. Falls back to bare env when no brain is configured yet (cfg is
+    // null on first-time install, matching the old behavior for that case).
+    const baseGatewayConfig = cfg ? buildGatewayConfig(cfg) : { env: { ...process.env } };
     if (tpArg === 'embedding') {
       const dims = recipe?.touchpoints.embedding?.default_dims ?? 1536;
       configureGateway({
+        ...baseGatewayConfig,
         embedding_model: modelArg,
+        embedding_identity_unverified: false,
         embedding_dimensions: dims,
-        env: { ...process.env },
       });
     } else {
       configureGateway({
+        ...baseGatewayConfig,
         chat_model: modelArg,
-        env: { ...process.env },
       });
     }
     void modelId; // intentionally unused but preserved for readability
@@ -212,6 +273,7 @@ async function runTest(args: string[]): Promise<void> {
       const result = await gwChat({
         messages: [{ role: 'user', content: 'Reply with just the word: pong' }],
         maxTokens: 16,
+        allowFallback: false,
       });
       const ms = Date.now() - start;
       const preview = (result.text || '<empty>').replace(/\s+/g, ' ').slice(0, 80);
@@ -226,8 +288,8 @@ async function runTest(args: string[]): Promise<void> {
       process.exit(2);
     } else if (e instanceof AITransientError) {
       console.error(`  ✗ transient error (${ms}ms): ${e.message}`);
-      console.error(`    Retry after a moment.`);
-      process.exit(3);
+      console.error(`    Retry after a moment (retryable).`);
+      process.exit(FAILED_EXIT_CODE);
     } else {
       console.error(`  ✗ unknown error (${ms}ms): ${e instanceof Error ? e.message : e}`);
       process.exit(4);
@@ -246,32 +308,7 @@ function runEnv(args: string[]): void {
     console.error(`Unknown provider: ${id}. Run \`gbrain providers list\` to see known providers.`);
     process.exit(1);
   }
-  console.log(`${recipe.name} (${recipe.id})`);
-  console.log('');
-  const required = recipe.auth_env?.required ?? [];
-  const optional = recipe.auth_env?.optional ?? [];
-  if (required.length > 0) {
-    console.log('Required:');
-    for (const k of required) {
-      const set = !!process.env[k];
-      console.log(`  ${k.padEnd(32)} ${set ? '✓ set' : '✗ not set'}`);
-    }
-  } else {
-    console.log('Required: (none)');
-  }
-  if (optional.length > 0) {
-    console.log('\nOptional:');
-    for (const k of optional) {
-      const set = !!process.env[k];
-      console.log(`  ${k.padEnd(32)} ${set ? '✓ set' : '✗ not set'}`);
-    }
-  }
-  if (recipe.auth_env?.setup_url) {
-    console.log(`\nSetup: ${recipe.auth_env.setup_url}`);
-  }
-  if (recipe.setup_hint) {
-    console.log(`\n${recipe.setup_hint}`);
-  }
+  console.log(formatEnvOutput(recipe));
 }
 
 async function runExplain(args: string[]): Promise<void> {
@@ -295,12 +332,20 @@ async function runExplain(args: string[]): Promise<void> {
   for (const r of recipes) {
     if (r.touchpoints.embedding && r.touchpoints.embedding.models.length > 0) {
       const m = r.touchpoints.embedding;
+      // v0.46.3: canonical model, not array position (Voyage lists voyage-4-large
+      // first; its canonical default is voyage-4).
+      const canonicalModel = m.default_model ?? m.models[0];
+      // Price the CANONICAL model, not the recipe-wide touchpoint hint — the
+      // touchpoint cost tracks models[0], which can differ from the canonical
+      // pick (voyage-4 is $0.06/M; the recipe-wide hint reflects the flagship).
+      const modelPrice = lookupEmbeddingPrice(`${r.id}:${canonicalModel}`);
       options.push({
-        id: `${r.id}:${m.models[0]}`,
+        id: `${r.id}:${canonicalModel}`,
         touchpoint: 'embedding',
-        model: m.models[0],
+        model: canonicalModel,
         dims: m.default_dims,
-        cost_per_1m_tokens_usd: m.cost_per_1m_tokens_usd,
+        cost_per_1m_tokens_usd:
+          modelPrice.kind === 'known' ? modelPrice.pricePerMTok : m.cost_per_1m_tokens_usd,
         price_last_verified: m.price_last_verified,
         env_ready: envReady(r) || (r.id === 'ollama' && ollama.models_endpoint_valid === true),
         tier: r.tier,
@@ -370,7 +415,8 @@ async function runExplain(args: string[]): Promise<void> {
   for (const o of options.filter(x => x.touchpoint === 'embedding')) {
     const cost = o.cost_per_1m_tokens_usd !== undefined ? `$${o.cost_per_1m_tokens_usd}/1M` : '—';
     const dims = o.dims ? `${o.dims}d` : '—';
-    console.log(`  ${o.env_ready ? '✓' : '✗'} ${o.id.padEnd(44)} ${dims.padEnd(8)} ${cost.padEnd(10)} ${o.tier}`);
+    const lead = o.env_ready ? '✓' : '✗';
+    console.log(`  ${lead} ${o.id.padEnd(44)} ${dims.padEnd(8)} ${cost.padEnd(10)} ${o.tier}`);
   }
   console.log('');
   console.log('Expansion options:');
@@ -399,7 +445,7 @@ function prosFor(r: Recipe, touchpoint: TouchpointFilter): string[] {
     if (r.id === 'anthropic') out.push('Default subagent driver', 'Prompt-cache support', 'Strong tool calling');
     else if (r.id === 'openai') out.push('Strong tool calling', 'Wide adapter support');
     else if (r.id === 'google') out.push('1M context', 'Cheap');
-    else if (r.id === 'deepseek') out.push('25-40x cheaper than Anthropic', 'Strong reasoning');
+    else if (r.id === 'deepseek') out.push('About 7-17x cheaper than Anthropic Sonnet 5.5 to Opus 5.5 at peak rates', 'Strong reasoning');
     else if (r.id === 'groq') out.push('500 tok/s inference', 'Cheap fallback');
     else if (r.id === 'together') out.push('Open-weights house', 'Llama / Qwen / Mixtral');
     return out;
@@ -422,11 +468,17 @@ function consFor(r: Recipe): string[] {
 }
 
 function pickRecommended(options: ProviderOption[], env: Record<string, boolean>, ollamaReady: boolean): { id: string; reason: string } {
-  // Embedding recommendation: prefer env-ready native providers in this order.
+  // Embedding recommendation: prefer env-ready providers in canonical order —
+  // Voyage first (the v0.46.3 new-install default: one key covers embedding +
+
   const embOpts = options.filter(o => o.touchpoint === 'embedding');
+  if (env.VOYAGE_API_KEY) {
+    const voyage = embOpts.find(o => o.id.startsWith('voyage:'));
+    if (voyage) return { id: voyage.id, reason: 'VOYAGE_API_KEY set — the default: voyage-4 at 1024 dims; the same key powers the rerank-3-lite reranker and the multimodal model.' };
+  }
   if (env.OPENAI_API_KEY) {
     const openai = embOpts.find(o => o.id.startsWith('openai:'));
-    if (openai) return { id: openai.id, reason: 'OPENAI_API_KEY set — OpenAI default is high-quality and preserves existing 1536-dim schema.' };
+    if (openai) return { id: openai.id, reason: 'OPENAI_API_KEY set — high-quality and preserves an existing 1536-dim schema.' };
   }
   if (ollamaReady) {
     const ollama = embOpts.find(o => o.id.startsWith('ollama:'));
@@ -436,13 +488,9 @@ function pickRecommended(options: ProviderOption[], env: Record<string, boolean>
     const google = embOpts.find(o => o.id.startsWith('google:'));
     if (google) return { id: google.id, reason: 'GOOGLE_GENERATIVE_AI_API_KEY set — Gemini embedding at 768 dims.' };
   }
-  if (env.VOYAGE_API_KEY) {
-    const voyage = embOpts.find(o => o.id.startsWith('voyage:'));
-    if (voyage) return { id: voyage.id, reason: 'VOYAGE_API_KEY set — Voyage at 1024 dims.' };
-  }
-  // Nothing ready. Recommend OpenAI as the lowest-friction path.
+  // Nothing ready. Recommend the canonical default as the setup path.
   return {
-    id: 'openai:text-embedding-3-large',
-    reason: 'No provider env detected. OpenAI is the fastest setup — get a key at https://platform.openai.com/api-keys.',
+    id: 'voyage:voyage-4',
+    reason: 'No provider env detected. Voyage is the default — get a key at https://dash.voyageai.com/api-keys (one key also powers reranking + multimodal).',
   };
 }

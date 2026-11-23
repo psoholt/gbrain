@@ -14,8 +14,12 @@
  */
 
 import type { BrainEngine } from './engine.ts';
-import { PGVECTOR_HNSW_VECTOR_MAX_DIMS } from './vector-index.ts';
-import { gbrainPath } from './config.ts';
+import type { GBrainConfig } from './config.ts';
+import { shellQuote, type Action } from './agent-output.ts';
+import { embeddingEnablement } from './readiness.ts';
+import { OperationError } from './ops/contract.ts';
+import { PGVECTOR_HNSW_VECTOR_MAX_DIMS, hnswMaxDimsForType } from './vector-index.ts';
+import { gbrainPath, loadConfig } from './config.ts';
 import { resolveRecipe } from './ai/model-resolver.ts';
 import type { Recipe } from './ai/types.ts';
 import { AIConfigError } from './ai/errors.ts';
@@ -23,12 +27,16 @@ import {
   supportsVoyageOutputDimension,
   isValidVoyageOutputDim,
   VOYAGE_VALID_OUTPUT_DIMS,
-  supportsZeroEntropyDimension,
-  isValidZeroEntropyDim,
-  ZEROENTROPY_VALID_DIMS,
   isOpenAITextEmbedding3Model,
   isValidOpenAITextEmbedding3Dim,
   maxOpenAITextEmbedding3Dim,
+  nvidiaEmbeddingDim,
+  nvidiaEmbeddingDimOptions,
+  supportsNvidiaEmbeddingDimension,
+  isPerplexityEmbeddingModel,
+  isValidPerplexityDim,
+  maxPerplexityEmbeddingDim,
+  PERPLEXITY_MIN_DIMS,
 } from './ai/dims.ts';
 
 /**
@@ -57,54 +65,92 @@ export const PGVECTOR_COLUMN_MAX_DIMS = 16000;
  * handlers) bubble it back as a structured job failure.
  */
 export class EmbeddingDisabledError extends Error {
-  constructor(message: string) {
+  constructor(message: string, public readonly fix?: Action) {
     super(message);
     this.name = 'EmbeddingDisabledError';
   }
 }
 
-export function assertEmbeddingEnabled(cfg: { embedding_disabled?: boolean } | null): void {
-  if (cfg?.embedding_disabled) {
-    throw new EmbeddingDisabledError(
-      'This brain was initialized with `--no-embedding` (deferred setup).\n' +
-      'Configure an embedding provider before running embed / import:\n' +
-      '  gbrain config set embedding_model <provider>:<model>\n' +
-      '  gbrain config set embedding_dimensions <N>\n' +
-      '  gbrain init --force --embedding-model <provider>:<model>   # re-init to size schema\n',
-    );
-  }
+/**
+ * Keyless-by-choice guard. The enable step comes from readiness's one
+ * `embeddingEnablement` (resolved datastore path, a provider whose key is
+ * present, effects credentials + paid), never `gbrain config set
+ * embedding_model`, which the config command refuses.
+ */
+/**
+ * Refuse an explicit embedding action (semantic takes search, takes embed,
+ * image search, a vector eval) on a brain that opted out of embedding by any
+ * plane (factEmbeddingDisabled: caller config, running consumer, config file
+ * or the brain's own row), with the same enable-command error as
+ * assertEmbeddingEnabled. Nothing is sent to a provider.
+ */
+export async function assertBrainEmbeddingEnabled(engine: BrainEngine, cfg?: GBrainConfig | null): Promise<void> {
+  const { factEmbeddingDisabled } = await import('./embedding-disabled.ts');
+  if (!await factEmbeddingDisabled(engine, cfg)) return;
+  assertEmbeddingEnabled({ engine: engine.kind, ...(cfg ?? loadConfig() ?? {}), embedding_disabled: true });
+}
+
+/**
+ * Refuse `gbrain embed` on a brain whose config file (`cfg`, the caller's) or own `embedding_disabled` row opts out (a failed row read
+ * counts as disabled), the planes the cycle's embed phase reads. A write consumer's config governs that consumer's fact
+ * writes only, so it is not consulted here.
+ */
+export async function assertBrainRowEmbeddingEnabled(engine: BrainEngine, cfg: GBrainConfig | null): Promise<void> {
+  assertEmbeddingEnabled(cfg);
+  const { embeddingSendBlocked } = await import('./embedding-disabled.ts');
+  if (await embeddingSendBlocked(engine)) assertEmbeddingEnabled({ engine: engine.kind, ...(cfg ?? {}), embedding_disabled: true });
+}
+
+export function assertEmbeddingEnabled(cfg: GBrainConfig | null): void {
+  if (!cfg?.embedding_disabled) return;
+  const fix = embeddingEnablement(cfg);
+  const step = fix.argv ? shellQuote(fix.argv) : undefined;
+  const lines = [
+    'This brain was initialized with `--no-embedding` (deferred setup): embeddings are off by choice, so nothing was embedded.',
+    ...(step ? [`To turn on semantic search (pages and facts are kept): ${step}`] : []),
+    `Why: ${fix.why}`,
+    ...(fix.consent.length ? [`This needs ${fix.consent.join(' + ')} consent: ask the user first.${fix.user_message ? ` ${fix.user_message}` : ''}`] : []),
+  ];
+  throw new EmbeddingDisabledError(lines.join('\n'), fix);
 }
 
 export interface ColumnDimResult {
-  /** Whether the `content_chunks.embedding` column exists. False on a fresh brain. */
+  /** Whether the probed `content_chunks` column exists. False on a fresh brain. */
   exists: boolean;
-  /** Parsed `vector(N)` dimension if known. null when the column doesn't exist or the type isn't vector. */
+  /** Parsed `vector(N)` / `halfvec(N)` dimension if known. null when the column doesn't exist or the type isn't a pgvector type. */
   dims: number | null;
 }
 
 /**
- * Read the actual dimension of `content_chunks.embedding` from the engine.
+ * Read the actual dimension of an arbitrary `content_chunks` vector column
+ * (S2 generalization of the legacy `embedding`-only reader — the bootstrap
+ * verify probe compares the runtime embedder against the registry-ACTIVE
+ * column, which need not be the legacy one).
  *
- * Uses information_schema + a vector-specific catalog query. Returns
- * { exists: false, dims: null } on a fresh brain that doesn't have the
- * column yet. Returns { exists: true, dims: null } on a brain whose
- * column type isn't `vector` (shouldn't happen but defensive).
+ * Uses information_schema + a vector-specific catalog query, with the column
+ * name bound as a parameter. Returns { exists: false, dims: null } when the
+ * column doesn't exist. Returns { exists: true, dims: null } on a column
+ * whose type isn't a pgvector type (defensive).
  */
-export async function readContentChunksEmbeddingDim(engine: BrainEngine): Promise<ColumnDimResult> {
+export async function readContentChunksColumnDim(
+  engine: BrainEngine,
+  columnName: string,
+): Promise<ColumnDimResult> {
   // Probe column existence first to avoid noisy errors on fresh brains.
   const existsRows = await engine.executeRaw<{ exists: boolean }>(
     `SELECT EXISTS (
        SELECT 1 FROM information_schema.columns
        WHERE table_schema = 'public'
          AND table_name = 'content_chunks'
-         AND column_name = 'embedding'
+         AND column_name = $1
      ) AS exists`,
+    [columnName],
   );
   const exists = !!existsRows?.[0]?.exists;
   if (!exists) return { exists: false, dims: null };
 
   // pgvector stores dim in pg_type.typmod when atttypmod is set; format_type
-  // returns the human-readable `vector(N)`. We parse N out of that.
+  // returns the human-readable `vector(N)` / `halfvec(N)`. We parse N out.
   const formatRows = await engine.executeRaw<{ formatted: string | null }>(
     `SELECT format_type(a.atttypid, a.atttypmod) AS formatted
        FROM pg_attribute a
@@ -112,14 +158,24 @@ export async function readContentChunksEmbeddingDim(engine: BrainEngine): Promis
        JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE n.nspname = 'public'
         AND c.relname = 'content_chunks'
-        AND a.attname = 'embedding'
+        AND a.attname = $1
         AND NOT a.attisdropped`,
+    [columnName],
   );
   const formatted = formatRows?.[0]?.formatted ?? null;
   if (!formatted) return { exists: true, dims: null };
 
-  const m = formatted.match(/vector\((\d+)\)/i);
+  const m = formatted.match(/(?:vector|halfvec)\((\d+)\)/i);
   return { exists: true, dims: m ? parseInt(m[1], 10) : null };
+}
+
+/**
+ * Legacy-column reader: the init/doctor dim-mismatch checks probe the
+ * default `embedding` column specifically. Thin wrapper over
+ * readContentChunksColumnDim so both share one catalog query shape.
+ */
+export async function readContentChunksEmbeddingDim(engine: BrainEngine): Promise<ColumnDimResult> {
+  return readContentChunksColumnDim(engine, 'embedding');
 }
 
 /**
@@ -130,10 +186,11 @@ export async function readContentChunksEmbeddingDim(engine: BrainEngine): Promis
  * are fundamentally different:
  *
  * - **PGLite** has no native pgvector extension (the WASM build can't
- *   `ALTER COLUMN TYPE vector(N)`), so the only path is wipe-and-reinit
- *   via `gbrain init --pglite --embedding-model X --embedding-dimensions N`.
- *   The recipe derives the active database path so users don't paste a
- *   stale literal that ignores `GBRAIN_HOME` / `--path` / their config.
+ *   `ALTER COLUMN TYPE vector(N)`). The recipe offers, in order: keeping the
+ *   existing width when the model supports it (in-place `init --force` on
+ *   the active database path), a previewed `gbrain migrate embeddings` that
+ *   keeps pages and DB-only facts, and `gbrain reinit-pglite` as the labelled
+ *   last resort. It never prints a hand-run wipe.
  * - **Postgres** keeps the existing four-step SQL recipe.
  *
  * The old recipe pointed at `gbrain config set embedding_model X` which
@@ -171,26 +228,29 @@ export function embeddingMismatchMessage(opts: EmbeddingMismatchOpts): string {
   if (engineKind === 'pglite') {
     const activePath = databasePath ?? gbrainPath('brain.pglite');
     const modelArg = requestedModel ? ` --embedding-model ${requestedModel}` : '';
+    const keepWidth = requestedModel && resolveSchemaEmbeddingDim({ embedding_model: requestedModel, embedding_dimensions: currentDims }).ok;
     const lines = [
       header,
       ``,
       `  Existing column: vector(${currentDims})`,
       `  Requested:       vector(${requestedDims})${requestedModel ? `  (${requestedModel})` : ''}`,
       ``,
-      `Switching dims is destructive: it drops every embedding in your brain.`,
-      `PGLite cannot ALTER vector column types (pgvector ships as embedded WASM,`,
-      `not a native extension). Wipe-and-reinit is the only path.`,
+      `${source === 'doctor' ? '' : 'Nothing was changed. '}Switching dims re-embeds every chunk and fact;`,
+      `PGLite cannot ALTER vector column types in place (pgvector ships as WASM).`,
       ``,
-      `Recommended (one command):`,
+      ...(keepWidth ? [
+        `Keep this brain's width (no rebuild; pages and facts kept):`,
+        ``,
+        `  gbrain init --force${modelArg} --embedding-dimensions ${currentDims} --path ${activePath}`,
+        ``,
+      ] : []),
+      `Change the width (re-embeds; pages and DB-only facts kept; preview first):`,
+      ``,
+      `  gbrain migrate embeddings --to ${requestedModel ?? '<provider:model>'} --dim ${requestedDims} --dry-run`,
+      ``,
+      `Last resort (moves the datastore aside; DB-only pages and facts are NOT carried over):`,
       ``,
       `  gbrain reinit-pglite${modelArg} --embedding-dimensions ${requestedDims}`,
-      ``,
-      `Or by hand:`,
-      ``,
-      `  mv ${activePath} ${activePath}.bak`,
-      `  gbrain init --pglite${modelArg} --embedding-dimensions ${requestedDims}`,
-      `  gbrain sync   # re-imports your brain repo from disk`,
-      `  gbrain embed --stale`,
       ``,
       `Full guide: docs/embedding-migrations.md`,
     ];
@@ -219,7 +279,7 @@ export function embeddingMismatchMessage(opts: EmbeddingMismatchOpts): string {
     `  DROP INDEX IF EXISTS idx_chunks_embedding;`,
     `  -- NULL embeddings BEFORE the alter: pgvector refuses to cast existing`,
     `  -- vectors across dimensions and aborts the transaction. NULLs cast fine.`,
-    `  UPDATE content_chunks SET embedding = NULL, embedded_at = NULL;`,
+    `  UPDATE content_chunks SET embedding = NULL, embedded_at = NULL, embedding_pending_since = now();`,
     `  ALTER TABLE content_chunks ALTER COLUMN embedding TYPE vector(${requestedDims});`,
     `  ${reindexLine.split('\n').join('\n  ')}`,
     `  COMMIT;`,
@@ -341,24 +401,6 @@ export function resolveSchemaMultimodalDim(opts: ResolveSchemaMultimodalDimOpts)
   }
 }
 
-/**
- * Shared validation of a requested dim against a recipe touchpoint's
- * declared dims, including provider-specific Matryoshka allow-lists.
- *
- * Recipes (`src/core/ai/recipes/*.ts`) declare `default_dims` per touchpoint
- * but do NOT generally encode Matryoshka steps as `dims_options`. The
- * per-provider valid-dim allow-lists live in `src/core/ai/dims.ts`:
- *   - `VOYAGE_VALID_OUTPUT_DIMS` (256/512/1024/2048) for flexible Voyage models
- *   - `ZEROENTROPY_VALID_DIMS` (2560/1280/640/320/160/80/40) for ZE zembed-1
- *   - OpenAI text-embedding-3-* accepts ANY positive integer up to the
- *     model's native size (1536 small / 3072 large)
- *
- * Validation order:
- *   1. recipe-declared `dims_options` (highest precedence — recipe author
- *      knows their backend)
- *   2. provider-specific dim.ts allow-lists (for known Matryoshka providers)
- *   3. fall through to "this model only emits default_dims" rejection
- */
 function validateDimAgainstTouchpoint(
   modelId: string,
   recipe: Recipe,
@@ -366,7 +408,9 @@ function validateDimAgainstTouchpoint(
   dimsOptions: number[] | undefined,
   requestedDims: number | undefined,
 ): ResolveSchemaDimResult {
-  const dim = requestedDims ?? defaultDims;
+  const nvidiaNaturalDims = recipe.id === 'nvidia' ? nvidiaEmbeddingDim(modelId) : undefined;
+  const effectiveDefaultDims = nvidiaNaturalDims ?? defaultDims;
+  const dim = requestedDims ?? effectiveDefaultDims;
 
   if (!Number.isInteger(dim) || dim <= 0) {
     return {
@@ -396,7 +440,7 @@ function validateDimAgainstTouchpoint(
     dim,
     model: `${recipe.id}:${modelId}`,
     provider: recipe.id,
-    recipeDefault: defaultDims,
+    recipeDefault: effectiveDefaultDims,
   };
 }
 
@@ -411,6 +455,22 @@ function isCustomDimValidForProvider(
   requestedDims: number,
   dimsOptions: number[] | undefined,
 ): CustomDimCheck {
+  // NVIDIA models are mixed: some fixed-dim, one Matryoshka-style. Handle
+  // them before generic recipe dims_options so llama-nemotron can use 1280d.
+  if (recipe.id === 'nvidia') {
+    const naturalDims = nvidiaEmbeddingDim(modelId);
+    if (naturalDims !== undefined && requestedDims === naturalDims) return { valid: true, error: '' };
+    if (supportsNvidiaEmbeddingDimension(modelId, requestedDims)) return { valid: true, error: '' };
+    const options = nvidiaEmbeddingDimOptions(modelId);
+    return {
+      valid: false,
+      error:
+        `NVIDIA model "${modelId}" does not support dimensions ${requestedDims}. ` +
+        `Natural dimensions: ${naturalDims ?? 'unknown'}. ` +
+        (options ? `Supported overrides: ${options.join(', ')}.` : 'No dimension overrides are supported for this NVIDIA model.'),
+    };
+  }
+
   // Tier 1: recipe-declared dims_options.
   if (dimsOptions && dimsOptions.length > 0) {
     if (dimsOptions.includes(requestedDims)) return { valid: true, error: '' };
@@ -432,13 +492,13 @@ function isCustomDimValidForProvider(
         `(allowed: ${VOYAGE_VALID_OUTPUT_DIMS.join(', ')}).`,
     };
   }
-  if (recipe.id === 'zeroentropyai' && supportsZeroEntropyDimension(modelId)) {
-    if (isValidZeroEntropyDim(requestedDims)) return { valid: true, error: '' };
+  if (recipe.id === 'perplexity' && isPerplexityEmbeddingModel(modelId)) {
+    if (isValidPerplexityDim(modelId, requestedDims)) return { valid: true, error: '' };
     return {
       valid: false,
       error:
-        `ZeroEntropy model "${modelId}" does not support custom dimensions ${requestedDims} ` +
-        `(allowed: ${ZEROENTROPY_VALID_DIMS.join(', ')}).`,
+        `Perplexity ${modelId} accepts dimensions ${PERPLEXITY_MIN_DIMS}..${maxPerplexityEmbeddingDim(modelId)}, ` +
+        `got ${requestedDims}.`,
     };
   }
   if (recipe.id === 'openai' && isOpenAITextEmbedding3Model(modelId)) {
@@ -449,6 +509,10 @@ function isCustomDimValidForProvider(
       error:
         `OpenAI ${modelId} accepts dimensions 1..${maxDim}, got ${requestedDims}.`,
     };
+  }
+
+  if (recipe.touchpoints.embedding?.trust_custom_dims === true) {
+    return { valid: true, error: '' };
   }
 
   // Tier 3: provider not known to support custom dims at all.
@@ -576,6 +640,17 @@ export function buildFactsAlterRecipe(
   const opclass = columnType === 'halfvec' ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
   const targetType = columnType === 'halfvec' ? `halfvec(${configuredDims})` : `vector(${configuredDims})`;
   const dimsChanged = columnDims !== configuredDims;
+  const hnswMaxDims = hnswMaxDimsForType(columnType);
+  const indexLines = configuredDims <= hnswMaxDims
+    ? [
+        `CREATE INDEX idx_facts_embedding_hnsw`,
+        `  ON facts USING hnsw (embedding ${opclass})`,
+        `  WHERE embedding IS NOT NULL AND expired_at IS NULL;`,
+      ]
+    : [
+        `-- Skip reindex. ${columnType}(${configuredDims}) exceeds pgvector's HNSW cap of ${hnswMaxDims};`,
+        `-- fact similarity falls back to exact scans.`,
+      ];
   return [
     `-- ALTER ${columnType}(${columnDims}) → ${columnType}(${configuredDims}) on indexed column.`,
     `-- HOLD a maintenance window: this rewrites every row's embedding.`,
@@ -596,9 +671,7 @@ export function buildFactsAlterRecipe(
       : []),
     `ALTER TABLE facts ALTER COLUMN embedding TYPE ${targetType}`,
     `  USING embedding::${targetType};`,
-    `CREATE INDEX idx_facts_embedding_hnsw`,
-    `  ON facts USING hnsw (embedding ${opclass})`,
-    `  WHERE embedding IS NOT NULL AND expired_at IS NULL;`,
+    ...indexLines,
   ].join('\n');
 }
 
@@ -607,16 +680,9 @@ export function buildFactsAlterRecipe(
  * probe is a cheap SELECT but runs at the top of every fact-writing
  * call site; caching keeps the cost off the hot path. The cache
  * stores the engine's `kind + a synthetic instance marker` so a fresh
- * engine connection in the same process re-probes. Test seam below
- * clears the cache between cases.
+ * engine connection in the same process re-probes.
  */
 const _factsDimCheckCache = new WeakMap<BrainEngine, { ok: true } | { err: FactsEmbeddingDimMismatchError }>();
-
-/** Test seam: clear the per-process facts-dim cache. */
-export function _resetFactsDimCheckCacheForTest(): void {
-  // WeakMap has no clear() — but tests can pass fresh engine instances
-  // to get fresh probes. This noop helper documents the intent.
-}
 
 /**
  * Preflight check: throws FactsEmbeddingDimMismatchError when the
@@ -704,4 +770,38 @@ export async function assertFactsEmbeddingDimMatchesConfig(engine: BrainEngine):
   );
   _factsDimCheckCache.set(engine, { err });
   throw err;
+}
+
+/**
+ * #4287 — name the dimension-mismatch write failure.
+ *
+ * pgvector rejects a vector whose width differs from the column with the bare
+ * "expected N dimensions, not M" message: no error code, no statement of
+ * consequence, no fix. That shape means the EMBEDDING PLANE is split — the
+ * runtime embedder and the schema column disagree — so EVERY embedding write
+ * fails and the page transaction rolls back (the page is NOT stored, even
+ * though the message never says so). Decorate it with a named OperationError
+ * (`embedding_plane_split` — distinct from `embedding_failed`, because a
+ * retry can never succeed until the planes are re-aligned) carrying the
+ * consequence and the recovery command. Anything else passes through
+ * untouched. Applied at the import/put transaction boundary
+ * (import-file.ts:importFromContent).
+ *
+ * S2: pgvector's message never names the column, and on a registry-routed
+ * brain the failing column is NOT the legacy `embedding`. When the caller
+ * knows the active column it passes `columnName`; otherwise the wording
+ * stays plane-agnostic instead of blaming the wrong column.
+ */
+export function decorateEmbeddingDimError(err: unknown, slug: string, columnName?: string): unknown {
+  const msg = err instanceof Error ? err.message : String(err);
+  const m = msg.match(/expected (\d+) dimensions, not (\d+)/);
+  if (!m) return err;
+  const colLabel = columnName
+    ? `content_chunks.${columnName} column`
+    : 'active embedding column';
+  return new OperationError(
+    'embedding_plane_split',
+    `page '${slug}' was NOT written: the runtime embedder emitted ${m[2]}d vectors but the ${colLabel} is ${m[1]}d (${msg}). Every embedding write fails until the planes agree.`,
+    `Diagnose with \`gbrain migrate embeddings --status\`; fix with \`gbrain migrate embeddings --to <provider:model> --dim ${m[2]}\` (or correct embedding_model/embedding_dimensions to match the column).`,
+  );
 }

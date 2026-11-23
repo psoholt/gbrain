@@ -69,6 +69,68 @@ describe('recipe: zhipu', () => {
     expect(sql.toLowerCase()).toContain('hnsw');
   });
 
+  test('chat touchpoint declares GLM models with tool + subagent-loop support (#1157)', () => {
+    const r = getRecipe('zhipu')!;
+    expect(r.touchpoints.chat).toBeDefined();
+    expect(r.touchpoints.chat!.models).toContain('glm-5.1');
+    expect(r.touchpoints.chat!.supports_tools).toBe(true);
+    expect(r.touchpoints.chat!.supports_subagent_loop).toBe(true);
+    expect(r.touchpoints.chat!.supports_prompt_cache).toBe(false);
+  });
+
+  test('gbrain#4727 — GLM-4.5+/5.x declare thinking_by_default; older GLM ids do not', async () => {
+    // GLM-4.5+ and the GLM-5.x series reason by default and bill reasoning
+    // as output tokens. Without thinking_by_default, supportsThinking is
+    // false and think caps max_tokens at 4000 instead of 16000 — the whole
+    // budget is spent reasoning and think returns truncated/empty JSON.
+    const { getProviderCapabilities } = await import('../../src/core/ai/capabilities.ts');
+    expect(getProviderCapabilities('zhipu:glm-5.3-flash').supportsThinking).toBe(true);
+    expect(getProviderCapabilities('zhipu:glm-5.3').supportsThinking).toBe(true);
+    expect(getProviderCapabilities('zhipu:glm-5.1').supportsThinking).toBe(true);
+    expect(getProviderCapabilities('zhipu:glm-4.6').supportsThinking).toBe(true);
+    expect(getProviderCapabilities('zhipu:glm-4.5').supportsThinking).toBe(true);
+    // Pre-4.5 ids keep the conservative default (no reasoning-by-default).
+    expect(getProviderCapabilities('zhipu:glm-4').supportsThinking).toBe(false);
+    expect(getProviderCapabilities('zhipu:glm-4-plus').supportsThinking).toBe(false);
+    expect(getProviderCapabilities('zhipu:glm-3-turbo').supportsThinking).toBe(false);
+  });
+
+  test('gbrain#4727 — informational models list carries the current glm-5.3 family', () => {
+    const r = getRecipe('zhipu')!;
+    expect(r.touchpoints.chat!.models).toContain('glm-5.3');
+    expect(r.touchpoints.chat!.models).toContain('glm-5.3-flash');
+  });
+
+  test('zhipu:glm-5.1 passes the subagent capability gate (degraded:no_caching, not refused)', async () => {
+    // Pre-fix: getProviderCapabilities threw "does not offer a chat touchpoint"
+    // and classifyCapabilities returned 'unknown' → subagent submit refused.
+    const { getProviderCapabilities, classifyCapabilities } =
+      await import('../../src/core/ai/capabilities.ts');
+    const caps = getProviderCapabilities('zhipu:glm-5.1');
+    expect(caps.supportsToolCalling).toBe(true);
+    expect(classifyCapabilities('zhipu:glm-5.1')).toBe('degraded:no_caching');
+  });
+
+  test('no-chat-touchpoint error hint lists only providers that actually have chat', async () => {
+    // The hint is computed from the registry; every provider it names must
+    // really carry a chat touchpoint (pre-fix it hardcoded zhipu/dashscope/
+    // minimax, all embedding-only at the time).
+    const { getProviderCapabilities } = await import('../../src/core/ai/capabilities.ts');
+    const { listRecipes } = await import('../../src/core/ai/recipes/index.ts');
+    let hint = '';
+    try {
+      getProviderCapabilities('voyage:voyage-3');
+      throw new Error('expected AIConfigError for embedding-only provider');
+    } catch (e) {
+      hint = (e as { fix?: string }).fix ?? String(e);
+    }
+    const listed = hint.match(/chat: ([^.]+)\./)?.[1]?.split(', ') ?? [];
+    expect(listed.length).toBeGreaterThan(0);
+    const withChat = new Set(listRecipes().filter(r => r.touchpoints.chat).map(r => r.id));
+    for (const id of listed) expect(withChat.has(id)).toBe(true);
+    expect(listed).toContain('zhipu');
+  });
+
   test('dimsProviderOptions threads dimensions for embedding-3 (Matryoshka)', async () => {
     // Codex finding #1: Zhipu embedding-3 is Matryoshka 256-2048. Without
     // `dimensions` on the wire, user-selected non-default dims are

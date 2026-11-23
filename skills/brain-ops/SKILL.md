@@ -1,6 +1,6 @@
 ---
 name: brain-ops
-version: 1.0.0
+version: 1.2.0
 description: |
   Brain knowledge base operations. The core read/write cycle: brain-first lookup,
   read-enrich-write loop, source attribution, ambient enrichment, back-linking.
@@ -8,6 +8,7 @@ description: |
 triggers:
   - any brain read/write/lookup/citation
 tools:
+  - recall
   - search
   - query
   - get_page
@@ -28,136 +29,136 @@ writes_to:
 
 # Brain Operations — The Ambient Context Layer
 
-The brain is not an archive. It is a live context membrane that every interaction
-flows through in both directions.
+Recall relevant context before responding. Save explicit requests with
+provenance; automatic capture is off until the user opts in. Reading this skill
+does not enable capture, delegation, or paid enrichment. A chat-only instruction
+suppresses writes for that turn, including when standing capture is enabled.
 
-> **Convention:** See `skills/conventions/brain-first.md` for the 5-step lookup protocol.
+> **Convention:** See `skills/conventions/brain-first.md` for the lookup chain and copyable retrieval filters.
 > **Convention:** See `skills/conventions/quality.md` for citation and back-link rules.
 
 ## Contract
 
 This skill guarantees:
 - Brain is checked BEFORE any external API call (brain-first lookup)
-- Every inbound signal triggers the READ → ENRICH → WRITE loop
+- Explicit save requests and opted-in inbound signals trigger the READ → WRITE
+  loop; enrichment requires its separately configured authority
 - Every outbound response checks brain for relevant context
 - Source attribution on every fact written (inline `[Source: ...]` citations)
 - User's direct statements are highest-authority data
 - Back-links maintained on every brain write (Iron Law)
 
-## Iron Law: Back-Linking (MANDATORY)
+**Iron Law:** every mention of a person or company with a brain page gets a
+back-link FROM that entity's page TO the page mentioning them.
 
-Every mention of a person or company with a brain page MUST create a back-link
-FROM that entity's page TO the page mentioning them. An unlinked mention is a
-broken brain. See `skills/conventions/quality.md` for format.
+## Read
 
-## Phases
+Before any external lookup of a person, company or topic:
 
-### Phase 1: Brain-First Lookup (MANDATORY)
+1. `gbrain entity "<name>"` — one call for a known entity: description,
+   aliases, open threads, recent events, edges. Near-misses return suggestions.
+2. `gbrain search "name"` for exact tokens; `gbrain query "question"` for
+   concepts (a nonzero `search` count is not proof of completeness).
+3. `gbrain get <slug>`, `gbrain backlinks <slug>`, `gbrain timeline <slug>`.
+4. `gbrain think "<question>"` only for paid multi-page synthesis ("what
+   changed since Q1"); `query` is enough to find a page.
 
-Before using ANY external API to research a person, company, or topic:
+External APIs fill gaps; they never start the lookup. Answer from the brain
+page when one exists, and cite it.
 
-1. `gbrain search "name"` — keyword search for existing pages
-2. `gbrain query "natural question about name"` — hybrid search for context
-3. `gbrain get <slug>` — if you know the slug, read the full page
-4. Check backlinks: who references this entity?
-5. Check timeline: recent events involving this entity
+**Count with gbrain, not `ls`.** Corpora nest (`meetings/YYYY/MM/` beside a
+flat layer), so a shallow `ls dir/*.md` undercounts. Use `gbrain sources list`,
+`gbrain list --type <t>`, or `find <dir> -name '*.md' | wc -l`.
 
-The brain almost always has something. External APIs fill gaps, not start from scratch.
+## Write (only when authorized)
 
-### Phase 2: On Every Inbound Signal (READ → ENRICH → WRITE)
+Write for an explicit save request, or a message inside the user's opted-in
+capture scope with no chat-only restriction. Otherwise use the information in
+this conversation without persisting it; explicit remembering does not enable
+ongoing capture.
 
-Every message, meeting, email, or conversation that references a person or company:
+1. Detect entities; read their pages first. Before creating a page, check for
+   it (`gbrain entity`, then `query` with name variants) — never duplicate.
+2. Write only what is new, with `[Source: User, YYYY-MM-DD]` (or the real
+   source) on each fact, plus a timeline entry
+   (`gbrain timeline-add <slug> <date> "<text>"`) on every entity involved.
+3. Never overwrite the user's direct statements with lower-authority sources.
+4. Confirm a write only after reading it back.
 
-1. **Detect entities** — people, companies, deals mentioned
-2. **Load brain pages** — read existing pages for context before responding
-3. **Identify new information** — what does this signal tell us that the page doesn't know?
-4. **Write it back** — update the brain page with new info + timeline entry + source citation
-5. **Create if missing** — if notable and no page exists, create via enrich skill
+**Memory verbs (MEMORY_VERBS v1).** `remember(fact, provenance)` saves one formed
+fact (CLI: `gbrain remember "<fact>" --entity <slug> --provenance "<who, date>"`);
+`recall`, `entity`, `synthesize`, `context_pack` and `delta` read.
+`forget(id)` (`gbrain forget <fact-id>`) withdraws a fact from active memory;
+history, source material and backups may remain, so never promise erasure.
+`put_page` / `add_link` / `add_timeline_entry` stay the page and graph path.
+Contract: `docs/protocol/MEMORY_VERBS_v1.md`.
 
-**User's direct statements are the highest-value data source.** Write them to brain
-pages immediately with attribution `[Source: User, YYYY-MM-DD]`.
+**Keyless brains:** when `extract_facts` returns `skipped: extraction_unavailable`
+(or `extraction_failed` for one turn), you are the extractor: write each fact
+with `remember`, setting `kind` (event | preference | commitment | belief |
+fact) and the visibility the envelope's `agent_action` names (default private;
+`remember` defaults to world, or to your own member page when your credential
+is bound to a member other than the brain owner).
 
-### Phase 2.5: Structured Graph Updates (automatic)
+**Visibility.** Every MCP caller (stdio included) and a thin CLI recall and
+withdraw world-visible facts only; private recall needs the trusted local CLI
+or a credential bound to the brain owner (`gbrain access owner`).
+Never widen visibility or request broader OAuth scopes to make a check pass.
+An MCP connection test uses only a harmless synthetic `visibility: "world"`
+fact, withdrawn afterward.
 
-Every `put_page` call automatically extracts entity references and writes them
-to the graph (`links` table) with inferred relationship types. Stale links
-(refs no longer in the page text) are removed in the same call. This is
-"auto-link" reconciliation.
+**`<REDACTED:pattern>`** in a result means the brain withheld a credential-shaped
+value; the page is unchanged and `gbrain recall` on the brain host shows it.
+Say which kind was withheld; never retry to recover it or guess it.
 
-- No manual `add_link` calls needed for ordinary page writes.
-- Inferred link types: `attended` (meeting -> person), `works_at`, `invested_in`,
-  `founded`, `advises`, `source` (frontmatter), `mentions` (default).
-- The `put_page` MCP response includes `auto_links: { created, removed, errors }`
-  so the agent can verify outcomes.
-- To disable: `gbrain config set auto_link false`. Default is on.
-- Timeline entries with specific dates still need explicit `gbrain timeline-add`
-  (or batch via `gbrain extract timeline --source db`).
+**Tight-budget page questions:**
+`gbrain recall --query '<q>' --budget-tokens 75 --budget-policy query_first --json`
+packs page evidence before recent facts (`skills/query/SKILL.md`). Read
+`budget_packing` before calling an empty result missing memory.
 
-### Phase 3: On Every Outbound Response (READ → PULL → RESPOND)
+### Auto-link
 
-Before answering any question about a person, company, or topic:
+Trusted local writes (`gbrain put`, `gbrain capture`, `gbrain call put_page`)
+auto-link inline and return `auto_links: { created, removed, errors }`. MCP
+writes (stdio and HTTP) return `auto_links: { skipped: "remote" }`: body
+wikilinks are saved as text and a post-commit effect queues plain `mentions`
+edges to existing pages (`gbrain config set mcp.remote_auto_links off` turns it
+off). Typed, frontmatter and timeline edges wait for a sweep: stdio
+`gbrain serve` runs one at startup and when idle; `gbrain serve --http` does not self-sweep, so run
+`gbrain sweep --once` or `gbrain extract links --source db`. Use `add_link` for
+a relationship you need now, except meeting attendance, which comes from the
+meeting page's attendee list. Dated events still need `gbrain timeline-add`.
+`gbrain config set auto_link false` disables auto-link.
 
-1. **Check the brain** — read relevant pages
-2. **Pull context** — use compiled truth + recent timeline
-3. **Respond with context** — the brain makes every answer better
+## Enrichment
 
-Don't answer from general knowledge when a brain page exists.
-
-### Phase 4: Ambient Enrichment
-
-This is not a special mode. This is the default. Everything the user says is an
-ingest event.
-
-- Person mentioned → check brain, create/enrich if needed (spawn background)
-- Company mentioned → same
-- Link shared → ingest it (delegate to idea-ingest)
-- Data shared → delegate to appropriate skill
-
-**Rules:**
-- Never interrupt the conversation to do enrichment
-- Spawn sub-agents for anything that would slow down the response
-- Never announce "I'm enriching the brain" — just do it silently
+External research, paid calls and delegation need their own authority: an
+explicit enrichment request or the user's stored scope and spending policy. A
+mentioned entity, a shared link or capture opt-in is not that authority. Never
+block the response on enrichment.
 
 ## Output Format
 
-No separate output. Brain-ops is an always-on behavior layer, not a report generator.
-The output is updated brain pages and enriched responses.
+Answer with the retrieved context and cite it. With several sources, cite
+`[source-id:slug]` using the `source_id` every page payload carries (never the
+source's display name); a single-source brain may write `[default:slug]` or the
+bare slug. Confirm authorized writes only after readback; if no write was
+requested or opted in, do not persist the conversation to produce a memory update.
 
-## Cross-source citation format (v0.18.0+)
+## When it fails
 
-When a brain has multiple sources (wiki, gstack, yc-media, etc.), every
-citation MUST include the source id: `[source-id:slug]`. Example:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
-> You told me about the retry budget approach — see
-> [wiki:topics/resilience] and [gstack:plans/retry-policy] for where
-> this came from.
-
-Rules:
-- The key is `sources.id` (immutable), never `sources.name` (mutable display).
-- Single-source brains still write `[default:slug]` OR may omit the prefix
-  for backward compat.
-- Every page payload returned by `search`, `query`, `get_page`, `list_pages`
-  carries `source_id` — always use it when citing, never guess.
-
-If a search result has `source_id: "gstack"` and `slug: "plans/foo"`,
-the citation is `[gstack:plans/foo]`. That's the whole rule.
+- `revision_conflict`: re-read, merge your change into the new text, save with the new revision. `write_pending` (exit 10): poll `gbrain write-request <request_id>` before claiming the write landed.
+- `owner_unavailable` with `detail: unbound_source` (classic Postgres brain): write the file in the source's checkout, commit, and run `gbrain sync --source <id>`; if you are remote, give the user those steps. Never claim the source or switch modes (see the [agent operator protocol](../conventions/agent-operator-protocol.md#a-write-refused-owner_unavailable-with-detail-unbound_source)).
+- `permission_denied` from the secret scan or a slug fence: do not strip or rename to dodge it; tell the user what was refused and why (`docs/guides/write-refusals.md`).
+- Empty `recall` / `search` with a degraded notice or `search_degraded`: say the brain is searching keywords only right now, not that nothing is saved.
+- `insufficient_scope` / `scope_denied` over MCP: tell the user; never ask for a broader token to make a write pass.
 
 ## Anti-Patterns
 
-- Answering questions about people/companies without checking the brain first
-- Using external APIs before checking the brain
-- Writing facts without inline `[Source: ...]` citations
-- Blocking the response to do enrichment
-- Overwriting user's direct statements with lower-authority sources
-- Creating brain pages for non-notable entities
-
-## Tools Used
-
-- `search` — keyword search
-- `query` — hybrid vector+keyword search
-- `get_page` — read a brain page
-- `put_page` — create/update brain pages
-- `add_link` — cross-reference entities
-- `add_timeline_entry` — record events
-- `get_backlinks` — check who references an entity
-- `sync_brain` — sync changes to the index
+- Answering about people or companies from general knowledge, or calling external APIs, before checking the brain
+- Writing facts without `[Source: ...]`, or without the back-links and timeline entries
+- Creating a duplicate page, or a page for a non-notable entity
+- Writing to the brain without a save request or capture opt-in
+- Promising that `forget` erases a fact everywhere

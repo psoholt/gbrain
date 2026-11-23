@@ -19,23 +19,44 @@
 import { chat as gatewayChat, toolLoop, type ChatMessage, type ChatToolDef, type ToolHandler } from '../ai/gateway.ts';
 import { BRAIN_TOOL_ALLOWLIST } from '../minions/tools/brain-allowlist.ts';
 import { paramDefToSchema } from '../../mcp/tool-defs.ts';
+import { findInvalidParam, normalizeOptionalParams, schemaInvalidParams } from '../../mcp/validate-params.ts';
+import { asAgentToolError } from '../../mcp/dispatch.ts';
 import { operations, type OperationContext } from '../operations.ts';
 import { loadConfig } from '../config.ts';
 import type { BrainEngine } from '../engine.ts';
-import type { BenchmarkTask, Trajectory } from './types.ts';
+import { SKILLOPT_PURPOSE, type BenchmarkTask, type Trajectory } from './types.ts';
+import { sharedSkillToolAccess } from '../shared-skills/tool-access.ts';
+import { authorizeSkillRead } from '../shared-skills/policy.ts';
+import { parseSkillFrontmatter } from '../skill-frontmatter.ts';
+
+/** An op a rollout may call: it exists, is not mutating and is not local-only. */
+function isRolloutReadOp(name: string): boolean {
+  const op = operations.find((o) => o.name === name);
+  return op !== undefined && !op.mutating && !op.localOnly;
+}
 
 /**
- * D13: which tools SkillOpt rollouts are allowed to call.
- *
- * Derived from BRAIN_TOOL_ALLOWLIST minus `put_page` (only mutating op in
- * the base set). New mutating ops MUST be added here AND BRAIN_TOOL_ALLOWLIST
- * mustn't be silently widened; the rollout test pins zero-write invariant.
+ * D13: which tools SkillOpt rollouts are allowed to call: BRAIN_TOOL_ALLOWLIST
+ * minus every mutating or local-only op (put_page, add_timeline_entry). The
+ * rollout test pins the zero-write invariant.
  */
-export const READ_ONLY_BRAIN_TOOLS: ReadonlySet<string> = new Set(
-  [...BRAIN_TOOL_ALLOWLIST].filter((name) => name !== 'put_page'),
-);
+export const READ_ONLY_BRAIN_TOOLS: ReadonlySet<string> = new Set([...BRAIN_TOOL_ALLOWLIST].filter(isRolloutReadOp));
+
+/**
+ * B1.5: read ops a skill may add to its rollouts by naming them in its
+ * frontmatter `tools:`. Each was reviewed for side effects under remote=true;
+ * add one only after the same review.
+ */
+const SKILL_DECLARABLE_TOOLS: ReadonlySet<string> = new Set(['recall', 'get_timeline']);
+
+/** The tools a rollout of this skill offers: the read-only base plus the reviewed read ops its frontmatter declares. */
+export function rolloutToolsForSkill(skillText: string): ReadonlySet<string> {
+  const declared = (parseSkillFrontmatter(skillText)?.tools ?? []).filter((n) => SKILL_DECLARABLE_TOOLS.has(n) && isRolloutReadOp(n));
+  return new Set([...READ_ONLY_BRAIN_TOOLS, ...declared]);
+}
 
 export interface RolloutOpts {
+  operationContext?: OperationContext;
   engine: BrainEngine;
   skillText: string;
   task: BenchmarkTask;
@@ -47,6 +68,8 @@ export interface RolloutOpts {
   abortSignal?: AbortSignal;
   /** F10: when true, enable write-capture (virtual put_page/submit_job/file_upload). */
   writeCapture?: boolean;
+  /** B1.5: tool names to offer instead of rolloutToolsForSkill(skillText); mutating and local-only ops are still dropped. */
+  allowedTools?: ReadonlySet<string>;
   /** Test seam — substitute the toolLoop call. */
   toolLoopFn?: typeof toolLoop;
   /** Test seam — substitute chat (currently unused; toolLoop wraps chat). */
@@ -68,7 +91,9 @@ export async function runRollout(opts: RolloutOpts): Promise<Trajectory> {
   // Build the tool handlers + defs. F10: when write-capture is on, swap
   // in the virtual-write registry (read-only base + virtual put_page /
   // submit_job / file_upload). Default: read-only allowlist only (D13).
-  const ctx = buildOpContext(engine);
+  const original = opts.operationContext;
+  const ctx = original ? { ...original, remote: true } : buildOpContext(engine);
+  if (original && original.engine !== engine) throw new Error('Optimizer context engine mismatch');
   let defs, handlers;
   if (opts.writeCapture) {
     const { buildWriteCaptureRegistry } = await import('./write-capture.ts');
@@ -76,7 +101,7 @@ export async function runRollout(opts: RolloutOpts): Promise<Trajectory> {
     defs = registry.defs;
     handlers = registry.handlers;
   } else {
-    const r = buildReadOnlyToolRegistry(ctx);
+    const r = buildReadOnlyToolRegistry(ctx, opts.allowedTools ?? rolloutToolsForSkill(skillText), original ? new Set(await sharedSkillToolAccess(original)) : undefined, original);
     defs = r.defs;
     handlers = r.handlers;
   }
@@ -105,6 +130,8 @@ export async function runRollout(opts: RolloutOpts): Promise<Trajectory> {
     maxTurns: opts.maxTurns ?? 20,
     cacheSystem: true, // D11: candidate skill is stable for a step's batch.
     abortSignal: opts.abortSignal,
+    purpose: SKILLOPT_PURPOSE.target,
+    allowFallback: false,
     onToolCallStart: async (_turnIdx, _messageIdx, _ordinal, toolName, input, providerToolCallId) => {
       const gbrainToolUseId = `skillopt-${nextOrdinal++}-${providerToolCallId}`;
       const idx = toolCalls.length;
@@ -183,11 +210,12 @@ interface ToolRegistry {
  * Tool names are prefixed `brain_` for Anthropic-name compliance (same
  * convention as the subagent handler's buildBrainTools).
  */
-function buildReadOnlyToolRegistry(ctx: OperationContext): ToolRegistry {
+function buildReadOnlyToolRegistry(ctx: OperationContext, offered: ReadonlySet<string>, allowed?: ReadonlySet<string>, original?: OperationContext): ToolRegistry {
   const defs: ChatToolDef[] = [];
   const handlers = new Map<string, ToolHandler>();
-  for (const op of operations) {
-    if (!READ_ONLY_BRAIN_TOOLS.has(op.name)) continue;
+  const ops = operations.filter(op => offered.has(op.name) && !op.mutating && !op.localOnly && (!allowed || allowed.has(op.name)));
+  const opNames = new Set(ops.map(op => op.name));
+  for (const op of ops) {
     const toolName = `brain_${op.name}`;
     defs.push({
       name: toolName,
@@ -197,7 +225,16 @@ function buildReadOnlyToolRegistry(ctx: OperationContext): ToolRegistry {
     handlers.set(toolName, {
       idempotent: true, // All read-only ops are idempotent by construction.
       execute: async (input: unknown) => {
-        return op.handler(ctx, (input as Record<string, unknown>) ?? {});
+        let active = ctx;
+        try {
+          if (original?.remote !== false && original) active = await authorizeSkillRead(original, op.name);
+          const params = normalizeOptionalParams(op, (input as Record<string, unknown>) ?? {});
+          const failure = findInvalidParam(op, params);
+          if (failure) throw schemaInvalidParams(op, failure, { remote: true }, params);
+          return await op.handler({ ...active, remote: true }, params);
+        } catch (e) {
+          throw asAgentToolError(e, op.name, active, opNames);
+        }
       },
     });
   }

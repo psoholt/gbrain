@@ -13,14 +13,25 @@ health_checks:
   - type: command
     argv: ["pgrep", "-f", "ngrok.*http"]
     label: "ngrok process"
-  - type: http
-    url: "http://localhost:4040/api/tunnels"
+  # NOTE: this must stay a `command` check. The `http` check type blocks
+  # internal/loopback URLs (SSRF guard), so `http: localhost:4040` can never pass.
+  - type: command
+    argv: ["curl", "-sf", "http://localhost:4040/api/tunnels"]
     label: "ngrok API"
 setup_time: 10 min
 cost_estimate: "$8/mo for Hobby tier (fixed domain). Free tier works but URLs change on restart."
 ---
 
 # Public Tunnel: Fixed URL for Your Brain
+
+> **Alternative path.** For MCP alone, `gbrain mcp expose` publishes the
+> server on your Tailscale tailnet over HTTPS and keeps it running as a user
+> service, with no ngrok account (`--funnel` for agents that run in a
+> vendor's cloud). That is the recommended shape; see
+> [use your brain from anywhere over MCP](../docs/guides/remote-mcp.md).
+> Use this recipe when you need a public fixed URL beyond MCP (Twilio
+> webhooks for voice-to-brain) or prefer ngrok. **Say to your agent:**
+> *"use my brain over mcp"*.
 
 Your GBrain MCP server and voice agent need public URLs so Claude Desktop,
 Perplexity, and Twilio can reach them. ngrok gives you a fixed domain that
@@ -43,16 +54,20 @@ never changes.
 
 ```
 Local services (your machine)
-  ├── GBrain MCP server (port 3000)    gbrain serve
+  ├── GBrain MCP server (port 3131)    gbrain serve --http [--port N]
+  │                                    (plain `gbrain serve` is stdio-only — not tunnelable)
   └── Voice agent (port 8765)          node server.mjs
          │
          ▼
 ngrok tunnel (fixed domain)
-  └── https://your-brain.ngrok.app
-         │
-         ├── /mcp   → Claude Desktop, Claude Code, Perplexity
-         └── /voice  → Twilio webhooks
+  └── https://your-brain.ngrok.app  →  ONE local port per tunnel
 ```
+
+A single `ngrok http <port>` forwards ALL paths to that one port. To serve both
+`/mcp` (→ 3131) and `/voice` (→ 8765) on one domain you need either an ngrok
+traffic policy (path-based routing, see ngrok's docs) or a local reverse proxy
+(Caddy/nginx) in front of both services — or simply tunnel whichever single
+service you need (most voice installs only tunnel 8765 for Twilio).
 
 ## Setup Flow
 
@@ -221,8 +236,11 @@ to debug MCP connection issues (see request/response headers, latency, errors).
    watchdog handles Twilio, but Claude Desktop and Perplexity must be manually
    reconfigured. This is why Hobby ($8/mo) is worth it.
 
-3. **One domain, multiple services.** Hobby gives 1 free domain. Route by path
-   (`/mcp`, `/voice`) on one domain, or pay $8/mo more for a second domain.
+3. **One domain, multiple services.** Hobby gives 1 free domain, and a bare
+   `ngrok http <port>` sends every path to that single port. To route `/mcp`
+   and `/voice` to different local ports on one domain you need an ngrok
+   traffic policy or a local reverse proxy (see Architecture above) — or pay
+   $8/mo more for a second domain and run one tunnel per service.
 
 4. **The watchdog must run on startup.** If the machine reboots, ngrok won't
    auto-start unless you have a watchdog cron or systemd service.
@@ -231,7 +249,8 @@ to debug MCP connection issues (see request/response headers, latency, errors).
 
 1. Start tunnel. Visit `https://your-brain.ngrok.app` in a browser.
    You should see a response (health check or default page).
-2. From Claude Desktop, run `gbrain search "test"`. Results should come back.
+2. From Claude Desktop, ask it to search your brain (it invokes the MCP `search`
+   tool over the tunnel). Results should come back.
 3. Kill ngrok. Wait 2 minutes. Check the watchdog restarted it.
 4. From a different device (phone), access the same URL. Verify it works.
 

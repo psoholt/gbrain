@@ -38,6 +38,8 @@
 
 import { existsSync, readFileSync, realpathSync, statSync } from 'fs';
 import { basename, join, relative, resolve } from 'path';
+import { FAILSAFE_SCHEMA } from 'js-yaml';
+import { loadBoundedYaml as load } from './data-frontmatter.ts';
 import {
   autoDetectSkillsDir,
   autoDetectSkillsDirReadOnly,
@@ -46,10 +48,16 @@ import {
   type SkillsDirSource,
 } from './repo-root.ts';
 import { loadOrDeriveManifest, type ManifestEntry } from './skill-manifest.ts';
+import { relativeEscapesRoot } from './path-confine.ts';
 import { loadSkillTriggerIndex, FRONTMATTER_SECTION } from './skill-trigger-index.ts';
 import { parseSkillFrontmatter } from './skill-frontmatter.ts';
-import { hasScope } from './scope.ts';
-import { operations, OperationError, type Operation, type OperationContext } from './operations.ts';
+import { oneLineDescription } from './skill-description.ts';
+import { splitWords } from './skills/resolver/tokenize.ts';
+import { operationScopesAllowed } from './scope.ts';
+import { currentVerifiedLocalWriter } from './persistence/identity.ts';
+import { disabledOpsForPublishGates } from '../mcp/publish-gates.ts';
+import { filterOpsForSurface } from '../mcp/surface.ts';
+import { operations, OperationError, opAllowedForBoundClient, type Operation, type OperationContext } from './operations.ts';
 import {
   SKILL_CATALOG_INSTRUCTIONS,
   SKILL_CLIENT_GUIDANCE,
@@ -93,6 +101,14 @@ export interface SkillCatalogEntry {
   unavailable_tools: string[];
   writes_pages: boolean;
   mutating: boolean;
+  /** #6471: present only when the call carried `query`; see `scoreSkillMatch`. */
+  match?: SkillMatch;
+}
+
+/** #6471: lexical relevance of a skill to a task. `matched_on` names the strongest contributor. */
+export interface SkillMatch {
+  score: number;
+  matched_on: 'trigger' | 'name' | 'description';
 }
 
 export interface ListSkillsResult {
@@ -213,18 +229,20 @@ export function resolveSkillsDir(
 // Path confinement (the security boundary)
 // ---------------------------------------------------------------------------
 
+const SKILL_NAME_HINT = `Pass name exactly as list_skills returned it: a lookup key of at most ${MAX_SKILL_NAME_LEN} characters with no slashes, spaces or "..", never a path.`;
+
 /** Validate the client-supplied skill name BEFORE any filesystem access. */
 function assertSkillNameShape(name: unknown): asserts name is string {
   if (typeof name !== 'string' || name.length === 0) {
-    throw new OperationError('invalid_params', 'skill name must be a non-empty string');
+    throw new OperationError('invalid_params', 'skill name must be a non-empty string', SKILL_NAME_HINT);
   }
   if (name.length > MAX_SKILL_NAME_LEN) {
-    throw new OperationError('invalid_params', `skill name exceeds ${MAX_SKILL_NAME_LEN} characters`);
+    throw new OperationError('invalid_params', `skill name exceeds ${MAX_SKILL_NAME_LEN} characters`, SKILL_NAME_HINT);
   }
   // No path separators, no traversal, no null byte. The name is a manifest
   // LOOKUP KEY — it must never look like a path component.
   if (/[/\\]|\.\.| /.test(name)) {
-    throw new OperationError('invalid_params', `Invalid skill name: ${name}`);
+    throw new OperationError('invalid_params', `Invalid skill name: ${name}`, SKILL_NAME_HINT);
   }
 }
 
@@ -260,28 +278,31 @@ export function confineManifestPath(skillsDir: string, entry: ManifestEntry): st
   try {
     realRoot = realpathSync(skillsDir);
   } catch {
-    throw new OperationError('storage_error', `Cannot resolve skills dir: ${skillsDir}`);
+    throw new OperationError('storage_error', `Cannot resolve skills dir: ${skillsDir}`,
+      'The skills directory on the brain host is missing or unreadable. The host\'s operator checks mcp.skills_dir (gbrain config get mcp.skills_dir) or unsets it so gbrain autodetects the directory.');
   }
   const candidate = join(realRoot, entry.path);
   try {
     realCandidate = realpathSync(candidate);
   } catch {
-    throw new OperationError('page_not_found', `Skill file not found: ${entry.name}`);
+    throw new OperationError('page_not_found', `Skill file not found: ${entry.name}`, `The skills manifest lists ${entry.name} but its SKILL.md is missing on the brain host. Call list_skills for the skills that are available; the host's operator restores the file or regenerates the manifest.`);
   }
   const rel = relative(realRoot, realCandidate);
-  if (rel.startsWith('..') || resolve(realRoot, rel) !== realCandidate) {
-    throw new OperationError('invalid_params', `Skill path escapes skills dir: ${entry.name}`);
+  if (relativeEscapesRoot(rel) || resolve(realRoot, rel) !== realCandidate) { // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- rel comes from relative() of two realpaths; resolve only re-joins it to confirm containment, no file is opened here
+    throw new OperationError('invalid_params', `Skill path escapes skills dir: ${entry.name}`,
+      `The manifest entry for ${entry.name} points outside the skills directory, so it is refused. Pick another skill from list_skills; the brain host's operator fixes the manifest.`);
   }
   let st;
   try {
     st = statSync(realCandidate);
   } catch {
-    throw new OperationError('page_not_found', `Skill file not found: ${entry.name}`);
+    throw new OperationError('page_not_found', `Skill file not found: ${entry.name}`, `The skills manifest lists ${entry.name} but its SKILL.md is missing on the brain host. Call list_skills for the skills that are available; the host's operator restores the file or regenerates the manifest.`);
   }
   if (!st.isFile() || basename(realCandidate) !== 'SKILL.md') {
     throw new OperationError(
       'invalid_params',
       `Skill target is not a SKILL.md regular file: ${entry.name}`,
+      `The manifest entry for ${entry.name} does not point at a regular SKILL.md file, so it is refused. Pick another skill from list_skills; the brain host's operator fixes the manifest.`,
     );
   }
   return realCandidate;
@@ -292,10 +313,22 @@ export function confineManifestPath(skillsDir: string, entry: ManifestEntry): st
 // ---------------------------------------------------------------------------
 
 /** Can THIS caller call THIS op on THIS server? Local owns everything. */
-function opCallableByCaller(op: Operation, ctx: OperationContext): boolean {
+function opCallableByCaller(op: Operation, ctx: OperationContext, gateDisabled?: ReadonlySet<string>): boolean {
   if (ctx.remote === false) return true; // local CLI — OS is the trust boundary
   if (op.localOnly) return false; // not reachable over a remote transport
-  return hasScope(ctx.auth?.scopes ?? [], op.scope ?? 'read');
+  if (!opAllowedForBoundClient(ctx.auth, op)) return false;
+  if (filterOpsForSurface([op], ctx.auth?.effectiveSurface ?? ctx.surfaceCeiling ?? 'full').length === 0) return false;
+  if (op.publishGateKey && (!gateDisabled || gateDisabled.has(op.name))) return false;
+  if (ctx.transport === 'stdio') {
+    const writer = currentVerifiedLocalWriter();
+    if (!ctx.auth && writer?.remote && !opAllowedForBoundClient({
+      allowedOperations: writer.grant.operations ?? undefined,
+      boundSlugPrefixes: writer.grant.slugPrefixes ?? undefined,
+    }, op)) return false;
+    const scopes = ctx.auth?.scopes ?? (writer?.remote ? writer.grant.scopes : undefined);
+    return scopes ? operationScopesAllowed(scopes, op) : !op.requiredScopes?.length;
+  }
+  return operationScopesAllowed(ctx.auth?.scopes ?? [], op);
 }
 
 /**
@@ -306,69 +339,47 @@ function opCallableByCaller(op: Operation, ctx: OperationContext): boolean {
 export function crossReferenceTools(
   declared: string[],
   ctx: OperationContext,
+  gateDisabled?: ReadonlySet<string>,
 ): { usable_tools: string[]; unavailable_tools: string[] } {
   const usable: string[] = [];
   const unavailable: string[] = [];
   for (const tool of declared) {
     const op = operations.find(o => o.name === tool);
-    if (op && opCallableByCaller(op, ctx)) usable.push(tool);
+    if (op && opCallableByCaller(op, ctx, gateDisabled)) usable.push(tool);
     else unavailable.push(tool);
   }
   return { usable_tools: usable, unavailable_tools: unavailable };
 }
 
 /** Every server tool this caller can call — the envelope's "what you can use". */
-function availableBrainTools(ctx: OperationContext): string[] {
-  return operations.filter(op => opCallableByCaller(op, ctx)).map(op => op.name).sort();
+function availableBrainTools(ctx: OperationContext, gateDisabled?: ReadonlySet<string>): string[] {
+  return operations.filter(op => opCallableByCaller(op, ctx, gateDisabled)).map(op => op.name).sort();
+}
+
+export async function readSkillToolGates(ctx: OperationContext): Promise<ReadonlySet<string> | undefined> {
+  return ctx.remote === false ? undefined : disabledOpsForPublishGates(ctx.engine, ctx.config);
+}
+
+function resolveSkillTools(
+  parsed: ReturnType<typeof parseSkillFrontmatter>,
+  ctx: OperationContext,
+  gateDisabled?: ReadonlySet<string>,
+): { usable_tools: string[]; unavailable_tools: string[] } {
+  if (parsed?.tools !== undefined) return crossReferenceTools(parsed.tools, ctx, gateDisabled);
+  if (parsed) {
+    try {
+      const data = load(parsed.raw, { schema: FAILSAFE_SCHEMA });
+      if (data && typeof data === 'object' && !Array.isArray(data) && !Object.hasOwn(data, 'tools')) {
+        return { usable_tools: availableBrainTools(ctx, gateDisabled), unavailable_tools: [] };
+      }
+    } catch {}
+  }
+  return { usable_tools: [], unavailable_tools: [] };
 }
 
 // ---------------------------------------------------------------------------
 // Frontmatter projection + description
 // ---------------------------------------------------------------------------
-
-/**
- * Parse a `description:` from raw frontmatter (best-effort).
- *
- * #1711: handles YAML block scalars. `description: |` (literal) and
- * `description: >` (folded), with optional chomping/indent indicators
- * (`|-`, `>+`, `|2`), are parsed by reading the following indented lines and
- * folding them into a single line for the one-line catalog. Pre-fix the regex
- * captured the bare `|`/`>` indicator as the description, so block-scalar skills
- * showed a literal "|" in the catalog instead of their text.
- */
-function parseDescriptionField(raw: string): string | undefined {
-  const lines = raw.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(/^description:[ \t]*(.*)$/);
-    if (!m) continue;
-    const inline = m[1].trim();
-
-    // Block scalar indicator (`|`, `>`, with optional chomp `+`/`-` and indent digit).
-    if (/^[|>][+-]?\d*$/.test(inline)) {
-      const block: string[] = [];
-      let baseIndent: number | null = null;
-      for (let j = i + 1; j < lines.length; j++) {
-        const line = lines[j];
-        if (line.trim().length === 0) { block.push(''); continue; }
-        const indent = line.length - line.trimStart().length;
-        if (baseIndent === null) {
-          if (indent === 0) break;   // no indented continuation
-          baseIndent = indent;
-        }
-        if (indent < baseIndent) break;  // dedent ends the block
-        block.push(line.slice(baseIndent));
-      }
-      // Catalog descriptions are one line; collapse literal/folded whitespace.
-      const folded = block.join(' ').replace(/\s+/g, ' ').trim();
-      return folded.length > 0 ? folded : undefined;
-    }
-
-    // Inline scalar: strip a matching pair of surrounding quotes.
-    const unq = inline.replace(/^(['"])([\s\S]*)\1$/, '$2').trim();
-    return unq.length > 0 ? unq : undefined;
-  }
-  return undefined;
-}
 
 /** Strip the leading `---\n...\n---` fence; return the prose body. */
 function stripFrontmatterFence(content: string): string {
@@ -376,22 +387,7 @@ function stripFrontmatterFence(content: string): string {
   return m ? content.slice(m[0].length) : content;
 }
 
-/** First non-empty, non-heading prose line of the body (description fallback). */
-function firstProseLine(body: string): string {
-  for (const line of body.split('\n')) {
-    const t = line.trim();
-    if (t.length === 0) continue;
-    if (t.startsWith('#')) continue;
-    if (t.startsWith('<!--')) continue;
-    return t.replace(/^[*_>`-]+\s*/, '').trim();
-  }
-  return '';
-}
-
-/** description = frontmatter `description:` or first prose line, else ''. */
-export function oneLineDescription(raw: string, body: string): string {
-  return parseDescriptionField(raw) ?? firstProseLine(body);
-}
+export { oneLineDescription };
 
 // ---------------------------------------------------------------------------
 // Catalog assembly
@@ -430,21 +426,62 @@ function dirNameOf(entry: ManifestEntry): string {
   return entry.path.split('/')[0] ?? entry.name;
 }
 
+const QUERY_STOPWORDS = new Set(['a', 'an', 'the', 'and', 'or', 'of', 'to', 'for', 'in', 'on', 'at', 'by', 'with', 'my', 'me', 'is', 'it', 'be', 'this', 'that', 'from', 'as']);
+const QUERY_RESULT_LIMIT_DEFAULT = 10;
+const QUERY_RESULT_LIMIT_MAX = 100;
+
+/** Lowercased word tokens; hyphens and punctuation split, so `meeting-prep` is `meeting` + `prep`. */
+function queryTokens(text: string): string[] {
+  return splitWords(text).filter(t => t.length >= 2 && !QUERY_STOPWORDS.has(t));
+}
+
+/**
+ * #6471: lexical token overlap between a task and one catalog entry. Trigger
+ * tokens count 2 each and a whole trigger phrase inside the query counts
+ * double again; name tokens count 3; description tokens count 1. Null when
+ * nothing overlaps (the entry is dropped from a ranked list). No model call:
+ * the catalog is ~100 entries and `list_skills` must stay keyless and fast.
+ */
+export function scoreSkillMatch(entry: Pick<SkillCatalogEntry, 'name' | 'description' | 'triggers'>, query: string): SkillMatch | null {
+  const queryWords = queryTokens(query);
+  if (queryWords.length === 0) return null;
+  const inQuery = new Set(queryWords);
+  const queryText = ` ${queryWords.join(' ')} `;
+  const overlap = (text: string): number => new Set(queryTokens(text).filter(t => inQuery.has(t))).size;
+  let trigger = 0;
+  for (const phrase of entry.triggers) {
+    const words = queryTokens(phrase);
+    if (words.length === 0) continue;
+    trigger += queryText.includes(` ${words.join(' ')} `) ? 4 * words.length : 2 * overlap(phrase);
+  }
+  const name = 3 * overlap(entry.name);
+  const description = overlap(entry.description);
+  const score = trigger + name + description;
+  if (score === 0) return null;
+  const matched_on = trigger >= name && trigger >= description ? 'trigger' : name >= description ? 'name' : 'description';
+  return { score, matched_on };
+}
+
 /**
  * Build the flat host-repo skill catalog + the instructional envelope. Resilient:
  * a single malformed/escaping skill is skipped, never throws the whole call.
+ * With `opts.query` (#6471) the section-filtered catalog is ranked by
+ * `scoreSkillMatch`, zero-score entries are dropped, ties break by name and
+ * `opts.limit` (default 10, max 100) caps the list; without it the output is
+ * unchanged.
  */
 export function buildSkillCatalog(
   ctx: OperationContext,
   skillsDir: string,
   source: ResolvedSkillsDirSource,
-  opts: { section?: string } = {},
+  opts: { section?: string; gateDisabled?: ReadonlySet<string>; query?: string; limit?: number } = {},
 ): ListSkillsResult {
   const { skills: manifest } = loadOrDeriveManifest(skillsDir);
   const triggerMap = buildTriggerMap(skillsDir);
   const sectionFilter = opts.section?.trim();
+  const query = opts.query?.trim();
 
-  const skills: SkillCatalogEntry[] = [];
+  let skills: SkillCatalogEntry[] = [];
   for (const entry of manifest) {
     let path: string;
     try {
@@ -471,7 +508,7 @@ export function buildSkillCatalog(
     if (sectionFilter && section !== sectionFilter) continue;
 
     const tools = parsed?.tools ?? [];
-    const { usable_tools, unavailable_tools } = crossReferenceTools(tools, ctx);
+    const { usable_tools, unavailable_tools } = resolveSkillTools(parsed, ctx, opts.gateDisabled);
     skills.push({
       name: entry.name,
       description: oneLineDescription(raw, body),
@@ -486,6 +523,13 @@ export function buildSkillCatalog(
   }
 
   skills.sort((a, b) => a.name.localeCompare(b.name));
+  if (query) {
+    const limit = Math.min(QUERY_RESULT_LIMIT_MAX, Math.max(1, Math.floor(opts.limit ?? QUERY_RESULT_LIMIT_DEFAULT)));
+    skills = skills
+      .flatMap(entry => { const match = scoreSkillMatch(entry, query); return match ? [{ ...entry, match }] : []; })
+      .sort((a, b) => b.match!.score - a.match!.score || a.name.localeCompare(b.name))
+      .slice(0, limit);
+  }
 
   return {
     schema_version: 1,
@@ -495,7 +539,7 @@ export function buildSkillCatalog(
     instructions: {
       summary: SKILL_CATALOG_INSTRUCTIONS.summary,
       how_to_use: [...SKILL_CATALOG_INSTRUCTIONS.how_to_use],
-      available_brain_tools: availableBrainTools(ctx),
+      available_brain_tools: availableBrainTools(ctx, opts.gateDisabled),
       fetch_op: 'get_skill',
     },
   };
@@ -506,6 +550,7 @@ export function getSkillDetail(
   ctx: OperationContext,
   skillsDir: string,
   name: string,
+  opts: { gateDisabled?: ReadonlySet<string> } = {},
 ): GetSkillResult {
   const path = resolveSkillMdPath(skillsDir, name);
 
@@ -519,14 +564,14 @@ export function getSkillDetail(
   }
   const content = readFileSync(path, 'utf-8');
   if (Buffer.byteLength(content, 'utf8') > MAX_SKILL_MD_BYTES) {
-    throw new OperationError('payload_too_large', `Skill ${name} exceeds the size cap.`);
+    throw new OperationError('payload_too_large', `Skill ${name} exceeds the size cap.`,
+      `Skill ${name} is over ${MAX_SKILL_MD_BYTES} bytes, so it is not served. The brain host's operator can raise GBRAIN_MAX_SKILL_MD_BYTES if it is legitimately large.`);
   }
 
   const parsed = parseSkillFrontmatter(content);
   const raw = parsed?.raw ?? '';
   const body = stripFrontmatterFence(content);
-  const tools = parsed?.tools ?? [];
-  const { usable_tools, unavailable_tools } = crossReferenceTools(tools, ctx);
+  const { usable_tools, unavailable_tools } = resolveSkillTools(parsed, ctx, opts.gateDisabled);
   const mutating = parsed?.mutating ?? false;
 
   return {
@@ -546,7 +591,7 @@ export function getSkillDetail(
     client_guidance: {
       nature: SKILL_CLIENT_GUIDANCE.nature,
       protocol: [...SKILL_CLIENT_GUIDANCE.protocol],
-      available_brain_tools: availableBrainTools(ctx),
+      available_brain_tools: availableBrainTools(ctx, opts.gateDisabled),
       mutating,
     },
   };
@@ -567,9 +612,17 @@ export function getSkillDetail(
 export function assertPublishEnabled(ctx: OperationContext, publishSkills: boolean): void {
   if (ctx.remote === false) return;
   if (publishSkills) return;
-  throw new OperationError(
+  // Caller-facing wording + machine-readable detail (WP1). The k=v `detail`
+  // grammar (`config_key=<key>`) is THE machine-parseable denial format —
+  // future denial classes reuse it rather than inventing new string shapes.
+  // Honest catalogs hide this op at list time; reaching this throw means a
+  // caller guessed the name or the gate flipped between list and call.
+  const err = new OperationError(
     'permission_denied',
-    'Skill publishing is disabled by the brain owner.',
+    'This tool is not published by the brain owner, so it is hidden from your tool catalog. ' +
+      'Ask the owner to enable skill publishing if you need it.',
     'The owner can enable it with `gbrain config set mcp.publish_skills true`.',
   );
+  err.detail = 'config_key=mcp.publish_skills';
+  throw err;
 }

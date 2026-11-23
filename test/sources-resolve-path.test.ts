@@ -1,0 +1,262 @@
+/**
+ * GBRA-150: `sources_resolve_path` / `gbrain sources resolve-path` answers what gbrain did with each file path by gbrain's
+ * own rules. The three shapes a copied slug rule gets wrong: a path whose slug
+ * gbrain folds (trailing hyphen), a deleted file whose case-folded twin owns the slug (checked by origin, never slug), and a
+ * nested `index.md` sync skips as folder scaffolding. Plus the states a harness must tell apart: missing (a real gap),
+ * held, not synced yet. Red on master: the module and the operation do not exist there.
+ */
+import { afterAll, beforeAll, expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { BrainEngine } from '../src/core/engine.ts';
+import type { SyncOpts } from '../src/commands/sync.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { claimWorktree } from '../src/core/persistence/ownership.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+import { performManagedSync } from '../src/core/persistence/sync-run.ts';
+import { resolveSourcePaths, RESOLVE_PATHS_MAX, type ResolvedPath } from '../src/core/persistence/resolve-paths.ts';
+import { dispatchToolCall } from '../src/mcp/dispatch.ts';
+import { operationsByName } from '../src/core/operations.ts';
+import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
+import { testBackends } from './helpers/test-backends.ts';
+import { withEnv } from './helpers/with-env.ts';
+
+const backends = testBackends();
+const home = mkdtempSync(join(tmpdir(), 'gbrain-resolve-path-'));
+const engines: BrainEngine[] = [];
+let closePostgres: (() => Promise<void>) | undefined;
+const env = { GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home };
+const git = (root: string, ...args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const commit = (root: string) => { git(root, 'add', '-A'); git(root, '-c', 'user.name=Example', '-c', 'user.email=example@example.invalid', 'commit', '-qm', 'content'); return git(root, 'rev-parse', 'HEAD'); };
+const note = (title: string) => `---\ntitle: ${title}\n---\nA synthetic observation about ${title}.\n`;
+
+beforeAll(async () => {
+  if (backends.includes('pglite')) { const engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema(); engines.push(engine); }
+  if (backends.includes('postgres')) { const pg = await isolatedPersistencePostgres(process.env.DATABASE_URL!); engines.push(pg.engine); closePostgres = pg.close; }
+}, 120_000);
+
+afterAll(async () => {
+  for (const engine of engines) { await disposePersistenceConsumer(engine); await engine.disconnect(); }
+  await closePostgres?.(); rmSync(home, { recursive: true, force: true });
+});
+
+async function unmanaged<T>(engine: BrainEngine, run: () => Promise<T>): Promise<T> {
+  await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+  try { return await run(); } finally { await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1'); }
+}
+
+async function source(engine: BrainEngine, files: Record<string, string>) {
+  const id = `rslv-${randomUUID().replace(/-/g, '').slice(0, 20)}`, repo = join(home, id);
+  const write = (path: string, content: string) => { mkdirSync(join(repo, path, '..'), { recursive: true }); writeFileSync(join(repo, path), content); };
+  mkdirSync(repo, { recursive: true }); git(repo, 'init', '-q');
+  for (const [path, content] of Object.entries(files)) write(path, content);
+  commit(repo);
+  await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+  await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,$3::text::jsonb)', [id, repo, '{}']);
+  await claimWorktree(engine, id, repo);
+  await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+  const sync = (extra: Partial<SyncOpts> = {}) => performManagedSync(engine, { sourceId: id, noPull: true, noEmbed: true, noExtract: true, ...extra });
+  return { id, repo, write, sync, remove: (path: string) => unlinkSync(join(repo, path)),
+    resolve: (...paths: string[]) => resolveSourcePaths(engine, id, paths),
+    legacy: async (added: Record<string, string>) => {
+      for (const [path, content] of Object.entries(added)) write(path, content);
+      await unmanaged(engine, () => engine.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [id, commit(repo)]));
+    } };
+}
+
+async function each(run: (engine: BrainEngine) => Promise<void>) {
+  await withEnv(env, async () => {
+    for (const engine of engines) {
+      try { await run(engine); } finally { await disposePersistenceConsumer(engine); }
+    }
+  });
+}
+
+const HYPHEN = 'articles/outlet-example/a-headline-.md';
+const TWIN_LOWER = 'sources/meetings/2026-10-19-call-abcdefghxyz.md';
+const TWIN_MIXED = 'sources/meetings/2026-10-19-call-AbCdEfGhXyZ.md';
+const NESTED_INDEX = 'projects/acme-example/index.md';
+
+test('the slug gbrain folds a trailing hyphen into resolves to the indexed page, not a missing one', () => each(async engine => {
+  const s = await source(engine, { [HYPHEN]: note('Headline') });
+  await s.sync();
+  const [p] = (await s.resolve(HYPHEN)).paths;
+  expect(p).toMatchObject({ path: HYPHEN, slug: 'articles/outlet-example/a-headline', in_synced_commit: true, at_head: true, skipped: null, hold: null });
+  expect(p!.page).toMatchObject({ slug: 'articles/outlet-example/a-headline', deleted: false });
+  expect(p!.page!.chunks).toBeGreaterThan(0);
+  expect(['searchable', 'pending_embedding']).toContain(p!.state);
+  expect(p!.searchable).not.toBe(false);
+}), 240_000);
+
+test('a deleted mixed-case file whose lowercase twin owns the slug reads deleted, with the twin named, never as a failed delete', () => each(async engine => {
+  const s = await source(engine, { [TWIN_LOWER]: note('Call') });
+  await s.sync();
+  const result = await s.resolve(TWIN_MIXED, TWIN_LOWER);
+  const [mixed, lower] = result.paths;
+  expect(mixed).toMatchObject({ path: TWIN_MIXED, slug: 'sources/meetings/2026-10-19-call-abcdefghxyz', state: 'deleted', in_synced_commit: false, page: null, fix: null,
+    slug_owner: { slug: 'sources/meetings/2026-10-19-call-abcdefghxyz', source_path: TWIN_LOWER } });
+  expect(mixed!.why).toContain(TWIN_LOWER);
+  expect(lower).toMatchObject({ slug: mixed!.slug, slug_owner: null, in_synced_commit: true });
+  expect(lower!.page).not.toBeNull();
+}), 240_000);
+
+test('a file deleted for real reads deleted once synced and stale_page before; a nested index.md reads skipped as a metafile with its typed frontmatter flagged', () => each(async engine => {
+  const s = await source(engine, { 'notes/gone.md': note('Gone'), 'notes/keep.md': note('Keep'), [NESTED_INDEX]: '---\ntype: project\nstatus: active\n---\nA synthetic project hub.\n',
+    'people/README.md': 'Folder notes.\n' });
+  await engine.setConfig('sync.metafile_pages', 'off');
+  try {
+    await s.sync();
+    s.remove('notes/gone.md');
+    await s.legacy({});
+    expect((await s.resolve('notes/gone.md')).paths[0]).toMatchObject({ state: 'stale_page', in_synced_commit: false });
+    await s.sync();
+    expect((await s.resolve('notes/gone.md')).paths[0]).toMatchObject({ state: 'deleted', page: { deleted: true }, slug_owner: null, fix: null });
+    const [index, readme] = (await s.resolve(NESTED_INDEX, 'people/README.md')).paths;
+    expect(index).toMatchObject({ state: 'skipped', searchable: false, page: null, skipped: { reason: 'metafile', typed_frontmatter: true }, fix: null });
+    expect(readme).toMatchObject({ state: 'skipped', skipped: { reason: 'metafile', typed_frontmatter: false } });
+  } finally { await engine.setConfig('sync.metafile_pages', ''); }
+}), 240_000);
+
+test('under the default sync.metafile_pages typed, a typed nested index.md resolves as its page; a bare nested README.md still reads skipped', () => each(async engine => {
+  const s = await source(engine, { [NESTED_INDEX]: '---\ntype: project\nstatus: active\n---\nA synthetic project hub.\n', 'people/README.md': 'Folder notes.\n' });
+  await s.sync();
+  const [index, readme] = (await s.resolve(NESTED_INDEX, 'people/README.md')).paths;
+  expect(index).toMatchObject({ path: NESTED_INDEX, slug: 'projects/acme-example/index', in_synced_commit: true, skipped: null, hold: null, page: { slug: 'projects/acme-example/index', deleted: false } });
+  expect(['searchable', 'pending_embedding']).toContain(index!.state);
+  expect(readme).toMatchObject({ state: 'skipped', page: null, skipped: { reason: 'metafile', typed_frontmatter: false } });
+}), 240_000);
+
+test('a committed eligible file with no page and no hold is missing (a real gap) with the re-screen fix; a held file and a not-yet-synced commit read as such', () => each(async engine => {
+  const s = await source(engine, { 'notes/a.md': note('A') });
+  await s.sync();
+  await s.legacy({ 'notes/lost.md': note('Lost') });
+  const [lost] = (await s.resolve('notes/lost.md')).paths;
+  expect(lost).toMatchObject({ state: 'missing', searchable: false, page: null, fix: { argv: ['gbrain', 'sources', 'retry-held', s.id, '--unindexed'],
+    then: { argv: ['gbrain', 'sync', '--source', s.id, '--no-pull'] } } });
+  s.write('investors/fund-a.md', '---\ntitle: Fund A\nslug: fund-a\n---\nA synthetic fund page.\n');
+  commit(s.repo);
+  const [early] = (await s.resolve('investors/fund-a.md')).paths;
+  expect(early).toMatchObject({ state: 'not_synced_yet', in_synced_commit: false, at_head: true, fix: { argv: ['gbrain', 'sync', '--source', s.id, '--no-pull'] } });
+  await s.sync();
+  const [held] = (await s.resolve('investors/fund-a.md')).paths;
+  expect(held).toMatchObject({ state: 'held', searchable: false, hold: { code: 'frontmatter_slug_conflict' }, frontmatter_slug: 'fund-a',
+    fix: { argv: ['gbrain', 'sync', 'status', '--source', s.id, '--json'] } });
+}), 240_000);
+
+test('the operation is read-scoped, takes paths relative to the source root, and refuses an empty or oversized batch', () => each(async engine => {
+  const s = await source(engine, { 'notes/a.md': note('A') });
+  await s.sync();
+  const op = operationsByName.sources_resolve_path!;
+  expect(op).toMatchObject({ scope: 'read', mutating: false });
+  const out = await op.handler({ engine, remote: false } as never, { id: s.id, paths: ['./notes/a.md'] }) as Awaited<ReturnType<typeof resolveSourcePaths>>;
+  expect(out.paths[0]).toMatchObject({ slug: 'notes/a', in_synced_commit: true });
+  const remote = { engine, remote: true, sourceId: 'other-example', auth: { allowedSources: ['other-example'] } } as never;
+  await expect(op.handler(remote, { id: s.id, paths: ['notes/a.md'] })).rejects.toMatchObject({ code: 'not_found' });
+  await expect(s.resolve()).rejects.toMatchObject({ code: 'invalid_params' });
+  await expect(s.resolve(...Array.from({ length: RESOLVE_PATHS_MAX + 1 }, (_, i) => `notes/${i}.md`))).rejects.toMatchObject({ code: 'invalid_params' });
+}), 240_000);
+
+test('a large page whose embedding budget is held reads pending_embedding with the hold, never keyword_only (which means embed_skip)', () => each(async engine => {
+  const { PAGE_INLINE_MAX_BYTES } = await import('../src/core/page-size-policy.ts');
+  const body = 'Weekly notes from acme-example with alice-example. '.repeat(Math.ceil((PAGE_INLINE_MAX_BYTES + 4096) / 51));
+  const s = await source(engine, { 'notes/large-example.md': `---\ntitle: Large\n---\n${body}\n`, 'notes/skip-example.md': '---\ntitle: Skip\nembed_skip:\n  reason: operator\n---\nSkipped by choice.\n' });
+  await s.sync();
+  const [page] = await engine.executeRaw<{ id: number }>('SELECT id FROM pages WHERE source_id=$1 AND slug=$2', [s.id, 'notes/large-example']);
+  await engine.executeRaw(`INSERT INTO page_embedding_budget (page_id, state, reason) VALUES ($1, 'held', 'upgrade_backfill')
+    ON CONFLICT (page_id) DO UPDATE SET state='held', reason='upgrade_backfill'`, [page!.id]);
+  const { paths: [held, skipped] } = await s.resolve('notes/large-example.md', 'notes/skip-example.md');
+  expect(held).toMatchObject({ state: 'pending_embedding', searchable: 'keyword', embedding_hold: { state: 'held', reason: 'upgrade_backfill' } });
+  expect(held!.page!.unembedded).toBe(held!.page!.chunks);
+  expect(held!.page!.chunks).toBeGreaterThan(0);
+  expect(held!.fix!.argv).toEqual(['gbrain', 'embed', '--held', '--dry-run', '--source', s.id]);
+  expect(skipped).toMatchObject({ state: 'keyword_only', searchable: 'keyword', embedding_hold: null });
+}), 240_000);
+
+
+const RESTRICTED = (fm: string, title: string) => note(title).replace('---\n', `---\n${fm}\n`);
+
+test('a page the caller may not read answers exactly like a path with no file or page; the owner-bound caller reads it as the local operator does (#8761)', () => each(async engine => {
+  for (const id of ['owner-example', 'alice-example', 'bob-example']) await engine.executeRaw('INSERT INTO access_members (id) VALUES ($1) ON CONFLICT DO NOTHING', [id]);
+  await engine.setConfig('access.owner_member', 'owner-example');
+  try {
+    const s = await source(engine, {
+      'team/kept.md': RESTRICTED('readable_by: [alice-example, owner-example]', 'Kept'),
+      'team/private.md': RESTRICTED('visibility: private', 'Private'),
+      'team/open.md': note('Open'),
+    });
+    await s.sync();
+    const columns = (await engine.executeRaw<{ name: string }>(
+      "SELECT column_name AS name FROM information_schema.columns WHERE table_name = 'pages' AND column_name NOT IN ('id', 'slug', 'source_path', 'deleted_at') AND is_generated = 'NEVER' ORDER BY ordinal_position"))
+      .map(c => c.name).join(', ');
+    await unmanaged(engine, () => engine.executeRaw(
+      `INSERT INTO pages (slug, source_path, deleted_at, ${columns}) SELECT 'team/old-kept', 'team/kept.md', now() - interval '1 day', ${columns} FROM pages WHERE source_id = $1 AND slug = 'team/open'`, [s.id]));
+    await s.legacy({ 'team/later-kept.md': RESTRICTED('readable_by: [alice-example, owner-example]', 'Kept later'), 'team/later-open.md': note('Open later') });
+    s.write('team/head-kept.md', RESTRICTED('readable_by: [alice-example, owner-example]', 'Kept at head'));
+    s.write('team/head-toml.md', '---toml\ntitle = "Odd"\n---\nBody.\n');
+    s.write('atoms/head-atom.md', 'An atom body with no frontmatter.\n');
+    s.write('team/head-large.md', note('Large') + 'x'.repeat(300 * 1024) + '\n');
+    commit(s.repo);
+    const paths = ['team/kept.md', 'team/private.md', 'team/open.md', 'team/KEPT.md', 'team/nothing-here.md', 'team/later-kept.md', 'team/later-open.md', 'team/head-kept.md', 'team/head-toml.md', 'atoms/head-atom.md', 'team/head-large.md'];
+    const call = async (stdioMember?: string) => {
+      const result = await dispatchToolCall(engine, 'sources_resolve_path', { id: s.id, paths },
+        { remote: true, transport: 'stdio', sourceId: s.id, ...(stdioMember ? { stdioMember } : {}) });
+      expect(result.isError).toBeFalsy();
+      return (JSON.parse(result.content[0]!.text) as Awaited<ReturnType<typeof resolveSourcePaths>>).paths;
+    };
+    const answer = ({ path: _p, source_path: _s, slug: _g, ...rest }: ResolvedPath) => rest;
+    for (const caller of ['bob-example', undefined]) {
+      const seen = await call(caller);
+      const nothing = answer(seen[4]!);
+      expect(nothing.state).toBe('deleted');
+      expect(answer(seen[0]!)).toEqual(nothing);
+      expect(answer(seen[1]!)).toEqual(nothing);
+      expect(answer(seen[3]!)).toEqual(nothing);
+      expect(seen[2]!.page?.slug).toBe('team/open');
+      expect(answer(seen[5]!)).toEqual(nothing);
+      expect(seen[6]).toMatchObject({ state: 'missing', in_synced_commit: true });
+      expect(answer(seen[7]!)).toEqual(nothing);
+      expect(answer(seen[8]!)).toEqual(nothing);
+      expect(answer(seen[9]!)).toEqual(nothing);
+      expect(answer(seen[10]!)).toEqual(nothing);
+      expect(JSON.stringify(seen)).not.toContain('Kept');
+    }
+    const alice = await call('alice-example');
+    expect(alice[0]!.page?.slug).toBe('team/kept');
+    expect(alice[5]).toMatchObject({ state: 'missing', in_synced_commit: true });
+    expect(alice[7]).toMatchObject({ at_head: true, in_synced_commit: false });
+    expect(alice[3]!.slug_owner).toEqual({ slug: 'team/kept', source_path: 'team/kept.md' });
+    expect(answer(alice[1]!)).toEqual(answer(alice[4]!));
+    const local = await s.resolve(...paths);
+    expect(local.paths[1]!.page?.slug).toBe('team/private');
+    expect(await call('owner-example')).toEqual(local.paths);
+  } finally {
+    await engine.executeRaw("DELETE FROM config WHERE key = 'access.owner_member'");
+  }
+}), 240_000);
+
+
+test('a plain directory with no Git anywhere above it refuses sync_not_applicable plain_directory; a broken .git above it or a source that expects Git keeps the Git error', () => each(async engine => {
+  const plain = mkdtempSync(join(tmpdir(), 'gbrain-resolve-plain-'));
+  const broken = join(home, `broken-${randomUUID().slice(0, 8)}`);
+  mkdirSync(join(broken, '.git'), { recursive: true }); mkdirSync(join(broken, 'notes'), { recursive: true });
+  const register = async (dir: string, config: Record<string, unknown> = {}) => {
+    const id = `rslv-plain-${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+    await unmanaged(engine, () => engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,$3::text::jsonb)', [id, dir, JSON.stringify(config)]));
+    return id;
+  };
+  try {
+    const id = await register(plain);
+    const refusal = await resolveSourcePaths(engine, id, ['notes/one.md']).then(() => null, (e: any) => e);
+    expect(refusal).toMatchObject({ code: 'sync_not_applicable', reason: 'plain_directory', fix: { argv: ['gbrain', 'sources', 'status', id, '--json'] } });
+    expect(refusal.message).not.toContain(plain);
+    for (const [dir, config] of [[join(broken, 'notes'), {}], [plain, { remote_url: 'https://example.invalid/repo.git' }], [plain, { managed_clone: true }]] as const) {
+      const other = await resolveSourcePaths(engine, await register(dir, config), ['one.md']).then(() => null, (e: any) => e);
+      expect(other?.code).not.toBe('sync_not_applicable');
+      expect(String(other?.stderr ?? other?.message)).toContain('not a git repository');
+    }
+  } finally { rmSync(plain, { recursive: true, force: true }); }
+}), 240_000);
+

@@ -8,10 +8,11 @@
  * drains again.
  */
 import { describe, test, expect } from 'bun:test';
-import { readFileSync } from 'fs';
-import { join } from 'path';
+import { surfaceFileSource, surfaceSource } from './helpers/source-surface.ts';
 
-const SRC = readFileSync(join(import.meta.dir, '../src/commands/autopilot.ts'), 'utf8');
+// W4 autopilot: containment reads the autopilot surface; positional spans name the module that holds the dispatch tick.
+const SRC = surfaceSource('autopilot');
+const DISPATCH_SRC = surfaceFileSource('autopilot', 'src/commands/autopilot-dispatch.ts');
 
 describe('autopilot auto-drain wiring', () => {
   test('CODEX #2: idempotency key includes a UTC-day time slot (not static)', () => {
@@ -21,7 +22,7 @@ describe('autopilot auto-drain wiring', () => {
   });
 
   test('CODEX #1: submits with allowProtectedSubmit', () => {
-    expect(SRC).toMatch(/extract-atoms-drain[\s\S]{0,800}allowProtectedSubmit: true/);
+    expect(DISPATCH_SRC).toMatch(/extract-atoms-drain[\s\S]{0,800}allowProtectedSubmit: true/);
   });
 
   test('CODEX #3: enumerates sources and counts backlog per source', () => {
@@ -29,8 +30,11 @@ describe('autopilot auto-drain wiring', () => {
     expect(SRC).toContain('countExtractAtomsBacklog(engine, src.id)');
   });
 
-  test('gates on pack NOT declaring extract_atoms (the silent-backlog condition)', () => {
-    expect(SRC).toContain("packDeclaresPhase(engine, 'extract_atoms')");
+  // #5028 (D6): the pack-declaration gate was removed on the daemon path; a
+  // declaring pack does not make the daemon's cycles run extract_atoms.
+  // Behavior pinned by test/autopilot-auto-drain-declared-pack-5028.test.ts.
+  test('does not gate on the pack declaring extract_atoms (#5028)', () => {
+    expect(SRC).not.toContain("packDeclaresPhase(engine, 'extract_atoms')");
   });
 
   test('gates on the enabled flag and a daily spend cap (DECISION 3C)', () => {
@@ -40,14 +44,27 @@ describe('autopilot auto-drain wiring', () => {
   });
 
   test('is Postgres-gated (PGLite has no worker surface)', () => {
-    expect(SRC).toMatch(/engine\.kind === 'postgres'[\s\S]{0,400}auto_drain/);
+    expect(DISPATCH_SRC).toMatch(/engine\.kind === 'postgres'[\s\S]{0,400}auto_drain/);
+  });
+
+  // issue #3218 (codex P1): with the handler now throwing on an
+  // all-provider-failed batch, max_attempts:1 made the queue's retry policy
+  // "dead-letter on the first failure, no backoff attempt" — regression-guard
+  // against silently reverting to 1.
+  test('issue #3218: submits with max_attempts 3 (not 1) so a retry can backoff before dead-lettering', () => {
+    // lastIndexOf: the queue.add(...) call site itself (the earlier occurrence
+    // is the unrelated created_at count query above it in the same function).
+    const callSite = DISPATCH_SRC.lastIndexOf("'extract-atoms-drain'");
+    const drainBlock = DISPATCH_SRC.slice(callSite, callSite + 900);
+    expect(drainBlock).toContain('max_attempts: 3');
+    expect(drainBlock).not.toContain('max_attempts: 1');
   });
 
   test('CODEX impl #4: no maxWaiting (it coalesces by name+queue, not source)', () => {
     // maxWaiting would return source A's waiting job for source B's submit,
     // never queuing B and over-counting the cap. The per-source idempotency key
     // is the dedup; a pre-check on it avoids counting idempotency-hit re-submits.
-    const drainBlock = SRC.slice(SRC.indexOf("'extract-atoms-drain'"));
+    const drainBlock = DISPATCH_SRC.slice(DISPATCH_SRC.indexOf("'extract-atoms-drain'"));
     expect(drainBlock.slice(0, 900)).not.toContain('maxWaiting');
     expect(SRC).toContain('WHERE idempotency_key = $1 LIMIT 1');
   });

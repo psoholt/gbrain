@@ -19,9 +19,9 @@ ${TAKES_FENCE_BEGIN}
 | # | claim | kind | who | weight | since | source |
 |---|-------|------|-----|--------|-------|--------|
 | 1 | CEO of Acme | fact | world | 1.0 | 2017-01 | Crustdata |
-| 2 | Strong technical founder | take | garry | 0.85 | 2026-04-29 | OH 2026-04-29 |
-| 3 | ~~Will reach $50B~~ | bet | garry | 0.7 | 2026-04-29 → 2026-06 | superseded by #4 |
-| 4 | Will reach $30B | bet | garry | 0.55 | 2026-06 | revised after Q2 |
+| 2 | Strong technical founder | take | dana | 0.85 | 2026-04-29 | OH 2026-04-29 |
+| 3 | ~~Will reach $50B~~ | bet | dana | 0.7 | 2026-04-29 → 2026-06 | superseded by #4 |
+| 4 | Will reach $30B | bet | dana | 0.55 | 2026-06 | revised after Q2 |
 ${TAKES_FENCE_END}
 
 ## Notes
@@ -66,6 +66,29 @@ describe('parseTakesFence', () => {
     expect(warnings).toEqual([]);
   });
 
+  // #3769 — a fence written with the standard TWO-dash HTML comment form
+  // (`<!-- gbrain:takes:begin -->`) is a fence the author MEANT to write;
+  // pre-fix it parsed as "no fence at all" with zero warnings.
+  test('warns TAKES_FENCE_NEAR_MISS on the two-dash comment form', () => {
+    const body = `## Takes
+
+<!-- gbrain:takes:begin -->
+| # | claim | kind | who | weight | since | source |
+|---|-------|------|-----|--------|-------|--------|
+| 1 | Some claim | fact | world | 1.0 | 2026-01 | source |
+<!-- gbrain:takes:end -->
+`;
+    const { takes, warnings } = parseTakesFence(body);
+    expect(takes).toEqual([]);
+    expect(warnings.some(w => w.includes('TAKES_FENCE_NEAR_MISS'))).toBe(true);
+  });
+
+  test('no near-miss warning for prose that merely mentions takes', () => {
+    const { takes, warnings } = parseTakesFence('# Prose\n\nI have hot takes about fences.');
+    expect(takes).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
+
   test('warns on unbalanced fence (missing end)', () => {
     const body = `## Takes\n\n${TAKES_FENCE_BEGIN}\n| # | claim | kind | who | weight | since | source |\n`;
     const { takes, warnings } = parseTakesFence(body);
@@ -78,8 +101,8 @@ describe('parseTakesFence', () => {
 | # | claim | kind | who | weight | since | source |
 |---|-------|------|-----|--------|-------|--------|
 | 1 | Valid row | fact | world | 1.0 | 2026-01 | source |
-| 2 | Bad weight | take | garry | not-a-number | 2026-01 | x |
-| 3 | Unknown kind | wibble | garry | 0.5 | 2026-01 | x |
+| 2 | Bad weight | take | dana | not-a-number | 2026-01 | x |
+| 3 | Unknown kind | wibble | dana | 0.5 | 2026-01 | x |
 | zzz | Bad rownum | fact | world | 1.0 | 2026-01 | x |
 ${TAKES_FENCE_END}`;
     const { takes, warnings } = parseTakesFence(body);
@@ -105,6 +128,23 @@ ${TAKES_FENCE_END}`;
 });
 
 describe('renderTakesFence', () => {
+  test('a struck multiline take stays inactive after a round trip', () => {
+    const original = parseTakesFence(SAMPLE_BODY).takes[1];
+    const rendered = renderTakesFence([{ ...original, claim: 'First line\nSecond line', active: false }]);
+    const { takes, warnings } = parseTakesFence(rendered);
+    expect(warnings).toEqual([]);
+    expect(takes[0]).toMatchObject({ claim: 'First line\nSecond line', active: false });
+  });
+
+  test('round-trips a multiline take claim without warnings', () => {
+    const original = parseTakesFence(SAMPLE_BODY).takes[1];
+    const rendered = renderTakesFence([{ ...original, claim: 'First line\nSecond line' }]);
+    const { takes, warnings } = parseTakesFence(rendered);
+    expect(warnings).toEqual([]);
+    expect(takes).toHaveLength(1);
+    expect(takes[0].claim).toBe('First line\nSecond line');
+  });
+
   test('round-trip preserves all fields', () => {
     const original = parseTakesFence(SAMPLE_BODY);
     const rendered = renderTakesFence(original.takes);
@@ -135,7 +175,7 @@ describe('upsertTakeRow', () => {
     const { body, rowNum } = upsertTakeRow(SAMPLE_BODY, {
       claim: 'Best founder I have met this batch',
       kind: 'take',
-      holder: 'garry',
+      holder: 'dana',
       weight: 0.95,
       sinceDate: '2026-05-01',
       source: 'OH 2026-05-01',
@@ -191,7 +231,7 @@ describe('supersedeRow', () => {
     const { body, oldRowNum, newRowNum } = supersedeRow(SAMPLE_BODY, 2, {
       claim: 'Strongest technical founder I have met',
       kind: 'take',
-      holder: 'garry',
+      holder: 'dana',
       weight: 0.95,
       sinceDate: '2026-05-01',
       source: 'OH 2026-05-01',
@@ -248,8 +288,8 @@ describe('v0.30.0 resolution columns', () => {
   const RESOLVED_BODY = `# Some Page\n\n## Takes\n\n${TAKES_FENCE_BEGIN}
 | # | claim | kind | who | weight | since | source | resolved | quality | evidence | value | unit | by |
 |---|-------|------|-----|--------|-------|--------|----------|---------|----------|-------|------|----|
-| 1 | First bet | bet | garry | 0.7 | 2026-04 | OH | 2026-04-30 | correct | Series A closed | 50 | usd | garry |
-| 2 | Pending bet | bet | garry | 0.6 | 2026-04 | OH |  |  |  |  |  |  |
+| 1 | First bet | bet | dana | 0.7 | 2026-04 | OH | 2026-04-30 | correct | Series A closed | 50 | usd | dana |
+| 2 | Pending bet | bet | dana | 0.6 | 2026-04 | OH |  |  |  |  |  |  |
 ${TAKES_FENCE_END}\n`;
 
   test('parses v0.30-shape fence: resolved row has resolution fields populated', () => {
@@ -264,7 +304,7 @@ ${TAKES_FENCE_END}\n`;
       resolvedEvidence: 'Series A closed',
       resolvedValue: 50,
       resolvedUnit: 'usd',
-      resolvedBy: 'garry',
+      resolvedBy: 'dana',
     });
   });
 
@@ -281,6 +321,18 @@ ${TAKES_FENCE_END}\n`;
     expect(rendered).toContain('| # | claim | kind | who | weight | since | source |');
     expect(rendered).not.toContain('quality');
     expect(rendered).not.toContain('resolved');
+  });
+
+  test('renderer: blank line between the begin marker and the header — GFM/Obsidian need it to render a table (#4615)', () => {
+    // Same jam as the facts fence: the HTML-comment begin marker plus a
+    // single newline makes GFM parsers read the pipe rows as a paragraph.
+    // parseTakesFence skips blank lines, so the extra newline is parse-safe.
+    const { takes } = parseTakesFence(SAMPLE_BODY);
+    const rendered = renderTakesFence(takes);
+    expect(rendered).toMatch(/takes:begin -->\n\n\|/);
+    const reparsed = parseTakesFence(rendered);
+    expect(reparsed.warnings).toEqual([]);
+    expect(reparsed.takes).toHaveLength(takes.length);
   });
 
   test('renderer: any resolved row triggers wide 13-column shape', () => {
@@ -318,7 +370,7 @@ ${TAKES_FENCE_END}\n`;
     expect(roundTripped[0].resolvedEvidence).toBe('Series A closed');
     expect(roundTripped[0].resolvedValue).toBe(50);
     expect(roundTripped[0].resolvedUnit).toBe('usd');
-    expect(roundTripped[0].resolvedBy).toBe('garry');
+    expect(roundTripped[0].resolvedBy).toBe('dana');
   });
 
   test('REGRESSION (codex F3): updating an unrelated row preserves resolution on the resolved row', () => {
@@ -372,7 +424,7 @@ ${TAKES_FENCE_END}\n`;
     const { body: nextBody, rowNum } = upsertTakeRow(RESOLVED_BODY, {
       claim: 'Brand new bet',
       kind: 'bet',
-      holder: 'garry',
+      holder: 'dana',
       weight: 0.4,
       active: true,
     });
@@ -396,7 +448,7 @@ ${TAKES_FENCE_END}\n`;
     const { body: nextBody } = supersedeRow(RESOLVED_BODY, 1, {
       claim: 'Updated bet',
       kind: 'bet',
-      holder: 'garry',
+      holder: 'dana',
       weight: 0.5,
     });
     const { takes } = parseTakesFence(nextBody);

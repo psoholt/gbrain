@@ -1,0 +1,180 @@
+/**
+ * Every gbrain function that pins a search_path ends it with pg_temp (#7632).
+ *
+ * A pinned `pg_catalog, public` (or `pg_catalog`) does not name pg_temp, and PostgreSQL then searches the calling
+ * session's temporary schema first for tables and views. Any role that may create temporary tables (PUBLIC may, by
+ * default) could shadow a ledger a guard reads, such as fact_purges, page_purges, take_purges or fact_withdrawals, with an
+ * empty temp table or view of the same name, and the guard let a purged claim, page or take, or a withdrawn fact,
+ * through: for the owner as much as for any other writer. Named last, pg_temp comes after every other schema for
+ * relations, and PostgreSQL never searches it for functions or operators.
+ *
+ * Every definition gbrain owns now pins `pg_catalog, public, pg_temp` itself (#7785; scripts/check-search-path.sh keeps
+ * it so), so a schema replay keeps pg_temp. Historical migration bodies still pin the legacy settings, and so does a
+ * brain created before the change, which is what the hardening below completes: ALTER FUNCTION only, no body rewritten,
+ * so every guard keeps master's body, SECURITY INVOKER and BEFORE ROW timing.
+ * A write role that RLS keeps from a ledger is refused by the guard itself since v318 (#7659, requireLedgerPoliciesSql).
+ */
+
+import type { BrainEngine } from './engine.ts';
+import { failClosedLedgerGuards } from './guard-ledger-checks.ts';
+import { migrationStatementTimeoutMs } from './migration-timeout.ts';
+import { isLockTimeoutError } from './retry-matcher.ts';
+import { resolveSchemaLockTimeoutMs, schemaLockBlockedError } from './postgres-engine/schema-lock-timeout.ts';
+
+/** The search_path settings gbrain functions pinned before #7632, which the hardening completes with pg_temp. */
+export const LEGACY_SEARCH_PATH_SETTINGS = ['search_path=pg_catalog, public', 'search_path=pg_catalog'] as const;
+
+/** The pinned path in a pg_proc.proconfig entry `c.setting` (`search_path=<path>`). */
+export const PINNED_PATH_SQL = `substr(c.setting, ${'search_path='.length + 1})`;
+
+/**
+ * Every function gbrain installs in public with a pinned search_path, on either engine. The hardening and the doctor
+ * check touch only these, so another application's function in a shared database keeps its own search_path. A new
+ * pinned function joins this list; scripts/check-search-path.sh (bun run check:search-path) names one that does not,
+ * and the fresh-install tests (test/function-search-path-pglite.test.ts, and case 3 of
+ * test/e2e/function-search-path-postgres.test.ts) fail until it does.
+ */
+export const PINNED_FUNCTION_NAMES = [
+  'auto_enable_rls', 'bump_page_generation_clock_fn', 'bump_page_generation_fn', 'enforce_minion_queue_protocol',
+  'gbrain_access_derive_page_readers', 'gbrain_access_folder_rules', 'gbrain_access_lineage_rules', 'gbrain_access_mark_restricted', 'gbrain_access_norm_readers',
+  'gbrain_access_origin_closed_for', 'gbrain_access_origin_hidden_for', 'gbrain_access_origin_labelled_for', 'gbrain_access_origin_restricted', 'gbrain_access_pending_covers', 'gbrain_access_readers', 'gbrain_access_refresh_serves', 'gbrain_access_refresh_serves_trigger', 'gbrain_access_stamp_folder_rules',
+  'gbrain_access_state_unreadable',
+  'gbrain_advance_page_revision', 'gbrain_advance_tag_revision', 'gbrain_bump_trust_generation',
+  'gbrain_clear_atom_page_state', 'gbrain_concept_inputs_private', 'gbrain_count_git_canonical_sources', 'gbrain_count_modifications', 'gbrain_forget_page_retrievals',
+  'gbrain_fts_input', 'gbrain_graduation_fence', 'gbrain_guard_deferred_request', 'gbrain_guard_effect_protocol', 'gbrain_guard_guest_records', 'gbrain_guard_inserted_facts',
+  'gbrain_guard_protocol_activation', 'gbrain_guard_request_protocol', 'gbrain_guard_skill_publication',
+  'gbrain_lease_shared_skill_delivery', 'gbrain_mark_derivation_scope_entry', 'gbrain_owner_only_held', 'gbrain_owner_only_hold', 'gbrain_owner_only_lineage', 'gbrain_owner_only_lineage_strict',
+  'gbrain_owner_only_mark_derived', 'gbrain_owner_only_marks_denied', 'gbrain_owner_only_read_mode', 'gbrain_owner_only_reads_complete', 'gbrain_owner_only_row_deleted',
+  'gbrain_owner_only_source_changed', 'gbrain_preserve_fact_withdrawal',
+  'gbrain_queue_page_projection', 'gbrain_refuse_purged_fact', 'gbrain_refuse_purged_page',
+  'gbrain_refuse_purged_take', 'gbrain_refuse_purging_derivation', 'gbrain_release_refresh_barrier', 'gbrain_require_managed_writer',
+  'gbrain_require_persistence_protocol', 'gbrain_snapshot_version_trust', 'gbrain_stamp_revision_attribution',
+  'gbrain_stamp_trust_tier', 'gbrain_stamp_version_attribution', 'gbrain_stamp_write_attribution', 'gbrain_try_jsonb',
+  'notify_minion_job_change', 'update_chunk_search_vector', 'update_page_search_vector',
+] as const;
+
+/**
+ * Appends pg_temp to the pinned search_path of every gbrain function (PINNED_FUNCTION_NAMES) in public the current
+ * role may alter that still pins `pg_catalog, public` or `pg_catalog`. A function the role does not own is
+ * left as it was, and so is a procedure (ALTER FUNCTION refuses one, and gbrain installs none). Shared by the schema blob (its last
+ * statement, so a replay's CREATE OR REPLACE never leaves a function without it), hardenFunctionSearchPaths below
+ * (migration v277 and the end of every migration run) and `gbrain reindex-search-vector`, which rewrites the
+ * search_vector trigger functions.
+ */
+export const FUNCTION_SEARCH_PATH_HARDENING_SQL = `DO $harden$
+DECLARE f RECORD;
+BEGIN
+  FOR f IN SELECT p.oid::regprocedure AS sig, ${PINNED_PATH_SQL} AS path
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace CROSS JOIN LATERAL unnest(p.proconfig) AS c(setting)
+    WHERE n.nspname = 'public' AND p.prokind = 'f' AND c.setting IN (${LEGACY_SEARCH_PATH_SETTINGS.map(v => `'${v}'`).join(', ')})
+      AND p.proname IN (${PINNED_FUNCTION_NAMES.map(name => `'${name}'`).join(', ')})
+      AND pg_has_role(current_user, p.proowner, 'USAGE')
+    ORDER BY 1
+  LOOP
+    EXECUTE format('ALTER FUNCTION %s SET search_path = %s, pg_temp', f.sig, f.path);
+  END LOOP;
+END $harden$;`;
+
+/** The gbrain functions (regprocedure text) whose pinned search_path is still a legacy setting. */
+export async function legacySearchPathFunctions(engine: BrainEngine): Promise<string[]> {
+  return (await engine.executeRaw<{ sig: string }>(
+    `SELECT p.oid::regprocedure::text AS sig FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.prokind = 'f' AND p.proconfig && $1::text[] AND p.proname = ANY($2::text[]) ORDER BY 1`,
+    [[...LEGACY_SEARCH_PATH_SETTINGS], [...PINNED_FUNCTION_NAMES]])).map(r => r.sig);
+}
+
+/** Attempts of the hardening when another session's ALTER or CREATE OR REPLACE updates the same pg_proc row. */
+const CONCURRENT_UPDATE_ATTEMPTS = 3;
+
+function isConcurrentCatalogUpdate(error: unknown): boolean {
+  return /tuple concurrently updated/i.test(error instanceof Error ? error.message : String(error));
+}
+
+/**
+ * A failure to re-create a purge or withdrawal guard other than another role owning it. It carries no `code` of its own,
+ * so a lock timeout in the re-create never reads as the migration run's lock refusal; the database error is its cause.
+ */
+export class LedgerGuardRecreateError extends Error {
+  constructor(cause: unknown) {
+    super(`purge or withdrawal guards not re-created (${cause instanceof Error ? cause.message : String(cause)}); gbrain doctor (guard_ledger_checks) names the ones left without their ledger check`, { cause });
+    this.name = 'LedgerGuardRecreateError';
+  }
+}
+
+/**
+ * Re-creates every purge or withdrawal guard left without its ledger check that the role owns (guard-ledger-checks.ts,
+ * #7659) and returns the failure, or null. Only a guard another role owns stays silent (SQLSTATE 42501): v318 and doctor's
+ * guard_ledger_checks name it, and every later migration run retries it. A concurrent update of the same pg_proc row is
+ * retried like the hardening's.
+ */
+async function recreateLedgerGuards(engine: BrainEngine, attempt = 1): Promise<LedgerGuardRecreateError | null> {
+  try {
+    await failClosedLedgerGuards(engine);
+    return null;
+  } catch (error) {
+    if ((error as { code?: string } | null)?.code === '42501') return null;
+    if (isConcurrentCatalogUpdate(error) && attempt < CONCURRENT_UPDATE_ATTEMPTS) {
+      await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+      return recreateLedgerGuards(engine, attempt + 1);
+    }
+    return new LedgerGuardRecreateError(error);
+  }
+}
+
+/** The stderr line a migration run prints when hardenFunctionSearchPaths throws, naming the doctor check that lists what is left. */
+export function hardenFailureLine(error: unknown): string {
+  if (error instanceof LedgerGuardRecreateError) return `  guards: ${error.message}\n`;
+  const guardFailure = (error as { guardFailure?: unknown } | null)?.guardFailure;
+  return `  search_path: pg_temp not restored on gbrain functions (${error instanceof Error ? error.message : String(error)}); gbrain doctor (function_search_path) names them\n`
+    + (guardFailure instanceof LedgerGuardRecreateError ? `  guards: ${guardFailure.message}\n` : '');
+}
+
+/**
+ * Re-creates the guards (recreateLedgerGuards), then puts pg_temp back (pinTempLast) and returns what that left. A
+ * failed re-create never skips the pg_temp hardening: it is thrown as a LedgerGuardRecreateError once the hardening has
+ * run. When the hardening fails too, its own error is thrown (a lock refusal keeps its meaning for the migration run)
+ * with the re-create failure attached as `guardFailure`, which hardenFailureLine prints as well.
+ */
+export async function hardenFunctionSearchPaths(engine: BrainEngine): Promise<string[] | null> {
+  const guardFailure = await recreateLedgerGuards(engine);
+  let left: string[] | null;
+  try {
+    left = await pinTempLast(engine);
+  } catch (error) {
+    if (guardFailure && error instanceof Error) Object.assign(error, { guardFailure });
+    throw error;
+  }
+  if (guardFailure) throw guardFailure;
+  return left;
+}
+
+/**
+ * Runs the hardening in one short transaction with the migration statement and lock timeouts and returns the
+ * functions it had to leave (owned by another role), [] when none needed it, or null when the hardening committed but
+ * listing what it left failed. A pg_proc row lock it cannot take
+ * becomes `schema_lock_blocked`; a concurrent update of the same pg_proc row (`apply-migrations --force-schema` beside
+ * another process's boot) is retried, since the step is idempotent.
+ */
+async function pinTempLast(engine: BrainEngine, attempt = 1): Promise<string[] | null> {
+  if ((await legacySearchPathFunctions(engine)).length === 0) return [];
+  const lockTimeoutMs = resolveSchemaLockTimeoutMs();
+  try {
+    await engine.transaction(async tx => {
+      if (engine.kind === 'postgres') {
+        await tx.executeRaw(`SET LOCAL statement_timeout = '${migrationStatementTimeoutMs()}'`);
+        await tx.executeRaw(`SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`);
+      }
+      await tx.runMigration(277, FUNCTION_SEARCH_PATH_HARDENING_SQL);
+    });
+  } catch (error) {
+    if (isLockTimeoutError(error)) {
+      throw schemaLockBlockedError({ step: 'search_path hardening', timeoutMs: lockTimeoutMs, sessions: null, sampledDuringWait: false, lock: 'a gbrain function row lock (pg_proc)' });
+    }
+    if (isConcurrentCatalogUpdate(error) && attempt < CONCURRENT_UPDATE_ATTEMPTS) {
+      await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+      return pinTempLast(engine, attempt + 1);
+    }
+    throw error;
+  }
+  return legacySearchPathFunctions(engine).catch(() => null);
+}

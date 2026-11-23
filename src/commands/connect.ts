@@ -1,3 +1,4 @@
+import { harnessAdapter } from '../core/harness/registry.ts';
 /**
  * `gbrain connect` — one-command coding-agent onboarding from a bearer token
  * (or OAuth 2.1 client credentials).
@@ -9,7 +10,7 @@
  * needed for the connection.
  *
  *   gbrain connect <mcp-url> [--token <bearer>] [--name gbrain]
- *                  [--agent claude-code|codex|perplexity|generic]
+ *                  [--agent claude-code|codex|opencode|perplexity|generic]
  *                  [--oauth [--register | --client-id ID --client-secret SECRET] [--scopes "read write"]]
  *                  [--install] [--yes] [--json] [--show-token] [--force]
  *                  [--timeout-ms N]
@@ -27,63 +28,120 @@
  *     only; --install runs it).
  *   - codex: `codex mcp add <name> --url <url> --bearer-token-env-var
  *     GBRAIN_REMOTE_TOKEN` (bearer via env var; --install runs it).
+ *   - opencode: `opencode mcp add <name> --url <url> --header
+ *     "Authorization=Bearer {env:GBRAIN_REMOTE_TOKEN}"` (the interpolation is
+ *     stored literally; --install writes the entry directly via
+ *     opencode-json.ts — no binary needed).
  *   - perplexity: GUI connector (Settings → Connectors). Supports bearer or
  *     OAuth; no --install.
  *   - generic: prints the connector fields for any other MCP client.
  */
 
-import { execFileSync } from 'child_process';
+import { execFileSync } from '../core/spawn.ts';
+import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { ConnectProbeResult } from '../core/connect-probe.ts';
 import { probeBrainIdentity, DEFAULT_PROBE_TIMEOUT_MS } from '../core/connect-probe.ts';
+import { opencodeGlobalConfigPath } from '../core/bootstrap/host-specs.ts';
+import { acquireBootstrapLock } from '../core/bootstrap/lock.ts';
+import { brainFirstTarget, describeBrainFirstOutcome, installerBrainFirst, isBrainFirstHarness, priorBrainFirst } from '../core/setup/brain-first.ts';
+import { describeTurnHookOutcome } from '../core/setup/turn-hook.ts';
+import { installerTurnHook, TURN_HOOK_NATIVE_INSPECT, turnHookFix } from '../core/setup/turn-hook-check.ts';
+import { resolveGbrainBin } from '../core/gbrain-bin.ts';
+import { describeSkillsBlockOutcome, indexLauncher, installerSkillsBlock, isSkillLoading, skillsOutcomeFailed, skillsOutcomeShown, type SkillLoading } from '../core/setup/skills-block.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
+import {
+  GBRAIN_REMOTE_TOKEN_ENV,
+  reconcileOpencodeSiblingGlobal,
+  writeOpencodeMcpEntry,
+} from '../core/bootstrap/opencode-json.ts';
 import { promptLine } from '../core/cli-util.ts';
+import { consentGateOrExit } from '../core/consent-cli.ts';
+import {
+  NAME_RE,
+  OAUTH_SECRET_NOTE,
+  REDACTED,
+  buildClaudeMcpAddArgv,
+  buildCodexMcpAddArgv,
+  buildOpencodeMcpAddArgv,
+  cmdString,
+  isValidName,
+  issuerFromMcpUrl,
+  normalizeMcpUrl,
+  redactToken,
+  shellQuote,
+  validateToken,
+} from '../core/mcp-registration.ts';
 
-export const ENV_VAR = 'GBRAIN_REMOTE_TOKEN';
+// The pure registration helpers moved to src/core/mcp-registration.ts for
+// #4043 (the bootstrap harness lane consumes them; core must not import from
+// commands). Re-exported so this module's public surface — and every test
+// that imports from it — is unchanged.
+export {
+  OAUTH_SECRET_NOTE,
+  REDACTED,
+  buildClaudeMcpAddArgv,
+  buildCodexMcpAddArgv,
+  buildOpencodeMcpAddArgv,
+  cmdString,
+  isLinkLocalOrMetadata,
+  issuerFromMcpUrl,
+  isValidName,
+  normalizeMcpUrl,
+  redactToken,
+  validateToken,
+  type TokenValidation,
+  type UrlResult,
+} from '../core/mcp-registration.ts';
+
+// Defined from the writer's exported constant so the printed interpolation and
+// the ownership fingerprint literal ({env:GBRAIN_REMOTE_TOKEN}) cannot drift.
+export const ENV_VAR = GBRAIN_REMOTE_TOKEN_ENV;
 export const PLACEHOLDER_TOKEN = '<paste-your-token>';
 export const PLACEHOLDER_SECRET = '<paste-your-client-secret>';
-export const REDACTED = '***';
 export const DEFAULT_NAME = 'gbrain';
 export const DEFAULT_SCOPES = 'read write';
-const NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
 // Single source of truth shared with the probe (was a duplicated 15_000 literal).
 const DEFAULT_TIMEOUT_MS = DEFAULT_PROBE_TIMEOUT_MS;
 
-export type AgentId = 'claude-code' | 'codex' | 'perplexity' | 'generic';
+export type AgentId = 'claude-code' | 'codex' | 'opencode' | 'perplexity' | 'generic';
 
 interface AgentSpec {
   id: AgentId;
   label: string;       // human label for messages
-  binary?: string;     // CLI binary backing --install ('claude' | 'codex')
+  binary?: string;     // CLI binary backing --install ('claude' | 'codex'; opencode installs via the direct JSONC writer)
   installable: boolean;
   supportsOAuth: boolean; // accepts OAuth client-credentials connector fields
 }
 
-export const AGENT_SPECS: Record<AgentId, AgentSpec> = {
-  'claude-code': { id: 'claude-code', label: 'Claude Code', binary: 'claude', installable: true, supportsOAuth: false },
-  codex: { id: 'codex', label: 'Codex', binary: 'codex', installable: true, supportsOAuth: false },
-  perplexity: { id: 'perplexity', label: 'Perplexity Computer', installable: false, supportsOAuth: true },
-  generic: { id: 'generic', label: 'your agent', installable: false, supportsOAuth: true },
-};
+export const AGENT_IDS: AgentId[] = ['claude-code', 'codex', 'opencode', 'perplexity', 'generic'];
 
-export const AGENT_IDS: AgentId[] = ['claude-code', 'codex', 'perplexity', 'generic'];
+// Preserve the legacy command surface while deriving adapter facts centrally.
+export const AGENT_SPECS = Object.fromEntries(AGENT_IDS.map(id => {
+  const adapter = harnessAdapter(id);
+  const binary = adapter.connection === 'codex-toml' ? 'codex' : adapter.connection === 'claude-json' ? 'claude' : undefined;
+  return [id, { id, label: adapter.label, binary, installable: adapter.connection !== 'manual', supportsOAuth: adapter.renewable }];
+})) as Record<AgentId, AgentSpec>;
 
 // The named tools MUST be real MCP-exposed ops (verified by the round-trip
-// E2E). `capture` is intentionally absent: it's a CLI-only convenience wrapper,
-// not an MCP tool — the agent writes over MCP with `put_page`.
+// E2E). `capture` earned its slot in the CLI→MCP gap-closure wave (D2A):
+// it is a starter-surface op now — prefer it for quick notes (auto-slug +
+// dedupe), `put_page` for full-control writes.
 export const LEARN_INSTRUCTION =
   'Once connected, call the `get_brain_identity` tool (whose brain this is), then ' +
   '`list_skills` (everything it can do; if it errors, the host has not enabled skill ' +
   'publishing — these core tools still work: search, query, get_page, put_page, ' +
-  'think, find_experts). Then call `list_brain_skillpack`: if this brain ships a ' +
-  'skillpack, ask the user whether to install it (gbrain skillpack scaffold <spec>). ' +
-  'Always search the brain before answering or writing.';
+  'capture, think, find_experts). Then call `list_brain_skillpack`: if this brain ships ' +
+  'a skillpack, ask the user whether to install it (gbrain skillpack scaffold <spec>). ' +
+  'Prefer `capture` for quick notes (auto-slug + dedupe) and `put_page` for ' +
+  'full-control writes. Always search the brain before answering or writing.';
 
 const SECRET_NOTE =
-  'Note: that bearer token is a long-lived, full-access secret — keep it private and ' +
-  'prefer a scoped/short-lived token if your host supports one.';
+  'Note: that bearer token is a long-lived secret that carries whatever its grant allows (whoami shows its scopes) — ' +
+  'keep it private and prefer a scoped/short-lived token if your host supports one.';
 
-const OAUTH_SECRET_NOTE =
-  'Note: the client secret is sensitive — store it like a password. It mints ' +
-  'short-lived, scoped access tokens; revoke with `gbrain auth revoke-client`.';
+// OAUTH_SECRET_NOTE moved to src/core/mcp-registration.ts (imported +
+// re-exported above; text unchanged).
 
 const PERPLEXITY_REMOTE_NOTE = [
   'Perplexity connects remotely, so the brain must be reachable over HTTPS. On the',
@@ -94,15 +152,20 @@ const PERPLEXITY_REMOTE_NOTE = [
 const HELP = `gbrain connect — wire a coding agent to a remote gbrain over MCP
 
 Usage:
+  gbrain connect <mcp-url> --harness <id> --credentials-file <private-file> --install
   gbrain connect <mcp-url> [--token <bearer>] [flags]
 
+The private-handoff path separates host provisioning from installation here.
+Thin CLI adapters require --root <absolute-persistent-root>. See gbrain mcp --help.
+
 Prints a copy-paste setup block for your agent, or wires it up directly with
---install (claude-code + codex only). The MCP URL is your remote
+--install (claude-code, codex + opencode). The MCP URL is your remote
 'gbrain serve --http' endpoint; a bare host is rejected — pass an explicit
 https:// URL.
 
 Auth:
-  Bearer token (default)         simple, long-lived, full-access — best local/personal
+  Bearer token (default)         simple, long-lived; carries its grant's scopes — best local/personal
+                                 (a member key from setup's member-keys/ folder works here)
   --oauth                        OAuth 2.1 client credentials (perplexity/generic):
                                  least-privilege scopes + short-lived tokens — best for
                                  anything exposed to a third-party cloud
@@ -110,15 +173,25 @@ Auth:
 Flags:
   --token <bearer>     Bearer token (else $${ENV_VAR}; from 'gbrain auth create')
   --name <id>          MCP server name in the agent (default: ${DEFAULT_NAME})
-  --agent <kind>       claude-code (default) | codex | perplexity | generic
+  --agent <kind>       claude-code (default) | codex | opencode | perplexity | generic
   --oauth              Use OAuth client credentials instead of a bearer token
   --register           With --oauth: mint a client on the host (gbrain auth register-client)
   --client-id <id>     With --oauth: use an existing OAuth client id
   --client-secret <s>  With --oauth: use an existing OAuth client secret
   --scopes "<s>"       With --oauth --register: client scopes (default: "${DEFAULT_SCOPES}")
   --install            Run the agent's MCP-add command, then smoke-test the token
-                       (claude-code + codex only)
-  --yes                Skip the install confirmation prompt
+                       (claude-code + codex + opencode; opencode installs via a direct
+                       config write — no binary needed, token stays out of the file).
+                       Also writes the brain-first instruction block into the agent's
+                       own instruction file (CLAUDE.md / AGENTS.md)
+  --no-instructions    With --install, skip (and remove) the brain-first block
+  --skill-loading M    With --install: off (default) or spring, a compact index of
+                       gbrain's bundled skills beside that block, each loaded on
+                       demand with gbrain bundled-skill <name>. Remembered.
+  --gbrain-bin PATH    With --skill-loading spring: the absolute gbrain the index
+                       names (default: this gbrain, else the one on PATH).
+  --yes                The user's approval for --install (writes a credential-
+                       bearing MCP entry); without it a non-interactive run exits 3
   --force              On --install, replace an existing server of the same name
   --json               Emit machine-readable JSON (secret redacted)
   --show-token         With --json, include the literal token/secret (avoid in logs)
@@ -128,113 +201,16 @@ Examples:
   gbrain connect https://brain.example.com/mcp --token gbrain_xxx
   gbrain connect https://brain.example.com:3131 --install --yes
   gbrain connect https://brain.example.com/mcp --token gbrain_xxx --agent codex
+  gbrain connect https://brain.example.com/mcp --token gbrain_xxx --agent opencode --install
   gbrain connect https://brain.example.com/mcp --agent perplexity --oauth --register
   gbrain connect https://brain.example.com/mcp --agent perplexity --oauth \\
     --client-id gbrain_cl_xxx --client-secret gbrain_cs_xxx
 `;
 
 // ---------------------------------------------------------------------------
-// Pure helpers (unit-tested in test/connect.test.ts)
+// Pure helpers (unit-tested in test/connect.test.ts; registration helpers
+// live in src/core/mcp-registration.ts and are re-exported above)
 // ---------------------------------------------------------------------------
-
-export type UrlResult =
-  | { ok: true; url: string; warning?: string }
-  | { ok: false; error: string };
-
-/**
- * Block link-local / cloud-metadata addresses — the one class of host that is
- * never a legitimate brain endpoint but IS a token-exfil target (e.g. the AWS/
- * GCP metadata service at 169.254.169.254). Deliberately does NOT block
- * localhost or RFC1918/LAN ranges: self-hosted brains on a private network are
- * a documented, supported topology (`gbrain serve --http --bind`).
- */
-export function isLinkLocalOrMetadata(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(h)) return true; // IPv4 link-local incl. cloud metadata
-  if (h.startsWith('fe80:')) return true;                  // IPv6 link-local
-  if (h === 'fd00:ec2::254') return true;                  // AWS IMDSv2 over IPv6
-  // IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254 dotted, or ::ffff:a9fe:xxxx
-  // hex where a9fe == 169.254) must not slip past the dotted-IPv4 check.
-  const mapped = h.match(/^::ffff:(.+)$/);
-  if (mapped) {
-    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(mapped[1])) return true;
-    if (mapped[1].startsWith('a9fe:')) return true;
-  }
-  return false;
-}
-
-/**
- * Normalize an MCP URL to a canonical `<scheme>//<host><path>` ending in /mcp.
- * Explicit spec (not best-effort) — see plan D-codex findings.
- */
-export function normalizeMcpUrl(input: string): UrlResult {
-  const raw = (input ?? '').trim();
-  if (!raw) {
-    return { ok: false, error: 'Missing MCP URL. Usage: gbrain connect <https://host/mcp> --token <bearer>' };
-  }
-  // Require an explicit scheme. A bare `host:3131` parses as scheme `host:`
-  // under WHATWG URL, so reject anything without `://`.
-  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
-    const guess = raw.replace(/^\/+/, '');
-    return { ok: false, error: `Add an explicit scheme, e.g. https://${guess} (a bare host:port is ambiguous).` };
-  }
-  let u: URL;
-  try {
-    u = new URL(raw);
-  } catch {
-    return { ok: false, error: `Invalid URL: ${raw}` };
-  }
-  const scheme = u.protocol.toLowerCase();
-  if (scheme !== 'http:' && scheme !== 'https:') {
-    return { ok: false, error: `Only http(s) URLs are supported (got ${u.protocol}).` };
-  }
-  if (u.username || u.password) {
-    return { ok: false, error: 'Remove credentials from the URL (user:pass@host is not supported); pass the token via --token.' };
-  }
-  if (u.search) {
-    return { ok: false, error: 'Remove the query string from the MCP URL.' };
-  }
-  if (isLinkLocalOrMetadata(u.hostname)) {
-    return { ok: false, error: `Refusing to target a link-local / cloud-metadata address (${u.hostname}). Point the MCP URL at the brain host's real address.` };
-  }
-  const host = u.host; // host:port; hostname already lowercased by URL
-  const path = u.pathname;
-  const trimmed = path.replace(/\/+$/, '');
-  const lower = trimmed.toLowerCase();
-  let finalPath: string;
-  if (path === '' || path === '/') {
-    finalPath = '/mcp';
-  } else if (lower === '/mcp') {
-    finalPath = '/mcp';
-  } else {
-    return {
-      ok: false,
-      error: `Unexpected path '${path}'. Pass the full /mcp URL, e.g. ${scheme}//${host}${trimmed}/mcp`,
-    };
-  }
-  const url = `${scheme}//${host}${finalPath}`;
-  const hn = u.hostname.toLowerCase();
-  const isLocal = hn === 'localhost' || hn === '127.0.0.1' || hn === '::1' || hn === '[::1]';
-  if (scheme === 'http:' && !isLocal) {
-    return { ok: true, url, warning: 'Warning: http:// sends your bearer token unencrypted. Use https:// unless this is localhost.' };
-  }
-  return { ok: true, url };
-}
-
-/** The OAuth issuer is the server base — the /mcp endpoint's URL minus /mcp. */
-export function issuerFromMcpUrl(url: string): string {
-  return url.replace(/\/mcp$/, '');
-}
-
-export type TokenValidation = { ok: true } | { ok: false; error: string };
-
-/** Reject empty/whitespace/control-char tokens (a newline is a header-injection vector). */
-export function validateToken(token: string): TokenValidation {
-  if (!token || !token.trim()) return { ok: false, error: 'Token is empty.' };
-  if (/\s/.test(token)) return { ok: false, error: 'Token contains whitespace (space/tab/newline) — refusing (header-injection risk).' };
-  if (/[\x00-\x1f\x7f]/.test(token)) return { ok: false, error: 'Token contains control characters — refusing (header-injection risk).' };
-  return { ok: true };
-}
 
 export type TokenResolution =
   | { kind: 'literal'; token: string }
@@ -253,43 +229,6 @@ export function resolveToken(opts: { tokenFlag?: string | null; env?: string | n
     kind: 'error',
     error: `No token. Pass --token <bearer> or set ${ENV_VAR}. Create one on the host with: gbrain auth create "<name>"`,
   };
-}
-
-export function isValidName(name: string): boolean {
-  return NAME_RE.test(name);
-}
-
-export function buildClaudeMcpAddArgv(p: { name: string; url: string; headerToken: string }): string[] {
-  return ['mcp', 'add', p.name, '-t', 'http', p.url, '-H', `Authorization: Bearer ${p.headerToken}`];
-}
-
-/** Codex reads the bearer from an env var at runtime — the token is NOT in argv. */
-export function buildCodexMcpAddArgv(p: { name: string; url: string; envVar: string }): string[] {
-  return ['mcp', 'add', p.name, '--url', p.url, '--bearer-token-env-var', p.envVar];
-}
-
-/**
- * POSIX single-quote any arg that isn't already shell-safe, so `$()`, backticks,
- * etc. in a token are inert literals when the block is pasted into a shell
- * (double-quoting would still allow command substitution).
- */
-function shellQuote(arg: string): string {
-  if (/^[A-Za-z0-9_.:/@-]+$/.test(arg)) return arg;
-  return `'${arg.replace(/'/g, "'\\''")}'`;
-}
-
-/** Render `<binary> <argv...>` as a copy-pasteable, shell-safe command string. */
-export function cmdString(binary: string, argv: string[]): string {
-  return `${binary} ${argv.map(shellQuote).join(' ')}`;
-}
-
-export function redactToken(s: string, token: string | null): string {
-  // Exact-substring scrub of the known token, plus a defense-in-depth pass over
-  // any `Bearer <value>` shape the SDK/CLI might echo in a transformed form the
-  // exact match would miss. Both run on the --install error paths only.
-  let out = token ? s.split(token).join(REDACTED) : s;
-  out = out.replace(/Bearer\s+\S+/gi, `Bearer ${REDACTED}`);
-  return out;
 }
 
 export interface OAuthCreds {
@@ -322,6 +261,31 @@ function codexBlock(p: { name: string; url: string; token: string | null }): str
   if (!p.token) lines.push(`Replace ${PLACEHOLDER_TOKEN} with a token from \`gbrain auth create "codex"\` on the host.`, '');
   lines.push(
     `Codex reads the token from $${ENV_VAR} at runtime — keep that variable set in your shell profile so new Codex sessions can reach the brain.`,
+    '',
+    LEARN_INSTRUCTION,
+    '',
+    SECRET_NOTE,
+  );
+  return lines.join('\n');
+}
+
+function opencodeBlock(p: { name: string; url: string; token: string | null }): string {
+  const tokenValue = p.token ?? PLACEHOLDER_TOKEN;
+  const cmd = cmdString('opencode', buildOpencodeMcpAddArgv({ name: p.name, url: p.url, envVar: ENV_VAR }));
+  const lines = [
+    '# Paste into opencode:',
+    '',
+    'Connect my knowledge brain, then learn what it can do:',
+    '',
+    `  export ${ENV_VAR}=${shellQuote(tokenValue)}`,
+    `  ${cmd}`,
+    '',
+  ];
+  if (!p.token) lines.push(`Replace ${PLACEHOLDER_TOKEN} with a token from \`gbrain auth create "opencode"\` on the host.`, '');
+  lines.push(
+    `The config stores the literal \`{env:${ENV_VAR}}\` interpolation — opencode resolves it at read time, ` +
+      `so keep that variable exported in your shell profile; the token never lands in the config file. ` +
+      `Restart opencode after registering (config is read at session start).`,
     '',
     LEARN_INSTRUCTION,
     '',
@@ -401,6 +365,7 @@ export function buildConnectBlock(p: { agent: AgentId; name: string; url: string
   switch (p.agent) {
     case 'claude-code': return claudeBlock(p);
     case 'codex': return codexBlock(p);
+    case 'opencode': return opencodeBlock(p);
     case 'perplexity': return perplexityBearerBlock(p);
     case 'generic': return genericBearerBlock(p);
   }
@@ -435,6 +400,10 @@ export function buildJson(p: { url: string; name: string; agent: AgentId; token:
     // Codex command carries no token (env-var name only), so it's safe verbatim.
     command_argv = buildCodexMcpAddArgv({ name: p.name, url: p.url, envVar: ENV_VAR });
     command = cmdString('codex', command_argv);
+  } else if (p.agent === 'opencode') {
+    // The literal {env:VAR} interpolation, not a token — safe verbatim.
+    command_argv = buildOpencodeMcpAddArgv({ name: p.name, url: p.url, envVar: ENV_VAR });
+    command = cmdString('opencode', command_argv);
   }
   return {
     schema_version: 1,
@@ -468,6 +437,22 @@ export interface ConnectDeps {
   probe(url: string, token: string, timeoutMs: number): Promise<ConnectProbeResult>;
   env(name: string): string | undefined;
   registerOAuthClient(name: string, scopes: string): RegisterResult;
+  /** opencode --install lane: direct JSONC write of a remote entry carrying
+   * the literal `{env:GBRAIN_REMOTE_TOKEN}` interpolation (no binary execed,
+   * no token on disk). Throws on a foreign same-name entry; an OURS entry at
+   * a different url refuses unless `allowReplaceOtherSource` (connect maps
+   * --force onto it). May be async: the default impl serializes on the
+   * config-dir bootstrap lock (the writer contract); sync test fakes remain
+   * assignable. */
+  writeOpencodeRemoteEntry(
+    name: string,
+    url: string,
+    opts?: { allowReplaceOtherSource?: boolean },
+  ): { configPath: string; replacedPrior: boolean } | Promise<{ configPath: string; replacedPrior: boolean }>;
+  /** After a successful registration: the brain-first block in the agent's own instruction file. Returns the line to print. */
+  writeInstructions(agent: AgentId, name: string, optOut: boolean, skillLoading?: SkillLoading, gbrainBin?: string): string | null;
+  /** After the block: the per-turn hook that puts the rule next to every turn (src/core/setup/turn-hook.ts). `ok: false` fails the install loudly. */
+  writeTurnHook(agent: AgentId): { lines: string[]; ok: boolean };
 }
 
 async function defaultPromptYesNo(question: string): Promise<boolean> {
@@ -525,6 +510,53 @@ const defaultDeps: ConnectDeps = {
   probe: (url, token, timeoutMs) => probeBrainIdentity(url, token, { timeoutMs }),
   env: (name) => process.env[name],
   registerOAuthClient: defaultRegisterOAuthClient,
+  writeInstructions: (agent, name, optOut, skillLoading, gbrainBin) => {
+    if (!isBrainFirstHarness(agent)) return null;
+    const target = brainFirstTarget(agent);
+    if ('error' in target) return null;
+    const writer = `gbrain connect --agent ${agent} --install`;
+    const o = installerBrainFirst({ target, access: { kind: 'mcp', server: name }, writer, instructions: optOut ? false : undefined });
+    const skills = installerSkillsBlock({ target, launcher: gbrainBin ?? indexLauncher() ?? 'gbrain', writer, brainFirstDeclined: o.decision.value === 'declined', skillLoading, audience: 'downstream' });
+    const lines = [`${describeBrainFirstOutcome(o, false).trim()}${o.decision.value === 'accepted' ? ' (opt out with --no-instructions)' : ''}`];
+    if (skillsOutcomeShown(skills)) lines.push(describeSkillsBlockOutcome(skills, false).trim());
+    if (skillsOutcomeFailed(skills)) setCliExitVerdict(1);
+    return lines.join('\n');
+  },
+  writeTurnHook: (agent) => {
+    const target = isBrainFirstHarness(agent) ? brainFirstTarget(agent) : null;
+    const accepted = !!target && !('error' in target) && priorBrainFirst(agent, target.path)?.status === 'installed' && process.env.GBRAIN_AGENT_INSTRUCTIONS !== '0';
+    const rerun = ['gbrain', 'setup', agent, '--instructions-only'];
+    const { outcome, verdict } = installerTurnHook({ harness: agent, accepted, gbrainBin: resolveGbrainBin(), gbrainHome: process.env.GBRAIN_HOME?.trim() || undefined, rerun: rerun.join(' ') });
+    const lines = [describeTurnHookOutcome(outcome).trim()];
+    if (!verdict || verdict.ok) return { lines: verdict ? [...lines, `verify   turn hook ${verdict.message}`] : lines, ok: true };
+    const fix = turnHookFix(agent, rerun);
+    return { lines: [...lines, `error turn_hook_not_loaded (${verdict.reason}): the per-turn gbrain hook is not active: ${verdict.message}. Fix: ${rerun.join(' ')}. Verify: ${fix.verify?.argv?.join(' ')}${TURN_HOOK_NATIVE_INSPECT[agent] ? `; the harness's own check: ${TURN_HOOK_NATIVE_INSPECT[agent]}` : ''}.`], ok: false };
+  },
+  writeOpencodeRemoteEntry: async (name, url, opts) => {
+    // The writer's contract: callers hold acquireBootstrapLock on the config
+    // dir (harness.ts [X11] parity) — the user-global file is shared across
+    // workspaces and homes, so concurrent gbrain writers serialize here.
+    const configPath = opencodeGlobalConfigPath();
+    const cfgDir = dirname(configPath);
+    mkdirSync(cfgDir, { recursive: true }); // the lock needs the dir; the writer mkdirs later anyway
+    const lock = await acquireBootstrapLock(cfgDir);
+    try {
+      // Two-filename merge blind spot: opencode merges BOTH user-global
+      // filenames, so a same-name gbrain entry in the SIBLING file would
+      // survive this write as a shadow registration (ours → removed with a
+      // note; foreign → refuse loudly naming both files).
+      const sib = reconcileOpencodeSiblingGlobal(configPath, name, { url });
+      for (const note of sib.notes) console.error(note);
+      const r = writeOpencodeMcpEntry(
+        configPath,
+        { kind: 'remote', name, url, tokenMode: 'env' },
+        { expect: { url }, ...(opts?.allowReplaceOtherSource ? { allowReplaceOtherSource: true } : {}) },
+      );
+      return { configPath: r.configPath, replacedPrior: r.replacedPrior };
+    } finally {
+      lock.release();
+    }
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -546,6 +578,9 @@ interface ParsedFlags {
   force: boolean;
   json: boolean;
   showToken: boolean;
+  noInstructions: boolean;
+  skillLoading?: SkillLoading;
+  gbrainBin?: string;
   timeoutMs: number;
   help: boolean;
   agentError?: string;
@@ -564,6 +599,7 @@ function parseArgs(args: string[]): ParsedFlags {
     force: false,
     json: false,
     showToken: false,
+    noInstructions: false,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     help: false,
   };
@@ -592,6 +628,15 @@ function parseArgs(args: string[]): ParsedFlags {
       case '--force': out.force = true; break;
       case '--json': out.json = true; break;
       case '--show-token': out.showToken = true; break;
+      case '--no-instructions': out.noInstructions = true; break;
+      case '--gbrain-bin': { const v = takeValue('--gbrain-bin'); if (v !== undefined) out.gbrainBin = v; break; }
+      case '--skill-loading': {
+        const v = takeValue('--skill-loading');
+        if (v === undefined) break;
+        if (isSkillLoading(v)) out.skillLoading = v;
+        else out.agentError = out.agentError ?? `Unknown --skill-loading '${v}'. Use off or spring.`;
+        break;
+      }
       case '--token': { const v = takeValue('--token'); if (v !== undefined) out.token = v; break; }
       case '--client-id': { const v = takeValue('--client-id'); if (v !== undefined) out.clientId = v; break; }
       case '--client-secret': { const v = takeValue('--client-secret'); if (v !== undefined) out.clientSecret = v; break; }
@@ -624,6 +669,39 @@ function fail(msg: string): never {
   process.exit(1);
 }
 
+/**
+ * A4 consent for `--install`: it writes a credential-bearing MCP entry into
+ * the agent's config (persistent_install) and sends the token to the remote
+ * host (credentials). `--yes` or a TTY prompt (deps seams) authorizes it;
+ * otherwise exit 3 with the consent payload. The approved argv never carries
+ * the token value: it names GBRAIN_REMOTE_TOKEN instead.
+ */
+async function installConsent(args: string[], f: ParsedFlags, url: string, destination: string, deps: ConnectDeps): Promise<void> {
+  const argv = ['gbrain', 'connect'];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '--yes' || a === '-y') continue;
+    if (a === '--token') { i++; continue; }
+    if (a.startsWith('--token=')) continue;
+    argv.push(a);
+  }
+  await consentGateOrExit({
+    command: 'connect --install',
+    effects: ['credentials', 'persistent_install'],
+    actor: 'agent',
+    what: `Register the MCP server '${f.name}' -> ${url} in ${destination}`,
+    why: 'Wires this agent to the remote brain so its memory tools are available in new sessions.',
+    risk: `Writes a credential-bearing MCP entry into ${destination} and sends the token to ${url} for a smoke test. `
+      + `Undo: remove the '${f.name}' MCP server from that agent. The approved command reads the token from GBRAIN_REMOTE_TOKEN (or the same --token).`,
+    user_message: `Add the brain at ${url} to ${destination} as MCP server '${f.name}' (it stores an access token there)?`,
+    argv,
+    args,
+  }, {
+    json: f.json,
+    env: { interactive: deps.isTTY(), readLine: async ({ prompt }) => ({ kind: 'line', text: (await deps.promptYesNo(prompt.replace(/ \[y\/N\] $/, ''))) ? 'y' : 'n' }) },
+  });
+}
+
 /** Resolve OAuth creds from explicit flags or by registering a client on the host. */
 function resolveOAuthCreds(f: ParsedFlags, url: string, deps: ConnectDeps): OAuthCreds {
   const issuer = issuerFromMcpUrl(url);
@@ -649,6 +727,10 @@ function resolveOAuthCreds(f: ParsedFlags, url: string, deps: ConnectDeps): OAut
 }
 
 export async function runConnect(args: string[], deps: ConnectDeps = defaultDeps): Promise<void> {
+  if (args.includes('--harness') || args.includes('--credentials-file')) {
+    const { runHarnessConnect } = await import('./harness-connect.ts');
+    return runHarnessConnect(args);
+  }
   const f = parseArgs(args);
   if (f.help) {
     console.log(HELP);
@@ -700,8 +782,49 @@ export async function runConnect(args: string[], deps: ConnectDeps = defaultDeps
   // --install path. token is guaranteed literal here (install mode resolveToken).
   const realToken = token as string;
   if (!spec.installable) {
-    fail(`--install supports claude-code and codex. ${spec.label} is set up through its own UI — drop --install to print the setup steps.`);
+    fail(`--install supports claude-code, codex, and opencode. ${spec.label} is set up through its own UI — drop --install to print the setup steps.`);
   }
+
+  if (f.agent === 'opencode') {
+    // Direct-writer lane: no opencode binary required (the JSONC write IS the
+    // registration), and the config carries only the {env:VAR} interpolation
+    // — the writer's fingerprint handles idempotent re-runs and refuses a
+    // foreign same-name entry (--force cannot override THAT; pick --name).
+    // --force maps to the writer's allowReplaceOtherSource so an OURS entry
+    // at an old url (a rotated serve) is replaceable, mirroring the exec
+    // lanes' documented --force semantics.
+    await installConsent(args, f, url, 'the opencode user-global config', deps);
+    let w: { configPath: string; replacedPrior: boolean };
+    try {
+      w = await deps.writeOpencodeRemoteEntry(f.name, url, { allowReplaceOtherSource: f.force });
+    } catch (e) {
+      fail(redactToken((e as Error).message, realToken));
+    }
+    console.error(
+      `Added MCP entry '${f.name}' -> ${url} in ${w.configPath}` +
+        `${w.replacedPrior ? ' (replaced the prior gbrain entry)' : ''}. Restart opencode (config is read at session start).`,
+    );
+    const ocInstructions = deps.writeInstructions(f.agent, f.name, f.noInstructions, f.skillLoading, f.gbrainBin);
+    if (ocInstructions) console.error(ocInstructions);
+    for (const line of deps.writeTurnHook(f.agent).lines) console.error(line);
+    if (deps.env(ENV_VAR) !== realToken) {
+      console.error(`opencode resolves {env:${ENV_VAR}} at read time. Add this to your shell profile so sessions can reach the brain:`);
+      console.error(`  export ${ENV_VAR}=<your-token>`);
+    }
+    const ocProbe = await deps.probe(url, realToken, f.timeoutMs);
+    if (ocProbe.ok) {
+      console.error(`Verified: ${ocProbe.identity || 'brain reachable'}`);
+      console.error('');
+      console.error(LEARN_INSTRUCTION);
+      return;
+    }
+    console.error(
+      `Warning: registered '${f.name}', but the smoke-test did not verify (${ocProbe.reason}): ${redactToken(ocProbe.message, realToken)}`,
+    );
+    console.error('The agent will likely hit 401/errors until the token or URL is fixed.');
+    process.exit(1);
+  }
+
   const binary = spec.binary as string; // 'claude' | 'codex'
   if (!deps.hasBinary(binary)) {
     fail(`${spec.label} CLI ('${binary}') not found on PATH. Install ${spec.label}, or drop --install to print the command to run manually.`);
@@ -712,16 +835,7 @@ export async function runConnect(args: string[], deps: ConnectDeps = defaultDeps
     fail(`An MCP server named '${f.name}' already exists in ${spec.label}. Run '${binary} mcp remove ${f.name}' first, pass --name <other>, or --force to replace it.`);
   }
 
-  if (!f.yes) {
-    if (!deps.isTTY()) {
-      // Non-interactive --install registers a credential-bearing MCP server and
-      // fires the token at a remote host — require an explicit --yes rather than
-      // silently proceeding when there's no TTY to confirm at.
-      fail('--install in a non-interactive shell requires --yes (refusing to register a credential-bearing MCP server without confirmation).');
-    }
-    const ok = await deps.promptYesNo(`Add MCP server '${f.name}' -> ${url} to ${spec.label}?`);
-    if (!ok) fail('Aborted.');
-  }
+  await installConsent(args, f, url, spec.label, deps);
 
   let removedExisting = false;
   if (exists && f.force) {
@@ -741,6 +855,10 @@ export async function runConnect(args: string[], deps: ConnectDeps = defaultDeps
     fail(`'${binary} mcp add' failed${note}: ${redactToken(add.stderr || add.stdout, realToken)}`);
   }
   console.error(`Added MCP server '${f.name}' -> ${url}.`);
+  const instructions = deps.writeInstructions(f.agent, f.name, f.noInstructions, f.skillLoading, f.gbrainBin);
+  if (instructions) console.error(instructions);
+  const turnHook = deps.writeTurnHook(f.agent);
+  for (const line of turnHook.lines) console.error(line);
 
   // Codex reads the token from the env var at runtime, not from its config.
   // If the current env doesn't already carry it, the user must export it.
@@ -756,6 +874,7 @@ export async function runConnect(args: string[], deps: ConnectDeps = defaultDeps
     console.error(`Verified: ${probe.identity || 'brain reachable'}`);
     console.error('');
     console.error(LEARN_INSTRUCTION);
+    if (!turnHook.ok) process.exit(1);
     return;
   }
   // Server is registered, but end-to-end auth did not verify. Exit non-zero so

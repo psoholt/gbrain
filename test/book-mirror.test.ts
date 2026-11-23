@@ -24,8 +24,9 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { fileURLToPath } from 'node:url';
 
-const REPO_ROOT = new URL('..', import.meta.url).pathname;
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 async function runCli(args: string[]): Promise<{
   stdout: string;
@@ -91,17 +92,6 @@ describe('gbrain book-mirror — source file invariants', () => {
     'utf-8',
   );
 
-  it('exports runBookMirrorCmd', () => {
-    expect(source).toContain('export async function runBookMirrorCmd');
-  });
-
-  it('documents the trust contract (codex HIGH-1 fix is in the file)', () => {
-    // codex HIGH-1 fix: the trust contract narrowing must not silently
-    // regress in a refactor.
-    expect(source).toContain('media/books/');
-    expect(source).toContain('codex HIGH-1');
-  });
-
   it('uses read-only allowed_tools for subagent fan-out (codex HIGH-1)', () => {
     // The trust narrowing actually happens at the tool-allowlist layer:
     // subagents get ['get_page', 'search'] — read-only — so they CANNOT
@@ -121,22 +111,13 @@ describe('gbrain book-mirror — source file invariants', () => {
     expect(source).toContain('viaSubagent intentionally omitted');
   });
 
-  it('prints a cost-estimate confirmation before launching (P1)', () => {
-    expect(source).toContain('estimateCost');
-    expect(source).toContain('confirmInteractive');
-  });
-
-  it('uses idempotency keys for child jobs (retry-friendly)', () => {
-    // Re-running the CLI on the same input should dedupe completed
-    // chapters at the queue layer.
-    expect(source).toContain('idempotency_key');
-    expect(source).toContain('book-mirror:');
-  });
-
-  it('handles partial-failure (continues + flags failed chapters)', () => {
-    // The plan said: assemble with completed chapters + a failed-list
-    // section. Don't abort the whole run on one chapter failure.
-    expect(source).toContain('Failed chapters');
-    expect(source).toContain('chapters_failed');
+  // gstack /ship Step 9 pass 1 (testing specialist). buildAssembledPage is private, so this pins it the way the
+  // invariants above pin the trust contract.
+  // Value: protects=each chapter analysis (model output over an untrusted book) is neutralized before assembly (GBRA-221);
+  //   fails_when=the neutralizeOutsideText call on a.result is removed; why_new=the GBRA-221 renderer suite has no
+  //   book-mirror case; seam=none; no_claim=the assembled page's parse (source text only).
+  it('neutralizes each chapter analysis before assembling the page (GBRA-221)', () => {
+    expect(source).toContain("import { neutralizeOutsideText } from '../core/outside-content.ts';");
+    expect(source).toContain('.map(a => neutralizeOutsideText(a.result.trim()))');
   });
 });

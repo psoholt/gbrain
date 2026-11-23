@@ -13,11 +13,14 @@
 // merge, dedup, dry-run, fail-soft on executeRaw errors.
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
-  runPhaseExtractAtoms,
   discoverExtractablePages,
 } from '../src/core/cycle/extract-atoms.ts';
+import { runPhaseWithStoredPageFixtures as runPhaseExtractAtoms } from './helpers/extract-atoms-page-fixtures.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import type { ChatOpts, ChatResult } from '../src/core/ai/gateway.ts';
 
@@ -50,7 +53,7 @@ function stubChat(text: string): (o: ChatOpts) => Promise<ChatResult> {
 
 /**
  * Stub that returns a unique-title atom on each call so atoms write to
- * distinct slugs (`atoms/${date}/${slugify(title)}`) instead of upserting
+ * distinct slugs (`atoms/<source-date>/<stem>-<title-hash>`) instead of upserting
  * into one row. Needed for tests that count atoms after multiple work items.
  */
 function stubChatUnique(): (o: ChatOpts) => Promise<ChatResult> {
@@ -108,12 +111,15 @@ async function seedPage(opts: {
 }
 
 describe('v0.41.2.1: discoverExtractablePages SQL contract', () => {
-  test('filters by all 6 extractable types', async () => {
-    for (const type of ['meeting', 'source', 'article', 'video', 'book', 'original']) {
+  test('discovers legacy + pack-extractable types, excludes synthesis outputs', async () => {
+    // Legacy floor + `note` (declared extractable:true in gbrain-base, now
+    // honored via the pack manifest — the D2 fix).
+    for (const type of ['meeting', 'source', 'article', 'video', 'book', 'original', 'note']) {
       await seedPage({ slug: `${type}/x`, type });
     }
-    // Add a non-extractable page that should NOT appear
-    await seedPage({ slug: 'notes/skip-me', type: 'note' });
+    // `concept` is also extractable:true in gbrain-base, but extracting atoms
+    // FROM concepts would loop — synthesis outputs are always excluded.
+    await seedPage({ slug: 'wiki/concepts/skip-me', type: 'concept' });
 
     const discovered = await discoverExtractablePages(engine, 'default');
     const slugs = discovered.map((d) => d.slug).sort();
@@ -121,6 +127,7 @@ describe('v0.41.2.1: discoverExtractablePages SQL contract', () => {
       'article/x',
       'book/x',
       'meeting/x',
+      'note/x',
       'original/x',
       'source/x',
       'video/x',
@@ -174,6 +181,18 @@ describe('v0.41.2.1: discoverExtractablePages SQL contract', () => {
     expect(discovered.map((d) => d.slug)).toEqual(['original/normal']);
   });
 
+  test('raw source-holder pages excluded (#5 — no permanent no-progress backlog)', async () => {
+    await seedPage({ slug: 'source/normal', type: 'source' });
+    await seedPage({
+      slug: 'wiki/raw-email-source',
+      type: 'source',
+      frontmatter: { raw: 'raw/email/example.md' },
+    });
+
+    const discovered = await discoverExtractablePages(engine, 'default');
+    expect(discovered.map((d) => d.slug)).toEqual(['source/normal']);
+  });
+
   test('pages with NULL content_hash excluded (D9 #3 — no .slice crash)', async () => {
     await seedPage({ slug: 'meeting/with-hash', type: 'meeting' });
     await seedPage({ slug: 'meeting/no-hash', type: 'meeting', content_hash: null });
@@ -217,7 +236,7 @@ describe('v0.41.2.1: discoverExtractablePages SQL contract', () => {
   test('executeRaw failure returns [] (fail-soft, transcript path proceeds)', async () => {
     // Inject a SQL error by passing a sourceId that breaks the query —
     // actually easier: temporarily replace executeRaw to throw.
-    const realExecute = engine.executeRaw.bind(engine);
+    const realExecute = engine.executeRaw;
     (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw =
       async () => { throw new Error('synthetic discovery failure'); };
     try {
@@ -291,6 +310,97 @@ describe('v0.41.2.1: runPhaseExtractAtoms — dual-source merge + idempotency', 
     expect(rows[0].source_id).toBe('dept-x');
   });
 
+  test('production transcript discovery is default-only while non-default DB pages still extract', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('dept-x', 'dept-x') ON CONFLICT DO NOTHING`,
+    );
+    await seedPage({
+      slug: 'meeting/dept-x-page',
+      type: 'meeting',
+      source_id: 'dept-x',
+      content_hash: 'dept-page-hash-1234567890',
+    });
+
+    const corpusDir = mkdtempSync(join(tmpdir(), 'gbrain-extract-atoms-corpus-'));
+    writeFileSync(join(corpusDir, '2026-07-28-global.txt'), 'global transcript '.repeat(180));
+    let chatCalls = 0;
+    const chat = async (opts: ChatOpts): Promise<ChatResult> => {
+      chatCalls++;
+      return stubChat(
+        `[{"title":"item-${chatCalls}","atom_type":"insight","body":"b"}]`,
+      )(opts);
+    };
+
+    try {
+      const result = await runPhaseExtractAtoms(engine, {
+        sourceId: 'dept-x',
+        brainDir: '/tmp/dept-x-brain',
+        _loadConfig: () => ({
+          dream: { synthesize: { session_corpus_dir: corpusDir } },
+        } as never),
+        _chat: chat,
+      });
+
+      expect(result.details?.transcripts_total).toBe(0);
+      expect(result.details?.pages_total).toBe(1);
+      expect(chatCalls).toBe(1);
+      const rows = await engine.executeRaw<{
+        source_id: string;
+        source_slug: string | null;
+        source_path: string | null;
+      }>(
+        `SELECT source_id,
+                frontmatter->>'source_slug' AS source_slug,
+                frontmatter->>'source_path' AS source_path
+           FROM pages
+          WHERE type = 'atom'`,
+      );
+      expect(rows).toEqual([{
+        source_id: 'dept-x',
+        source_slug: 'meeting/dept-x-page',
+        source_path: null,
+      }]);
+    } finally {
+      rmSync(corpusDir, { recursive: true, force: true });
+    }
+  });
+
+  test('production transcript discovery remains enabled for the default source', async () => {
+    const corpusDir = mkdtempSync(join(tmpdir(), 'gbrain-extract-atoms-default-corpus-'));
+    const transcriptPath = join(corpusDir, '2026-07-28-global.txt');
+    writeFileSync(transcriptPath, 'global transcript '.repeat(180));
+
+    try {
+      const result = await runPhaseExtractAtoms(engine, {
+        sourceId: 'default',
+        brainDir: '/tmp/default-brain',
+        _pages: [],
+        _loadConfig: () => ({
+          dream: { synthesize: { session_corpus_dir: corpusDir } },
+        } as never),
+        _chat: stubChat('[{"title":"default-item","atom_type":"insight","body":"b"}]'),
+      });
+
+      expect(result.details?.transcripts_total).toBe(1);
+      expect(result.details?.pages_total).toBe(0);
+      const rows = await engine.executeRaw<{
+        source_id: string;
+        source_path: string | null;
+      }>(
+        `SELECT source_id,
+                frontmatter->>'source_path' AS source_path
+           FROM pages
+          WHERE type = 'atom'`,
+      );
+      expect(rows).toEqual([{
+        source_id: 'default',
+        source_path: transcriptPath,
+      }]);
+    } finally {
+      rmSync(corpusDir, { recursive: true, force: true });
+    }
+  });
+
   test('transcript-side idempotency: re-discovered same-hash transcript skipped (closes pre-existing bug)', async () => {
     const chat = stubChatUnique();
     // First run writes the atom
@@ -337,6 +447,41 @@ describe('v0.41.2.1: runPhaseExtractAtoms — dual-source merge + idempotency', 
       `SELECT COUNT(*)::int AS count FROM pages WHERE type = 'atom'`,
     );
     expect(after[0].count).toBe(before[0].count);
+  });
+
+  test('deterministic slug: source-dated + title-hashed, trailing dash stripped, re-extract upserts (no cross-day twin)', async () => {
+    // 16 three-letter words → slugifySegment output truncates ON a hyphen at the
+    // 60-char cut, exercising the trailing-dash re-strip (Bug A).
+    const title = 'aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp';
+    const chat = stubChat(`[{"title":"${title}","atom_type":"insight","body":"b"}]`);
+    // Transcript filename carries a date DIFFERENT from the run date, so a
+    // source-dated slug is observably distinct from the old run-date one.
+    const filePath = '/srv/transcripts/2026-06-12-telegram.md';
+    await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath, content: 'first', contentHash: 'aaaa1111bbbb2222' }],
+      _pages: [],
+      _chat: chat,
+    });
+    // Same file, GROWN content (append-only) → different contentHash, so the
+    // source-hash fast-path does NOT skip and the atom is re-extracted. Pre-fix
+    // this minted a second atom under a new run-date prefix (Bug B); the
+    // source-dated, title-hashed slug must upsert into the same row instead.
+    await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath, content: 'first plus appended', contentHash: 'cccc3333dddd4444' }],
+      _pages: [],
+      _chat: chat,
+    });
+    const rows = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE type = 'atom'`,
+    );
+    expect(rows.length).toBe(1); // upsert, not a cross-day duplicate
+    const slug = rows[0].slug;
+    expect(slug.startsWith('atoms/2026-06-12/')).toBe(true); // SOURCE date, not run date
+    expect(slug).toMatch(/-[0-9a-f]{6}$/); // 6-char title-hash suffix
+    expect(slug).not.toContain('--'); // trailing dash stripped before -<hash>
+    const stem = slug.slice('atoms/2026-06-12/'.length).replace(/-[0-9a-f]{6}$/, '');
+    expect(stem.endsWith('-')).toBe(false);
+    expect(stem.length).toBeLessThanOrEqual(60);
   });
 
   test('PhaseResult.details has additive page fields populated', async () => {
@@ -392,4 +537,175 @@ describe('v0.41.2.1: runPhaseExtractAtoms — dual-source merge + idempotency', 
     expect(discovered.details?.pages_total).toBe(1);
     expect(discovered.details?.atoms_extracted).toBe(1);
   });
+});
+
+describe('#2144: zero-yield tombstone', () => {
+  test('zero-yield page is stamped and excluded from rediscovery', async () => {
+    await seedPage({ slug: 'article/zero-yield', type: 'article' });
+    // Successful LLM call that yields no atoms.
+    const result = await runPhaseExtractAtoms(engine, { _transcripts: [], _chat: stubChat('[]') });
+    expect(result.details?.pages_processed).toBe(1);
+    expect(result.details?.atoms_extracted).toBe(0);
+
+    const rows = await engine.executeRaw<{ scan: string; ch: string }>(
+      `SELECT scan.content_hash AS scan, p.content_hash AS ch
+         FROM pages p JOIN extract_atoms_page_state scan ON scan.page_id=p.id
+         WHERE p.slug = 'article/zero-yield' AND scan.tombstoned`,
+    );
+    expect(rows[0].scan).toBe(rows[0].ch);
+
+    // No longer rediscovered.
+    const discovered = await discoverExtractablePages(engine, 'default');
+    expect(discovered.find((d) => d.slug === 'article/zero-yield')).toBeUndefined();
+  });
+
+  test('content change re-eligibilizes a tombstoned page', async () => {
+    await seedPage({ slug: 'article/evolves', type: 'article' });
+    await runPhaseExtractAtoms(engine, { _transcripts: [], _chat: stubChat('[]') });
+    expect((await discoverExtractablePages(engine, 'default')).length).toBe(0);
+
+    // Simulate an edit: content_hash moves while the stale stamp stays.
+    await engine.executeRaw(
+      `UPDATE pages SET content_hash = 'fresh-hash-after-edit' WHERE slug = $1 AND source_id = 'default'`,
+      ['article/evolves'],
+    );
+    const rediscovered = await discoverExtractablePages(engine, 'default');
+    expect(rediscovered.map((d) => d.slug)).toContain('article/evolves');
+  });
+
+  test('failed chat does NOT stamp — page stays retryable', async () => {
+    await seedPage({ slug: 'article/transient-failure', type: 'article' });
+    const failingChat = async (_o: ChatOpts): Promise<ChatResult> => { throw new Error('rate limit'); };
+    await runPhaseExtractAtoms(engine, { _transcripts: [], _chat: failingChat as never });
+    const rows = await engine.executeRaw<{ scan: string | null }>(
+      `SELECT scan.content_hash AS scan FROM pages p LEFT JOIN extract_atoms_page_state scan ON scan.page_id=p.id
+        WHERE p.slug = 'article/transient-failure'`,
+    );
+    expect(rows[0].scan).toBeNull();
+    const discovered = await discoverExtractablePages(engine, 'default');
+    expect(discovered.map((d) => d.slug)).toContain('article/transient-failure');
+  });
+});
+
+// Local extract-atoms config knobs (cherry-picked fix): the two new
+// KNOWN_CONFIG_KEYS resolve through runPhaseExtractAtoms —
+//   cycle.extract_atoms.page_discovery_budget caps discovery LIMIT
+//   cycle.extract_atoms.max_source_chars truncates the prompt payload
+describe('local extract-atoms config knobs', () => {
+  test('page_discovery_budget caps discovery; max_source_chars truncates the prompt slice', async () => {
+    await engine.setConfig('cycle.extract_atoms.page_discovery_budget', '1');
+    await engine.setConfig('cycle.extract_atoms.max_source_chars', '600');
+    await seedPage({ slug: 'note/knob-1', type: 'note', compiled_truth: 'z'.repeat(2000) });
+    await seedPage({ slug: 'note/knob-2', type: 'note', compiled_truth: 'z'.repeat(2000) });
+
+    const captured: string[] = [];
+    const capturingChat = async (o: ChatOpts): Promise<ChatResult> => {
+      captured.push(String(o.messages[0]?.content ?? ''));
+      const text = '[{"title":"knob-atom","atom_type":"insight","body":"b"}]';
+      return {
+        text,
+        blocks: [{ type: 'text', text }],
+        stopReason: 'end',
+        usage: { input_tokens: 100, output_tokens: 50, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'anthropic:claude-haiku-4-5',
+        providerId: 'anthropic',
+      };
+    };
+
+    const result = await runPhaseExtractAtoms(engine, {
+      sourceId: 'default',
+      _transcripts: [],
+      _chat: capturingChat as never,
+    });
+
+    // Discovery honored the configured budget: 2 eligible pages, 1 processed.
+    expect(result.details.pages_processed).toBe(1);
+    expect(captured.length).toBe(1);
+    // Payload inside the <transcript> wrapper is sliced to the
+    // configured max_source_chars (default would have been 50_000 → 2000 z's).
+    const body = /<transcript>\n([\s\S]*)\n<\/transcript>/.exec(captured[0])?.[1] ?? '';
+    expect(body).toBe('z'.repeat(600));
+  }, 30_000);
+});
+
+// Invalid-value fallbacks for the two knobs: garbage config must degrade to
+// the compiled-in defaults, never crash or zero out discovery.
+describe('local extract-atoms config knobs — invalid-value fallbacks', () => {
+  /**
+   * Observe the EFFECTIVE discovery limit by spying on executeRaw: the
+   * page-discovery SQL binds the resolved budget as `LIMIT $4`. This pins
+   * resolvePageDiscoveryLimit's parse/clamp behavior without exporting it.
+   */
+  async function effectiveDiscoveryLimit(): Promise<number> {
+    const realExecute = engine.executeRaw;
+    let limitParam: number | undefined;
+    (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw = (async function (
+      this: PGLiteEngine,
+      sql: string,
+      params?: unknown[],
+    ) {
+      if (sql.includes('extract_atoms_page_state') && sql.includes('LIMIT $4')) {
+        limitParam = Number((params ?? [])[3]);
+      }
+      return realExecute.call(this, sql as never, params as never);
+    }) as typeof engine.executeRaw;
+    try {
+      await runPhaseExtractAtoms(engine, { _transcripts: [], _chat: stubChat('[]') });
+    } finally {
+      (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw = realExecute;
+    }
+    if (limitParam === undefined) throw new Error('page-discovery query was never observed');
+    return limitParam;
+  }
+
+  test('page_discovery_budget: non-positive/NaN fall back to default; floats floored; oversized clamped to 10000', async () => {
+    // Unset → compiled-in PAGE_DISCOVERY_BUDGET (50).
+    expect(await effectiveDiscoveryLimit()).toBe(50);
+    const cases: Array<[string, number]> = [
+      ['0', 50],        // not > 0 → default
+      ['-5', 50],       // negative → default
+      ['abc', 50],      // NaN → default
+      ['2.7', 2],       // positive finite float is FLOORED (not rejected)
+      ['20000', 10000], // ceiling clamp — discovery materializes full bodies per row
+    ];
+    for (const [value, expected] of cases) {
+      await engine.setConfig('cycle.extract_atoms.page_discovery_budget', value);
+      expect(await effectiveDiscoveryLimit()).toBe(expected);
+    }
+  }, 60_000);
+
+  function capturingChat(captured: string[]): (o: ChatOpts) => Promise<ChatResult> {
+    return async (o: ChatOpts) => {
+      captured.push(String(o.messages[0]?.content ?? ''));
+      const text = '[]';
+      return {
+        text,
+        blocks: [{ type: 'text', text }],
+        stopReason: 'end',
+        usage: { input_tokens: 100, output_tokens: 50, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'anthropic:claude-haiku-4-5',
+        providerId: 'anthropic',
+      };
+    };
+  }
+
+  test("max_source_chars: '499' (below the 500 floor) rejected — default leaves a 2000-char payload untruncated", async () => {
+    await engine.setConfig('cycle.extract_atoms.max_source_chars', '499');
+    await seedPage({ slug: 'note/floor-reject', type: 'note', compiled_truth: 'z'.repeat(2000) });
+    const captured: string[] = [];
+    await runPhaseExtractAtoms(engine, { _transcripts: [], _chat: capturingChat(captured) as never });
+    expect(captured.length).toBe(1);
+    const body = /<transcript>\n([\s\S]*)\n<\/transcript>/.exec(captured[0])?.[1] ?? '';
+    expect(body).toBe('z'.repeat(2000)); // default 50_000 → no truncation
+  }, 30_000);
+
+  test("max_source_chars: '500' (at the floor) accepted — payload sliced to 500", async () => {
+    await engine.setConfig('cycle.extract_atoms.max_source_chars', '500');
+    await seedPage({ slug: 'note/floor-accept', type: 'note', compiled_truth: 'z'.repeat(2000) });
+    const captured: string[] = [];
+    await runPhaseExtractAtoms(engine, { _transcripts: [], _chat: capturingChat(captured) as never });
+    expect(captured.length).toBe(1);
+    const body = /<transcript>\n([\s\S]*)\n<\/transcript>/.exec(captured[0])?.[1] ?? '';
+    expect(body).toBe('z'.repeat(500));
+  }, 30_000);
 });

@@ -10,6 +10,8 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { resolveTierDefault } from '../src/core/model-config.ts';
 import {
   PreFlightBudgetError,
   runContradictionProbe,
@@ -17,6 +19,7 @@ import {
 } from '../src/core/eval-contradictions/runner.ts';
 import type { JudgeOutput } from '../src/core/eval-contradictions/judge.ts';
 import type { SearchResult } from '../src/core/types.ts';
+import { operations, type OperationContext } from '../src/core/operations.ts';
 
 let engine: PGLiteEngine;
 
@@ -113,6 +116,25 @@ describe('runContradictionProbe', () => {
     expect(out.report.total_contradictions_flagged).toBe(0);
   });
 
+  test('default judge model follows the key-aware utility tier (#3813)', async () => {
+    // With only OPENAI_API_KEY present, the judge default must not be a
+    // hardcoded Anthropic model the install cannot serve.
+    await withEnv({ ANTHROPIC_API_KEY: undefined, OPENAI_API_KEY: 'sk-test-openai' }, async () => {
+      const expected = resolveTierDefault('utility');
+      // Guard against a tautological pass: the key-aware default for an
+      // OpenAI-only env must actually be an OpenAI model.
+      expect(expected.startsWith('openai:')).toBe(true);
+      const out = await runContradictionProbe({
+        engine,
+        queries: [],
+        judgeFn: stubJudge({}),
+        searchFn: async () => [],
+        budgetUsd: 5,
+      });
+      expect(out.report.judge_model).toBe(expected);
+    });
+  });
+
   test('cross-slug pair detection with stubbed search + judge', async () => {
     const idA = await seedPage('companies/acme', 'Acme');
     const idB = await seedPage('openclaw/chat/x', 'Chat');
@@ -186,6 +208,68 @@ describe('runContradictionProbe', () => {
     });
     expect(out.report.per_query[0].pairs_skipped_by_date).toBe(1);
     expect(out.report.per_query[0].pairs_judged).toBe(0);
+  });
+
+  test('N2-1: an undated page reaches the judge as (date unknown), not its recorded-time fallback', async () => {
+    const putPage = operations.find((o) => o.name === 'put_page')!;
+    const ctx = {
+      engine, config: { engine: 'pglite' }, dryRun: false, remote: false, sourceId: 'default',
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+    } as unknown as OperationContext;
+    const put = (slug: string, line: string) =>
+      putPage.handler(ctx, { slug, content: `---\ntype: note\ntitle: ${slug}\n---\n${line}\n` });
+    await put('notes/a', 'As of March 1, 2025: Acme Example headcount is 45 people.');
+    await put('notes/b', 'As of September 1, 2025: Acme Example headcount is now 90 people.');
+    const stored = await engine.getPage('notes/a');
+    expect(stored!.effective_date_source).toBe('fallback');
+    expect(stored!.effective_date).not.toBeNull();
+    const seen: Array<[string | null | undefined, string | null | undefined]> = [];
+    const out = await runContradictionProbe({
+      engine,
+      queries: ['headcount Acme Example'],
+      noCache: true,
+      budgetUsd: 5,
+      judgeFn: async (input) => {
+        seen.push([input.a.effective_date, input.b.effective_date]);
+        return stubJudge({ verdict: 'no_contradiction' })(input);
+      },
+    });
+    expect(out.report.per_query[0].result_count).toBeGreaterThanOrEqual(2);
+    expect(out.report.per_query[0].pairs_skipped_by_date).toBe(1);
+    expect(seen).toEqual([]);
+  });
+
+  test('N2-1: fallback dates are dropped on both chunk and take members; content dates survive', async () => {
+    const idA = await seedPage('people/alice', 'Alice');
+    const idB = await seedPage('meetings/2025-06-01-sync', 'Sync');
+    await engine.addTakesBatch([
+      { page_id: idA, row_num: 1, claim: 'Alice is the CTO', kind: 'fact', holder: 'garry', weight: 1, active: true, superseded_by: null },
+    ]);
+    const seen: Array<{ a: [string, string | null | undefined]; b: [string, string | null | undefined] }> = [];
+    const out = await runContradictionProbe({
+      engine,
+      queries: ['alice role'],
+      noCache: true,
+      budgetUsd: 5,
+      judgeFn: async (input) => {
+        seen.push({ a: [input.a.slug, input.a.effective_date], b: [input.b.slug, input.b.effective_date] });
+        return stubJudge({ verdict: 'temporal_supersession' })(input);
+      },
+      searchFn: async () => [
+        { ...mkResult('people/alice', idA, 1, 'Alice is the CFO'), effective_date: '2026-09-30', effective_date_source: 'fallback' },
+        { ...mkResult('meetings/2025-06-01-sync', idB, 2, 'Alice became COO'), effective_date: '2025-06-01', effective_date_source: 'filename' },
+      ],
+    });
+    expect(seen).toEqual([
+      { a: ['people/alice', null], b: ['meetings/2025-06-01-sync', '2025-06-01'] },
+      { a: ['people/alice', null], b: ['people/alice', null] },
+    ]);
+    const members = out.report.per_query[0].contradictions.flatMap((f) => [f.a, f.b]);
+    for (const m of members.filter((m) => m.slug === 'people/alice')) {
+      expect(m.effective_date).toBeNull();
+    }
+    const cross = out.report.per_query[0].contradictions.find((f) => f.kind === 'cross_slug_chunks')!;
+    expect(cross.resolution_command).toContain('date order unclear');
   });
 
   test('judge throw counts as judge_errors, does not crash run', async () => {
@@ -505,6 +589,75 @@ describe('runContradictionProbe', () => {
     expect(out.report.queries_with_contradiction).toBe(0);
     expect(out.report.queries_with_any_finding).toBe(0);
     expect(out.report.verdict_breakdown.no_contradiction).toBe(1);
+  });
+
+  // ---- #3889: all-errors run stamps run_status='judge_failed' ----
+  // Without the stamp, a run where every judge call threw renders as
+  // "0 contradictions" — an untrustworthy green.
+
+  test('#3889: every judge call throwing => run_status=judge_failed', async () => {
+    const idA = await seedPage('a/allfail', 'A');
+    const idB = await seedPage('b/allfail', 'B');
+    const out = await runContradictionProbe({
+      engine,
+      queries: ['q-allfail'],
+      judgeFn: stubJudge({ throwOn: () => true }),
+      searchFn: async () => [
+        mkResult('a/allfail', idA, 1, 'chunk a'),
+        mkResult('b/allfail', idB, 2, 'chunk b'),
+      ],
+      budgetUsd: 5,
+      noCache: true,
+    });
+    expect(out.report.judge_errors.total).toBe(1);
+    expect(out.report.run_status).toBe('judge_failed');
+  });
+
+  test('#3889: clean run (and zero-pair run) stamps run_status=ok', async () => {
+    const idA = await seedPage('a/ok3889', 'A');
+    const idB = await seedPage('b/ok3889', 'B');
+    const clean = await runContradictionProbe({
+      engine,
+      queries: ['q-ok3889'],
+      judgeFn: stubJudge({ verdict: 'no_contradiction' }),
+      searchFn: async () => [
+        mkResult('a/ok3889', idA, 1, 'chunk a'),
+        mkResult('b/ok3889', idB, 2, 'chunk b'),
+      ],
+      budgetUsd: 5,
+      noCache: true,
+    });
+    expect(clean.report.run_status).toBe('ok');
+
+    // Zero pairs attempted (empty search): also 'ok' — nothing failed.
+    const empty = await runContradictionProbe({
+      engine,
+      queries: ['q-empty3889'],
+      judgeFn: stubJudge({}),
+      searchFn: async () => [],
+      budgetUsd: 5,
+    });
+    expect(empty.report.run_status).toBe('ok');
+  });
+
+  test('#3889: partial errors (some verdicts landed) stays run_status=ok', async () => {
+    const idA = await seedPage('a/part3889', 'A');
+    const idB = await seedPage('b/part3889', 'B');
+    const idC = await seedPage('c/part3889', 'C');
+    const out = await runContradictionProbe({
+      engine,
+      queries: ['q-part3889'],
+      judgeFn: stubJudge({ verdict: 'no_contradiction', throwOn: (i) => i === 0 }),
+      searchFn: async () => [
+        mkResult('a/part3889', idA, 1, 'a'),
+        mkResult('b/part3889', idB, 2, 'b'),
+        mkResult('c/part3889', idC, 3, 'c'),
+      ],
+      budgetUsd: 5,
+      noCache: true,
+    });
+    expect(out.report.judge_errors.total).toBe(1);
+    expect(out.report.run_status).toBe('ok');
   });
 
   // ---- Lane D: R5 regression — cache key tuple shape stays 5 fields ----

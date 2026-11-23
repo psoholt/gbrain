@@ -1,6 +1,6 @@
 ---
 name: maintain
-version: 1.0.0
+version: 1.1.0
 description: |
   Brain health checks: back-link enforcement, citation audit, filing validation,
   stale info detection, orphan pages, and benchmarks. Use when asked to check
@@ -17,6 +17,8 @@ triggers:
   - "populate links"
   - "backfill graph"
   - "extract timeline entries"
+  - "retriage the backlog"
+  - "re-score the triage"
   - "run dream"
   - "process today's session"
   - "process yesterday's transcripts"
@@ -26,6 +28,7 @@ triggers:
   - "consolidate yesterday's conversations"
 tools:
   - get_health
+  - get_brain_health
   - get_page
   - put_page
   - list_pages
@@ -50,26 +53,54 @@ This skill guarantees:
 
 ## Phases
 
+### Ownership failures are an inspection boundary
+
+Routine maintenance, startup checks, `doctor --fix`, and a request to "fix what's
+broken" do not authorize writer topology changes. On `owner_unavailable` or a
+writer coordination refusal, inspect `gbrain sources writer status --brain <id>
+--json` on the selected host first and report the owner, epoch, enabled state and
+blocked recovery to the operator. Do not claim a checkout, activate managed mode,
+transfer an owner, replace identities, or remove ownership markers as a repair.
+When the status reads `enabled: false` and the refusal says `unbound_source`,
+the brain is in classic mode on purpose: report that writes go through the
+checkout (file, commit, `gbrain sync`) and leave it classic.
+Deliberate administration requires a separately approved topology change and the
+action-specific intent plus reviewed state precondition described in
+`docs/architecture/topologies.md`. Neither a TTY nor `--yes` nor
+`--confirm-quiesced` substitutes for that decision. Remote credentials remain
+ineligible for local writer administration.
+
 ### Autonomous path (v0.36.4.0) — when you want to reach a target score
 
-If the user asks "get my brain to 90/100" or "fix what's broken", prefer the
-one-command loop over walking each dimension by hand:
+If the user asks "get my brain to 90/100" or "fix what's broken", preview first
+and ask before applying anything:
 
 ```bash
-gbrain doctor --remediation-plan --json              # preview what would run
-gbrain doctor --remediate --yes --target-score 90 --max-usd 5
+gbrain doctor --remediation-plan --json              # preview: job steps + repair steps
+# Show the user the repair steps (each "requires user agreement") and the cost.
+# Only after the user agrees (plan_hash from the preview binds the approval):
+gbrain doctor --remediate --yes --include-repairs --expect <plan_hash> --target-score 90 --max-usd 5
 ```
 
-`--remediation-plan` prints a dependency-ordered list (sync before extract,
-embed after consolidate, etc.) with per-step `est_seconds` and `est_usd_cost`.
-`--remediate` walks the plan, submitting each step as a Minion job, re-checking
-score between every step. `--max-usd N` is a hard cost cap — submission refuses
-when the plan would exceed the cap (prevents synthesize loops from burning
-Anthropic credits unattended).
+`--remediation-plan` prints a dependency-ordered list of job steps (sync before
+extract, embed after consolidate, etc.) with per-step `est_seconds` and
+`est_usd_cost`, and, independent of the score target, the PROTECTED repair steps
+for every `gbrain repair` kind with pending items. Each step carries the exact
+command that applies it, and the plan ends with one combined command.
+`--remediate` runs the repair steps only with `--include-repairs` (the user's
+agreement; without it they are listed as skipped), then walks the job plan,
+submitting each step as a Minion job and re-checking score between steps.
+`--max-usd N` is a cumulative cost cap across the run and every `--resume`: a
+paid step that would exceed it is not started, free steps still run, and the run
+stops with a resume command that keeps the cap and the agreement.
 
 When the target score is unreachable for the brain (empty brain with no entity
 pages → `graph_coverage` caps at 70; unconfigured embedding key → caps at 60),
-the command bails with a list of what's missing rather than looping.
+job steps stop with a list of what's missing rather than looping; included repair
+steps still run. `--json` classifies each finding `cleared`, `pending`,
+`consent_required`, `operator_required` (follow its instruction) or
+`unsupported` (report it; nothing clears it yet). After an upgrade, follow the
+recipe in `docs/guides/repair.md#recover-after-upgrading-to-this-release`.
 
 Use the per-dimension walk below (Phase 2 onward) when:
 - The user explicitly asks for a dimension-by-dimension audit
@@ -78,7 +109,7 @@ Use the per-dimension walk below (Phase 2 onward) when:
 
 ### Manual path
 
-1. **Run health check.** Check gbrain health to get the dashboard.
+1. **Run health check.** Check gbrain health (`get_health`) to get the dashboard. `get_health` needs admin scope; without it, call `get_brain_health` (read scope), which returns bands only (write capacity, write failures, ghost pages, unsearchable chunks), and skip the dimensions it cannot answer: stale pages, orphan pages, dead links, embed coverage, link and timeline counts and the brain score. Name the skipped dimensions in the report and ask for an admin token, or for `gbrain doctor --json` on the brain host, to cover them.
 2. **Check each dimension:**
 
 ### Stale pages
@@ -115,34 +146,105 @@ gbrain extract timeline --dir ~/brain
 
 ### Dream cycle (v0.23): synthesize + patterns
 
-`gbrain dream` runs the full 8-phase maintenance cycle:
+`gbrain dream` runs the full maintenance cycle (core phases shown; opt-in
+phases like atoms/concepts/drift slot in between):
 
 ```
 lint -> backlinks -> sync -> synthesize -> extract -> patterns -> embed -> orphans
 ```
 
+`fence_repair` runs right after `sync`, once per maintenance pass: it repairs
+the facts and takes fences sync held or pages store malformed (the same plan
+`gbrain repair fences` previews), for at most 300 s or a third of the job's
+remaining time, and resumes on the next run. `content_repair` runs right after
+it (#6377): the rest of the content-repair lane, today the `slug-conflicts`
+kind that removes a stray frontmatter `slug:` or records a recommended merge
+for a person (`gbrain repair content` previews both kinds), for at most 120 s
+or a third of the remaining time. Pause both with
+`gbrain config set fences.repair.enabled false`.
+
 The two new phases consolidate yesterday's conversations into long-term memory:
 
-**Synthesize phase:** reads transcripts from `dream.synthesize.session_corpus_dir`,
-runs a cheap Haiku verdict (cached in `dream_verdicts`) to filter routine
-ops sessions, then fans out one Sonnet subagent per worth-processing
-transcript. Each subagent writes reflections (`wiki/personal/reflections/...`),
-originals (`wiki/originals/ideas/...`), and people timeline entries. The
-orchestrator collects the slugs from `subagent_tool_executions` (NOT
-`pages.updated_at` — that would pick up unrelated writes) and reverse-renders
-each new page from DB → markdown on disk.
+**Synthesize phase (two-stage cascade):** reads the cycle source's transcripts from
+`dream.synthesize.session_corpus_dir` (another source's sessions wait for their own
+`gbrain dream --source <id> --phase synthesize`; unresolved or legacy files are held,
+already-extracted ones included, until `gbrain sweep --assign-corpus <source>`), then triages before it spends: a cheap
+utility-tier judge (`models.dream.triage`) scores every new file 0–1 for
+salience and pre-extracts candidate quotes + entities, cached in
+`dream_verdicts` with the judging model + prompt version (bounded per cycle
+by `dream.triage.max_ms`, default 5 min — deferred files retry next cycle,
+never silently rejected). A file passes the gate two ways: it scores at or
+above `dream.triage.threshold` (default 0.5), OR the **verified-segment
+rescue** fires — a score in `[dream.triage.rescue_floor, threshold)` still
+passes when at least `dream.triage.rescue_min_segments` (default 2; `0`
+disables) of the judge's own quoted segments verify as substrings of the
+transcript AND the content type is in `dream.triage.rescue_content_types`
+(default `mixed,reflection,idea,strategy,people` — never routine/technical).
+The rescue costs nothing (no extra LLM calls, it re-reads the cached verdict)
+and it is what recovers real signal buried in an otherwise mundane transcript.
+The whole gate is applied at READ time, so retuning the threshold or the
+rescue knobs re-gates with zero new LLM calls. Files that pass fan out one
+synthesis subagent per transcript chunk, each primed with the triage map. By default
+each child runs in oneshot mode (`dream.synthesize.mode`, default `oneshot`):
+ONE tool-less completion against a prompt carrying a pre-retrieved LINK
+CANDIDATES manifest (`dream.synthesize.link_manifest`, default on) and the
+write allow-list, validated end-to-end (slug fences, task shapes, wikilinks)
+before any page is written programmatically. A response that fails validation
+falls back to the classic agentic loop in the same job, where the
+`dream.synthesize.max_turns` cap (default 16) applies; revert dial:
+`gbrain config set dream.synthesize.mode agentic`. Each child writes reflections
+(`wiki/personal/reflections/...`) and originals (`wiki/originals/ideas/...`);
+people timeline entries are written only on the agentic path (fallback or
+`mode agentic`), where the child has the `add_timeline_entry` tool. The orchestrator collects the slugs from
+`subagent_tool_executions` (NOT `pages.updated_at` — that would pick up
+unrelated writes), runs the quote verify pass over them (below), and
+reverse-renders each new page from DB → markdown on disk. To re-apply the
+gate after retuning the threshold or the rescue knobs, or to drain a queued
+backlog, run `gbrain dream retriage --dry-run` (zero LLM calls, cached
+scores only) then `gbrain dream retriage --reconcile-queue`; `--force`
+re-judges everything from scratch. Retriage reads the SAME gate the cycle
+does, so a reconcile sweep never cancels a job the rescue admitted.
+
+**Claim verification (post-write, zero LLM):** after slug collection and
+before the reverse-write, `dream.synthesize.quote_verify` (default on) checks
+every page this phase's children wrote against the transcripts that produced
+it. Pages created this run are checked whole; pages that already existed are
+checked only on the sentences this run added. An exact quote is kept; a quote
+that differs only in whitespace, curly quotes, dashes, or case, or a close
+paraphrase inside one speaker's turn, is replaced with the verbatim transcript
+slice. A sentence is quarantined when a quote grounds nowhere or only across
+two speakers, when it attributes a real quote to the wrong speaker, or when it
+states a number or date the transcript lacks. Quarantined sentences leave the
+page body (and the timeline, facts and links derived from it) and are kept
+verbatim in frontmatter `unverified_claims`, which `get_page` shows but search,
+recall and think do not read. Grounded quotes record their source span and
+speaker in `grounding.quotes`. Nothing is ever fabricated. Telemetry lands in
+`details.synthesis.quote_verify`; the config key is the incident off switch.
 
 **Patterns phase:** runs after `extract` (so the graph state is fresh).
 Reads recent reflections within `dream.patterns.lookback_days` (default 30),
 runs a single Sonnet pass to surface recurring themes, and writes pattern
 pages to `wiki/personal/patterns/<theme>` when ≥`dream.patterns.min_evidence`
-(default 3) reflections support a pattern.
+(default 3) reflections support a pattern. A completed run records the newest
+reflection it consumed (`dream.patterns.last_evidence_ts`); until a reflection
+in the window is newer than that, re-runs skip with `no_new_evidence` instead
+of paying for another model pass — `gbrain dream --phase patterns --once`
+forces one.
 
 **Quality bar (Iron Law for synthesis):**
-1. Quote the user verbatim. Do not paraphrase memorable phrasings.
+1. Quote the user verbatim. Quotation marks are ONLY for spans reproducible
+   EXACTLY from the transcript — if you cannot reproduce a span exactly,
+   paraphrase it WITHOUT quotation marks. Do not paraphrase memorable
+   phrasings you can quote exactly. (The quote verify pass enforces this
+   mechanically after the write.)
 2. Cross-reference compulsively: every new page MUST have at least one wikilink.
 3. Slug discipline: lowercase alphanumeric and hyphens only. NO underscores, NO file extensions.
 4. Edited transcripts produce NEW slugs (content-hash suffix changes) — never silently overwrite.
+5. Preserve concrete facts: carry the specific numbers, dates, dollar amounts,
+   names, and who-decided-what of the salient content, exactly as the
+   transcript states them. Do not pad with routine logistics.
+6. Ground every claim in the transcript. Attribute speculation as speculation,
+   and never state a completion state or outcome the transcript does not show.
 
 **Trust boundary (`allowed_slug_prefixes`):** the synthesis subagent runs with an
 explicit allow-list of write paths sourced from `_brain-filing-rules.json`'s
@@ -157,21 +259,31 @@ so re-running on the same content is a no-op. `dream.synthesize.exclude_patterns
 Each entry is auto-wrapped as a word-boundary regex (e.g. `medical` matches
 "medical advice" but NOT "comedical"). Power users may pass full regex.
 
-**Cooldown:** the cycle's spend cap. `dream.synthesize.cooldown_hours` (default
-12) means at most ~2 synthesize runs per day under autopilot. The completion
-timestamp is stored in `dream.synthesize.last_completion_ts` and is written
-ONLY on successful runs (not on skipped/failed). Explicit `--input` /
-`--date` / `--from` / `--to` invocations bypass cooldown.
+**Cooldown:** `dream.synthesize.cooldown_hours` (default 12) skips synthesize
+for that long after a fully drained pass. The completion timestamp is stored
+in `dream.synthesize.last_completion_ts` and is written only when every child
+completed and nothing was deferred (synthesis budget, triage time budget or
+publish pending), never on skipped or failed runs. So under a standing
+backlog the cooldown never applies and synthesize runs every cycle until the
+backlog drains (#6753); it is not a cap of ~2 runs a day. The same setting
+also holds a growing transcript: one whose earlier version was synthesized
+within `dream.synthesize.cooldown_hours` is skipped as `resynthesis_cooldown`
+until that window passes, so it is re-synthesized at most about twice a day.
+To cap spend, use
+`dream.synthesize.max_submissions_per_source_per_day`. Explicit `--input` /
+`--date` / `--from` / `--to` invocations bypass cooldown and the hold.
 
-**`--dry-run` semantics:** runs the cheap Haiku significance filter (caches
-verdicts) but skips the Sonnet synthesis pass. NOT zero LLM calls.
+**`--dry-run` semantics:** runs the scored triage pass (judges + caches
+verdicts for new files) but skips the synthesis subagents. NOT zero LLM
+calls — for a zero-call preview from cached scores use
+`gbrain dream retriage --dry-run` instead.
 
 **Configure synthesize on a fresh brain:**
 ```bash
 gbrain config set dream.synthesize.session_corpus_dir /path/to/transcripts
 gbrain config set dream.synthesize.enabled true
 gbrain dream --phase synthesize --dry-run --json   # preview
-gbrain dream                                       # full 8-phase cycle
+gbrain dream                                       # full cycle
 ```
 
 **Invocation patterns:**
@@ -188,13 +300,27 @@ gbrain dream --json                                   # CycleReport JSON
 `git add` / `commit` / `push`. Either commit yourself or let `gbrain autopilot`
 handle it.
 Parses `- **YYYY-MM-DD** | Source — Summary` and `### YYYY-MM-DD — Title` formats.
+The `Source — Summary` dash may be an em dash, an en dash or a spaced hyphen (` - `);
+a colon (`Source: Summary`) is prose, so the row keeps `source: markdown` and the
+whole text as its summary.
 Note: extracted entries improve structured queries (`gbrain timeline`), not vector search.
 
-### Autopilot check
-Verify autopilot is running:
+### Upkeep and autopilot check
+`gbrain maintain --status` shows the last free-upkeep run, which an open
+`gbrain serve` does while idle; an item serve could not finish in 30 slices is
+listed as parked, and `gbrain maintain --unattended` finishes it. For a brain
+no agent opens most days, offer `gbrain maintain --schedule` (asks consent). On a Postgres brain with a repo,
+verify autopilot:
 ```bash
 gbrain autopilot --status
 ```
+The exit code is trustworthy for gating: 0 fresh (or nothing installed),
+1 needs attention (stale heartbeat, never ran, or paused by a migration),
+2 the daemon disabled itself (its repo path vanished). `--json` emits the
+full report (`state`, `heartbeat_age_seconds`, `paused_reason`,
+`disabled_reason`). Status reads only the filesystem, so it works even
+when the database is down.
+
 If not running, install it:
 ```bash
 gbrain autopilot --install --repo ~/brain
@@ -270,6 +396,9 @@ Populate them periodically or after major imports:
 - `gbrain stats` — verify `link_count > 0` and `timeline_entry_count > 0` after extraction.
 - `gbrain health` — review `link_coverage` and `timeline_coverage` percentages
   on entity pages (person/company). Below 50% means more extraction is needed.
+  On brains with very few entity pages these report "too few to grade"
+  (`null` in JSON, with `entity_page_count` carrying the denominator) instead
+  of a misleading 0%/100% — grow the entity set before acting on coverage.
 
 Available link types (use with `gbrain graph-query --type`):
 `attended`, `works_at`, `invested_in`, `founded`, `advises`, `mentions`, `source`.
@@ -279,11 +408,34 @@ auto-link post-hook (default on; disable: `gbrain config set auto_link false`).
 So link-extract is mostly a one-time backfill. timeline-extract should be re-run
 after bulk imports or content edits that add new dated entries.
 
+### Feature adoption check (weekly)
+```bash
+gbrain features --json    # scan for underused features + recommendations
+```
+Run weekly alongside lint. Surfaces missing embeddings, unused integrations,
+and configuration improvements.
+
 ### Embedding freshness
-Chunks without embeddings, or chunks embedded with an old model.
-- For large embedding refreshes (>1000 chunks), use nohup:
-  `nohup gbrain embed refresh > /tmp/gbrain-embed.log 2>&1 &`
-- Then check progress: `tail -1 /tmp/gbrain-embed.log`
+Chunks without an embedding yet (`--stale` selects exactly those). Embedding
+calls the configured provider, which bills per token, so this is paid work
+that needs the user's approval first:
+1. Preview with no provider calls: `gbrain embed --stale --dry-run`.
+2. Relay the chunk count and cost estimate to the user and wait for an answer.
+3. Only after they agree, run `gbrain embed --stale --yes --max-usd <cap>`
+   with the cap they approved.
+
+Without approval the command stops with exit 3 and an `[AGENT]` block asking
+you to ask the user; relay it and stop. Never pass `--yes` on your own.
+For a long run (>1000 chunks), route the approved command through the
+durable ladder in `skills/minion-orchestrator/SKILL.md` instead of a bare
+background shell, which hides that exit 3 in a log file.
+
+To see what search cannot reach on one source, run
+`gbrain pages unsearchable --source <id> --json` (read-only). Read
+`semantic_unsearchable`, not only `unsearchable`: it adds `keyword_only`
+pages, which keyword search finds but vector search misses. `awaiting_sync`
+counts files sync still holds, which no embedding state includes; follow
+`gbrain sync status --source <id> --json` for those. Each row carries its `fix`.
 
 ### Security (RLS verification)
 Run `gbrain doctor --json` and check the RLS status.
@@ -332,17 +484,31 @@ your operational heartbeat.
 
 ### On every heartbeat (hourly or per-session)
 
-Run `gbrain doctor --json` and check for degradation. Report any failing checks
-to the user. Key signals: connection health, schema version, RLS status, embedding
-staleness.
+Run `gbrain doctor --alert --json`. Exit 0: report nothing. Exit 17: report each
+`alert.items` entry with its fix. Exit 18: report only when
+`alert.consecutive_unknown` is 2 or more. Never alert on `health_score`.
 
 ### Weekly maintenance
 
-Run `gbrain embed --stale` to refresh embeddings for pages that have changed since
-their last embedding. For large brains (>5000 pages), run this with nohup:
+Refresh embeddings for chunks that have none yet, with the same consent steps
+as "Embedding freshness" above: `gbrain embed --stale --dry-run`, relay the
+estimate, and after the user agrees `gbrain embed --stale --yes --max-usd <cap>`
+(or a standing approval the user set with
+`consent.preapprove.paid.max_usd_per_run`). For large brains (>5000 pages),
+submit the approved command through the minion-orchestrator durable ladder;
+if you must background it in a shell, keep the exit code:
 ```bash
-nohup gbrain embed --stale > /tmp/gbrain-embed.log 2>&1 &
+(gbrain embed --stale --yes --max-usd <cap>; echo "exit=$?") > /tmp/gbrain-embed.log 2>&1 &
+tail -2 /tmp/gbrain-embed.log   # later: the last line is exit=<code>
 ```
+Exit 3 in that log means the run needs the user's approval: relay it and stop.
+
+### Monthly backup check
+
+Run `gbrain backup status` and relay anything red. It verifies every knowledge
+repo (and the agent workspace) has a git remote — local-only means a disk loss
+loses it. Fixes are printed inline (`gbrain bootstrap repo`, `git remote add`,
+`gbrain sources harden <id>`).
 
 ### Daily verification
 
@@ -372,6 +538,16 @@ This creates an audit trail for brain health over time.
 - Never delete pages without confirmation
 - Log all changes via timeline entries
 - Check gbrain health before and after to show improvement
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain doctor --remediate` steps marked "requires user agreement" (PROTECTED repairs, paid steps): show the plan and cost, and run with `--yes --include-repairs --expect <plan_hash> --max-usd <n>` (the hash from `--remediation-plan --json`) only after the user agrees; `preview_changed` means the plan moved, so preview and ask again. A step that would exceed the cap is not started.
+- A finding classified `operator_required`: follow its instruction or relay it to the brain host's operator. `consent_required`: ask the user.
+- A writer-coordination refusal (`writer_coordinator_required`, `writer_not_quiesced`, `recovery_required`): inspect `gbrain sources writer status` and hand the blocked recovery to the operator; never claim a checkout or delete a lock.
+- Doctor warns `persistence_terminal_failures`: run its `fix.command` (an active blocker: a recovery record or a sync checkpoint blocker; or an unresolved gbrain-defect class to report with the receipt ids). For the rest of the pile, `gbrain sources writer failures <source> --group-by category` (read-only) groups receipts with a fix and drill-down per group; historical rows need nothing. Never cancel or edit receipts to clear the count. Runbook: [terminal write failures](https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#terminal-write-failures).
+- `gbrain dream` stops on a budget (exit 11): run the printed `resume_command` within the agreed budget.
 
 ## Anti-Patterns
 
@@ -419,7 +595,8 @@ The maintenance report follows this structure:
 
 ## Tools Used
 
-- Check gbrain health (get_health)
+- Check gbrain health (get_health; admin scope)
+- Check banded brain health without admin scope (get_brain_health)
 - List pages in gbrain with filters (list_pages)
 - Read a page from gbrain (get_page)
 - Check backlinks in gbrain (get_backlinks)

@@ -12,9 +12,13 @@ The persistent worker can die silently from:
 - Bun process crashes with no automatic restart.
 - Internal event-loop death (PID alive, worker loop stopped).
 
-When the worker dies, submitted jobs sit in `waiting` forever. The
-canonical answer is `gbrain jobs supervisor` — a first-class CLI that
-spawns `gbrain jobs work` as a child and auto-restarts it on crash.
+When the worker dies, submitted jobs sit in `waiting` — indefinitely for
+most types; types with a waiting-TTL (`subagent` defaults to 48h, see the
+[queue operations runbook](queue-operations-runbook.md)) are eventually
+cancelled with an auditable reason rather than queueing forever. Either
+way the work doesn't happen. The canonical answer is
+`gbrain jobs supervisor` — a first-class CLI that spawns `gbrain jobs work`
+as a child and auto-restarts it on crash.
 
 ## Worker supervision
 
@@ -40,6 +44,12 @@ gbrain jobs supervisor status --json
 
 # Graceful stop (SIGTERM + drain wait + SIGKILL fallback).
 gbrain jobs supervisor stop
+
+# Cap worker memory in MB (--max-rss). Without the flag the RSS watchdog is
+# still on, at a RAM-relative auto-sized cap. With --job-isolation process the
+# cap also covers each job child's process tree; size the host for
+# (concurrency + 1) × the cap.
+gbrain jobs supervisor --concurrency 4 --max-rss 4096
 ```
 
 **Exit codes:**
@@ -50,9 +60,21 @@ gbrain jobs supervisor stop
 | 1 | Max crashes exceeded (worker kept dying) |
 | 2 | Another supervisor holds the PID lock |
 | 3 | PID file unwritable (permission / path error) |
+| 4 | Queue-scoped DB lock lost mid-run (`LOCK_LOST` — exited rather than risk a split-brain) |
 
 An agent seeing exit=2 can safely treat it as "one is already running";
-exit=1 should page a human.
+exit=4 as "restart me — the DB lock refresh failed"; exit=1 should page
+a human.
+
+A local configuration fault does not produce a supervisor exit code. When
+the worker finds that its installation or selected job child cannot run jobs
+safely (for example, a driver without the required cancellation support or an
+incompatible `GBRAIN_JOB_CHILD_CLI`), it exits with code 16. The supervisor then
+stays alive without respawning it, and `status --json` reports
+`processing_state: "configuration_blocked"` with a `reason_code`. Repair the
+installation, then explicitly restart the supervisor; see
+[Minions fix](minions-fix.md). A running supervisor is not proof of progress,
+so check `processing_ready` as well as `running`.
 
 ### Lowering scheduling priority (`--nice`)
 
@@ -81,6 +103,95 @@ check warns if what you asked for isn't what's actually running (e.g. a
 negative value denied without privilege, or an OS `RLIMIT_NICE` clamp). This
 is distinct from the concurrency / inflight cap and composes with it.
 
+### Keeping a slot for short jobs
+
+A worker running two or more jobs at once keeps one slot free of long jobs, so
+a 50-minute autopilot cycle can't hold every slot while short per-page jobs
+such as `facts-absorb` wait behind it. At `--concurrency N` (N of 2 or more),
+long jobs run in at most `N - minions.short_job_reserved_slots` slots, never
+fewer than one; the other slots take everything else. The long set is
+`autopilot-cycle`, `autopilot-global-maintenance`, `embed-backfill`,
+`connector-sync` and `extract`. A worker at `--concurrency 1` is unaffected.
+
+```bash
+gbrain config set minions.short_job_reserved_slots 2    # default 1; 0 turns it off
+gbrain config set minions.long_job_names sync,book-mirror   # added to the built-in set (comma list or JSON array)
+```
+
+The worker reads both keys at start, so restart the supervisor after changing
+them. The `Minion worker started` line shows the result, for example
+`long-job lane: 1 of 2 slots`. Claim order inside each lane is still
+`priority` then submission time.
+
+### Per-job process isolation (`--job-isolation process`)
+
+By default all concurrency slots execute inside one worker process. A
+handler that ignores its abort signal can only be force-evicted — the
+promise is abandoned, still running, still holding connections and memory —
+and any worker exit destroys every in-flight job at once. With isolation on,
+each claimed job runs in its own child process: a stuck handler is
+group-SIGKILLed for real (group signaling under Bun falls back to POSIX
+`/bin/kill`; if that's unavailable the worker logs that isolation is
+degraded), a crash or OOM in a child takes that one job instead of all N,
+and the OS reclaims every leaked resource when the child dies:
+
+```bash
+# Recommended for long-running LLM-bound handlers (subagent):
+gbrain jobs supervisor --concurrency 4 --job-isolation process
+
+# Bare worker, or durably via env:
+GBRAIN_JOB_ISOLATION=process gbrain jobs work --concurrency 4
+```
+
+How it works: the worker keeps claim, lock renewal, and all result
+recording; the child (an internal `run-child` entrypoint of the same gbrain
+binary) re-validates the claim, runs the handler with its own small engine
+pool, and reports one atomic outcome file. Handler-error semantics are
+preserved across the boundary (unrecoverable → dead, rate-lease → no attempt
+burned, everything else → normal backoff). On worker shutdown children get
+the drain window to finish and report; a child killed before reporting is
+released with no attempt burned. If the worker dies hard, the orphaned child
+self-terminates via a parent-liveness watchdog and the stall sweeper
+requeues the job after lock expiry — the lock token fences the orphan's
+queue writes (result recording, progress, state transitions) into no-ops.
+The handler's own side effects (page writes through its engine) can still
+land until the watchdog stops the child; that window is the watchdog's
+poll + grace, not unbounded.
+
+Sizing notes:
+
+- **Connections:** each child opens its own small pools (read 3 by default,
+  override via `GBRAIN_JOB_CHILD_POOL_SIZE`; direct 1). Worked example at
+  concurrency 15: 15×(3+1) + the worker's 10+3 ≈ **73 client connections**
+  total — 55 ride the transaction-pooler lane (multiplexed, no extra server
+  backends) and 18 are lazy direct session-lane connections, each holding a
+  real server backend while open. Budget the pooler-lane count against your
+  pooler's client limit and the session-lane count against
+  `max_connections`.
+- **Memory:** `--max-rss` applies to the worker and, separately, to each
+  job child's process tree (RssAnon + RssShmem, measured every 5 s). A child
+  past the cap gets SIGTERM, then SIGKILL after the 25 s grace, and its
+  attempt fails with `ChildRssLimitError`, so a job that grows the same way
+  on every retry ends at its `max_attempts` instead of exhausting the host.
+  Size host memory for (concurrency + 1) × the cap.
+- **Spawn cost:** ~0.3–1s per job (engine connect included) — noise for
+  long-running handlers, meaningful for sub-second ones (`lint`,
+  `backlinks`). Keep those inline or on a separate inline worker.
+- **Security note:** the child receives the job's lock token via env. It is
+  a *fencing* token (split-brain protection), not a secret — same-user env
+  already contains the database URL.
+- **Child CLI resolution:** the worker selects the child CLI in this order:
+  the `GBRAIN_JOB_CHILD_CLI` env override (the ops/test escape hatch), then
+  its own compiled executable or source entrypoint, then `gbrain` on PATH.
+  Before claiming any job it checks that the selected child exists and passes
+  a compatibility handshake. A missing, non-executable or incompatible child
+  is a configuration fault: the worker exits with code 16 and its supervisor
+  stays up, blocked, instead of respawning it (see
+  [Minions fix](minions-fix.md#configuration-blocked)). Three consecutive
+  transient child spawn/bootstrap failures still self-exit the worker as
+  unhealthy for process-manager restart instead of burning attempts across
+  the queue.
+
 ### Which supervisor when?
 
 The supervisor solves in-process crash recovery. Platform-level
@@ -89,8 +200,8 @@ usually want both.
 
 | Environment | Recommendation |
 |---|---|
-| **Container (Fly / Railway / Render / Heroku)** | `gbrain jobs supervisor` runs as PID 1. The platform restarts the container on OOM / host loss; supervisor restarts the worker on crash. See [Fly.io](#flyio) / [Render / Railway / Heroku](#render--railway--heroku). |
-| **Linux VM with systemd** | Two-layer recommended: systemd supervises `gbrain jobs supervisor`, which in turn supervises `gbrain jobs work`. Buys you automatic restart on reboot (systemd) plus fast crash recovery (supervisor). See [systemd](#systemd). |
+| **Container (Fly / Railway / Render / Heroku)** | `gbrain jobs supervisor` runs as PID 1. The platform restarts the container on OOM / host loss; supervisor restarts the worker on crash. See [Fly.io](#deployment-flyio) / [Render / Railway / Heroku](#deployment-render--railway--heroku). |
+| **Linux VM with systemd** | Two-layer recommended: systemd supervises `gbrain jobs supervisor`, which in turn supervises `gbrain jobs work`. Buys you automatic restart on reboot (systemd) plus fast crash recovery (supervisor). See [systemd](#deployment-systemd). |
 | **Dev laptop / macOS** | `gbrain jobs supervisor` in a terminal. Ctrl-C stops it. No system-level setup needed. |
 
 ### Variables used in this guide
@@ -116,7 +227,7 @@ command -v gbrain || { echo "gbrain not on PATH. Install, then retry."; exit 1; 
 #    (Supervisor is Postgres-only. PGLite's exclusive file lock blocks the
 #    separate worker process. If `config.engine === 'pglite'` the CLI rejects
 #    with a clear error.)
-gbrain doctor --fast --json | jq '.checks[] | select(.name=="db_connectivity")'
+gbrain doctor --fast --json | jq '.checks[] | select(.name=="connection")'
 
 # 3. Schema is up to date. If version=0 or status=="fail":
 #    gbrain apply-migrations --yes
@@ -134,11 +245,11 @@ Three-command pattern an agent can drive without shell archaeology:
 ```bash
 # Start (returns PIDs + pid_file on stdout as JSON, then detaches)
 gbrain jobs supervisor start --detach --json
-# → {"event":"started","supervisor_pid":1234,"worker_pid":1235,"pid_file":"/Users/you/.gbrain/supervisor.pid"}
+# → {"event":"started","supervisor_pid":1234,"pid_file":"/Users/you/.gbrain/supervisor-<brain-id>.pid","detached":true}
 
 # Check health (machine-parseable JSON, no log scraping)
 gbrain jobs supervisor status --json
-# → {"running":true,"supervisor_pid":1234,"last_start":"2026-04-23T15:30:22Z","crashes_24h":0, ...}
+# → {"running":true,"processing_ready":true,"processing_state":"ready","supervisor_pid":1234,"last_start":"2026-04-23T15:30:22Z","crashes_24h":0, ...}
 
 # Stop cleanly (SIGTERM + 35s drain + SIGKILL fallback)
 gbrain jobs supervisor stop
@@ -148,6 +259,32 @@ Every lifecycle event (spawn, crash, backoff, health warning, max-crashes,
 shutdown) is also written to `${GBRAIN_AUDIT_DIR:-~/.gbrain/audit}/supervisor-YYYY-Www.jsonl`
 for historical inspection. `gbrain doctor` reads that file and surfaces
 a `supervisor` check in its health report.
+
+### Watching jobs from an agent
+
+Every `jobs get --json`, `jobs list --json`, `get_job` and `list_jobs` row carries fields computed on read:
+
+- `submitted_by`: `{kind: 'local', via}` for a job submitted on the brain host (`via` is `autopilot`, `serve`, `worker`, `job:<name>` for a handler inside a running job, or `cli:<command>`, kept in the job's data as `__submitter`, a display label and never authority; rows queued before this field existed have no `via`), `{kind: 'parent_job', id}` for a child, `{kind: 'mcp_client', id}` for a remote submitter.
+- `blocked_by`: why a job that is not running is not running: `queue` (its `queue_position`, how many are ahead and which active jobs hold the queue's slots), `waiting_children`, `delayed` (with `delay_until` and the reason), `paused`, `unreviewed_authority`, or `lock` when a sync or cycle lock of the job's source is held (`holder_job_id` names the holding job when the drain lease records one). `null` for running and finished jobs.
+- `heartbeat_age_ms`, `lock_expires_in_ms` and `stalled` for an active job: how long since its lease was last renewed, measured on the database clock, and whether the lease has already run out.
+- `spend`: the token counts plus `cost_usd`, the settled, priced spend of the job and its children. `cost_usd` is `null` (`cost_basis: 'unpriced'`) when nothing priced it, never a made-up 0.
+
+An agent token without admin sees another principal only by kind: a foreign submitter, parent, slot holder or lock holder is never named, and another principal's children are left out of its spend.
+
+`gbrain jobs wait <id> [--timeout 10m] [--json]` blocks until the job ends and prints it. It exits 0 when the job completed, 1 when it failed, died or was cancelled, and 124 when the timeout elapsed and the job is still running (the job is not cancelled). MCP agents call `wait_job {id, timeout_s}`, which answers after at most 55 s with `terminal: true|false`; call it again while `terminal` is false.
+
+To learn about every job that finished without polling each one, read the terminal event cursor: `gbrain jobs list --finished-since <ISO time> --json` (MCP: `list_jobs {finished_since}`) returns `{jobs, next_cursor}`, oldest first. Pass `next_cursor` back on the next call. Rows deleted on completion or pruned are not in it.
+
+#### Terminal hook
+
+A worker can run a command each time a job it ran completes, fails, dies or is cancelled. It is off by default and lives only in the local file-plane config (`~/.gbrain/config.json`), never in the database config, MCP or job data:
+
+```bash
+gbrain config set minions.terminal_hook '["/usr/local/bin/notify-job", "--quiet"]'
+# or, with a timeout: '{"argv": ["/usr/local/bin/notify-job"], "timeout_ms": 5000}'
+```
+
+The value is an argv array whose first element is an absolute path; it is spawned without a shell, so nothing from the job is ever interpolated into a command line. The job arrives in `GBRAIN_JOB_ID`, `GBRAIN_JOB_NAME`, `GBRAIN_JOB_QUEUE` and `GBRAIN_JOB_STATUS`, and as one JSON object on stdin (id, name, queue, status, attempts_made, parent_job_id, created_at, started_at, finished_at, error_text; never the job's data or result: run `gbrain jobs get $GBRAIN_JOB_ID --json` for those). The hook runs as the gbrain process user with that process's environment, is killed after `timeout_ms` (default 10 s), and a failure is logged once on the worker's stderr and never retried; it never changes the job. Workers read it at start, so restart the supervisor after setting it. A job that died in another worker's stall sweep or was cancelled while waiting runs no hook; the event cursor above covers every terminal transition.
 
 ## Deployment: systemd
 
@@ -233,13 +370,12 @@ use a dedicated queue name like `nightly-enrich` above.
 
 ## Upgrading from an older deployment
 
-### From `minion-watchdog.sh` (pre-v0.20)
+### From `minion-watchdog.sh`
 
-Earlier versions of this guide shipped a 68-line bash watchdog
-(`minion-watchdog.sh`). It's been replaced by `gbrain jobs supervisor`
-which handles everything the script did, plus atomic PID locking,
-structured audit events, queue-scoped health checks, and graceful
-drain on SIGTERM.
+If a cron-driven bash watchdog (`minion-watchdog.sh`) is still keeping
+your worker alive, replace it with `gbrain jobs supervisor`, which covers
+the same job plus atomic PID locking, structured audit events,
+queue-scoped health checks, and graceful drain on SIGTERM.
 
 **Migration:**
 
@@ -252,7 +388,7 @@ crontab -e   # delete the "*/5 * * * * /usr/local/bin/minion-watchdog.sh" line
 
 # 2. Start the supervisor (systemd users: reinstall the unit from
 #    docs/guides/minions-deployment-snippets/systemd.service, which
-#    now calls `gbrain jobs supervisor`).
+#    calls `gbrain jobs supervisor`).
 gbrain jobs supervisor start --detach --json
 # Or: sudo systemctl restart gbrain-worker
 
@@ -270,10 +406,10 @@ Regardless of which deployment path you're upgrading from:
    in-flight job landing partial schema.
 2. **Run `gbrain upgrade`**. Then `gbrain apply-migrations --yes` if
    `gbrain doctor` reports any migration as `partial` or `pending`.
-3. **If you run shell jobs:** from v0.14 onward, pass
-   `--allow-shell-jobs` to the supervisor (or keep
-   `GBRAIN_ALLOW_SHELL_JOBS=1` in `/etc/gbrain.env`). Submitters don't
-   need the flag; only the worker does.
+3. **If you run shell jobs:** pass `--allow-shell-jobs` to the
+   supervisor (or keep `GBRAIN_ALLOW_SHELL_JOBS=1` in
+   `/etc/gbrain.env`). Submitters don't need the flag; only the worker
+   does.
 4. **Verify.** `gbrain doctor` should report zero `pending` or `partial`
    migrations plus a healthy `supervisor` check. `gbrain jobs stats`
    should show no unexplained growth in `dead` between pre- and
@@ -283,29 +419,43 @@ Regardless of which deployment path you're upgrading from:
 
 ### Supabase connection drops
 
-The worker uses a single Postgres connection. If Supabase drops it
-(maintenance, connection limits, network blip), lock renewal fails
-silently. The stall detector then dead-letters the job after
-`max_stalled` misses.
+If Supabase drops the worker's Postgres connection (maintenance,
+connection limits, network blip), this self-heals under the
+supervisor: the worker's DB-liveness probe self-exits (`db_dead`) on a
+dead pool and the supervisor respawns it with a fresh pool, and the
+supervisor also restarts a worker that stops making progress while
+claimable work waits. The escalation commands and thresholds live in the
+[queue operations runbook](queue-operations-runbook.md) — that's the
+canonical home for wedge recovery.
 
-**Current defaults that make this worse:**
+What can still bite is narrow. Lock renewal is verify-before-evict:
+a thrown or timed-out renewal is never treated as loss — at the deadline
+the worker asks the database the authoritative question (one fenced
+re-check), so a starved-but-healthy job recovers its lease and keeps
+working. Eviction happens only on a fenced miss (the row was genuinely
+reclaimed — requeued with no attempt burned) or after a hard backstop
+(default 2× the lease) during a total outage. Long LLM handlers, plus
+`sync`, get a 300 s lock lease by default (`HANDLER_DEFAULT_LOCK_DURATION_MS`)
+instead of the worker-global 30 s, and the stall sweep grants a 15 s
+reclaim grace so a just-recovered worker's renewal beats the sweep.
+The remaining exposure: a genuinely dead worker's long-lease job waits
+up to lease + grace + one sweep interval before requeue, and the stall
+detector still dead-letters after `max_stalled` genuine misses (schema
+column default 5).
 
-- `lockDuration: 30000` (30 s) — too short for long jobs during
-  connection blips.
-- `max_stalled: 5` (schema column default — see `src/schema.sql` and
-  `src/core/pglite-schema.ts`). Five missed heartbeats before dead-letter.
-- `stalledInterval: 30000` (30 s) — checks too aggressively.
-
-**Tune per-job today.** `gbrain jobs submit` accepts `--max-stalled N`,
+**Tune per-job.** `gbrain jobs submit` accepts `--max-stalled N`,
 `--backoff-type fixed|exponential`, `--backoff-delay <ms>`,
-`--backoff-jitter 0..1`, and `--timeout-ms N` as first-class flags
-(since v0.13.1). These write onto the job row at submit time — which is
-what `handleStalled()` reads — so per-job tuning is the real knob today.
+`--timeout-ms N`, `--lock-duration-ms N` (lock lease, clamped to
+[5 s, 1 h]), and `--backoff-jitter 0..1` as first-class flags.
+These write onto the job row at submit time — which is what
+`handleStalled()` and the renewal timer read — so per-job tuning is the
+real knob. The lock-renewal env knobs (incident escape hatches) are
+documented in the [queue operations runbook](queue-operations-runbook.md).
 
 ### DO NOT pass `maxStalledCount` to `MinionWorker`
 
 It's a no-op. The stall detector reads the row's `max_stalled` column
-(set at submit time), not the worker opt in `src/core/minions/worker.ts:74`.
+(set at submit time), not the worker opt in `src/core/minions/worker.ts`.
 Use `gbrain jobs submit --max-stalled N` per-job instead.
 
 ### Zombie shell children
@@ -319,8 +469,8 @@ over relying on hard kills.
 ## Smoke test
 
 ```bash
-# Supervisor alive?
-gbrain jobs supervisor status --json | jq .running
+# Supervisor alive, and admitting work?
+gbrain jobs supervisor status --json | jq '{running, processing_ready, processing_state, reason_code}'
 
 # Aggregate queue health.
 gbrain jobs stats
@@ -331,8 +481,17 @@ gbrain jobs list --status active --limit 10
 # Dead-lettered jobs.
 gbrain jobs list --status dead --limit 10
 
-# Shell handler registered? (check supervisor audit log or worker stderr.)
-gbrain jobs supervisor status --json | jq '.worker_config.allow_shell_jobs'
+# Shell jobs enabled on the worker? There is no supervisor-status JSON field
+# for this — the gate is the worker's opt-in (the handler is always registered
+# but guarded). A supervisor started with --allow-shell-jobs (or with
+# GBRAIN_ALLOW_SHELL_JOBS=1 exported) passes `--allow-shell-jobs` on the
+# worker's command line AND sets the env var on it. Inspect the worker
+# process directly (args + environment):
+for pid in $(pgrep -f 'gbrain jobs work'); do ps eww -p "$pid"; done \
+  | grep -o -e '--allow-shell-jobs' -e 'GBRAIN_ALLOW_SHELL_JOBS=[^ ]*' | sort -u \
+  || echo "shell jobs not enabled"
+# An unflagged worker that claims a shell job dead-letters it instantly:
+gbrain jobs list --status dead --json | jq '[.[] | select(.name == "shell")][:3]'
 ```
 
 ## Uninstall

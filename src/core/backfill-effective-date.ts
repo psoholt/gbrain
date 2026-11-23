@@ -26,7 +26,7 @@
  */
 
 import type { BrainEngine } from './engine.ts';
-import { computeEffectiveDate } from './effective-date.ts';
+import { computeEffectiveDate, fallbackCreatedAt } from './effective-date.ts';
 import type { EffectiveDateSource } from './types.ts';
 
 const BATCH_SIZE = 1000;
@@ -46,6 +46,19 @@ export interface BackfillOpts {
    * scope to a subset. Undefined = no filter.
    */
   slugPrefix?: string;
+  /**
+   * Optional source filter (one `sources.id`). The preview, the plan hash and
+   * the apply of `gbrain reindex-frontmatter --source` walk this one selection.
+   */
+  sourceId?: string;
+  /**
+   * Apply only to these page ids (the approved selection). Rows outside it are
+   * examined but never written, so a page that starts matching after the
+   * preview is not touched without a new approval.
+   */
+  onlyIds?: ReadonlySet<number>;
+  /** Called for every row the walk would change (dry run) or changed (apply), with its prior value. */
+  onChange?: (row: { id: number; slug: string; effective_date: string | null; effective_date_source: string | null }) => void;
   /**
    * When true, recompute even if existing effective_date matches what
    * the chain would produce. Default false (no-op-on-equal saves writes).
@@ -77,7 +90,13 @@ interface PageRow {
   updated_at: string;
 }
 
-function parseFrontmatter(raw: unknown): Record<string, unknown> {
+/**
+ * Exported so callers outside this module (e.g. the doctor's
+ * `effective_date_health` check) can normalize a raw `pages.frontmatter`
+ * JSONB value the same way the backfill walk does, before feeding it to
+ * `computeEffectiveDate`.
+ */
+export function parseFrontmatter(raw: unknown): Record<string, unknown> {
   if (raw == null) return {};
   if (typeof raw === 'string') {
     try { return JSON.parse(raw) as Record<string, unknown>; }
@@ -130,7 +149,11 @@ export async function backfillEffectiveDate(
   const start = Date.now();
   const slugPrefix = opts.slugPrefix?.replace(/[\\%_]/g, (c) => '\\' + c) ?? null;
 
-  let lastId = await getCheckpoint(engine, opts.fresh ?? false);
+  // A scoped walk (slug prefix, source, approved ids) never reads or writes the
+  // orchestrator's brain-wide checkpoint: resuming an unscoped walk from a
+  // scoped walk's last id would skip every other source's rows.
+  const scoped = Boolean(opts.slugPrefix || opts.sourceId || opts.onlyIds);
+  let lastId = await getCheckpoint(engine, (opts.fresh ?? false) || scoped);
   let examined = 0;
   let updated = 0;
   let fallback = 0;
@@ -140,6 +163,8 @@ export async function backfillEffectiveDate(
   // batch otherwise; PGLite ignores SET LOCAL outside transactions but
   // doesn't have the timeout problem in the first place (single writer).
   const isPostgres = engine.kind === 'postgres';
+  // Same zone the importer reads offset-less datetimes in (brain.timezone).
+  const timeZone = (await engine.getConfig('brain.timezone').catch(() => null))?.trim() || undefined;
 
   while (true) {
     if (opts.maxRows && examined >= opts.maxRows) break;
@@ -150,18 +175,23 @@ export async function backfillEffectiveDate(
 
     // Keyset pagination: WHERE id > last_id ORDER BY id LIMIT N. Single-direction
     // walk; safe under concurrent inserts (new rows show up at the tail).
-    const slugFilter = slugPrefix
-      ? `AND slug LIKE $2 ESCAPE '\\\\'`
-      : '';
     const params: unknown[] = [lastId];
-    if (slugPrefix) params.push(slugPrefix + '%');
+    let slugFilter = '';
+    if (slugPrefix) {
+      params.push(slugPrefix + '%');
+      slugFilter += ` AND slug LIKE $${params.length} ESCAPE '\\\\'`;
+    }
+    if (opts.sourceId) {
+      params.push(opts.sourceId);
+      slugFilter += ` AND source_id = $${params.length}`;
+    }
     params.push(limit);
     const limitParam = `$${params.length}`;
 
     const rows = await engine.executeRaw<PageRow>(
       `SELECT id, slug, frontmatter, import_filename, effective_date, effective_date_source, created_at, updated_at
          FROM pages
-         WHERE id > $1 ${slugFilter}
+         WHERE id > $1${slugFilter}
          ORDER BY id
          LIMIT ${limitParam}`,
       params,
@@ -191,8 +221,9 @@ export async function backfillEffectiveDate(
             slug: r.slug,
             frontmatter: fm,
             filename,
+            timeZone,
             updatedAt: new Date(r.updated_at),
-            createdAt: new Date(r.created_at),
+            createdAt: fallbackCreatedAt({ existing: r, now: new Date(r.created_at) }),
           });
 
           // No-op-on-equal: skip the UPDATE if existing matches (saves write
@@ -203,12 +234,14 @@ export async function backfillEffectiveDate(
           const sourcesMatch = (r.effective_date_source ?? null) === (computed.source ?? null);
 
           if (!opts.force && datesMatch && sourcesMatch) continue;
+          if (opts.onlyIds && !opts.onlyIds.has(Number(r.id))) continue;
 
           await tx.executeRaw(
             `UPDATE pages SET effective_date = $1::timestamptz, effective_date_source = $2 WHERE id = $3`,
             [computed.date ? computed.date.toISOString() : null, computed.source, r.id],
           );
           touched++;
+          opts.onChange?.(r);
           if (computed.source === 'fallback') fallback++;
         }
       });
@@ -222,13 +255,15 @@ export async function backfillEffectiveDate(
           slug: r.slug,
           frontmatter: fm,
           filename,
+          timeZone,
           updatedAt: new Date(r.updated_at),
-          createdAt: new Date(r.created_at),
+          createdAt: fallbackCreatedAt({ existing: r, now: new Date(r.created_at) }),
         });
         const existingMs = r.effective_date ? new Date(r.effective_date).getTime() : null;
         const computedMs = computed.date ? computed.date.getTime() : null;
-        if (existingMs !== computedMs || (r.effective_date_source ?? null) !== (computed.source ?? null)) {
+        if (opts.force || existingMs !== computedMs || (r.effective_date_source ?? null) !== (computed.source ?? null)) {
           touched++;
+          opts.onChange?.(r);
         }
         if (computed.source === 'fallback') fallback++;
       }
@@ -237,12 +272,12 @@ export async function backfillEffectiveDate(
     updated += touched;
     lastId = rows[rows.length - 1].id;
     batchNum++;
-    if (!opts.dryRun) await setCheckpoint(engine, lastId);
+    if (!opts.dryRun && !scoped) await setCheckpoint(engine, lastId);
     opts.onBatch?.({ batch: batchNum, lastId, rowsTouched: touched, cumulative: examined });
   }
 
   // Walk done; clear the checkpoint so the next manual run starts fresh.
-  if (!opts.dryRun) await clearCheckpoint(engine);
+  if (!opts.dryRun && !scoped) await clearCheckpoint(engine);
 
   return {
     examined,

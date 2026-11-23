@@ -20,7 +20,13 @@ cd "$REPO_ROOT"
 OUT_BIN="$(mktemp /tmp/gbrain-img-decoders-check.XXXXXX)"
 trap 'rm -f "$OUT_BIN"' EXIT
 
-bun build --compile --outfile "$OUT_BIN" scripts/image-decoders-smoketest.ts >/dev/null 2>&1
+if ! BUILD_LOG="$(bun build --compile --no-compile-autoload-bunfig --outfile "$OUT_BIN" scripts/image-decoders-smoketest.ts 2>&1)"; then
+  echo "[check-image-decoders-embedded] FAIL: bun build --compile of scripts/image-decoders-smoketest.ts failed:" >&2
+  echo "$BUILD_LOG" | tail -20 >&2
+  echo "Why: the HEIC/AVIF decoder imports (heic-decode, @jsquash/avif's avif_dec.wasm via type: 'file') must resolve inside a compiled binary, or image import breaks in the shipped gbrain binary." >&2
+  echo "Fix: correct the import path above in scripts/image-decoders-smoketest.ts and mirror it in src/core/import-file.ts, then re-run: bun run check:image-decoders" >&2
+  exit 1
+fi
 
 OUTPUT="$("$OUT_BIN" 2>&1 || true)"
 

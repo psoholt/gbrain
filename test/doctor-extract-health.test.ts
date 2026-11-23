@@ -73,6 +73,50 @@ describe('computeExtractHealthCheck — WARN paths', () => {
     expect((check.details as any)?.kinds[0].halt_rate).toBe(0.5);
   });
 
+  test('a stale high-halt-rate kind (no activity in 6 days) shows its age in the message', async () => {
+    await clearRollup();
+    // day/updated_at 6 days ago, still inside the 7-day rolling window (day
+    // >= CURRENT_DATE - 7) — the historical halts still sum into the
+    // reported rate even though nothing has run since.
+    await engine.executeRaw(
+      `INSERT INTO extract_rollup_7d (kind, source_id, day, cost_usd, eval_pass_count, eval_fail_count, halt_count, round_completed_count, rollup_write_failures, updated_at)
+       VALUES ('atoms', 'chatgpt', CURRENT_DATE - 6, 5.00, 0, 0, 90, 5, 0, NOW() - INTERVAL '6 days')`,
+      [],
+    );
+    const check = await computeExtractHealthCheck(engine);
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('atoms');
+    expect(check.message).toContain('6d ago');
+  });
+
+  test("today's activity shows 'today', not '0d ago'", async () => {
+    await clearRollup();
+    await engine.executeRaw(
+      `INSERT INTO extract_rollup_7d (kind, source_id, day, cost_usd, eval_pass_count, eval_fail_count, halt_count, round_completed_count, rollup_write_failures, updated_at)
+       VALUES ('atoms', 'default', CURRENT_DATE, 5.00, 0, 0, 90, 5, 0, NOW())`,
+      [],
+    );
+    const check = await computeExtractHealthCheck(engine);
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('today');
+    expect(check.message).not.toContain('0d ago');
+  });
+
+  test('the age is the last halt, not the last clean run (#5863)', async () => {
+    await clearRollup();
+    await engine.executeRaw(
+      `INSERT INTO extract_rollup_7d (kind, source_id, day, cost_usd, eval_pass_count, eval_fail_count, halt_count, round_completed_count, rollup_write_failures, updated_at)
+       VALUES ('atoms', 'default', CURRENT_DATE - 4, 1.00, 0, 0, 9, 1, 0, NOW() - INTERVAL '4 days'),
+              ('atoms', 'default', CURRENT_DATE, 1.00, 0, 0, 0, 2, 0, NOW())`,
+      [],
+    );
+    const check = await computeExtractHealthCheck(engine);
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('atoms=75.0%, last halt 4d ago');
+    expect(check.message).not.toContain('today');
+    expect((check.details as any)?.kinds[0].last_halt_age_days).toBe(4);
+  });
+
   test('multiple kinds with high halt rate: top-3 listed in message', async () => {
     await clearRollup();
     await engine.executeRaw(

@@ -30,7 +30,7 @@ describe('runner boundaries — pre-LLM (no API calls fire)', () => {
     await expect(runEval(engine, { source: 'fs', limit: 10 })).rejects.toThrow(/fs source not yet wired/);
   });
 
-  test('--budget-usd with unknown model → PricingNotFoundError BEFORE any HTTP call (codex review #4)', async () => {
+  test('--budget-usd with unknown model → no_pricing refusal BEFORE any HTTP call (codex review #4)', async () => {
     // Seed 1 take so the corpus isn't empty (otherwise we'd fail on that check first).
     await engine.putPage('test/budget-bound', {
       type: 'note', title: 't', compiled_truth: 'b', frontmatter: {},
@@ -43,15 +43,15 @@ describe('runner boundaries — pre-LLM (no API calls fire)', () => {
     ]);
 
     // Unknown model + budget cap set → must abort fail-closed before any
-    // network call. The error message names the offending model and points
-    // at pricing.ts.
+    // network call. The refusal names the offending model; its fix registers
+    // the rate (gbrain pricing set).
     await expect(
       runEval(engine, {
         models: ['unknown:gpt-99'],
         budgetUsd: 1.0,
         limit: 1,
       }),
-    ).rejects.toThrow(/has no pricing entry/);
+    ).rejects.toMatchObject({ code: 'no_pricing', message: expect.stringContaining('no pricing for chat model "unknown:gpt-99"') });
   });
 
   test('--budget-usd null with unknown model → does NOT pre-flight pricing (allowed; cost may be unknown)', async () => {
@@ -63,8 +63,8 @@ describe('runner boundaries — pre-LLM (no API calls fire)', () => {
     // so we test the negative: pre-flight does NOT fire when budgetUsd is null.
     // The actual call would error at gateway level, separate from pricing.
     //
-    // Verify by checking that the error (if any) is NOT the
-    // PricingNotFoundError shape — it should be a provider-resolve error.
+    // Verify by checking that the error (if any) is NOT the no_pricing
+    // refusal — it should be a provider-resolve error.
     try {
       await runEval(engine, {
         models: ['unknown:gpt-99'],
@@ -75,7 +75,7 @@ describe('runner boundaries — pre-LLM (no API calls fire)', () => {
       // If the call reached the gateway, the error message should be
       // about provider/recipe, NOT pricing.
       const msg = (e as Error).message;
-      expect(msg).not.toContain('has no pricing entry');
+      expect(msg).not.toContain('no pricing for chat model');
     }
   });
 });

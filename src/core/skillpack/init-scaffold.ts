@@ -13,6 +13,7 @@
  * scaffold command.
  */
 
+import { assertLegacySkillFilesystemWrite } from './writer-guard.ts';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
@@ -70,6 +71,7 @@ export function applyWritePlan(
   plan: WritePlanEntry[],
   opts: { dryRun?: boolean } = {},
 ): { written: string[]; skipped: string[] } {
+  if (!opts.dryRun) for (const p of plan) assertLegacySkillFilesystemWrite(p.path);
   const written: string[] = [];
   const skipped: string[] = [];
   for (const p of plan) {
@@ -78,6 +80,7 @@ export function applyWritePlan(
       continue;
     }
     if (!opts.dryRun) {
+      assertLegacySkillFilesystemWrite(p.path);
       mkdirSync(join(p.path, '..'), { recursive: true });
       writeFileSync(p.path, p.content);
     }
@@ -178,7 +181,9 @@ export function runInitScaffold(opts: InitScaffoldOptions): InitScaffoldResult {
       'The agent reads it and walks per-step at its own discretion.',
       '',
       `1. show user: "${opts.name} is installed. Try one of the trigger phrases from skills/${firstSlug}/SKILL.md."`,
-      `2. (edit me) agent: gbrain put_page wiki/_${opts.name}-config --frontmatter type=config`,
+      // #3697: `gbrain put_page ... --frontmatter` never resolved (CLI name is
+      // `put`, content arrives on stdin, and no --frontmatter flag exists).
+      `2. (edit me) agent: printf -- '---\\ntype: config\\n---\\n\\nconfig body\\n' | gbrain put wiki/_${opts.name}-config`,
       '',
     ].join('\n'),
   });

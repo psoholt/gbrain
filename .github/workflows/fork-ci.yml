@@ -1,0 +1,59 @@
+# Fork-only CI for psoholt/gbrain.
+#
+# Upstream's workflows run on ubicloud runners this fork has no access to
+# (jobs queue forever) and include release/scheduled jobs that don't belong
+# here, so the fork drops them on every upstream sync and keeps only this
+# file. It covers what the fork actually changes plus a smoke test of the
+# path the brain depends on (GBRAIN_CONFIG_DIR, init, import, search).
+name: Fork CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Fork-delta tests
+        run: >
+          bun test
+          test/public-exports.test.ts
+          test/audit/audit-writer.test.ts
+          test/config.test.ts
+          test/utils.test.ts
+
+      - name: Smoke test (GBRAIN_CONFIG_DIR, init, import, search)
+        env:
+          GBRAIN_CONFIG_DIR: ${{ runner.temp }}/gbrain-config
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/notes"
+          printf -- '---\ntitle: Smoke\n---\n# Smoke\nfork smoke canary\n' > "$RUNNER_TEMP/notes/smoke.md"
+          bun run src/cli.ts --version
+          bun run src/cli.ts init --pglite --path "$RUNNER_TEMP/brain.pglite" \
+            --embedding-model openai:text-embedding-3-large --embedding-dimensions 1536 > /dev/null
+          test -f "$GBRAIN_CONFIG_DIR/config.json"
+          test ! -e "$HOME/.gbrain/config.json"
+          bun run src/cli.ts import "$RUNNER_TEMP/notes" --no-embed
+          bun run src/cli.ts search "smoke canary" --match keyword | tee "$RUNNER_TEMP/search.txt"
+          grep -q smoke "$RUNNER_TEMP/search.txt"

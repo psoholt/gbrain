@@ -3,7 +3,8 @@
  *
  * Hardcoded v1 collector list (open-Q4): a static array keeps ordering
  * deterministic and the surface auditable. Each collector runs in its OWN
- * try/catch so one failure never kills the whole report. Workspace-dependent
+ * try/catch so one failure never kills the whole report (it is reported as a
+ * warn `collector_failed:<id>` finding). Workspace-dependent
  * collectors (A1) are dropped over MCP.
  */
 
@@ -16,6 +17,10 @@ import { collectUsageShape } from './collect-usage-shape.ts';
 import { collectSetupSmells } from './collect-setup-smells.ts';
 import { collectUninstalledBrainPack } from './collect-uninstalled-brain-pack.ts';
 import { collectUninstalledBundled } from './collect-uninstalled-bundled.ts';
+import { collectChronicle } from './collect-chronicle.ts';
+import { collectMcpClientFit } from './collect-mcp-client-fit.ts';
+import { collectBackupCoverage } from './collect-backup-coverage.ts';
+import { collectWritebackConsent } from './collect-writeback-consent.ts';
 
 /** Deterministic v1 collector order (also the secondary sort key for ranking). */
 export const COLLECTORS: AdvisorCollector[] = [
@@ -27,6 +32,10 @@ export const COLLECTORS: AdvisorCollector[] = [
   collectSetupSmells,
   collectUninstalledBrainPack,
   collectUninstalledBundled,
+  collectChronicle,
+  collectMcpClientFit,
+  collectBackupCoverage,
+  collectWritebackConsent,
 ];
 
 const SEV_RANK: Record<AdvisorSeverity, number> = { critical: 0, warn: 1, info: 2 };
@@ -57,7 +66,8 @@ export function rankFindings(findings: AdvisorFinding[], opts: { infoCap?: numbe
 
 /**
  * Run every collector and return a ranked report. Resilient: a collector that
- * throws contributes nothing and never aborts the others.
+ * throws never aborts the others, and surfaces as a warn `collector_failed:<id>`
+ * finding so a failed check can't read as a clean one.
  */
 export async function runAdvisor(ctx: AdvisorContext): Promise<AdvisorReport> {
   const all: AdvisorFinding[] = [];
@@ -70,7 +80,16 @@ export async function runAdvisor(ctx: AdvisorContext): Promise<AdvisorReport> {
         all.push(f);
       }
     } catch {
-      // one collector failing must not kill the report
+      // Static text only: the thrown error can carry connection strings or file contents.
+      all.push({
+        id: `collector_failed:${c.id}`,
+        severity: 'warn',
+        title: `Advisor check "${c.id}" could not complete, so its result is unknown (not healthy).`,
+        detail: 'This check failed to run, so this report does not cover it. Re-run `gbrain advisor`; if it keeps failing, run `gbrain doctor`.',
+        fix: { command_argv: null },
+        collector: c.id,
+        ask_user: true,
+      });
     }
   }
   const ranked = rankFindings(all);

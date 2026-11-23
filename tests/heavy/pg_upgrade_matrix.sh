@@ -33,11 +33,15 @@
 
 set -euo pipefail
 
+# #3485: shared name floor — these scripts mutate whatever DATABASE_URL names
+# and are documented for direct invocation, so each sources the floor itself.
+source "$(dirname "$0")/_db_floor.sh"
+
 cd "$(dirname "$0")/../.."
 
 if [ -z "${DATABASE_URL:-}" ]; then
   echo "[pg_upgrade_matrix] DATABASE_URL not set; skipping (informational)." >&2
-  echo "  Local: docker run -d --name gbrain-test-pg -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=gbrain_test -p 5434:5432 pgvector/pgvector:pg16" >&2
+  echo "  Local: docker run -d --name gbrain-test-pg -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=gbrain_test -p 127.0.0.1:5434:5432 pgvector/pgvector:pg16" >&2
   echo "  Then: export DATABASE_URL=postgresql://postgres:postgres@localhost:5434/gbrain_test" >&2
   exit 0
 fi
@@ -89,7 +93,11 @@ for SHAPE in "${SHAPES[@]}"; do
   # a freshly walked-forward brain may have legitimate warnings (zero pages,
   # no embeddings, etc) that are not wedge-class failures. We do NOT accept
   # 'fail' or 'failures' (gbrain doctor's terminal-failure shape).
-  STATUS=$(grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]+"' "$DOCTOR_OUT" | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
+  # The report is one JSON line with a "status" per check, so grep -o can print
+  # more than one pipe buffer. A reader that stops after the first line (head)
+  # SIGPIPEs grep, and pipefail + set -e then kill the script with 141 and no
+  # message. sed -n reads to EOF and keeps only the first (top-level) match.
+  STATUS=$(grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]+"' "$DOCTOR_OUT" | sed -nE '1s/.*"([^"]+)"$/\1/p') || STATUS=""
   case "$STATUS" in
     ok|warn|warnings)
       echo "[pg_upgrade_matrix] OK: shape=$SHAPE → status=$STATUS" | tee -a "$LOG_FILE"

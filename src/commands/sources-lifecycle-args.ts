@@ -1,0 +1,270 @@
+/** Parse trusted source administration before connecting to the selected datastore. */
+import { randomUUID } from 'node:crypto';
+import { resolve } from 'node:path';
+import { opError } from '../core/ops/contract.ts';
+import { readFix } from '../core/ops/op-fix.ts';
+import { isValidSourceId } from '../core/source-id.ts';
+import { msysToNativePath } from '../core/path-confine.ts';
+import { isWriteRequestId } from '../core/persistence/types.ts';
+import { CONNECTOR_SOURCE_KINDS, isConnectorSourceKind } from '../core/persistence/connector-kinds.ts';
+import { isMeetingProviderName, MEETING_PROVIDERS } from '../core/meetings/types.ts';
+import { isValidTimeZone, normalizeSlackChannels, SLACK_CHANNEL_ID_RE } from '../core/slack/source-config.ts';
+import { SLACK_SKIPPABLE, type SlackSkippable } from '../core/slack/types.ts';
+import { defaultCloneDir, type AddSourceOpts } from '../core/sources-ops.ts';
+import { isValidRepoName } from '../core/github-source.ts';
+import { ALL_GOOGLE_SERVICES, DEFAULT_CALENDAR_ID } from '../core/google/types.ts';
+import { CALENDAR_FUTURE_DAYS_MAX, CALENDAR_HORIZON_DAYS } from '../core/google/calendar-window.ts';
+import { parseExcludeLabelTokens } from '../core/google/loops-exclusion.ts';
+import { parseContactsDir } from '../core/google/source-config.ts';
+import { parseAppleContactsDir, parseHelperHost, parseHelperPort, parseSocksProxy } from '../core/apple-contacts/source-config.ts';
+import { APPLE_CONTACTS_DEFAULT_DIR, APPLE_CONTACTS_DEFAULT_PORT } from '../core/apple-contacts/types.ts';
+
+export const SOURCE_LIFECYCLE_COMMANDS = ['add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'] as const;
+export function isSourceLifecycleCommand(value: string): boolean {
+  return (SOURCE_LIFECYCLE_COMMANDS as readonly string[]).includes(value);
+}
+const absolute = (value: string) => resolve(msysToNativePath(value));
+
+export interface ParsedSourceLifecycle {
+  operation: 'source_add' | 'source_lifecycle';
+  params: Record<string, unknown>;
+  brain?: string;
+  legacyOnly: boolean;
+  json: boolean;
+}
+
+export function parseSourceLifecycleArgs(args: string[], generatedId = randomUUID()): ParsedSourceLifecycle {
+  const [verb, ...rest] = args;
+  const known = isSourceLifecycleCommand(verb);
+  const invalid = (message: string, suggestion: string) => opError('invalid_params', message, suggestion, {
+    fix: readFix(`Prints the managed source administration forms and their options.`, { argv: ['gbrain', 'sources', ...(known ? [verb] : []), '--help'] }),
+  });
+  if (!known) throw invalid('Unknown source lifecycle command.', `Use one of gbrain sources ${SOURCE_LIFECYCLE_COMMANDS.join(', ')}.`);
+  const values = new Map<string, string>();
+  const flags = new Set<string>();
+  const positionals: string[] = [];
+  const booleans = new Set(['json', 'dry-run', 'yes', 'confirm-destructive', 'keep-storage', 'force',
+    'federated', 'no-federated', 'no-federate', 'refederate', 'no-harden']);
+  const valued = new Set(['request-id', 'expected-incarnation', 'brain', 'path', 'url', 'name', 'clone-dir',
+    'pat-file', 'kind', 'account', 'access', 'token-command', 'token-env', 'gbrainio-command', 'private-senders-file', 'services', 'history-days',
+    'future-days', 'loops-exclude-labels', 'contacts-dir', 'calendar-id', 'scope', 'repos', 'dir', 'app-id', 'app-pem', 'app-install',
+    'provider', 'transcript', 'lookback-days', 'sync-interval-min', 'record', 'visibility', 'channels', 'timezone', 'max-requests', 'skip',
+    'helper-host', 'helper-port', 'proxy', 'token-file']);
+  for (let i = 0; i < rest.length; i++) {
+    const token = rest[i];
+    if (!token.startsWith('-')) { positionals.push(token); continue; }
+    if (!token.startsWith('--')) throw invalid(`Unknown option: ${token}.`, `Write options in long form with two dashes (e.g. --dry-run); sources ${verb} has no short options.`);
+    const equal = token.indexOf('=');
+    const key = token.slice(2, equal < 0 ? undefined : equal);
+    if (flags.has(key) || values.has(key)) throw invalid(`Duplicate option --${key}.`, `Pass --${key} once, with the one value you mean.`);
+    if (booleans.has(key)) {
+      if (equal >= 0) throw invalid(`--${key} does not accept a value.`, `Write --${key} on its own, without =value; leave it out to keep it off.`);
+      flags.add(key); continue;
+    }
+    if (!valued.has(key)) throw invalid(`Unknown option --${key}.`, `Remove --${key}; gbrain sources ${verb} --help lists the options sources ${verb} accepts.`);
+    const value = equal < 0 ? rest[++i] : token.slice(equal + 1);
+    if (value === undefined || value === '' || value.startsWith('--')) throw invalid(`--${key} requires a value.`, `Give --${key} its value right after it, as --${key} VALUE or --${key}=VALUE.`);
+    values.set(key, value);
+  }
+  const id = positionals.shift();
+  if (!id && verb === 'purge') throw invalid('Managed purge requires an explicit archived source ID. Run sources archived, then sources purge <id> --confirm-destructive.',
+    'Run gbrain sources archived --json to list the archived source ids, then gbrain sources purge with that id and --confirm-destructive after the user confirms.');
+  if (!id || !isValidSourceId(id)) throw invalid('An explicit valid source ID is required.',
+    `Name the source id right after sources ${verb}: 1-32 lowercase letters, digits and inner hyphens, e.g. gbrain sources ${verb} notes.`);
+  const requestId = values.get('request-id') ?? generatedId;
+  const incarnation = values.get('expected-incarnation');
+  if (!isWriteRequestId(requestId) || incarnation !== undefined && !isWriteRequestId(incarnation)) {
+    throw invalid('--request-id and --expected-incarnation must be UUIDs.',
+      `Pass --request-id and --expected-incarnation as UUIDs exactly as an earlier sources ${verb} printed them; omit --request-id to start a new request.`);
+  }
+  const dryRun = flags.has('dry-run');
+  const params: Record<string, unknown> = { action: verb === 'set-path' ? 'rebind' : verb,
+    source_id: id, request_id: requestId, ...(incarnation ? { expected_incarnation: incarnation } : {}),
+    ...(dryRun ? { dry_run: true } : {}) };
+  const common = new Set(['request-id', 'expected-incarnation', 'brain', 'json', 'dry-run']);
+  const allowed = verb === 'add' ? new Set([...common, ...valued, 'federated', 'no-federated', 'force', 'no-harden'])
+    : new Set([...common, ...(verb === 'set-path' ? ['path', 'force'] : []),
+      ...(['remove', 'purge'].includes(verb) ? ['yes', 'confirm-destructive', 'keep-storage'] : []),
+      ...(verb === 'restore' ? ['no-federate', 'refederate'] : [])]);
+  for (const key of [...values.keys(), ...flags]) if (!allowed.has(key)) throw invalid(`--${key} does not apply to sources ${verb}.`,
+    `Remove --${key}; sources ${verb} accepts ${[...allowed].map(name => `--${name}`).join(', ')}.`);
+  if (verb === 'set-path') {
+    if (positionals.length && values.has('path')) throw invalid('Specify the set-path target once.',
+      `Give the successor directory once: gbrain sources set-path ${id} DIRECTORY, or --path DIRECTORY, not both.`);
+    const target = positionals.shift() ?? values.get('path');
+    if (!target) throw invalid('set-path requires the verified successor directory.',
+      `Pass the directory that now holds source ${id}'s checkout: gbrain sources set-path ${id} DIRECTORY (--clear clears a connector source's stale local_path, or any relative one).`);
+    params.path = absolute(target);
+  }
+  if (positionals.length) throw invalid(`Unexpected argument: ${positionals[0]}.`, `Remove ${positionals[0]}; sources ${verb} takes only the source id${verb === 'set-path' ? ' and the directory' : ''} as arguments.`);
+  if (verb === 'restore') {
+    if (flags.has('no-federate') && flags.has('refederate')) throw invalid('Choose one federation setting.',
+      'Pass either --no-federate or --refederate, not both; restore refederates by default.');
+    params.refederate = !flags.has('no-federate');
+  }
+  if (verb === 'remove' || verb === 'purge') {
+    // --yes must never bypass the populated-source destructive confirmation.
+    params.confirm_destructive = flags.has('confirm-destructive');
+  }
+  if (verb !== 'add') return { operation: 'source_lifecycle', params, brain: values.get('brain'), legacyOnly: false, json: flags.has('json') };
+
+  if (flags.has('federated') && flags.has('no-federated')) throw invalid('Choose one federation setting.', 'Pass either --federated or --no-federated, not both.');
+  const kind = values.get('kind');
+  if (kind !== undefined && !isConnectorSourceKind(kind)) throw invalid(`Source kind must be ${CONNECTOR_SOURCE_KINDS.join(', ')}.`,
+    `Pass --kind ${CONNECTOR_SOURCE_KINDS.join(', --kind ')}; a directory or Git remote source uses --path or --url instead of --kind.`);
+  if ([values.has('path'), values.has('url'), kind !== undefined].filter(Boolean).length > 1) throw invalid('--path, --url and --kind are mutually exclusive.',
+    `Give exactly one of --path (a local directory), --url (an https Git remote) or --kind (${CONNECTOR_SOURCE_KINDS.join(', ')}).`);
+  // The kinds each kind-specific option applies to.
+  const optionKinds: Record<string, readonly string[]> = {
+    ...Object.fromEntries(['account', 'access', 'token-command', 'gbrainio-command', 'private-senders-file', 'services', 'future-days', 'loops-exclude-labels', 'calendar-id']
+      .map(key => [key, ['google']])),
+    'contacts-dir': ['google', 'apple-contacts'],
+    ...Object.fromEntries(['helper-host', 'helper-port', 'proxy', 'token-file'].map(key => [key, ['apple-contacts']])),
+    ...Object.fromEntries(['scope', 'repos', 'app-id', 'app-pem', 'app-install'].map(key => [key, ['github']])),
+    ...Object.fromEntries(['provider', 'transcript'].map(key => [key, ['meetings']])),
+    'lookback-days': ['meetings', 'slack', 'imessage'],
+    'sync-interval-min': ['meetings', 'slack', 'imessage', 'apple-contacts'],
+    record: ['meetings', 'slack', 'apple-contacts'],
+    visibility: ['meetings', 'slack'],
+    ...Object.fromEntries(['channels', 'max-requests', 'skip'].map(key => [key, ['slack']])),
+    timezone: ['slack', 'imessage'],
+    'history-days': ['google', 'meetings', 'slack', 'imessage'],
+    // An apple-contacts token is read only from its 0600 --token-file, never from the environment.
+    'token-env': CONNECTOR_SOURCE_KINDS.filter(k => k !== 'apple-contacts'),
+    // An imessage source is always database-recorded: its message text never reaches a directory.
+    dir: CONNECTOR_SOURCE_KINDS.filter(k => k !== 'imessage'),
+  };
+  for (const [key, kinds] of Object.entries(optionKinds)) {
+    if (!values.has(key)) continue;
+    if (!kind) throw invalid(`--${key} requires --kind ${kinds.join(' or ')}.`, `Add --kind ${kinds.join(' or --kind ')} for --${key}, or remove --${key}.`);
+    if (!kinds.includes(kind)) throw invalid(`--${key} requires --kind ${kinds.join(' or ')}.`,
+      `--${key} configures a ${kinds.join(' or ')} source: use --kind ${kinds.join(' or --kind ')}, or remove --${key} from this ${kind} source.`);
+  }
+  const number = (key: string, fallback?: number): number | undefined => {
+    if (!values.has(key)) return fallback;
+    const value = Number(values.get(key));
+    if (!Number.isSafeInteger(value) || value <= 0) throw invalid(`--${key} must be a positive integer.`,
+      `Pass --${key} as a positive whole number, e.g. --${key} ${key === 'history-days' ? 90 : 123456}.`);
+    return value;
+  };
+  const opts: AddSourceOpts = { id, requestId, expectedIncarnation: incarnation,
+    name: values.get('name'), localPath: values.has('path') ? absolute(values.get('path')!) : null,
+    remoteUrl: values.get('url'), cloneDir: values.has('clone-dir') ? absolute(values.get('clone-dir')!) : undefined,
+    federated: flags.has('federated') ? true : flags.has('no-federated') ? false : null, force: flags.has('force') };
+  if (kind === 'github') {
+    const scope = values.get('scope') ?? 'auto';
+    const repos = (values.get('repos') ?? '').split(',').map(value => value.trim()).filter(Boolean);
+    if (!['auto', 'repos'].includes(scope) || scope === 'repos' && !repos.length || repos.some(repo => !isValidRepoName(repo))) {
+      throw invalid('GitHub scope must be auto or repos; repos requires valid owner/name entries.',
+        'Pass --scope auto, or --scope repos with --repos as comma-separated owner/name entries (e.g. --repos acme-example/notes).');
+    }
+    if (values.has('app-id') !== values.has('app-pem')) throw invalid('--app-id and --app-pem are required together.',
+      `Pass both --app-id and --app-pem for a GitHub App, or neither to authenticate with --token-env (default GH_TOKEN).`);
+    opts.github = { tokenEnv: values.get('token-env') ?? 'GH_TOKEN', handle: '', scope: scope as 'auto' | 'repos', repos,
+      dir: absolute(values.get('dir') ?? defaultCloneDir(`${id}-github`)), involvement: true,
+      appId: number('app-id'), appPemPath: values.has('app-pem') ? absolute(values.get('app-pem')!) : undefined,
+      appInstallId: number('app-install') };
+  }
+  if (kind === 'google') {
+    const account = values.get('account')?.trim().toLowerCase();
+    const access = values.get('access') ?? 'vault';
+    const services = (values.get('services') ?? (access === 'gbrainio' ? 'gmail' : 'gmail,calendar,contacts')).split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
+    if (!account || !services.length || services.some(service => !(ALL_GOOGLE_SERVICES as readonly string[]).includes(service))) throw invalid('Google requires --account and valid --services.',
+      `Pass --account with the Google account email and --services as a comma-separated subset of ${ALL_GOOGLE_SERVICES.join(',')}.`);
+    if (!['vault', 'command', 'env', 'gbrainio'].includes(access) || access === 'command' && !values.has('token-command')
+      || access === 'env' && !values.has('token-env') || (access === 'vault' || access === 'gbrainio') && (values.has('token-command') || values.has('token-env'))
+      || access !== 'gbrainio' && values.has('gbrainio-command')) {
+      throw invalid('Google access must be vault, command with --token-command, env with --token-env, or gbrainio.',
+        'Use --access vault (the default, with no token flags), --access command with --token-command, --access env with --token-env, or --access gbrainio (optionally with --gbrainio-command).');
+    }
+    if (access === 'gbrainio' && services.some(service => service !== 'gmail')) throw invalid('--access gbrainio reads Gmail only.',
+      'Pass --services gmail, or leave --services out, for a source that reads mail through gbrain.io.');
+    if (values.has('private-senders-file') && !values.get('private-senders-file')?.trim()) throw invalid('--private-senders-file needs a path.',
+      'Pass --private-senders-file with the path of a file holding one address or @domain per line.');
+    const futureDays = number('future-days');
+    if (futureDays !== undefined && futureDays > CALENDAR_FUTURE_DAYS_MAX) throw invalid(`--future-days must be at most ${CALENDAR_FUTURE_DAYS_MAX}.`,
+      `Pass --future-days between 1 and ${CALENDAR_FUTURE_DAYS_MAX} (days ahead the calendar sweep covers; default ${CALENDAR_HORIZON_DAYS}).`);
+    const loopsExcludeLabels = parseExcludeLabelTokens(values.get('loops-exclude-labels'));
+    if (values.has('loops-exclude-labels') && loopsExcludeLabels.length === 0) throw invalid('--loops-exclude-labels needs at least one label.',
+      'Pass --loops-exclude-labels as a comma-separated list of Gmail label names or ids, e.g. --loops-exclude-labels "Newsletters,Label_7".');
+    const contactsDir = values.has('contacts-dir') ? parseContactsDir(values.get('contacts-dir')) : undefined;
+    if (contactsDir === null) throw invalid('--contacts-dir must be a relative directory of lower-case segments.',
+      'Pass --contacts-dir as one or more segments of a-z, 0-9, - and _ (e.g. --contacts-dir contacts); it is relative to the source directory.');
+    opts.google = { account, services, historyDays: number('history-days', 90)!, calendarId: values.get('calendar-id') ?? DEFAULT_CALENDAR_ID,
+      ...(contactsDir ? { contactsDir } : {}),
+      ...(futureDays !== undefined ? { futureDays } : {}), ...(loopsExcludeLabels.length > 0 ? { loopsExcludeLabels } : {}),
+      dir: absolute(values.get('dir') ?? defaultCloneDir(`${id}-google`)), access: access as 'vault' | 'command' | 'env' | 'gbrainio',
+      tokenCommand: values.get('token-command'), tokenEnv: values.get('token-env'),
+      ...(values.has('gbrainio-command') ? { gbrainioCommand: values.get('gbrainio-command')!.trim() } : {}),
+      ...(values.has('private-senders-file') ? { privateSendersFile: absolute(values.get('private-senders-file')!.trim()) } : {}) };
+  }
+  /** The record mode, directory, visibility and schedule flags the API-backed kinds share. */
+  const recordFlags = (pages: string, alwaysPrivate: string) => {
+    const record = values.get('record') ?? 'auto';
+    if (record !== 'auto' && record !== 'git' && record !== 'database') throw invalid('--record must be git or database.',
+      'Pass --record git (pages committed to the Git checkout at --dir) or --record database (the database is the record, no directory); leave it out to choose from --dir.');
+    if (record === 'database' && values.has('dir')) throw invalid('--record database takes no --dir.',
+      'Remove --dir: a database-recorded source keeps no directory. To record pages in Git, pass --record git with --dir inside a Git checkout.');
+    const visibility = values.get('visibility') ?? 'default';
+    if (visibility !== 'default' && visibility !== 'private') throw invalid('--visibility must be private.',
+      `Pass --visibility private to write every ${pages} private, or leave it out (${alwaysPrivate} are private either way).`);
+    const interval = number('sync-interval-min');
+    return { record: record as 'auto' | 'git' | 'database', historyDays: number('history-days'), lookbackDays: number('lookback-days'),
+      ...(interval !== undefined ? { syncIntervalMin: interval } : {}), ...(values.has('token-env') ? { tokenEnv: values.get('token-env') } : {}),
+      ...(values.has('dir') ? { dir: absolute(values.get('dir')!) } : {}), private: visibility === 'private' };
+  };
+  if (kind === 'meetings') {
+    const provider = values.get('provider') ?? 'fireflies';
+    if (!isMeetingProviderName(provider)) throw invalid(`--provider must be one of ${MEETING_PROVIDERS.join(', ')}.`,
+      `Pass --provider ${MEETING_PROVIDERS.join(' or --provider ')}; other meeting providers are not supported yet.`);
+    const transcript = values.get('transcript') ?? 'none';
+    if (transcript !== 'none' && transcript !== 'full') throw invalid('--transcript must be none or full.',
+      'Pass --transcript none (summary, action items and attendees; the default) or --transcript full (also the sentence transcript).');
+    opts.meetings = { provider, transcript, ...recordFlags('meeting page', 'meetings the key owner did not attend') };
+  }
+  if (kind === 'slack') {
+    const channels = normalizeSlackChannels(values.get('channels'));
+    if (!channels.length || channels.some(channel => !SLACK_CHANNEL_ID_RE.test(channel))) throw invalid('--channels needs one or more Slack channel ids.',
+      'Pass --channels as comma-separated channel ids (for example --channels C0123ABCDEF,C0456GHIJKL); a channel id is in the channel\'s details in Slack, below its name. Direct messages are not supported.');
+    const timezone = values.get('timezone') ?? 'UTC';
+    if (!isValidTimeZone(timezone)) throw invalid('--timezone must be an IANA time zone.', 'Pass --timezone as an IANA zone name such as UTC or America/Los_Angeles; a day page starts at midnight there.');
+    const skip = (values.get('skip') ?? '').split(',').map(value => value.trim()).filter(Boolean);
+    if (skip.some(value => !(SLACK_SKIPPABLE as readonly string[]).includes(value))) throw invalid(`--skip takes ${SLACK_SKIPPABLE.join(', ')}.`,
+      `Pass --skip as a comma-separated subset of ${SLACK_SKIPPABLE.join(',')} to leave bot messages or join notices out of the pages.`);
+    const maxRequests = number('max-requests');
+    opts.slack = { channels, ...recordFlags('Slack page', 'pages of private channels'), ...(values.has('timezone') ? { timezone } : {}),
+      ...(maxRequests !== undefined ? { maxRequests } : {}), ...(skip.length ? { skip: skip as SlackSkippable[] } : {}) };
+  }
+  if (kind === 'imessage') {
+    const timezone = values.get('timezone') ?? 'UTC';
+    if (!isValidTimeZone(timezone)) throw invalid('--timezone must be an IANA time zone.', 'Pass --timezone as an IANA zone name such as UTC or America/Los_Angeles; a day page starts at midnight there.');
+    const interval = number('sync-interval-min');
+    opts.imessage = { historyDays: number('history-days'), lookbackDays: number('lookback-days'), ...(values.has('timezone') ? { timezone } : {}),
+      ...(interval !== undefined ? { syncIntervalMin: interval } : {}), ...(values.has('token-env') ? { tokenEnv: values.get('token-env') } : {}) };
+  }
+  if (kind === 'apple-contacts') {
+    const helperHost = parseHelperHost(values.get('helper-host'));
+    if (!helperHost) throw invalid('Apple Contacts requires --helper-host.',
+      'Pass --helper-host with the address the helper listens on as this machine reaches it (a host name or an IP address, no scheme or port), e.g. --helper-host mac-example.');
+    const helperPort = values.has('helper-port') ? parseHelperPort(values.get('helper-port')) : undefined;
+    if (helperPort === null) throw invalid('--helper-port must be a port number.', `Pass --helper-port as a whole number from 1 to 65535 (default ${APPLE_CONTACTS_DEFAULT_PORT}).`);
+    const proxy = values.has('proxy') ? parseSocksProxy(values.get('proxy')) : undefined;
+    if (proxy === null) throw invalid('--proxy must be socks5h://host:port.', 'Pass --proxy as socks5h://<host>:<port> (for example socks5h://127.0.0.1:1055), with no user name or password in it.');
+    const tokenFile = values.get('token-file');
+    if (!tokenFile) throw invalid('Apple Contacts requires --token-file.',
+      'Pass --token-file with the path of the 0600 JSON file {"accessToken":"..."} that holds the helper\'s read:contacts token; the token itself is never passed on the command line.');
+    const contactsDir = values.has('contacts-dir') ? parseAppleContactsDir(values.get('contacts-dir')) : undefined;
+    if (contactsDir === null) throw invalid('--contacts-dir must be a relative directory of lower-case segments, outside people/.',
+      `Pass --contacts-dir as one or more segments of a-z, 0-9, - and _, not people/ or a folder under it (default ${APPLE_CONTACTS_DEFAULT_DIR}).`);
+    const record = values.get('record') ?? 'auto';
+    if (record !== 'auto' && record !== 'git' && record !== 'database') throw invalid('--record must be git or database.',
+      'Pass --record git (pages committed to the Git checkout at --dir) or --record database (the database is the record, no directory); leave it out to choose from --dir.');
+    if (record === 'database' && values.has('dir')) throw invalid('--record database takes no --dir.', 'Remove --dir: a database-recorded source keeps no directory.');
+    const interval = number('sync-interval-min');
+    opts.appleContacts = { helperHost, ...(helperPort !== undefined ? { helperPort } : {}), ...(proxy ? { proxy: proxy.url } : {}), tokenFile: absolute(tokenFile),
+      ...(contactsDir ? { contactsDir } : {}), record: record as 'auto' | 'git' | 'database', ...(values.has('dir') ? { dir: absolute(values.get('dir')!) } : {}),
+      ...(interval !== undefined ? { syncIntervalMin: interval } : {}) };
+  }
+  return { operation: 'source_add', params: { options: opts, request_id: requestId, ...(dryRun ? { dry_run: true } : {}) },
+    brain: values.get('brain'), legacyOnly: values.has('pat-file'), json: flags.has('json') };
+}

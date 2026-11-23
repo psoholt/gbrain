@@ -49,9 +49,9 @@ export class RateLimiter {
   private readonly clock: Clock;
 
   constructor(opts: RateLimitOpts, clock: Clock = Date.now) {
-    if (opts.limit <= 0) throw new Error('RateLimiter: limit must be > 0');
-    if (opts.windowMs <= 0) throw new Error('RateLimiter: windowMs must be > 0');
-    if (opts.lruCap <= 0) throw new Error('RateLimiter: lruCap must be > 0');
+    if (opts.limit <= 0) throw new RangeError('RateLimiter: limit must be > 0');
+    if (opts.windowMs <= 0) throw new RangeError('RateLimiter: windowMs must be > 0');
+    if (opts.lruCap <= 0) throw new RangeError('RateLimiter: lruCap must be > 0');
     this.opts = opts;
     this.clock = clock;
   }
@@ -115,6 +115,19 @@ export class RateLimiter {
       if (oldestKey === undefined) break;
       this.buckets.delete(oldestKey);
     }
+  }
+
+  /**
+   * Return one token to a key's bucket (capped at the limit). For callers
+   * that meter an action's SUCCESS, not its attempt: check() before the
+   * action, refund() when the action turns out to be a no-op (e.g. a
+   * concurrent-lock loser whose UPDATE affected 0 rows) so denials don't
+   * consume the caller's budget. No-op for unknown keys.
+   */
+  refund(key: string): void {
+    const bucket = this.buckets.get(key);
+    if (!bucket) return;
+    bucket.tokens = Math.min(this.opts.limit, bucket.tokens + 1);
   }
 
   /** Test helper: current key count. */

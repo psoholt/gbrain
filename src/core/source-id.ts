@@ -33,6 +33,26 @@
 
 export const SOURCE_ID_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 
+/**
+ * Sentinel meaning "span every source" (#1712). Deliberately NOT a valid
+ * source id (underscores are rejected by SOURCE_ID_RE), so it can never
+ * collide with a real source, be created via `sources add`, or leak into
+ * lock ids / path joins. The resolver's explicit/env tiers pass it through
+ * verbatim; `sourceScopeOpts` translates it to an unscoped read for trusted
+ * local callers and keeps it as an unsatisfiable literal for remote callers
+ * (fail-closed).
+ */
+export const ALL_SOURCES = '__all__';
+
+/**
+ * Sentinel for a legacy token whose stored source grant is an explicit empty
+ * list (`gbrain auth rescope-token <name> --sources none`). Like
+ * `ALL_SOURCES` it can never name a real source; `sourceScopeOpts`, the
+ * dispatch fence and write submission refuse it instead of falling back to
+ * the `default` floor.
+ */
+export const NO_SOURCES = '__none__';
+
 /** Returns true if the string matches the canonical source_id regex. */
 export function isValidSourceId(s: unknown): s is string {
   return typeof s === 'string' && SOURCE_ID_RE.test(s);
@@ -51,4 +71,44 @@ export function assertValidSourceId(s: unknown): asserts s is string {
       `(matches ${SOURCE_ID_RE}).`,
     );
   }
+}
+
+/**
+ * Normalize the optional `source` field of an `/admin/api/register-client`
+ * request body into a write source_id.
+ *
+ * Mirrors the CLI's `--source` flag. Returns the literal `'default'` when the
+ * field is omitted (`undefined`/`null`) so every caller that doesn't send
+ * `source` keeps landing on source_id='default' (the pre-source HTTP
+ * register-client behavior). A present-but-invalid value throws (via
+ * `assertValidSourceId`) so the route can surface a structured 400 instead of
+ * failing at INSERT time.
+ */
+export function normalizeSourceInput(raw: unknown): string {
+  if (raw === undefined || raw === null) return 'default';
+  assertValidSourceId(raw);
+  return raw;
+}
+
+/**
+ * Normalize the optional `federatedRead` field of an
+ * `/admin/api/register-client` request body into a source_id array, or
+ * `undefined` when omitted.
+ *
+ * Mirrors the CLI's `--federated-read` flag. `undefined`/`null` → `undefined`
+ * so `registerClientManual` applies its own default (`[sourceId]`, a
+ * non-federated client whose read scope equals its write scope). A present
+ * value must be a non-empty array whose every element is a valid source_id;
+ * anything else throws for a structured 400.
+ */
+export function normalizeFederatedReadInput(raw: unknown): string[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new Error(
+      `Invalid federatedRead: ${JSON.stringify(raw)}. ` +
+      `Must be a non-empty array of source_ids.`,
+    );
+  }
+  for (const s of raw) assertValidSourceId(s);
+  return raw as string[];
 }

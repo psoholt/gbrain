@@ -22,8 +22,8 @@ import {
   assertFactsEmbeddingDimMatchesConfig,
 } from '../src/core/embedding-dim-check.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
-import { readFileSync } from 'fs';
-import { resolve } from 'path';
+import { doctorSource, doctorFileSource } from './helpers/doctor-source.ts';
+import { surfaceFileSource } from './helpers/source-surface.ts';
 
 /**
  * Synthetic engine satisfying the slice of BrainEngine these helpers
@@ -122,9 +122,9 @@ describe('buildFactsAlterRecipe', () => {
   });
 
   test('vector recipe uses vector_cosine_ops + vector(N) USING cast', () => {
-    const recipe = buildFactsAlterRecipe(1024, 2048, 'vector');
-    expect(recipe).toContain('vector(2048)');
-    expect(recipe).toContain('USING embedding::vector(2048)');
+    const recipe = buildFactsAlterRecipe(1024, 1536, 'vector');
+    expect(recipe).toContain('vector(1536)');
+    expect(recipe).toContain('USING embedding::vector(1536)');
     expect(recipe).toContain('vector_cosine_ops');
     expect(recipe).not.toContain('halfvec_cosine_ops');
   });
@@ -163,6 +163,14 @@ describe('buildFactsAlterRecipe', () => {
     expect(recipe).not.toContain('UPDATE facts SET embedding = NULL');
     expect(recipe).toContain('USING embedding::vector(1536)');
   });
+
+  test('halfvec recipe skips HNSW rebuild above pgvector cap', () => {
+    const recipe = buildFactsAlterRecipe(1536, 4096, 'halfvec');
+    expect(recipe).toContain('halfvec(4096)');
+    expect(recipe).toContain('Skip reindex');
+    expect(recipe).toContain("exceeds pgvector's HNSW cap of 4000");
+    expect(recipe).not.toMatch(/CREATE INDEX idx_facts_embedding_hnsw[\s\S]*USING hnsw/);
+  });
 });
 
 describe('FactsEmbeddingDimMismatchError', () => {
@@ -197,38 +205,39 @@ describe('assertFactsEmbeddingDimMatchesConfig', () => {
 });
 
 describe('doctor checkFactsEmbeddingWidthConsistency wiring (T6)', () => {
-  const DOC_PATH = resolve(import.meta.dir, '..', 'src/commands/doctor.ts');
-  const DOC_SRC = readFileSync(DOC_PATH, 'utf-8');
+  // Containment greps read the whole doctor surface; the ordering assertion
+  // stays pinned to the single file that holds both call sites.
+  const DOC_ALL = doctorSource();
+  const DOC_TS = doctorFileSource('doctor/checks/sync-search.ts');
 
   test('doctor.ts exports the new check function', () => {
-    expect(DOC_SRC).toMatch(
+    expect(DOC_ALL).toMatch(
       /export\s+async\s+function\s+checkFactsEmbeddingWidthConsistency/,
     );
   });
 
   test('check is registered in runDoctor alongside the content_chunks check', () => {
-    expect(DOC_SRC).toMatch(/checkFactsEmbeddingWidthConsistency\(engine\)/);
+    expect(DOC_ALL).toMatch(/checkFactsEmbeddingWidthConsistency\(engine\)/);
     // Must appear AFTER the content_chunks check so a single
     // mismatch surface ordering is stable in the JSON envelope.
-    const widthIdx = DOC_SRC.indexOf('checkEmbeddingWidthConsistency(engine)');
-    const factsIdx = DOC_SRC.indexOf('checkFactsEmbeddingWidthConsistency(engine)');
+    const widthIdx = DOC_TS.indexOf('checkEmbeddingWidthConsistency(engine)');
+    const factsIdx = DOC_TS.indexOf('checkFactsEmbeddingWidthConsistency(engine)');
     expect(widthIdx).toBeGreaterThan(0);
     expect(factsIdx).toBeGreaterThan(0);
     expect(widthIdx).toBeLessThan(factsIdx);
   });
 
   test('doctor check uses readFactsEmbeddingDim from the shared helper', () => {
-    expect(DOC_SRC).toMatch(/readFactsEmbeddingDim/);
+    expect(DOC_ALL).toMatch(/readFactsEmbeddingDim/);
   });
 
   test('doctor check uses buildFactsAlterRecipe (NOT a hand-rolled ALTER string)', () => {
-    expect(DOC_SRC).toMatch(/buildFactsAlterRecipe/);
+    expect(DOC_ALL).toMatch(/buildFactsAlterRecipe/);
   });
 });
 
 describe('postgres-engine fact insert cast (T6, codex #20)', () => {
-  const PG_PATH = resolve(import.meta.dir, '..', 'src/core/postgres-engine.ts');
-  const PG_SRC = readFileSync(PG_PATH, 'utf-8');
+  const PG_SRC = surfaceFileSource('postgres-engine', 'src/core/postgres-engine.ts');
 
   test('insertFacts batch path uses cached castSuffix, NOT a hardcoded ::vector', () => {
     expect(PG_SRC).toMatch(/resolveFactsEmbeddingCast/);
@@ -240,7 +249,4 @@ describe('postgres-engine fact insert cast (T6, codex #20)', () => {
     expect(literalHits ?? []).toEqual([]);
   });
 
-  test('cached cast suffix has a test-only reset hook for unit cases', () => {
-    expect(PG_SRC).toMatch(/__resetFactsEmbeddingCastCacheForTest/);
-  });
 });

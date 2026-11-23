@@ -36,17 +36,26 @@
  *                  (escalating exponential backoff).
  */
 
-import { spawn, type ChildProcess } from 'child_process';
+import { spawn, type ChildProcess } from '../spawn.ts';
+import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { buildSpawnInvocation, detectTini } from './spawn-helpers.ts';
 import { classifyWorkerExit } from './exit-classification.ts';
 import { calculateBackoffMs } from './supervisor.ts';
-import { WORKER_EXIT_RSS_WATCHDOG } from './worker-exit-codes.ts';
+import { WORKER_EXIT_CONFIGURATION, WORKER_EXIT_RSS_WATCHDOG } from './worker-exit-codes.ts';
+import type { OwnerProcessingState, OwnerProcessingStatus } from './processing-state.ts';
+import { killProcessGroup, observeTiniChildProcessGroups } from './job-isolation.ts';
+import { CWD_ENV_QUARANTINED_MARKER } from '../cli-preflight.ts';
 
 export type ChildSupervisorEvent =
   | { kind: 'worker_spawned'; pid: number; tini: boolean }
+  | { kind: 'worker_startup_timeout'; timeoutMs: number }
   | { kind: 'worker_spawn_failed'; error: string; phase: 'sync' | 'async'; errnoCode?: string }
   | {
       kind: 'worker_exited';
+      /** The exited child's pid (absent when the spawn never produced a process). */
+      pid?: number;
       code: number | null;
       signal: NodeJS.Signals | null;
       runDurationMs: number;
@@ -70,6 +79,10 @@ export type ChildSupervisorEvent =
     };
 
 export interface ChildWorkerSupervisorOpts {
+  processingState?: OwnerProcessingState;
+  onConfigurationBlocked?: (status: OwnerProcessingStatus | null) => void;
+  _startupReadyTimeoutMs?: number;
+  _startupKillGraceMs?: number;
   /** Path to the gbrain CLI binary. */
   cliPath: string;
   /** Worker argv after cliPath (e.g. ['jobs', 'work', '--max-rss', '2048']). */
@@ -145,6 +158,17 @@ export interface ChildWorkerSupervisorOpts {
   /** Accessor for the composer's stopping flag; loop exits when this returns true. */
   isStopping: () => boolean;
 
+  /**
+   * Optional fenced maintenance hook run immediately before EVERY child spawn,
+   * including crash/watchdog respawns. The composer owns error handling AND
+   * bounding: a rejection propagates out of run() with no crash accounting or
+   * respawn, and the await is not isStopping-checked — so composers must
+   * try/catch and time-bound the hook themselves (MinionSupervisor wraps its
+   * recovery hook in a 30s race and spawns on failure). Reserve a bare
+   * rethrowing hook for genuine spawn-blocking safety preconditions.
+   */
+  beforeSpawn?: () => Promise<void>;
+
   /** Test seed for the clean-restart window. Defaults to Date.now. @internal */
   _now?: () => number;
 }
@@ -154,6 +178,7 @@ export interface ChildWorkerSupervisorOpts {
  *  consecutive crashes (each within the stable-run window) before we conclude
  *  it's a genuine code bug and stop. A transient outage recovers long before. */
 export const HARD_STOP_CRASH_MULTIPLIER = 10;
+export const WORKER_STARTUP_READY_TIMEOUT_MS = 120_000;
 
 const DEFAULTS = {
   stableRunResetMs: 5 * 60 * 1000,
@@ -170,6 +195,7 @@ export class ChildWorkerSupervisor {
   private readonly tiniPath: string;
   private _crashCount = 0;
   private _lastExitCode: number | null = null;
+  private _lastExit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   private _cleanRestartTimestamps: number[] = [];
   /** Sliding window of RSS-watchdog exit timestamps (issue #1678). Separate
    *  from crashCount so the >5-min stable-run reset can't defeat the breaker. */
@@ -183,6 +209,8 @@ export class ChildWorkerSupervisor {
   /** issue #1801: carried from the exit handler to applyBackoff so a wedge
    *  self-heal respawns immediately (ms:0) instead of paying crash backoff. */
   private _lastWasIntentionalRestart = false;
+  private _configurationBlocked = false;
+  private wakeBackoff: (() => void) | null = null;
 
   constructor(opts: ChildWorkerSupervisorOpts) {
     this.opts = opts;
@@ -198,6 +226,24 @@ export class ChildWorkerSupervisor {
   }
   get crashCount(): number {
     return this._crashCount;
+  }
+  /** #5062: how the most recent child exited, recorded on the shutdown path
+   *  too, so a composer can tell a clean drain (code 0) from a forced or
+   *  failed stop. */
+  get lastExit(): { code: number | null; signal: NodeJS.Signals | null } | null {
+    return this._lastExit;
+  }
+  get configurationBlocked(): boolean {
+    if (this.opts.processingState?.blocked) this.markConfigurationBlocked();
+    return this._configurationBlocked;
+  }
+
+  private markConfigurationBlocked(): void {
+    if (this._configurationBlocked) return;
+    this._configurationBlocked = true;
+    this.wakeBackoff?.();
+    this.opts.processingState?.block();
+    this.opts.onConfigurationBlocked?.(this.opts.processingState?.snapshot ?? null);
   }
   /** Whether tini was detected at construction. Used by tests + worker_spawned event payload. */
   get isTiniDetected(): boolean {
@@ -286,6 +332,7 @@ export class ChildWorkerSupervisor {
    * loop budget. `run()` respawns a fresh worker (and a fresh DB pool) on exit.
    */
   async restartCurrentChild(graceMs: number): Promise<void> {
+    if (this.configurationBlocked) return;
     const child = this._child;
     if (!child) return;
     this._intentionalRestart = true;
@@ -324,66 +371,108 @@ export class ChildWorkerSupervisor {
    * for a genuinely unrecoverable hot crash-loop.
    */
   async run(): Promise<void> {
-    const hardStop = this.opts.hardStopMaxCrashes ??
-      this.opts.maxCrashes * HARD_STOP_CRASH_MULTIPLIER;
-    let degradedAnnounced = false;
-    while (!this.opts.isStopping()) {
-      await this.spawnOnce();
-
-      if (this.opts.isStopping()) return;
-
-      // Hard ceiling: permanent give-up (the runaway backstop). hardStop <= 0
-      // disables it entirely (retry-forever-with-backoff for deployments that
-      // would rather never auto-stop a recoverable supervisor).
-      if (hardStop > 0 && this._crashCount >= hardStop) {
-        this.opts.onMaxCrashesExceeded(this._crashCount, hardStop);
-        return;
-      }
-
-      // Soft budget crossed → degraded mode. Announce once per degradation
-      // episode; re-arm after a stable-run reset drops us back under budget.
-      if (this._crashCount >= this.opts.maxCrashes) {
-        if (!degradedAnnounced) {
-          degradedAnnounced = true;
-          this.opts.onEvent({
-            kind: 'health_warn',
-            reason: 'crash_budget_degraded',
-            count: this._crashCount,
-            max: this.opts.maxCrashes,
-          });
+    const statusTimer = this.opts.processingState
+      ? setInterval(() => { void this.configurationBlocked; }, 100)
+      : null;
+    try {
+      const hardStop = this.opts.hardStopMaxCrashes ??
+        this.opts.maxCrashes * HARD_STOP_CRASH_MULTIPLIER;
+      let degradedAnnounced = false;
+      while (!this.opts.isStopping() && !this.configurationBlocked) {
+        try {
+          await this.opts.beforeSpawn?.();
+        } catch (error) {
+          if (this.configurationBlocked) return;
+          throw error;
         }
-      } else {
-        degradedAnnounced = false;
-      }
+        if (this.opts.isStopping() || this.configurationBlocked) return;
+        await this.spawnOnce();
 
-      await this.applyBackoff();
+        if (this.configurationBlocked || this.opts.isStopping()) return;
+
+        // Hard ceiling: permanent give-up (the runaway backstop). hardStop <= 0
+        // disables it entirely (retry-forever-with-backoff for deployments that
+        // would rather never auto-stop a recoverable supervisor).
+        if (hardStop > 0 && this._crashCount >= hardStop) {
+          this.opts.processingState?.waiting('stopped');
+          this.opts.onMaxCrashesExceeded(this._crashCount, hardStop);
+          return;
+        }
+
+        // Soft budget crossed → degraded mode. Announce once per degradation
+        // episode; re-arm after a stable-run reset drops us back under budget.
+        if (this._crashCount >= this.opts.maxCrashes) {
+          if (!degradedAnnounced) {
+            degradedAnnounced = true;
+            this.opts.onEvent({
+              kind: 'health_warn',
+              reason: 'crash_budget_degraded',
+              count: this._crashCount,
+              max: this.opts.maxCrashes,
+            });
+          }
+        } else {
+          degradedAnnounced = false;
+        }
+
+        await this.applyBackoff();
+      }
+    } finally {
+      if (statusTimer) clearInterval(statusTimer);
     }
   }
 
   /** Single spawn lifecycle: spawn -> await exit -> classify. */
   private spawnOnce(): Promise<void> {
     return new Promise<void>((resolve) => {
-      if (this.opts.isStopping()) {
+      if (this.opts.isStopping() || this.configurationBlocked) {
         resolve();
         return;
       }
 
-      const env = this.opts.env ?? { ...process.env };
+      const env: NodeJS.ProcessEnv = { ...(this.opts.env ?? process.env) };
       this._lastStartTime = this.now();
+      const originalCwd = process.cwd();
+      const args = [...this.opts.args];
+      if (this.opts.processingState && ['bun', 'bun.exe', 'node', 'node.exe'].includes(basename(this.opts.cliPath)) &&
+          args[0] && !args[0].startsWith('-') && !isAbsolute(args[0]) && existsSync(resolvePath(originalCwd, args[0]))) {
+        args[0] = resolvePath(originalCwd, args[0]);
+      }
 
       const { cmd: spawnCmd, args: spawnArgs } = buildSpawnInvocation(
         this.tiniPath,
-        this.opts.cliPath,
-        this.opts.args,
+        this.opts.processingState && !isAbsolute(this.opts.cliPath) && /[/\\]/.test(this.opts.cliPath)
+          ? resolvePath(this.opts.cliPath) : this.opts.cliPath,
+        args,
       );
 
       let child: ChildProcess;
+      let neutralCwd: string | undefined;
+      let startupTimer: ReturnType<typeof setInterval> | undefined;
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
+      let startupTimedOut = false;
+      const processGroups = new Set<number>();
+      const cleanup = () => {
+        if (startupTimer) clearInterval(startupTimer);
+        if (killTimer) clearTimeout(killTimer);
+        if (neutralCwd) {
+          try { rmSync(neutralCwd, { recursive: true, force: true }); } catch {}
+        }
+      };
       try {
+        if (this.opts.processingState) {
+          Object.assign(env, this.opts.processingState.prepareChild());
+          neutralCwd = realpathSync(mkdtempSync(join(tmpdir(), 'gbrain-worker-')));
+          env[CWD_ENV_QUARANTINED_MARKER] = JSON.stringify({ cwd: originalCwd, neutral: neutralCwd });
+        }
         child = spawn(spawnCmd, spawnArgs, {
           stdio: 'inherit',
           env,
+          ...(neutralCwd ? { cwd: neutralCwd } : {}),
         });
       } catch (err: unknown) {
+        cleanup();
+        this.opts.processingState?.workerExited();
         // Synchronous spawn error (e.g. invalid cliPath shape). Count as a crash.
         this.opts.onEvent({
           kind: 'worker_spawn_failed',
@@ -398,27 +487,130 @@ export class ChildWorkerSupervisor {
 
       this._child = child;
 
+      if (this.opts.processingState) {
+        const deadlineMs = this.opts._startupReadyTimeoutMs ?? WORKER_STARTUP_READY_TIMEOUT_MS;
+        const deadline = this.now() + deadlineMs;
+        const signalStartupChild = (signal: 'SIGTERM' | 'SIGKILL') => {
+          if (child.pid && this.tiniPath) observeTiniChildProcessGroups(child.pid, processGroups);
+          for (const group of processGroups) killProcessGroup(group, signal);
+          if (!this.tiniPath || processGroups.size === 0 || signal === 'SIGTERM') {
+            try { child.kill(signal); } catch {}
+          }
+        };
+        startupTimer = setInterval(() => {
+          if (this.configurationBlocked || this.opts.isStopping() || this.opts.processingState!.snapshot.processing_ready) {
+            clearInterval(startupTimer);
+            return;
+          }
+          if (this.now() < deadline) return;
+          clearInterval(startupTimer);
+          if (!this.opts.processingState!.waiting('startup_timeout')) return;
+          startupTimedOut = true;
+          this.opts.onEvent({ kind: 'worker_startup_timeout', timeoutMs: deadlineMs });
+          signalStartupChild('SIGTERM');
+          killTimer = setTimeout(() => signalStartupChild('SIGKILL'), this.opts._startupKillGraceMs ?? 35_000);
+        }, Math.min(100, Math.max(1, deadlineMs)));
+      }
+
       this.opts.onEvent({
         kind: 'worker_spawned',
         pid: child.pid ?? -1,
         tini: this.tiniPath !== '',
       });
 
-      // Async spawn errors (ENOENT, EACCES). Node fires 'error' first, then
-      // 'exit' with code=null. We log the error; the 'exit' handler increments
-      // crashCount as usual so the restart loop bounds permanent misconfigs
-      // via max_crashes.
+      // Settle-once guard shared by the 'exit' path (the child ran) and the
+      // spawn-failure path (the child never became a process).
+      let settled = false;
+      let spawnErrored = false;
+
+      /**
+       * The child never launched — ENOENT/EACCES on `cliPath`, or a target the
+       * OS refuses to execute (e.g. a `.sh` on Windows). Node and Bun emit
+       * 'error' and then 'close' for such a spawn but NEVER 'exit', so the
+       * 'exit' handler below can never settle this promise.
+       *
+       * Without this path `run()` awaits a promise that can never resolve: the
+       * supervisor wedges forever on the FIRST bad spawn — no respawn, no crash
+       * accounting, no give-up — which is the exact opposite of the bounded-retry
+       * contract this class exists to provide. (The comment that used to live
+       * here claimed 'exit' fires after 'error'; it does not.)
+       *
+       * A worker that can never start is a crash: increment `_crashCount` so it
+       * pays the normal exponential backoff in applyBackoff() and is ultimately
+       * bounded by `hardStopMaxCrashes`, the same as any other permanent misconfig.
+       */
+      const settleSpawnFailure = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        this._child = null;
+        this._intentionalRestart = false;
+
+        if (this.opts.isStopping()) {
+          resolve();
+          return;
+        }
+
+        const runDuration = this.now() - this._lastStartTime;
+        this._lastExitCode = null;
+        this._crashCount++;
+
+        this.opts.onEvent({
+          kind: 'worker_exited',
+          pid: child.pid,
+          code: null,
+          signal: null,
+          runDurationMs: runDuration,
+          likelyCause: 'spawn_failed',
+          crashCount: this._crashCount,
+        });
+
+        resolve();
+      };
+
+      // Async spawn errors (ENOENT, EACCES).
       child.on('error', (err) => {
+        spawnErrored = true;
         this.opts.onEvent({
           kind: 'worker_spawn_failed',
           error: err.message,
           phase: 'async',
           errnoCode: (err as NodeJS.ErrnoException).code,
         });
+        // No pid means the OS never created a process, so no 'exit' is coming.
+        // Settle now instead of awaiting an event that can never fire.
+        if (child.pid === undefined) settleSpawnFailure();
+      });
+
+      // Belt-and-braces for a failed spawn that did get a pid (platform-dependent
+      // EACCES shapes). Gated on `spawnErrored` so a normal run — which never
+      // emits 'error' — can't have its classified 'exit' path pre-empted by
+      // 'close', whose ordering relative to 'exit' is not guaranteed.
+      child.on('close', () => {
+        if (spawnErrored) settleSpawnFailure();
       });
 
       child.on('exit', (code, signal) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         this._child = null;
+        this._lastExit = { code, signal };
+
+        if (code === WORKER_EXIT_CONFIGURATION) {
+          this.opts.processingState?.workerExited();
+          this._lastExitCode = code;
+          this.markConfigurationBlocked();
+          this.opts.onEvent({ kind: 'worker_exited', pid: child.pid, code, signal: signal ?? null,
+            runDurationMs: this.now() - this._lastStartTime, likelyCause: 'configuration_blocked', crashCount: this._crashCount });
+          resolve();
+          return;
+        }
+        this.opts.processingState?.workerExited();
+        if (this.configurationBlocked) {
+          resolve();
+          return;
+        }
 
         if (this.opts.isStopping()) {
           resolve();
@@ -433,8 +625,11 @@ export class ChildWorkerSupervisor {
         // tracking and prune entries outside the sliding window. Routes
         // through the shared `classifyWorkerExit` helper so doctor.ts and
         // jobs.ts (audit-log consumers) read the same rule.
-        this._lastExitCode = code;
-        if (this._intentionalRestart) {
+        this._lastExitCode = startupTimedOut ? 1 : code;
+        if (startupTimedOut) {
+          this._intentionalRestart = false;
+          this._crashCount++;
+        } else if (this._intentionalRestart) {
           // issue #1801: deliberate wedge self-heal (restartCurrentChild). Leave
           // crashCount UNTOUCHED — like the RSS watchdog — so a recurring wedge
           // never trips max_crashes and kills the daemon. A SIGTERM exit has
@@ -476,7 +671,9 @@ export class ChildWorkerSupervisor {
 
         // Likely-cause heuristic, kept verbatim from MinionSupervisor.
         let likelyCause: string;
-        if (this._lastWasIntentionalRestart) {
+        if (startupTimedOut) {
+          likelyCause = 'startup_readiness_timeout';
+        } else if (this._lastWasIntentionalRestart) {
           // issue #1801: a deliberate wedge restart. Label it as such even
           // though the kill signal was SIGTERM/SIGKILL, so the audit summary
           // (supervisor-audit.ts CLEAN_EXIT_CAUSES) counts it as a self-heal,
@@ -498,6 +695,7 @@ export class ChildWorkerSupervisor {
 
         this.opts.onEvent({
           kind: 'worker_exited',
+          pid: child.pid,
           code: code ?? null,
           signal: signal ?? null,
           runDurationMs: runDuration,
@@ -628,7 +826,17 @@ export class ChildWorkerSupervisor {
   }
 
   private sleep(ms: number): Promise<void> {
-    return new Promise<void>((resolve) => setTimeout(resolve, ms));
+    if (this.configurationBlocked) return Promise.resolve();
+    this.opts.processingState?.waiting('retry_backoff', this.now() + ms);
+    return new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        this.wakeBackoff = null;
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      this.wakeBackoff = finish;
+    });
   }
 
   private now(): number {

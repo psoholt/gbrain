@@ -1,3 +1,5 @@
+import { parseSubmissionAuthority, type SubmissionAuthority } from './submission-authority.ts';
+import { parseSpendAuthorization, type JobSpendContext, type SpendAuthorization } from './spend-record.ts';
 /**
  * Minions — BullMQ-inspired Postgres-native job queue for GBrain.
  *
@@ -39,6 +41,12 @@ export interface MinionJob {
   status: MinionJobStatus;
   priority: number;
   data: Record<string, unknown>;
+  /** Internal authority column; never accepted from job data or remote options. */
+  submission_authority?: SubmissionAuthority | null;
+  /** Submit-time spend authorization (spend-authorization.ts); never read from job data. */
+  spend_authorization?: SpendAuthorization | null;
+  /** The column holds a value the strict parser rejects; the worker refuses to run the job. */
+  spend_authorization_invalid?: true;
 
   // Retry
   max_attempts: number;
@@ -71,9 +79,17 @@ export interface MinionJob {
   max_children: number | null;
   timeout_ms: number | null;
   timeout_at: Date | null;
+  /** Per-job lock lease (ms, #4145). NULL = worker-global lockDuration default. */
+  lock_duration_ms: number | null;
   remove_on_complete: boolean;
   remove_on_fail: boolean;
   idempotency_key: string | null;
+  /** Private dream-inline queue owner job, when this job is owned by an inline parent. */
+  private_queue_owner_job_id: number | null;
+  /** Private dream-inline queue owner token; random per phase run. */
+  private_queue_owner_token: string | null;
+  /** Renewable private-queue lease. Startup recovery may cancel only after this expires. */
+  private_queue_lease_until: Date | null;
 
   // v12: scheduler polish — quiet-hours gate + deterministic stagger
   quiet_hours: Record<string, unknown> | null;
@@ -90,6 +106,14 @@ export interface MinionJob {
   started_at: Date | null;
   finished_at: Date | null;
   updated_at: Date;
+
+  /** Submission metadata, NOT a DB column: set only by MinionQueue.add()
+   *  when it returned an EXISTING row instead of inserting (idempotency
+   *  fast-path, backpressure cap-hit, or the ON CONFLICT zero-row fallback).
+   *  rowToMinionJob never sets it; absent on fresh inserts and on rows read
+   *  back later. Surfaces in `jobs submit`'s JSON output — intended and
+   *  additive, so scripts can tell a real dispatch from a coalesce. */
+  coalesced?: boolean;
 }
 
 // --- Input Types ---
@@ -120,6 +144,8 @@ export interface MinionJobInput {
   max_children?: number;
   /** Wall-clock per-job deadline in ms. Set on claim → timeout_at. Terminal on expire (no retry). */
   timeout_ms?: number;
+  /** Per-job lock lease in ms (#4145). Clamped to [5s,1h]; NULL/undefined → handler map, then worker default. INSERT-only: an idempotency-key re-submit never mutates the first submitter's lease. */
+  lock_duration_ms?: number;
   /** DELETE row on successful completion (after token rollup + child_done insert). */
   remove_on_complete?: boolean;
   /** DELETE row on terminal failure (after parent failure hook). */
@@ -128,8 +154,47 @@ export interface MinionJobInput {
   max_spawn_depth?: number;
   /** Global dedup key. Same key returns the existing job, no second row created. */
   idempotency_key?: string;
-  /** Submission backpressure: cap waiting jobs with this name before inserting a new row. */
+  /**
+   * Internal: owner metadata for parent-owned `dream-inline-*` queues. Used by
+   * startup recovery to distinguish crashed owners from live private queues.
+   */
+  private_queue_owner_job_id?: number | null;
+  private_queue_owner_token?: string | null;
+  private_queue_lease_ms?: number | null;
+  /** Submission backpressure: cap waiting jobs with this name before inserting
+   *  a new row. Scope is (name, queue, source), where source reads
+   *  data.sourceId ?? data.source_id; a submission with NO source key counts
+   *  ALL rows for (name, queue) — the NULL-as-wildcard arm is intentional and
+   *  relied on by existing rate-cap callers. For single-flight semantics see
+   *  maxPending (exact scoping, counts in-flight work too). */
   maxWaiting?: number;
+  /** Submission single-flight: cap PENDING jobs — waiting rows plus LIVE-LOCK
+   *  active rows (status='active' AND lock_until > now()) — for this
+   *  (name, queue, source) scope before inserting a new row. Expired-lock
+   *  actives belong to a dead/blocked worker and never count, so a wedged
+   *  worker cannot suppress dispatch (new waiting rows keep feeding the
+   *  waitingClaimable>0 wedge detectors); dead/cancelled/completed never
+   *  count either. Cap-hit returns the most-recent waiting row, else the
+   *  most-recent live-lock active row, stamped `coalesced: true`. Scope is
+   *  EXACT (unlike maxWaiting): COALESCE(data.sourceId, data.source_id)
+   *  compared with IS NOT DISTINCT FROM — a NULL-source submission matches
+   *  only NULL-source rows, never a wildcard. If both maxPending and
+   *  maxWaiting are supplied, both guards apply; maxPending is checked
+   *  first. Internal option (autopilot dispatch single-flight); not exposed
+   *  as a public submit flag yet — semantics exclude delayed/paused/
+   *  waiting-children rows deliberately. */
+  maxPending?: number;
+  /**
+   * Admission param-coalescing override. When unset, the per-name default
+   * (admission.ts PARAM_COALESCE_DEFAULT, config-overridable via
+   * minions.coalesce_params.<name>) applies — on for 'subagent'. When
+   * active, a parentless submit whose payload hash (sha256 of
+   * stable-stringified data, __owner_client_id INCLUDED so owner lanes never
+   * cross) matches a WAITING row for the same (name, queue) returns that row
+   * with `coalesced: true` instead of inserting a duplicate. Parented
+   * submits never coalesce regardless of this flag.
+   */
+  coalesce_params?: boolean;
 
   // v12: scheduler polish
   /**
@@ -155,6 +220,8 @@ export interface MinionQueueOpts {
 
 export interface MinionWorkerOpts {
   queue?: string;
+  /** #7242: called (never awaited, errors swallowed) after each job this worker ran settles; terminal-hook.ts re-reads the row. */
+  onJobSettled?: (job: MinionJob) => void;
   concurrency?: number; // default 1
   lockDuration?: number; // ms, default 30000
   stalledInterval?: number; // ms, default 30000
@@ -189,6 +256,23 @@ export interface MinionWorkerOpts {
    *  hung probe would wedge the recursive setTimeout chain forever and
    *  silently disable the health monitor. Default: 10000 (10 seconds). */
   dbProbeTimeoutMs?: number;
+  /** issue #5: 'process' runs each claimed job in a SIGKILL-able child
+   *  process (blast radius = 1 job). Default 'inline' (today's behavior).
+   *  Requires childCliInvocation; the CLI layer resolves + validates it. */
+  jobIsolation?: 'inline' | 'process';
+  /** How to invoke the gbrain CLI for job children (resolved fail-fast at
+   *  worker startup by the CLI layer; structurally ChildCliInvocation from
+   *  job-isolation.ts — kept inline here to avoid an import cycle). */
+  childCliInvocation?: { cmd: string; argsPrefix: string[] } | null;
+  /** tini path for wrapping job children ('' = absent, direct spawn). */
+  childTiniPath?: string;
+  /** #7242: job names that count against the long-job lane. Default: lanes.ts DEFAULT_LONG_JOB_NAMES. */
+  longJobNames?: readonly string[];
+  /** #7242: slots kept free of long jobs when concurrency >= 2 (at least one slot still takes long jobs). Default 1; 0 disables. */
+  shortJobReservedSlots?: number;
+  /** GST-2529: how long a watchdog-marked job waits before this worker stops claiming to drain and run it alone. Default 60000.
+   *  The worker looks for such a job at most every 5 s and otherwise claims in plain priority order. */
+  watchdogSuspectWaitMs?: number;
 }
 
 // --- Job Context (passed to handlers) ---
@@ -197,9 +281,21 @@ export interface MinionJobContext {
   id: number;
   name: string;
   data: Record<string, unknown>;
+  /** Internal authority column; never accepted from job data or remote options. */
+  submission_authority?: SubmissionAuthority | null;
+  /** Set by runWithJobSpend for a spend-authorized job: its group record and meter key. */
+  spend?: JobSpendContext;
   attempts_made: number;
+  /** The job row's idempotency key (null when it was queued without one); ingest_capture records an applied capture under it (GST-1856). */
+  idempotency_key: string | null;
   /** AbortSignal for cooperative cancellation (fires on timeout, cancel, pause, or lock loss). */
   signal: AbortSignal;
+  /** Absolute wall-clock deadline (epoch ms) from the claim-time `timeout_at` stamp,
+   *  or null when the job has no per-job timeout. This is the DB's ground truth —
+   *  the same instant handleTimeouts() dead-letters against — so handlers that
+   *  spawn bounded sub-work (e.g. autopilot-cycle's subagent phases) can budget
+   *  from the REMAINING time instead of a fixed constant that may exceed it. */
+  deadlineAtMs: number | null;
   /** AbortSignal that fires only on worker process SIGTERM/SIGINT. Handlers sensitive
    *  to deploy restarts (e.g. the shell handler, which must run a SIGTERM → 5s → SIGKILL
    *  sequence on its child) listen to this in addition to `signal`. Most handlers can
@@ -337,17 +433,30 @@ export type TranscriptEntry =
   | { type: 'llm_turn'; model: string; tokens_in: number; tokens_out: number; ts: string }
   | { type: 'error'; message: string; stack?: string; ts: string };
 
+// --- Abort-reason literals (single source of truth) ---
+//
+// Per-job abort sites construct `new Error(REASON)`; classification sites
+// (worker.ts INFRASTRUCTURE_ABORT_REASONS, child-job-runner.ts
+// PER_JOB_ABORT_REASONS) match on the message. Deriving both sets from these
+// constants keeps a rename at an abort site from silently flipping child
+// classification (maintainability review).
+
+/** Infrastructure faults: released, no attempt burned; stall sweeper requeues. */
+export const ABORT_REASON_LOCK_RENEWAL_FAILED = 'lock-renewal-failed';
+export const ABORT_REASON_LOCK_LOST = 'lock-lost';
+/** Job-targeted aborts: keep their existing attempt semantics. */
+export const ABORT_REASON_TIMEOUT = 'timeout';
+
 // --- Errors ---
 
-/** Throw this from a handler to skip all retry logic and go straight to 'dead'. */
-export class UnrecoverableError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'UnrecoverableError';
-  }
-}
+export { JobDeferredError, UnrecoverableError } from './errors.ts';
 
 // --- Row Mapping ---
+
+function spendAuthorizationFields(raw: unknown): Pick<MinionJob, 'spend_authorization' | 'spend_authorization_invalid'> {
+  try { return { spend_authorization: parseSpendAuthorization(raw) }; }
+  catch { return { spend_authorization: null, spend_authorization_invalid: true }; }
+}
 
 export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
   return {
@@ -356,6 +465,8 @@ export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
     queue: row.queue as string,
     status: row.status as MinionJobStatus,
     priority: row.priority as number,
+    submission_authority: parseSubmissionAuthority(row.submission_authority),
+    ...spendAuthorizationFields(row.spend_authorization),
     data: (typeof row.data === 'string' ? JSON.parse(row.data) : row.data ?? {}) as Record<string, unknown>,
     max_attempts: row.max_attempts as number,
     attempts_made: row.attempts_made as number,
@@ -376,10 +487,14 @@ export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
     depth: (row.depth as number) ?? 0,
     max_children: (row.max_children as number) ?? null,
     timeout_ms: (row.timeout_ms as number) ?? null,
+    lock_duration_ms: (row.lock_duration_ms as number) ?? null,
     timeout_at: row.timeout_at ? new Date(row.timeout_at as string) : null,
     remove_on_complete: row.remove_on_complete === true,
     remove_on_fail: row.remove_on_fail === true,
     idempotency_key: (row.idempotency_key as string) || null,
+    private_queue_owner_job_id: (row.private_queue_owner_job_id as number | null) ?? null,
+    private_queue_owner_token: (row.private_queue_owner_token as string) || null,
+    private_queue_lease_until: row.private_queue_lease_until ? new Date(row.private_queue_lease_until as string) : null,
     quiet_hours: row.quiet_hours ? (typeof row.quiet_hours === 'string' ? JSON.parse(row.quiet_hours) : row.quiet_hours) as Record<string, unknown> : null,
     stagger_key: (row.stagger_key as string) || null,
     result: row.result ? (typeof row.result === 'string' ? JSON.parse(row.result) : row.result) as Record<string, unknown> : null,
@@ -402,6 +517,20 @@ export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
  * tool registry and provider config resolve via handler-side defaults + env,
  * not per-job data, so restart/replay uses the same behavior.
  */
+/** GBRA-60: the transcript a dream synthesis child's pages are verified against, and the stamp they carry. */
+export interface DreamOutputSpec {
+  /** The transcript path (or conversation-page URI) the cycle discovered; stamped as `raw_source`. */
+  raw_source: string;
+  /** sha256 of the transcript content the cycle discovered; a child that reads other bytes does not verify. */
+  transcript_hash: string;
+  /** The cycle date the prompt gave as today (`dream_cycle_date`, the verify `checkedAt`). */
+  cycle_date: string;
+  /** `dream.synthesize.quote_verify`; false stamps without verifying. */
+  quote_verify: boolean;
+  /** #4618: the capturing seat. */
+  seat?: string;
+}
+
 export interface SubagentHandlerData {
   /** Top-level user turn kicking off the loop. */
   prompt: string;
@@ -411,6 +540,12 @@ export interface SubagentHandlerData {
   model?: string;
   /** Max assistant turns before the loop fails with stop_reason='max_turns'. */
   max_turns?: number;
+  /**
+   * Per-turn max output tokens (#2778). Resolution: this field →
+   * `agent.max_output_tokens` config → 8192 default. The pre-#2778
+   * hardcoded 4096 made pages >~12KB unwritable via put_page.
+   */
+  max_tokens?: number;
   /**
    * Whitelist of tool names the agent may call. MUST be a subset of the
    * derived registry names — invalid entries are rejected at tool-dispatch
@@ -449,6 +584,92 @@ export interface SubagentHandlerData {
    * and direct CLI submitters set it.
    */
   allowed_slug_prefixes?: string[];
+  /**
+   * Brain source the subagent's tool calls are scoped to (#1586).
+   *
+   * When set, every tool-call `OperationContext.sourceId` uses this value
+   * instead of the legacy 'default', so put_page writes land in the cycle's
+   * resolved source. Same trust story as `allowed_slug_prefixes`:
+   * PROTECTED_JOB_NAMES gates subagent submission, so only cycle.ts and
+   * direct CLI submitters can set it. Validated via `validateSourceId` at
+   * tool-registry build time.
+   */
+  source_id?: string;
+  /**
+   * When true, a job must complete at least one put_page write or FAIL
+   * (UnrecoverableError → dead, idempotency key released) instead of
+   * reporting `completed` with zero pages. Set by the dream
+   * synthesize + patterns fan-outs (jobs whose entire purpose is writing
+   * pages). Left unset for open-ended `gbrain agent run` jobs, where one
+   * rejected write plus a useful read-only answer is a legitimate
+   * completion — those still get truthful pages_* counts on the result.
+   * Same trust story as `allowed_slug_prefixes` (PROTECTED_JOB_NAMES).
+   */
+  require_writes?: boolean;
+  /**
+   * #5540 — only meaningful with `require_writes: true`. A clean finish
+   * (`end_turn`) with zero attempted put_page calls completes instead of
+   * dead-lettering when at least one tool execution completed. All attempted
+   * writes failing, a dirty stop, or a prose-only finish still fail. Workers
+   * that predate the field ignore it and keep the strict behavior.
+   */
+  allow_clean_zero_writes?: boolean;
+  /**
+   * #6297 — byte budget on this job's `get_page` results (the dream patterns
+   * child, `dream.patterns.child_read_budget_kb`). Past it a read returns a
+   * short summary instead of the page, so the replayed transcript stays
+   * bounded. Counted from the job's own tool-execution ledger, so a crash
+   * replay keeps the budget. Trusted field (PROTECTED_JOB_NAMES); unset = no budget.
+   */
+  read_budget_bytes?: number;
+  /**
+   * #4216 — synthesis execution mode. 'oneshot' = single structured
+   * completion + programmatic validated writes, falling back to the agentic
+   * loop in the SAME job when the output fails validation. Unset/'agentic'
+   * = the classic multi-turn tool loop. Trusted field (PROTECTED_JOB_NAMES);
+   * old binaries ignore it and run agentic — safe mixed-version degradation.
+   */
+  mode?: 'agentic' | 'oneshot';
+  /**
+   * #4216/CDX-9 — the exact transcript hash suffix every oneshot page slug
+   * must end with (`<hash6>` or `<hash6>-c<idx>` for chunked transcripts).
+   * The suffix is the idempotency boundary between transcripts; oneshot
+   * validation enforces it structurally instead of trusting prompt
+   * discipline. Set by the dream fan-out alongside `mode`.
+   */
+  oneshot_slug_suffix?: string;
+  /**
+   * #6160 — the namespaces a oneshot synthesis child may write (the cycle's
+   * resolved reflections and originals prefixes). Oneshot validation uses
+   * them as its task shapes instead of guessing from the allow-list's
+   * spelling, so root-level and custom namespaces validate. Absent on jobs
+   * queued by older builds, which keep the allow-list derivation.
+   */
+  oneshot_task_prefixes?: string[];
+  /**
+   * GBRA-60: a managed dream synthesis child verifies and stamps each oneshot page against this transcript before it
+   * writes it (cycle/synthesize-child-verify.ts), so a strict source commits each output once. Trusted field
+   * (PROTECTED_JOB_NAMES); a delegated (remote-owned) job ignores it. Absent on jobs queued by older builds, whose
+   * outputs postprocessing verifies and republishes.
+   */
+  dream_output?: DreamOutputSpec;
+  /**
+   * #7850: the session-corpus file a dream synthesis child writes for, the corpus dir and the source incarnation discovery
+   * resolved it to. The child resolves the file again (read-only) before any model call and refuses
+   * (`session_source_changed: <reason>`) when the session no longer resolves to `source_id` or the incarnation changed; a
+   * child without it is re-checked from `dream_output.raw_source` and the configured corpus dir. Trusted field
+   * (PROTECTED_JOB_NAMES); a delegated (remote-owned) job ignores it.
+   */
+  corpus_source?: { raw_source: string; corpus_dir: string; incarnation: string };
+  /**
+   * GBRA-60: the agent loop's put_page stages each page instead of writing it (minions/tools/staged-put-page.ts): every
+   * check put_page runs before journaling still refuses, but the page lives only in this job's tool-execution ledger
+   * until the submitting phase publishes it (a managed patterns run grounds, stamps and publishes the staged pages as
+   * one maintenance batch, so a strict source commits each page once). Staged writes count for require_writes. Trusted
+   * field: 'subagent' is a PROTECTED_JOB_NAMES job, submit_agent never copies it, and a delegated (remote-owned) job
+   * ignores it. A replacement tool registry (SubagentDeps.toolRegistry) does not stage.
+   */
+  stage_writes?: boolean;
   /**
    * v0.41 Approach C: opt out of the auto-generated tool-usage preamble
    * that `buildSystemPrompt()` splices into `system`. Default behavior
@@ -562,8 +783,20 @@ export type ContentBlock =
 export type SubagentStopReason =
   | 'end_turn'    // Anthropic says end_turn and last message has no tool_use
   | 'max_turns'   // hit max_turns budget before end_turn
+  | 'max_tokens'  // final turn hit the output-token cap — result text is TRUNCATED (#2778)
   | 'refusal'     // detected via stop_reason + content shape
   | 'error';      // unrecoverable (empty response retry exhausted, etc.)
+
+/**
+ * #4216 — why a oneshot attempt fell back to the agentic loop. Owned here
+ * (the lower layer) so subagent-oneshot.ts and the result type can never
+ * drift; 'no_put_page_tool' and 'too_many_pages' distinguish operator
+ * misconfiguration and contract overflow from model-output failures in the
+ * fallback_reasons telemetry.
+ */
+export type OneshotFallbackReason =
+  | 'unparseable' | 'length' | 'refusal' | 'bad_slug' | 'no_wikilink'
+  | 'empty_no_skip' | 'oneshot_timeout' | 'no_put_page_tool' | 'too_many_pages';
 
 /** Terminal result payload emitted by the subagent handler. */
 export interface SubagentResult {
@@ -580,4 +813,58 @@ export interface SubagentResult {
     cache_read: number;
     cache_create: number;
   };
+  /**
+   * #4217 structural write accounting, merged by finalizeWriteAccounting on
+   * every subagent job. attempted = settled rows only (complete + failed);
+   * pending rows count toward neither.
+   */
+  pages_attempted?: number;
+  pages_written?: number;
+  pages_failed?: number;
+  /**
+   * #4216 — which execution path produced this result: 'oneshot' (single
+   * structured call), 'agentic_fallback' (oneshot attempt failed validation,
+   * same job fell through to the loop), or 'agentic' (mode never requested
+   * oneshot). Absent on pre-wave results.
+   */
+  synth_mode_used?: 'oneshot' | 'agentic_fallback' | 'agentic';
+  /**
+   * #4216 — why the oneshot attempt fell back (only on synth_mode_used =
+   * 'agentic_fallback').
+   */
+  fallback_reason?: OneshotFallbackReason;
+  /** #4216 — slugs written by the oneshot path (operator visibility supplement). */
+  written_refs?: Array<{ slug: string; status: 'complete' | 'failed' }>;
+  /** #4216 — true when a retried oneshot job finalized from a prior invocation's ledger. */
+  recovered?: boolean;
+  /**
+   * #5590 — true when the oneshot model answered with the explicit skip
+   * contract (`{"pages":[],"skipped":true}`): a legitimate zero-write
+   * completion that `require_writes` must not dead-letter.
+   */
+  oneshot_skipped?: boolean;
+}
+
+/**
+ * GST-359 C2: the attested actor an agent job belongs to, then its audience (GBRA-231). submit_agent stores one of them in
+ * the accepted grant (`submission_authority.grant.actor` or `.actingFor`); every owner-fenced job read and cancel also
+ * matches both, so behind one client a job is visible only to the person or audience it was submitted for, and a job
+ * with neither only to calls asserting neither.
+ */
+export type JobActor = readonly [string, string, string, string];
+
+/** The actor of a caller without an attested actor or an audience. */
+export const NO_JOB_ACTOR: JobActor = ['', '', '', ''];
+
+/** An audience as jobActorSql compares it: its distinct entries sorted and joined by commas ('' for none). */
+export function jobAudienceKey(audience: readonly string[] | null | undefined): string {
+  return [...new Set(audience ?? [])].sort().join(',');
+}
+
+/** SQL: the job's accepted actor and audience equal the four parameters starting at `$first`. `alias` is a code-provided table alias. */
+export function jobActorSql(first: number, alias?: string): string {
+  const grant = `${alias ? alias + '.' : ''}submission_authority->'grant'`;
+  const actingFor = `${grant}->'actingFor'`;
+  const audience = `COALESCE(CASE WHEN jsonb_typeof(${actingFor}) = 'array' THEN (SELECT string_agg(DISTINCT e COLLATE "C", ',' ORDER BY e COLLATE "C") FROM jsonb_array_elements_text(${actingFor}) e) WHEN ${actingFor} IS NOT NULL THEN '!' END, '') = $${first + 3}::text`;
+  return [...['system', 'external_id', 'member'].map((key, i) => `COALESCE(${grant}->'actor'->>'${key}', '') = $${first + i}::text`), audience].join(' AND ');
 }

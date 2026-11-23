@@ -67,12 +67,23 @@ the agent's operational state:
 
 ```json
 {
+  "userAwake": true,
   "currentLocation": {
-    "timezone": "US/Pacific",
-    "city": "San Francisco"
+    "timezone": "Europe/Zurich",
+    "city": "Basel",
+    "source": "user-confirmed"
+  },
+  "homeLocation": {
+    "timezone": "Europe/Zurich",
+    "city": "Basel"
   }
 }
 ```
+
+`homeLocation` is optional. The context engine shows a separate home clock only
+when an explicit home timezone differs from the current timezone. It never
+guesses a home city or timezone. The `garryAwake` alias remains readable
+for compatibility; producers should write `userAwake`.
 
 **Update the timezone when:**
 - Calendar shows the user flying somewhere (check for airline/hotel events)
@@ -113,6 +124,22 @@ fi
 send_notification "$OUTPUT"
 ```
 
+### GBrain-native hooks
+
+Two places gbrain already understands quiet hours natively — use these
+before rolling your own gate for the same job:
+
+- **Self-upgrade** — `auto` mode only applies upgrades during quiet hours,
+  configured via `gbrain config set self_upgrade.quiet_hours
+  '{"start":23,"end":8,"tz":"US/Pacific"}'`. See
+  [upgrades-auto-update.md](upgrades-auto-update.md).
+- **Cron prompts** — schedule-driven notification jobs should carry the
+  gate described in this doc; [cron-schedule.md](cron-schedule.md) covers
+  the scheduling side.
+
+The shell pattern below is for everything else: your own cron jobs,
+collectors, and notification paths that gbrain doesn't gate for you.
+
 ### Configurable Hours
 
 Some users want different quiet hours. Store the config:
@@ -140,7 +167,11 @@ Set `enabled: false` to disable quiet hours entirely (e.g., for 24/7 monitoring)
    skill reads and clears the held directory. Orphaned held files mean the
    pickup integration is broken.
 
-3. **Timezone auto-detection is fragile.** Calendar-based timezone detection
+3. **`/tmp` doesn't survive reboots (or, on macOS, periodic cleanup).** If a
+   held message must not be lost across a restart, use a durable held
+   directory (e.g. `~/.local/state/cron-held/`) instead of `/tmp/cron-held/`.
+
+4. **Timezone auto-detection is fragile.** Calendar-based timezone detection
    relies on the user having airline/hotel events with location data. If the
    user books travel without calendar entries, the system won't detect the
    move. Fall back to activity-hour analysis (responding at 3 AM PT = probably

@@ -9,6 +9,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { checkCycleFreshness } from '../src/commands/doctor.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 
@@ -29,17 +30,27 @@ beforeEach(async () => {
 const NOW = Date.parse('2026-05-22T12:00:00.000Z');
 const agoH = (h: number) => new Date(NOW - h * 3600_000).toISOString();
 
-async function seed(id: string, lastFullCycleAt?: string, opts: { local_path?: string | null } = {}): Promise<void> {
-  const config = lastFullCycleAt
-    ? JSON.stringify({ last_full_cycle_at: lastFullCycleAt })
-    : '{}';
+/**
+ * A source row. Never-cycled sources get one page created 30 days before NOW
+ * (content that should have been cycled) unless `pageAgeH` says otherwise
+ * (`null` = no pages: an empty source, which E2 reports as information).
+ */
+async function seed(id: string, lastFullCycleAt?: string, opts: { local_path?: string | null; syncEnabled?: boolean; pageAgeH?: number | null } = {}): Promise<void> {
+  const config = JSON.stringify({ last_full_cycle_at: lastFullCycleAt, syncEnabled: opts.syncEnabled });
   const localPath = opts.local_path === undefined ? `/tmp/${id}` : opts.local_path;
   await engine.executeRaw(
     `INSERT INTO sources (id, name, local_path, config, archived, created_at)
-     VALUES ($1, $2, $3, $4::jsonb, false, NOW())
+     VALUES ($1, $2, $3, $4::text::jsonb, false, NOW())
      ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path, config = EXCLUDED.config`,
     [id, id, localPath, config],
   );
+  const pageAgeH = opts.pageAgeH === undefined ? (lastFullCycleAt === undefined ? 24 * 30 : null) : opts.pageAgeH;
+  if (pageAgeH !== null) {
+    await engine.executeRaw(
+      `INSERT INTO pages (source_id, slug, type, title, created_at) VALUES ($1, $2, 'note', $2, $3::timestamptz)`,
+      [id, `${id}-page`, agoH(pageAgeH)],
+    );
+  }
 }
 
 describe('doctor checkCycleFreshness', () => {
@@ -79,12 +90,69 @@ describe('doctor checkCycleFreshness', () => {
     expect(result.message).toMatch(/gbrain dream --source/);
   });
 
-  test('source with NO last_full_cycle_at (never cycled) returns fail', async () => {
+  test('source with NO last_full_cycle_at (never cycled) returns warn, not fail (#2540)', async () => {
+    // #2540: never-cycled used to FAIL, which turned doctor permanently red
+    // on any install that doesn't cycle every local_path source (e.g. one
+    // nightly `dream --dir <vault>` plus other federated sources) — and on
+    // any source added minutes ago. It surfaces as a warning; only a source
+    // that HAS cycled and then went stale escalates to fail.
     await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
     await seed('virgin');
     const result = await checkCycleFreshness(engine, { nowMs: NOW });
-    expect(result.status).toBe('fail');
+    expect(result.status).toBe('warn');
     expect(result.message).toMatch(/never completed a full cycle/);
+    expect(result.message).toMatch(/gbrain dream --source/);
+  });
+
+  test('E2: a never-cycled source with no pages is information, not a warning', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('empty-vault', undefined, { pageAgeH: null });
+    const result = await checkCycleFreshness(engine, { nowMs: NOW });
+    expect(result.status).toBe('ok');
+    expect(result.severity).toBe('info');
+    expect(result.readiness_state).toBe('not_applicable');
+    expect(result.message).toMatch(/empty-vault/);
+  });
+
+  test('E2: a never-cycled source whose pages are all under 24h old is information', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('new-vault', undefined, { pageAgeH: 2 });
+    const result = await checkCycleFreshness(engine, { nowMs: NOW });
+    expect(result.status).toBe('ok');
+    expect(result.severity).toBe('info');
+  });
+
+  test('E2: a never-cycled source with old pages still warns, with a dream fix that asks first', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('old-vault');
+    configureGateway({ embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536, env: { OPENAI_API_KEY: 'test' } });
+    try {
+      const result = await checkCycleFreshness(engine, { nowMs: NOW });
+      expect(result.status).toBe('warn');
+      expect(result.fix).toMatchObject({ argv: ['gbrain', 'dream', '--source', 'old-vault'], consent: ['paid'], actor: 'agent' });
+    } finally {
+      resetGateway();
+    }
+  });
+
+  test('reporter case (#2540): one cycled vault + never-cycled siblings is warn, not permanent fail', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('nightly-vault', agoH(2)); // the one vault dreamt via --dir
+    await seed('federated-a');            // never cycled
+    await seed('federated-b');            // never cycled
+    const result = await checkCycleFreshness(engine, { nowMs: NOW });
+    expect(result.status).toBe('warn');
+    expect(result.message).toMatch(/federated-a/);
+    expect(result.message).toMatch(/federated-b/);
+    expect(result.message).not.toMatch(/nightly-vault/);
+  });
+
+  test('a previously-cycled source gone stale still fails even next to never-cycled sources', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('stale', agoH(72));  // real regression signal
+    await seed('virgin');           // never cycled — warn-only
+    const result = await checkCycleFreshness(engine, { nowMs: NOW });
+    expect(result.status).toBe('fail');
   });
 
   test('mixed sources: highest severity wins (fail > warn > ok)', async () => {
@@ -120,5 +188,24 @@ describe('doctor checkCycleFreshness', () => {
     const result = await checkCycleFreshness(engine, { nowMs: NOW });
     expect(result.status).toBe('ok');
     expect(result.message).toMatch(/No federated sources/);
+  });
+
+  test('GST-3337: a sync-disabled source reads sync off, never stale or failing, and is never the fix target', async () => {
+    await seed('disabled-example', agoH(72), { syncEnabled: false });
+    await seed('enabled-example', agoH(1), { syncEnabled: true });
+    const result = await checkCycleFreshness(engine, { nowMs: NOW });
+    expect(result.status).toBe('ok');
+    expect(result.message).toBe("All 1 federated source(s) cycled recently. Sync off (not checked; only an explicit gbrain sync --source <id> syncs it): 'disabled-example'.");
+    expect(result.fix).toBeUndefined();
+  });
+
+  test('GST-3337: a stale enabled source is still the fix target beside a sync-disabled one', async () => {
+    await seed('disabled-example', undefined, { syncEnabled: false });
+    await seed('stale-example', agoH(72));
+    const result = await checkCycleFreshness(engine, { nowMs: NOW });
+    expect(result.status).toBe('fail');
+    expect(result.message).toContain("'stale-example' last cycled 72h ago");
+    expect(result.message).toContain("Sync off (not checked; only an explicit gbrain sync --source <id> syncs it): 'disabled-example'.");
+    expect(result.fix?.argv).toEqual(expect.arrayContaining(['gbrain', 'dream', '--source', 'stale-example']));
   });
 });

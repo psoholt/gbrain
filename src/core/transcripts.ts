@@ -14,9 +14,12 @@
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { corpusSpoolDir } from './context/corpus-segments.ts';
+import { join, basename, dirname } from 'node:path';
 import type { BrainEngine } from './engine.ts';
+import type { Action } from './agent-output.ts';
 import { isDreamOutput } from './cycle/transcript-discovery.ts';
+import { TRANSCRIPT_LANE_SCAN_OPTS, redactFindings } from './secret-scan.ts';
 
 export interface RecentTranscriptOpts {
   /** Window in days. Default 7. */
@@ -62,15 +65,54 @@ export async function listRecentTranscripts(
   const summary = opts.summary !== false;
   const limit = Math.max(1, Math.min(opts.limit ?? 50, 500));
 
+  const { dirs, candidates } = await transcriptCandidates(engine, days);
+  if (dirs.length === 0) return [];
+
+  // Newest first.
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  const out: RecentTranscript[] = [];
+  for (const c of candidates) {
+    if (out.length >= limit) break;
+    let raw: string;
+    try {
+      raw = readFileSync(c.path, 'utf-8');
+    } catch {
+      continue;
+    }
+    // Skip dream-generated outputs (would re-feed the synthesize loop).
+    if (isDreamOutput(raw)) continue;
+
+    const name = basename(c.path);
+    const dateMatch = DATE_RE.exec(name);
+    // Redact the whole file before the summary/full-read cap cuts it.
+    const text = redactFindings(raw, TRANSCRIPT_LANE_SCAN_OPTS).text;
+    out.push({
+      path: name,
+      date: dateMatch ? dateMatch[1] : null,
+      mtime: new Date(c.mtimeMs).toISOString(),
+      length: c.size,
+      summary: summary ? buildSummary(text) : text.slice(0, FULL_READ_CAP),
+    });
+  }
+  return out;
+}
+
+/** The configured transcript corpus dirs (session + meeting), from the brain's config. */
+export async function transcriptCorpusDirs(engine: Pick<BrainEngine, 'getConfig'>): Promise<string[]> {
   const dirs: string[] = [];
   const sessionDir = await engine.getConfig('dream.synthesize.session_corpus_dir');
   const meetingDir = await engine.getConfig('dream.synthesize.meeting_transcripts_dir');
-  if (sessionDir) dirs.push(sessionDir);
+  // #6268: source-stamped session files live in the corpus spool subdirectory.
+  if (sessionDir) dirs.push(sessionDir, corpusSpoolDir(sessionDir));
   if (meetingDir) dirs.push(meetingDir);
-  if (dirs.length === 0) return [];
+  return dirs;
+}
 
+/** `.txt` files modified within `days` in the corpus dirs (stat only, no content read). */
+async function transcriptCandidates(engine: Pick<BrainEngine, 'getConfig'>, days: number): Promise<{ dirs: string[]; candidates: { path: string; mtimeMs: number; size: number }[] }> {
+  const dirs = await transcriptCorpusDirs(engine);
   const cutoffMs = Date.now() - days * 86400000;
-
   const candidates: { path: string; mtimeMs: number; size: number }[] = [];
   for (const dir of dirs) {
     let entries: string[];
@@ -96,33 +138,28 @@ export async function listRecentTranscripts(
       candidates.push({ path: full, mtimeMs: st.mtimeMs, size: st.size });
     }
   }
+  return { dirs, candidates };
+}
 
-  // Newest first.
-  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+/** The read an agent (or the user) runs to see the transcripts; it works while a live serve holds the brain. */
+export function localTranscriptsFix(): Action {
+  return {
+    argv: ['gbrain', 'transcripts', 'recent', '--json'],
+    consent: [], actor: 'agent', requires_exclusive: false,
+    why: 'Lists the recent session transcripts with a short summary of each (add --full for the text, --days <n> for a wider window). It reads through a running gbrain serve when one holds the brain.',
+  };
+}
 
-  const out: RecentTranscript[] = [];
-  for (const c of candidates) {
-    if (out.length >= limit) break;
-    let raw: string;
-    try {
-      raw = readFileSync(c.path, 'utf-8');
-    } catch {
-      continue;
-    }
-    // Skip dream-generated outputs (would re-feed the synthesize loop).
-    if (isDreamOutput(raw)) continue;
-
-    const name = basename(c.path);
-    const dateMatch = DATE_RE.exec(name);
-    out.push({
-      path: name,
-      date: dateMatch ? dateMatch[1] : null,
-      mtime: new Date(c.mtimeMs).toISOString(),
-      length: c.size,
-      summary: summary ? buildSummary(raw) : raw.slice(0, FULL_READ_CAP),
-    });
-  }
-  return out;
+/**
+ * Whether local session transcripts exist for the agent-facing pointers
+ * (readiness `local_transcripts`, the `local_transcripts` notice): the dirs
+ * holding recent `.txt` transcripts and how many there are. Stat only; the
+ * count may include dream outputs the reader later skips.
+ */
+export async function recentTranscriptPresence(engine: Pick<BrainEngine, 'getConfig'>, days = 7): Promise<{ dirs: string[]; count: number }> {
+  const { candidates } = await transcriptCandidates(engine, days);
+  const dirs = [...new Set(candidates.map(c => dirname(c.path)))];
+  return { dirs, count: candidates.length };
 }
 
 /**

@@ -1,0 +1,967 @@
+/**
+ * .github/workflows/promote-stable.yml + scripts/promote-stable.ts — the
+ * stable channel.
+ *
+ * Protects: `stable` moves only for an admin or maintainer, only to an
+ * existing, published v<VERSION> release whose exact git tree passed a
+ * completed, successful run of the configured soak workflow, only forward
+ * unless a rollback names its reason, with the immutable stable-v<VERSION>
+ * record created once and pushed atomically with the leased `stable` move. Regressions it
+ * catches: accepting a soak of a different tree or workflow, a run from
+ * another repository, a no-op or silent downgrade, re-creating a record tag,
+ * a changed tag message contract, and the workflow interpolating inputs
+ * into shell or growing a trigger other than workflow_dispatch.
+ */
+import { describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { load } from 'js-yaml';
+import {
+  checkOrder, checkSoakRun, compareVersions, RELEASE_NOTES_MAX, rolledUpNotes, mergeKnownBad, mergeNotPromotable, normaliseWorkflowPath, parseRunUrl, parseTagMessage, processDeps, promote, Refusal, renderRecord, renderSummary, renderTagMessage, STABLE_RECORD_MAX_BYTES,
+  type GitResult, type PromoteDeps, type PromoteInputs, type SoakRun, type TagFields,
+} from '../../scripts/promote-stable.ts';
+import type { MatrixReceipt } from '../../scripts/stable-matrix.ts';
+import { offeredVersion } from '../../src/core/self-upgrade.ts';
+import { upgradeSummary } from '../../src/core/upgrade-summary.ts';
+import { RECORD_MAX_BYTES } from '../../src/core/stable-channel.ts';
+import { parseStableRecord } from '../../src/core/stable-channel.ts';
+
+const ROOT = join(import.meta.dir, '..', '..');
+const REPO = 'garrytan/gbrain';
+const RUN_URL = `https://github.com/${REPO}/actions/runs/123456`;
+const SOAK = '.github/workflows/soak.yml';
+const sha = (c: string) => c.repeat(40);
+const NOW = new Date('2026-10-21T17:00:00.123Z');
+
+const refused = (fn: () => unknown, pattern: RegExp) => {
+  let error: unknown;
+  try { fn(); } catch (e) { error = e; }
+  expect(error).toBeInstanceOf(Refusal);
+  expect((error as Error).message).toMatch(pattern);
+};
+const refusedAsync = async (p: Promise<unknown>, pattern: RegExp) => {
+  const error = await p.then(() => null, e => e);
+  expect(error).toBeInstanceOf(Refusal);
+  expect((error as Error).message).toMatch(pattern);
+};
+
+interface FakeRepo {
+  commits: Record<string, string>;
+  tags: Record<string, { commit: string; object?: string; message?: string }>;
+  remote?: Record<string, string>;
+  /** What `git show v<version>:VERSION` prints; default: the tag's own version. */
+  versionFile?: string;
+  failPush?: boolean;
+  /** Evidence record commits (stable-record branch history): commit → stable.json content. */
+  records?: Record<string, string>;
+  /** The remote stable-record branch head (fetched into refs/remotes/origin/stable-record); absent before the first promotion. */
+  recordBranch?: string;
+  /** What `git show v<version>:CHANGELOG.md` prints; absent: the tag has no CHANGELOG.md. */
+  changelog?: string;
+}
+
+const ok = (stdout = ''): GitResult => ({ code: 0, stdout: `${stdout}\n`, stderr: '' });
+const fail: GitResult = { code: 1, stdout: '', stderr: 'fatal: bad revision' };
+
+function fakeGit(repo: FakeRepo, calls: string[]) {
+  let objects = 0;
+  const resolve = (spec: string): { commit: string; object: string } | null => {
+    const ref = spec.replace(/^refs\/tags\//, '');
+    const tag = repo.tags[ref];
+    if (tag) return { commit: tag.commit, object: tag.object ?? tag.commit };
+    return repo.commits[spec] ? { commit: spec, object: spec } : null;
+  };
+  const blobs: Record<string, string> = {};
+  const trees: Record<string, string> = {};
+  return async (args: string[], input?: string): Promise<GitResult> => {
+    calls.push(args.join(' '));
+    const [cmd, ...rest] = args;
+    if (cmd === 'hash-object') { const id = `blob-${++objects}`; blobs[id] = input ?? ''; return ok(id); }
+    if (cmd === 'mktree') { const id = `tree-${++objects}`; trees[id] = /blob (\S+)	stable\.json/.exec(input ?? '')![1]!; return ok(id); }
+    if (cmd === 'commit-tree') { const id = `rec-${++objects}`; (repo.records ??= {})[id] = blobs[trees[rest[0]!]!]!; return ok(id); }
+    if (cmd === 'rev-parse' && rest.at(-1) === 'refs/remotes/origin/stable-record^{commit}') return repo.recordBranch ? ok(repo.recordBranch) : fail;
+    if (cmd === 'show' && rest[0]!.endsWith(':CHANGELOG.md')) return repo.changelog === undefined ? fail : ok(repo.changelog);
+    if (cmd === 'show' && rest[0]!.endsWith(':stable.json')) {
+      const body = repo.records?.[rest[0]!.replace(/:stable\.json$/, '')];
+      return body === undefined ? fail : ok(body);
+    }
+    if (cmd === 'rev-parse') {
+      const spec = rest.at(-1)!;
+      const m = /^(.*?)(\^\{(commit|tree)\})?$/.exec(spec)!;
+      const hit = resolve(m[1]!);
+      if (!hit) return fail;
+      if (m[3] === 'tree') return ok(repo.commits[hit.commit]!);
+      return ok(m[3] === 'commit' ? hit.commit : hit.object);
+    }
+    if (cmd === 'tag' && rest[0] === '--points-at') {
+      return ok(Object.entries(repo.tags).filter(([n, t]) => t.commit === rest[1] && n.startsWith('v')).map(([n]) => n).join('\n'));
+    }
+    if (cmd === 'tag' && rest[0] === '-a') {
+      const message = rest[rest.indexOf('-m') + 1]!;
+      const [name, commit] = rest.slice(-2) as [string, string];
+      if (repo.tags[name] && !rest.includes('-f')) return fail;
+      repo.tags[name] = { commit, object: `tagobj-${name}-${++objects}`, message };
+      return ok();
+    }
+    if (cmd === 'push') {
+      const refspecs = rest.filter(a => a.includes(':') && !a.startsWith('--'));
+      const lease = rest.find(a => a.startsWith('--force-with-lease=refs/tags/stable:'));
+      const recordLease = rest.find(a => a.startsWith('--force-with-lease=refs/heads/stable-record:'));
+      repo.remote ??= {};
+      if (repo.failPush) return { code: 1, stdout: '', stderr: 'fatal: the remote end hung up unexpectedly' };
+      if (lease && lease.split(':').at(-1) !== (repo.remote.stable ?? '')) return { code: 1, stdout: '', stderr: '! [rejected] stable -> stable (stale info)' };
+      if (recordLease && recordLease.split(':').at(-1) !== (repo.recordBranch ?? '')) return { code: 1, stdout: '', stderr: '! [rejected] stable-record -> stable-record (stale info)' };
+      for (const spec of refspecs) {
+        const [src, dst] = spec.split(':') as [string, string];
+        if (dst === 'refs/heads/stable-record') { repo.recordBranch = src; continue; }
+        const name = src.replace(/^refs\/tags\//, '');
+        repo.remote[name] = repo.tags[name]!.object!;
+      }
+      return ok();
+    }
+    if (cmd === 'show') {
+      const ref = rest[0]!.replace(/:VERSION$/, '').replace(/^refs\/tags\//, '');
+      return repo.tags[ref] ? ok(repo.versionFile ?? ref.replace(/^v/, '')) : fail;
+    }
+    if (cmd === 'fetch') return ok();
+    if (cmd === 'for-each-ref' && rest[0] === '--format=%(contents)') {
+      const tag = repo.tags[rest[1]!.replace(/^refs\/tags\//, '')];
+      return tag ? ok(tag.message ?? '') : fail;
+    }
+    return fail;
+  };
+}
+
+interface Setup {
+  role?: { permission: string; role_name?: string };
+  run?: SoakRun;
+  /** The GitHub release for the tag; null: there is none (404). */
+  release?: { draft: boolean; id?: number } | null;
+  /** Make the release edit (marking it Latest) fail. */
+  failWrite?: boolean;
+  /** The tag GitHub calls Latest now; absent: none. */
+  latest?: string;
+  soakWorkflow?: string;
+  repo?: FakeRepo;
+}
+
+function harness(setup: Setup = {}) {
+  const calls: string[] = [];
+  const api: string[] = [];
+  const logs: string[] = [];
+  const summaries: string[] = [];
+  const writes: Array<{ method: string; path: string; body: Record<string, unknown> }> = [];
+  const repo: FakeRepo = setup.repo ?? {
+    commits: { [sha('a')]: sha('1'), [sha('b')]: sha('2'), [sha('c')]: sha('3') },
+    tags: { 'v0.60.360.0': { commit: sha('a') }, 'v0.60.361.0': { commit: sha('b') }, stable: { commit: sha('a'), object: 'tagobj-stable-old' }, 'stable-v0.60.360.0': { commit: sha('a'), object: 'tagobj-record-360' } },
+    remote: { stable: 'tagobj-stable-old', 'stable-v0.60.360.0': 'tagobj-record-360' },
+  };
+  const run: SoakRun = setup.run ?? { status: 'completed', conclusion: 'success', path: SOAK, head_sha: sha('b') };
+  const deps: PromoteDeps = {
+    repo: REPO,
+    actor: 'alice-example',
+    soakWorkflow: setup.soakWorkflow ?? 'soak.yml',
+    async ghApi(path) {
+      api.push(path);
+      if (path.endsWith('/permission')) return setup.role ?? { permission: 'write', role_name: 'maintain' };
+      if (path.endsWith('/releases/latest')) {
+        if (!setup.latest) throw new Error(`gh api ${path} failed: HTTP 404: Not Found`);
+        return { tag_name: setup.latest };
+      }
+      if (path.includes('/releases/tags/')) {
+        if (setup.release === null) throw new Error(`gh api ${path} failed: HTTP 404: Not Found`);
+        return setup.release ?? { draft: false, id: 42 };
+      }
+      return run;
+    },
+    async ghApiWrite(method, path, body) {
+      if (setup.failWrite) throw new Error(`gh api ${method} ${path} failed: HTTP 502`);
+      writes.push({ method, path, body });
+      return {};
+    },
+    git: fakeGit(repo, calls),
+    now: () => NOW,
+    log: line => logs.push(line),
+    summary: md => summaries.push(md),
+  };
+  return { deps, calls, api, logs, summaries, repo, writes };
+}
+
+const bad = (version: string, fixed_in = '0.60.365.0') => ({ version, reason: 'preview exceeds its statement bound', fixed_in });
+const inputs = (over: Partial<PromoteInputs> = {}): PromoteInputs => ({ version: '0.60.361.0', soakRunUrl: RUN_URL, scoreboardUrl: '', rollback: false, reason: '', ...over });
+
+describe('soak run URL parsing', () => {
+  test('accepts a run, a run attempt and a trailing slash in this repository', () => {
+    expect(parseRunUrl(RUN_URL, REPO)).toEqual({ runId: '123456', attempt: null });
+    expect(parseRunUrl(`${RUN_URL}/attempts/2`, REPO)).toEqual({ runId: '123456', attempt: '2' });
+    expect(parseRunUrl(`${RUN_URL}/`, REPO)).toEqual({ runId: '123456', attempt: null });
+    expect(parseRunUrl(`${RUN_URL}/attempts/3/`, REPO)).toEqual({ runId: '123456', attempt: '3' });
+  });
+
+  test('refuses a run of another repository and anything that is not a run URL', () => {
+    refused(() => parseRunUrl('https://github.com/acme-example/gbrain/actions/runs/123456', REPO), /run of acme-example\/gbrain, not garrytan\/gbrain/);
+    for (const junk of ['', 'not a url', 'http://github.com/garrytan/gbrain/actions/runs/1', `${RUN_URL}/job/9`, 'https://github.com/garrytan/gbrain/actions/runs/abc', `${RUN_URL}?x=1`, 'https://example.com/garrytan/gbrain/actions/runs/1']) {
+      refused(() => parseRunUrl(junk, REPO), /is not a GitHub Actions run URL/);
+    }
+  });
+});
+
+describe('soak run validation', () => {
+  const good: SoakRun = { status: 'completed', conclusion: 'success', path: SOAK, head_sha: sha('b') };
+
+  test('accepts a completed successful run of the configured workflow, named bare or by path', () => {
+    for (const name of ['soak.yml', '.github/workflows/soak.yml', './.github/workflows/soak.yml', ' soak.yml ']) {
+      expect(() => checkSoakRun(good, name, RUN_URL)).not.toThrow();
+    }
+    expect(normaliseWorkflowPath('soak.yml')).toBe(SOAK);
+    expect(normaliseWorkflowPath('.github/workflows/soak.yml@refs/heads/master')).toBe(SOAK);
+  });
+
+  test('refuses a run that has not completed or did not succeed', () => {
+    refused(() => checkSoakRun({ ...good, status: 'in_progress', conclusion: null }, 'soak.yml', RUN_URL), /is in_progress, not completed; wait for it to finish/);
+    refused(() => checkSoakRun({ ...good, conclusion: 'failure' }, 'soak.yml', RUN_URL), /concluded failure, not success/);
+    refused(() => checkSoakRun({ ...good, conclusion: 'cancelled' }, 'soak.yml', RUN_URL), /concluded cancelled, not success/);
+  });
+
+  test('refuses a run of another workflow', () => {
+    refused(() => checkSoakRun({ ...good, path: '.github/workflows/test.yml' }, 'soak.yml', RUN_URL), /ran \.github\/workflows\/test\.yml, not the soak workflow \.github\/workflows\/soak\.yml/);
+  });
+
+  test('refuses when the STABLE_SOAK_WORKFLOW variable is unset, naming where to set it', () => {
+    refused(() => checkSoakRun(good, '', RUN_URL), /set the repository variable STABLE_SOAK_WORKFLOW to the soak workflow's file \(Settings → Secrets and variables → Actions → Variables\)/);
+  });
+});
+
+describe('version ordering', () => {
+  test('compares 3- and 4-part versions numerically', () => {
+    expect(compareVersions('0.60.361.0', '0.60.360.0')).toBe(1);
+    expect(compareVersions('0.60.99.0', '0.60.100.0')).toBe(-1);
+    expect(compareVersions('0.61.0', '0.60.999.9')).toBe(1);
+    expect(compareVersions('0.60.1', '0.60.1.0')).toBe(0);
+  });
+
+  test('newer promotes; same is a no-op; older needs rollback and a reason', () => {
+    expect(() => checkOrder('0.60.361.0', '0.60.360.0', false, '')).not.toThrow();
+    expect(() => checkOrder('0.60.361.0', null, false, '')).not.toThrow();
+    refused(() => checkOrder('0.60.361.0', '0.60.361.0', false, ''), /already the stable release, so there is nothing to promote/);
+    refused(() => checkOrder('0.60.361.0', '0.60.361.0', true, 'retry'), /already the stable release/);
+    refused(() => checkOrder('0.60.359.0', '0.60.360.0', false, ''), /older than the current stable v0\.60\.360\.0; to move stable back, re-run with rollback=true and a reason/);
+    refused(() => checkOrder('0.60.359.0', '0.60.360.0', true, '  '), /A rollback needs a reason/);
+    expect(() => checkOrder('0.60.359.0', '0.60.360.0', true, 'sync regression in 0.60.360.0')).not.toThrow();
+  });
+});
+
+describe('tag message and summary', () => {
+  const fields: TagFields = {
+    version: '0.60.361.0', commit: sha('b'), tree: sha('2'), soakRun: RUN_URL, scoreboard: 'https://example.com/scoreboard',
+    promotedBy: 'alice-example', promotedAt: '2026-10-21T17:00:00Z', previous: '0.60.360.0', rollback: false, reason: '',
+  };
+
+  test('renders the exact key: value body', () => {
+    expect(renderTagMessage(fields)).toBe([
+      'gbrain stable channel: v0.60.361.0',
+      '',
+      'version: 0.60.361.0',
+      `commit: ${sha('b')}`,
+      `tree: ${sha('2')}`,
+      `soak_run: ${RUN_URL}`,
+      'scoreboard: https://example.com/scoreboard',
+      'promoted_by: alice-example',
+      'promoted_at: 2026-10-21T17:00:00Z',
+      'previous: 0.60.360.0',
+      'rollback: false',
+      'reason: -',
+      '',
+    ].join('\n'));
+    const first = renderTagMessage({ ...fields, previous: null, rollback: true, reason: 'bad\nrelease' });
+    expect(first).toContain('previous: none\n');
+    expect(first).toContain('rollback: true\nreason: bad release\n');
+  });
+
+  test('the step summary names version, commit, tree, soak run, scoreboard, previous and rollback', () => {
+    const md = renderSummary({ ...fields, rollback: true, reason: 'a | b', recordCreated: false, knownBad: ['0.60.359.0'] });
+    for (const part of ['## Stable channel: v0.60.361.0', sha('b'), sha('2'), RUN_URL, 'https://example.com/scoreboard', 'v0.60.360.0', 'yes: a \\| b', 'already existed', 'v0.60.359.0']) expect(md).toContain(part);
+  });
+});
+
+describe('promote', () => {
+  test('a maintainer promotes a newer release: the record tag and the leased stable move in one atomic push', async () => {
+    const h = harness();
+    const p = await promote(h.deps, inputs());
+    expect(p).toMatchObject({ version: '0.60.361.0', commit: sha('b'), tree: sha('2'), previous: '0.60.360.0', scoreboard: RUN_URL, recordCreated: true, promotedAt: '2026-10-21T17:00:00Z' });
+    expect(h.api).toEqual([`repos/${REPO}/collaborators/alice-example/permission`, `repos/${REPO}/releases/tags/v0.60.361.0`, `repos/${REPO}/actions/runs/123456`, `repos/${REPO}/releases/latest`]);
+    const pushes = h.calls.filter(c => c.startsWith('push'));
+    expect(pushes).toEqual([
+      `push --atomic --force-with-lease=refs/tags/stable:tagobj-stable-old --force-with-lease=refs/heads/stable-record: origin refs/tags/stable-v0.60.361.0:refs/tags/stable-v0.60.361.0 refs/tags/stable:refs/tags/stable ${h.repo.recordBranch}:refs/heads/stable-record`,
+    ]);
+    expect(JSON.parse(h.repo.records![h.repo.recordBranch!]!)).toEqual(JSON.parse(renderRecord(p, [])));
+    expect(h.repo.tags['stable-v0.60.361.0']!.commit).toBe(sha('b'));
+    expect(h.repo.tags.stable!.commit).toBe(sha('b'));
+    expect(h.repo.tags.stable!.message).toBe(renderTagMessage(p));
+    expect(h.repo.tags['stable-v0.60.361.0']!.message).toBe(renderTagMessage(p));
+    expect(h.summaries).toHaveLength(1);
+    expect(h.logs.length).toBeGreaterThanOrEqual(6);
+    expect(h.calls).not.toContain(`fetch --no-tags origin ${sha('b')}`);
+  });
+
+  test('a named attempt is read from the attempts endpoint and the first promotion records previous: none', async () => {
+    const h = harness({ repo: { commits: { [sha('b')]: sha('2') }, tags: { 'v0.60.361.0': { commit: sha('b') } } } });
+    const p = await promote(h.deps, inputs({ soakRunUrl: `${RUN_URL}/attempts/2`, scoreboardUrl: 'https://example.com/board' }));
+    expect(h.api[2]).toBe(`repos/${REPO}/actions/runs/123456/attempts/2`);
+    expect(p.previous).toBeNull();
+    expect(p.scoreboard).toBe('https://example.com/board');
+    expect(h.calls.at(-1)).toBe(`push --atomic --force-with-lease=refs/tags/stable: --force-with-lease=refs/heads/stable-record: origin refs/tags/stable-v0.60.361.0:refs/tags/stable-v0.60.361.0 refs/tags/stable:refs/tags/stable ${h.repo.recordBranch}:refs/heads/stable-record`);
+  });
+
+  test('admins pass; write, triage and read collaborators are refused before anything else is read', async () => {
+    await promote(harness({ role: { permission: 'admin', role_name: 'admin' } }).deps, inputs());
+    for (const role of [{ permission: 'write', role_name: 'write' }, { permission: 'read', role_name: 'triage' }, { permission: 'none' }]) {
+      const h = harness({ role });
+      await refusedAsync(promote(h.deps, inputs()), /only admins and maintainers promote to stable/);
+      expect(h.calls).toEqual([]);
+      expect(h.api).toHaveLength(1);
+    }
+  });
+
+  test('refuses a malformed version and a version with no release tag', async () => {
+    await refusedAsync(promote(harness().deps, inputs({ version: '0.60.361.0; rm -rf /' })), /is not a release version/);
+    await refusedAsync(promote(harness().deps, inputs({ version: '0.60.362.0' })), /There is no release tag v0\.60\.362\.0/);
+  });
+
+  test('refuses a tag whose VERSION file names another version, a tag with no GitHub release and a draft release, before anything moves', async () => {
+    const mismatched = harness();
+    mismatched.repo.versionFile = '0.60.999.0';
+    await refusedAsync(promote(mismatched.deps, inputs()), /v0\.60\.361\.0's VERSION file says "0\.60\.999\.0"/);
+    const missing = harness({ release: null });
+    await refusedAsync(promote(missing.deps, inputs()), /v0\.60\.361\.0 has no published GitHub release \(.*404.*\); wait for release\.yml to publish it/);
+    const draft = harness({ release: { draft: true } });
+    await refusedAsync(promote(draft.deps, inputs()), /is still a draft/);
+    for (const h of [mismatched, missing, draft]) expect(h.calls.filter(c => c.startsWith('tag -a') || c.startsWith('push'))).toEqual([]);
+  });
+
+  test('refuses when STABLE_SOAK_WORKFLOW is unset without reading the run', async () => {
+    const h = harness({ soakWorkflow: '' });
+    await refusedAsync(promote(h.deps, inputs()), /set the repository variable STABLE_SOAK_WORKFLOW/);
+    expect(h.api.filter(p => p.includes('/actions/runs/'))).toEqual([]);
+  });
+
+  test('refuses a soak of a different tree, naming both trees and the run head', async () => {
+    const h = harness({ run: { status: 'completed', conclusion: 'success', path: SOAK, head_sha: sha('c') } });
+    await refusedAsync(promote(h.deps, inputs()), new RegExp(`soak ran tree ${sha('3')} \\(run head ${sha('c')}\\) but v0\\.60\\.361\\.0 is tree ${sha('2')}`));
+    expect(h.calls.filter(c => c.startsWith('tag -a') || c.startsWith('push'))).toEqual([]);
+  });
+
+  test('a soak head missing locally is fetched; a different commit with the same tree passes', async () => {
+    const repo: FakeRepo = { commits: { [sha('b')]: sha('2') }, tags: { 'v0.60.361.0': { commit: sha('b') } } };
+    const h = harness({ repo, run: { status: 'completed', conclusion: 'success', path: SOAK, head_sha: sha('d') } });
+    const git = h.deps.git;
+    h.deps.git = async (args, input) => { if (args[0] === 'fetch') repo.commits[sha('d')] = sha('2'); return git(args, input); };
+    await promote(h.deps, inputs());
+    expect(h.calls).toContain(`fetch --no-tags origin ${sha('d')}`);
+  });
+
+  test('ordering through promote: same refuses, older refuses without rollback, rollback without a reason refuses, rollback with a reason moves stable back', async () => {
+    const same = harness();
+    same.repo.tags.stable = { commit: sha('b'), object: 'tagobj-stable-old' };
+    await refusedAsync(promote(same.deps, inputs()), /already the stable release/);
+    const older = () => { const h = harness({ run: { status: 'completed', conclusion: 'success', path: SOAK, head_sha: sha('a') } }); h.repo.tags.stable = { commit: sha('b'), object: 'tagobj-stable-old' }; return h; };
+    await refusedAsync(promote(older().deps, inputs({ version: '0.60.360.0' })), /older than the current stable v0\.60\.361\.0/);
+    await refusedAsync(promote(older().deps, inputs({ version: '0.60.360.0', rollback: true })), /A rollback needs a reason/);
+    const back = older();
+    const p = await promote(back.deps, inputs({ version: '0.60.360.0', rollback: true, reason: 'sync regression' }));
+    expect(p).toMatchObject({ previous: '0.60.361.0', rollback: true, recordCreated: false });
+    expect(back.repo.tags.stable!.commit).toBe(sha('a'));
+    expect(back.repo.tags.stable!.message).toContain('rollback: true\nreason: sync regression\n');
+    expect(back.calls.filter(c => c.startsWith('push'))).toEqual([`push --atomic --force-with-lease=refs/tags/stable:tagobj-stable-old --force-with-lease=refs/heads/stable-record: origin refs/tags/stable:refs/tags/stable ${back.repo.recordBranch}:refs/heads/stable-record`]);
+    expect(back.repo.tags['stable-v0.60.360.0']!.object).toBe('tagobj-record-360');
+  });
+
+  test('an existing record tag refuses without rollback and is never re-created', async () => {
+    const h = harness();
+    h.repo.tags['stable-v0.60.361.0'] = { commit: sha('b'), object: 'tagobj-record-361' };
+    await refusedAsync(promote(h.deps, inputs()), /stable-v0\.60\.361\.0 already exists, so v0\.60\.361\.0 was promoted before/);
+    expect(h.calls.filter(c => c.startsWith('tag -a') || c.startsWith('push'))).toEqual([]);
+    const moved = harness();
+    moved.repo.tags['stable-v0.60.361.0'] = { commit: sha('c'), object: 'tagobj-record-361' };
+    await refusedAsync(promote(moved.deps, inputs({ rollback: true, reason: 'restore' })), /points at c+, not the release commit b+/);
+  });
+
+  test('stable on a commit with no release tag refuses', async () => {
+    const h = harness();
+    h.repo.tags.stable = { commit: sha('c'), object: 'tagobj-stable-old' };
+    await refusedAsync(promote(h.deps, inputs()), /carries no v<VERSION> release tag/);
+  });
+
+  test('a stable tag moved by someone else after it was read loses the lease', async () => {
+    const h = harness();
+    h.repo.remote!.stable = 'tagobj-someone-else';
+    await refusedAsync(promote(h.deps, inputs()), /Moving the stable tag failed.*stale info/);
+  });
+
+  test('a failed push leaves the remote unchanged, so the re-run it asks for promotes cleanly', async () => {
+    const h = harness();
+    h.repo.failPush = true;
+    await refusedAsync(promote(h.deps, inputs()), /nothing changed on the remote.*re-run this workflow/);
+    expect(h.repo.remote).toEqual({ stable: 'tagobj-stable-old', 'stable-v0.60.360.0': 'tagobj-record-360' });
+    const retry = harness();
+    expect((await promote(retry.deps, inputs())).recordCreated).toBe(true);
+  });
+});
+
+describe('evidence record (GBRA-224 W1)', () => {
+  test('the record a promotion writes is the generation-1 shape the client accepts (soak evidence, no matrix run)', async () => {
+    const h = harness();
+    const p = await promote(h.deps, inputs());
+    const body = h.repo.records![h.repo.recordBranch!]!;
+    expect(parseStableRecord(body)).toMatchObject({ ok: true, record: { schema: 1, version: '0.60.361.0', commit: sha('b'), tree: sha('2'), soak_run: RUN_URL, matrix_run: null, previous: '0.60.360.0', known_bad: [] } });
+    expect(JSON.parse(body)).toMatchObject({ channel: 'stable', promoted_by: 'alice-example', promoted_at: p.promotedAt });
+    expect(h.calls.some(c => c.startsWith('commit-tree ') && c.endsWith(' -m stable record: v0.60.361.0') && !c.includes(' -p '))).toBe(true);
+  });
+
+  test('known_bad carries forward from the previous record, gains this run\'s withdrawals and is parented on the previous record', async () => {
+    const h = harness();
+    h.repo.records = { 'rec-prior': JSON.stringify({ schema: 1, version: '0.60.360.0', known_bad: ['0.60.300.0'] }) };
+    h.repo.recordBranch = 'rec-prior';
+    const p = await promote(h.deps, inputs({ withdraw: ['0.60.355.0', '0.60.300.0'] }));
+    expect(p.knownBad).toEqual(['0.60.300.0', '0.60.355.0']);
+    expect(JSON.parse(h.repo.records![h.repo.recordBranch!]!).known_bad).toEqual(['0.60.300.0', '0.60.355.0']);
+    expect(h.calls.some(c => c.startsWith('commit-tree') && c.includes('-p rec-prior'))).toBe(true);
+    expect(h.calls.filter(c => c.startsWith('push'))[0]).toContain('--force-with-lease=refs/heads/stable-record:rec-prior');
+  });
+
+  test('not_promotable carries forward through a promotion, gains this run\'s entries, and refuses promoting a listed release before anything moves', async () => {
+    const h = harness();
+    h.repo.records = { 'rec-prior': JSON.stringify({ schema: 1, version: '0.60.360.0', known_bad: [], not_promotable: [bad('0.60.363.0')] }) };
+    h.repo.recordBranch = 'rec-prior';
+    await promote(h.deps, inputs({ notPromotable: [bad('0.60.362.0')] }));
+    expect(JSON.parse(h.repo.records![h.repo.recordBranch!]!)).toMatchObject({ known_bad: [], not_promotable: [bad('0.60.362.0'), bad('0.60.363.0')] });
+    expect(h.summaries.at(-1)).toContain('v0.60.362.0 (preview exceeds its statement bound; fixed in v0.60.365.0)');
+    const listed = harness();
+    listed.repo.records = { 'rec-prior': JSON.stringify({ schema: 1, version: '0.60.360.0', known_bad: [], not_promotable: [bad('0.60.361.0')] }) };
+    listed.repo.recordBranch = 'rec-prior';
+    await refusedAsync(promote(listed.deps, inputs()), /v0\.60\.361\.0 is on the stable record's not_promotable list \(preview exceeds its statement bound; fixed in v0\.60\.365\.0\)/);
+    expect(listed.calls.filter(c => c.startsWith('push'))).toEqual([]);
+  });
+
+  test('refuses a not_promotable entry without a release version, a newer fixed_in or a reason, and a previous list it cannot read', async () => {
+    refused(() => mergeNotPromotable([], [bad('0.60.x')], '0.60.361.0'), /not_promotable entry "0\.60\.x" is not a release version/);
+    refused(() => mergeNotPromotable([], [bad('0.60.362.0', '0.60.362.0')], '0.60.361.0'), /needs fixed_in: the newer release that carries the fix/);
+    refused(() => mergeNotPromotable([], [bad('0.60.362.0', '')], '0.60.361.0'), /needs fixed_in/);
+    refused(() => mergeNotPromotable([], [{ ...bad('0.60.362.0'), reason: ' ' }], '0.60.361.0'), /needs a reason/);
+    expect(mergeNotPromotable([bad('0.60.362.0')], [{ ...bad('0.60.362.0'), reason: 'a  newer\nreason' }], '0.60.361.0')).toEqual([{ ...bad('0.60.362.0'), reason: 'a newer reason' }]);
+    const corrupt = harness();
+    corrupt.repo.records = { 'rec-prior': JSON.stringify({ schema: 1, version: '0.60.360.0', known_bad: [], not_promotable: ['0.60.362.0'] }) };
+    corrupt.repo.recordBranch = 'rec-prior';
+    await refusedAsync(promote(corrupt.deps, inputs()), /has a not_promotable list that is not \{version, reason, fixed_in\} entries/);
+    expect(corrupt.calls.filter(c => c.startsWith('push'))).toEqual([]);
+  });
+
+  test('a reason over 500 characters is refused, and a record over the size clients accept is refused before anything is pushed', async () => {
+    expect(STABLE_RECORD_MAX_BYTES).toBe(RECORD_MAX_BYTES);
+    refused(() => mergeNotPromotable([], [{ ...bad('0.60.362.0'), reason: 'x'.repeat(501) }], '0.60.361.0'), /reason is 501 characters; keep it to 500/);
+    expect(mergeNotPromotable([], [{ ...bad('0.60.362.0'), reason: 'x'.repeat(500) }], '0.60.361.0')).toHaveLength(1);
+    const big = harness();
+    const many = Array.from({ length: 200 }, (_, i) => ({ version: '0.59.' + i + '.0', reason: 'y'.repeat(400), fixed_in: '0.60.365.0' }));
+    big.repo.records = { 'rec-prior': JSON.stringify({ schema: 1, version: '0.60.360.0', known_bad: [], not_promotable: many }) };
+    big.repo.recordBranch = 'rec-prior';
+    await refusedAsync(promote(big.deps, inputs()), /stable\.json would be \d+ bytes, over the 65536 clients accept/);
+    expect(big.calls.filter(c => c.startsWith('push'))).toEqual([]);
+  });
+
+  test('not_promotable_remove takes a listed release off the list, so it can be promoted; a version not on the list is refused', async () => {
+    expect(mergeNotPromotable([bad('0.60.362.0'), bad('0.60.363.0')], [], '0.60.361.0', ['0.60.362.0'])).toEqual([bad('0.60.363.0')]);
+    refused(() => mergeNotPromotable([bad('0.60.362.0')], [], '0.60.361.0', ['0.60.364.0']), /v0\.60\.364\.0 is not on the not_promotable list/);
+    refused(() => mergeNotPromotable([bad('0.60.362.0')], [bad('0.60.362.0')], '0.60.361.0', ['0.60.362.0']), /both added to and removed from/);
+    const h = harness();
+    h.repo.records = { 'rec-prior': JSON.stringify({ schema: 1, version: '0.60.360.0', known_bad: [], not_promotable: [bad('0.60.361.0'), bad('0.60.363.0')] }) };
+    h.repo.recordBranch = 'rec-prior';
+    await promote(h.deps, inputs({ notPromotableRemove: ['0.60.361.0'] }));
+    expect(JSON.parse(h.repo.records![h.repo.recordBranch!]!)).toMatchObject({ version: '0.60.361.0', not_promotable: [bad('0.60.363.0')] });
+  });
+
+  test('a client reads a record carrying not_promotable exactly as one without it: a client on a listed release is offered nothing, never a downgrade', () => {
+    const fields: TagFields = {
+      version: '0.60.361.0', commit: sha('b'), tree: sha('2'), soakRun: RUN_URL, scoreboard: RUN_URL,
+      promotedBy: 'alice-example', promotedAt: '2026-10-20T09:00:00Z', previous: '0.60.360.0', rollback: false, reason: '',
+    };
+    const without = parseStableRecord(renderRecord(fields, []));
+    const listed = parseStableRecord(renderRecord(fields, [], [bad('0.60.362.0')]));
+    expect(without.ok).toBe(true);
+    expect(listed).toEqual(without);
+    if (!listed.ok) return;
+    expect(offeredVersion('0.60.362.0', listed.record.version, listed.record.known_bad)).toBeNull();
+    expect(offeredVersion('0.60.360.0', listed.record.version, listed.record.known_bad)).toBe('0.60.361.0');
+    expect(offeredVersion('0.60.362.0', listed.record.version, ['0.60.362.0'])).toBe('0.60.361.0');
+  });
+
+  test('refuses promoting a withdrawn version, a malformed withdrawal and an unreadable previous record, before anything moves', async () => {
+    refused(() => mergeKnownBad(['0.60.361.0'], [], '0.60.361.0'), /known_bad list \(withdrawn\)/);
+    refused(() => mergeKnownBad([], ['0.60.x'], '0.60.361.0'), /withdraw entry "0\.60\.x" is not a release version/);
+    await refusedAsync(promote(harness().deps, inputs({ withdraw: ['0.60.361.0'] })), /known_bad list/);
+    const corrupt = harness();
+    corrupt.repo.records = { 'rec-prior': 'not json' };
+    corrupt.repo.recordBranch = 'rec-prior';
+    await refusedAsync(promote(corrupt.deps, inputs()), /previous stable record .* is not JSON/);
+    expect(corrupt.calls.filter(c => c.startsWith('push'))).toEqual([]);
+  });
+
+  test('a record branch moved by someone else after it was read loses the lease and nothing changes', async () => {
+    const h = harness();
+    const git = h.deps.git;
+    h.deps.git = async (args, input) => {
+      if (args[0] === 'push') h.repo.recordBranch = 'rec-someone-else';
+      return git(args, input);
+    };
+    await refusedAsync(promote(h.deps, inputs()), /Moving the stable tag failed.*re-run this workflow/);
+    expect(h.repo.remote).toEqual({ stable: 'tagobj-stable-old', 'stable-v0.60.360.0': 'tagobj-record-360' });
+  });
+});
+
+describe('promote against real git', () => {
+  const git = (cwd: string, ...args: string[]) => {
+    const r = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' } });
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+
+  test('creates the annotated tags, pushes them and peels stable to the release commit', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'promote-stable-'));
+    try {
+      const origin = join(dir, 'origin.git');
+      const work = join(dir, 'work');
+      git(dir, 'init', '-q', '--bare', origin);
+      git(dir, 'init', '-q', work);
+      git(work, 'config', 'user.name', 'test-bot');
+      git(work, 'config', 'user.email', 'test-bot@example.com');
+      git(work, 'config', 'commit.gpgsign', 'false');
+      git(work, 'config', 'tag.gpgsign', 'false');
+      git(work, 'remote', 'add', 'origin', origin);
+      for (const version of ['1.0.0', '1.0.1']) {
+        writeFileSync(join(work, 'VERSION'), `${version}\n`);
+        git(work, 'add', 'VERSION');
+        git(work, 'commit', '-q', '-m', `release ${version}`);
+        git(work, 'tag', `v${version}`);
+      }
+      git(work, 'push', '-q', 'origin', 'HEAD:refs/heads/master', '--tags');
+      const head = git(work, 'rev-parse', 'HEAD');
+      const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' };
+      const run: SoakRun = { status: 'completed', conclusion: 'success', path: SOAK, head_sha: head };
+      const deps = (version: string): PromoteDeps => ({
+        ...processDeps(env, work), repo: REPO, actor: 'alice-example', soakWorkflow: 'soak.yml', now: () => NOW, log: () => {}, summary: () => {},
+        ghApi: async path => (path.endsWith('/permission') ? { permission: 'admin', role_name: 'admin' }
+          : path.includes('/releases/tags/') ? { draft: false, id: 7 }
+          : { ...run, head_sha: git(work, 'rev-parse', `v${version}^{commit}`) }),
+        ghApiWrite: async () => ({}),
+      });
+
+      await promote(deps('1.0.0'), inputs({ version: '1.0.0' }));
+      await promote(deps('1.0.1'), inputs({ version: '1.0.1' }));
+      expect(git(work, 'ls-remote', origin, 'refs/tags/stable^{}').split('\t')[0]).toBe(head);
+      expect(git(work, 'cat-file', '-t', 'refs/tags/stable')).toBe('tag');
+      expect(git(work, 'cat-file', '-t', 'refs/tags/stable-v1.0.1')).toBe('tag');
+      const body = git(work, 'for-each-ref', '--format=%(contents)', 'refs/tags/stable');
+      expect(body).toContain('gbrain stable channel: v1.0.1\n\nversion: 1.0.1\n');
+      expect(body).toContain('previous: 1.0.0\nrollback: false\nreason: -');
+      const remote = git(work, 'ls-remote', '--tags', origin);
+      expect(remote).toContain('refs/tags/stable-v1.0.0');
+      expect(remote).toContain('refs/tags/stable-v1.0.1');
+
+      const readRecord = () => parseStableRecord(git(dir, '--git-dir', origin, 'show', 'refs/heads/stable-record:stable.json'));
+      expect(readRecord()).toMatchObject({ ok: true, record: { version: '1.0.1', commit: git(work, 'rev-parse', 'v1.0.1^{commit}'), tree: git(work, 'rev-parse', 'v1.0.1^{tree}'), soak_run: RUN_URL, previous: '1.0.0', known_bad: [] } });
+
+      const record = git(work, 'rev-parse', 'refs/tags/stable-v1.0.0');
+      await promote(deps('1.0.0'), inputs({ version: '1.0.0', rollback: true, reason: 'regression', withdraw: ['1.0.1'] }));
+      expect(git(work, 'ls-remote', origin, 'refs/tags/stable^{}').split('\t')[0]).toBe(git(work, 'rev-parse', 'v1.0.0^{commit}'));
+      expect(git(work, 'ls-remote', origin, 'refs/tags/stable-v1.0.0').split('\t')[0]).toBe(record);
+      // The evidence record moved with the tag, in the same push, and carries the withdrawal; its history is the audit log.
+      expect(readRecord()).toMatchObject({ ok: true, record: { version: '1.0.0', rollback: true, known_bad: ['1.0.1'] } });
+      expect(git(dir, '--git-dir', origin, 'rev-list', '--count', 'refs/heads/stable-record')).toBe('3');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('stable.json bridge for a stable promoted before the evidence record (GBRA-346)', () => {
+  const prior: TagFields = {
+    version: '0.60.361.0', commit: sha('b'), tree: sha('2'), soakRun: RUN_URL, scoreboard: RUN_URL,
+    promotedBy: 'alice-example', promotedAt: '2026-10-20T09:00:00Z', previous: '0.60.360.0', rollback: false, reason: '',
+  };
+  /** Stable at 0.60.361.0, moved by a promotion that wrote no evidence record (no stable-record branch). */
+  const preRecord = () => {
+    const h = harness();
+    h.repo.tags.stable = { commit: sha('b'), object: 'tagobj-stable-361', message: renderTagMessage(prior) };
+    h.repo.tags['stable-v0.60.361.0'] = { commit: sha('b'), object: 'tagobj-record-361', message: renderTagMessage(prior) };
+    h.repo.remote = { stable: 'tagobj-stable-361', 'stable-v0.60.361.0': 'tagobj-record-361' };
+    return h;
+  };
+
+  test('the tag message parses back to the fields it was rendered from; anything else is null', () => {
+    expect(parseTagMessage(renderTagMessage(prior))).toEqual(prior);
+    expect(parseTagMessage(renderTagMessage({ ...prior, previous: null, rollback: true, reason: 'bad release' }))).toMatchObject({ previous: null, rollback: true, reason: 'bad release' });
+    for (const junk of ['', 'hand-moved', renderTagMessage(prior).replace(/^commit: .*$/m, 'commit: nope'), renderTagMessage(prior).replace(/^soak_run: .*\n/m, '')]) {
+      expect(parseTagMessage(junk)).toBeNull();
+    }
+  });
+
+  test('re-promoting the current stable writes stable.json from its tag message and moves no tag', async () => {
+    const h = preRecord();
+    const p = await promote(h.deps, inputs());
+    expect(p).toMatchObject({ version: '0.60.361.0', previous: '0.60.360.0', promotedAt: '2026-10-20T09:00:00Z', promotedBy: 'alice-example', recordCreated: false, knownBad: [] });
+    expect(h.calls.filter(c => c.startsWith('tag -a'))).toEqual([]);
+    expect(h.calls.filter(c => c.startsWith('push'))).toEqual([
+      `push --atomic --force-with-lease=refs/tags/stable:tagobj-stable-361 --force-with-lease=refs/heads/stable-record: origin refs/tags/stable:refs/tags/stable ${h.repo.recordBranch}:refs/heads/stable-record`,
+    ]);
+    expect(h.repo.remote).toEqual({ stable: 'tagobj-stable-361', 'stable-v0.60.361.0': 'tagobj-record-361' });
+    expect(parseStableRecord(h.repo.records![h.repo.recordBranch!]!)).toMatchObject({ ok: true, record: { version: '0.60.361.0', commit: sha('b'), tree: sha('2'), soak_run: RUN_URL, previous: '0.60.360.0', rollback: false, known_bad: [] } });
+    expect(h.summaries).toHaveLength(1);
+  });
+
+  test('a published record that already matches is a no-op; a withdrawal still writes, carried forward', async () => {
+    const h = preRecord();
+    await promote(h.deps, inputs());
+    await refusedAsync(promote(h.deps, inputs()), /already the stable release, and stable\.json on stable-record records it/);
+    const first = h.repo.recordBranch!;
+    const p = await promote(h.deps, inputs({ withdraw: ['0.60.355.0'] }));
+    expect(p.knownBad).toEqual(['0.60.355.0']);
+    expect(h.calls.some(c => c.startsWith('commit-tree') && c.includes(`-p ${first}`))).toBe(true);
+    expect(JSON.parse(h.repo.records![h.repo.recordBranch!]!).known_bad).toEqual(['0.60.355.0']);
+  });
+
+  test('not_promotable is written through the current-stable re-record path, moving no tag; the same list again is a no-op', async () => {
+    const h = preRecord();
+    await promote(h.deps, inputs());
+    await promote(h.deps, inputs({ notPromotable: [bad('0.60.363.0'), bad('0.60.362.0')] }));
+    expect(h.calls.filter(c => c.startsWith('tag -a'))).toEqual([]);
+    expect(h.repo.remote).toEqual({ stable: 'tagobj-stable-361', 'stable-v0.60.361.0': 'tagobj-record-361' });
+    expect(JSON.parse(h.repo.records![h.repo.recordBranch!]!)).toMatchObject({ version: '0.60.361.0', known_bad: [], not_promotable: [bad('0.60.362.0'), bad('0.60.363.0')] });
+    await refusedAsync(promote(h.deps, inputs({ notPromotable: [bad('0.60.362.0')] })), /already the stable release, and stable\.json on stable-record records it/);
+    await promote(h.deps, inputs({ withdraw: ['0.60.355.0'] }));
+    expect(JSON.parse(h.repo.records![h.repo.recordBranch!]!)).toMatchObject({ known_bad: ['0.60.355.0'], not_promotable: [bad('0.60.362.0'), bad('0.60.363.0')] });
+    await promote(h.deps, inputs({ notPromotableRemove: ['0.60.363.0'] }));
+    expect(JSON.parse(h.repo.records![h.repo.recordBranch!]!)).toMatchObject({ known_bad: ['0.60.355.0'], not_promotable: [bad('0.60.362.0')] });
+  });
+
+  test('a record left behind by a later record-less promotion is brought up to the stable tag, keeping known_bad', async () => {
+    const h = preRecord();
+    h.repo.records = { 'rec-360': renderRecord({ ...prior, version: '0.60.360.0', commit: sha('a'), tree: sha('1'), previous: null }, ['0.60.300.0']) };
+    h.repo.recordBranch = 'rec-360';
+    await promote(h.deps, inputs());
+    expect(JSON.parse(h.repo.records![h.repo.recordBranch!]!)).toMatchObject({ version: '0.60.361.0', commit: sha('b'), known_bad: ['0.60.300.0'] });
+    expect(h.calls.filter(c => c.startsWith('push'))[0]).toContain('--force-with-lease=refs/heads/stable-record:rec-360');
+  });
+
+  test('refuses, writing nothing, when the tag message is missing, names another release or another soak run', async () => {
+    const cases: Array<[string | undefined, Partial<PromoteInputs>, RegExp]> = [
+      [undefined, {}, /stable tag carries no promotion message .* to write stable\.json from/],
+      [renderTagMessage({ ...prior, commit: sha('c') }), {}, /stable tag's message names commit c+, not v0\.60\.361\.0's commit b+/],
+      [renderTagMessage({ ...prior, tree: sha('3') }), {}, /names tree 3+, not v0\.60\.361\.0's tree 2+/],
+      [renderTagMessage(prior), { soakRunUrl: `${RUN_URL}/attempts/2` }, /promoted on soak run .*runs\/123456, not .*attempts\/2; pass the soak run the stable tag names/],
+    ];
+    for (const [message, over, pattern] of cases) {
+      const h = preRecord();
+      h.repo.tags.stable!.message = message;
+      await refusedAsync(promote(h.deps, inputs(over)), pattern);
+      expect(h.calls.filter(c => c.startsWith('push') || c.startsWith('tag -a'))).toEqual([]);
+    }
+  });
+
+  test('the soak run is verified again: a failed run writes nothing', async () => {
+    const h = preRecord();
+    h.deps.ghApi = async path => (path.endsWith('/permission') ? { permission: 'admin' } : path.includes('/releases/') ? { draft: false, id: 42 } : { status: 'completed', conclusion: 'failure', path: SOAK, head_sha: sha('b') });
+    await refusedAsync(promote(h.deps, inputs()), /concluded failure, not success/);
+    expect(h.calls.filter(c => c.startsWith('push'))).toEqual([]);
+  });
+
+  test('a stable tag moved after it was read loses the lease and the record is not written', async () => {
+    const h = preRecord();
+    h.repo.remote!.stable = 'tagobj-someone-else';
+    await refusedAsync(promote(h.deps, inputs()), /Writing the stable record failed and nothing changed on the remote/);
+    expect(h.repo.recordBranch).toBeUndefined();
+  });
+
+  test('against real git: the backfill pushes only the record, and a moved stable tag refuses', async () => {
+    const git = (cwd: string, ...args: string[]) => {
+      const r = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' } });
+      if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+      return r.stdout.trim();
+    };
+    const dir = mkdtempSync(join(tmpdir(), 'promote-stable-bridge-'));
+    try {
+      const origin = join(dir, 'origin.git');
+      const work = join(dir, 'work');
+      git(dir, 'init', '-q', '--bare', origin);
+      git(dir, 'init', '-q', work);
+      for (const [k, v] of [['user.name', 'test-bot'], ['user.email', 'test-bot@example.com'], ['commit.gpgsign', 'false'], ['tag.gpgsign', 'false']]) git(work, 'config', k!, v!);
+      git(work, 'remote', 'add', 'origin', origin);
+      writeFileSync(join(work, 'VERSION'), '1.0.0\n');
+      git(work, 'add', 'VERSION');
+      git(work, 'commit', '-q', '-m', 'release 1.0.0');
+      git(work, 'tag', 'v1.0.0');
+      const commit = git(work, 'rev-parse', 'HEAD');
+      const fields: TagFields = { ...prior, version: '1.0.0', commit, tree: git(work, 'rev-parse', 'HEAD^{tree}'), previous: null };
+      // What a promotion without the evidence record left: the annotated tags, no stable-record branch.
+      for (const tag of ['stable-v1.0.0', 'stable']) git(work, 'tag', '-a', '--cleanup=verbatim', '-m', renderTagMessage(fields), tag, commit);
+      git(work, 'push', '-q', 'origin', 'HEAD:refs/heads/master', '--tags');
+      const stableObject = git(work, 'rev-parse', 'refs/tags/stable');
+      const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' };
+      const deps = (): PromoteDeps => ({
+        ...processDeps(env, work), repo: REPO, actor: 'alice-example', soakWorkflow: 'soak.yml', now: () => NOW, log: () => {}, summary: () => {},
+        ghApi: async path => (path.endsWith('/permission') ? { permission: 'admin', role_name: 'admin' } : path.includes('/releases/tags/') ? { draft: false, id: 7 } : { status: 'completed', conclusion: 'success', path: SOAK, head_sha: commit }),
+        ghApiWrite: async () => ({}),
+      });
+
+      await promote(deps(), inputs({ version: '1.0.0' }));
+      expect(git(work, 'ls-remote', origin, 'refs/tags/stable').split('\t')[0]).toBe(stableObject);
+      const record = parseStableRecord(git(dir, '--git-dir', origin, 'show', 'refs/heads/stable-record:stable.json'));
+      expect(record).toMatchObject({ ok: true, record: { version: '1.0.0', commit, tree: fields.tree, soak_run: RUN_URL, promoted_at: '2026-10-20T09:00:00Z', previous: null } });
+      await refusedAsync(promote(deps(), inputs({ version: '1.0.0' })), /records it, so there is nothing to promote/);
+
+      // Someone moves stable on the remote after this checkout read it: the leased push refuses and the record stays.
+      const other = join(dir, 'other');
+      git(dir, 'clone', '-q', origin, other);
+      for (const [k, v] of [['user.name', 'test-bot'], ['user.email', 'test-bot@example.com'], ['tag.gpgsign', 'false']]) git(other, 'config', k!, v!);
+      git(other, 'tag', '-a', '-f', '-m', 'moved by hand', 'stable', commit);
+      git(other, 'push', '-q', '-f', 'origin', 'refs/tags/stable:refs/tags/stable');
+      const recordHead = git(dir, '--git-dir', origin, 'rev-parse', 'refs/heads/stable-record');
+      await refusedAsync(promote(deps(), inputs({ version: '1.0.0', withdraw: ['0.9.0'] })), /Writing the stable record failed and nothing changed on the remote/);
+      expect(git(dir, '--git-dir', origin, 'rev-parse', 'refs/heads/stable-record')).toBe(recordHead);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('promote: the upgrade matrix run (stability plan 3a)', () => {
+  const MATRIX_URL = `https://github.com/${REPO}/actions/runs/777`;
+  const HARNESS = sha('f');
+  const greenRun = { id: 777, status: 'completed', conclusion: 'success', head_sha: HARNESS, head_branch: 'master', event: 'schedule', path: '.github/workflows/upgrade-matrix.yml' };
+  const greenReceipt = (): MatrixReceipt => ({
+    schema: 'gbrain-upgrade-matrix-run/1', harness: { sha: HARNESS }, candidate: { tag: 'v0.60.361.0', sha: sha('b'), tree: sha('2') }, profile: 'full',
+    status: 'green', cells: [], red: [], holds: [], foreign_receipts: [], from: [{ tag: 'v0.60.360.0', roles: ['N-1', 'stable-window'] }], skipped: [],
+  });
+  function withMatrix(run: Record<string, unknown>, receipt: MatrixReceipt | null, setup: Parameters<typeof harness>[0] = {}) {
+    const h = harness(setup);
+    const ghApi = h.deps.ghApi;
+    h.deps.ghApi = async path => (path.endsWith('/actions/runs/777') ? (h.api.push(path), run) : ghApi(path));
+    h.deps.matrixReceipt = async id => (id === 777 ? structuredClone(receipt) : null);
+    return h;
+  }
+
+  test('a green gate run on the exact tag and tree lands in stable.json and the tag message, and round-trips', async () => {
+    const h = withMatrix(greenRun, greenReceipt());
+    const p = await promote(h.deps, inputs({ matrixRunUrl: MATRIX_URL }));
+    expect(p.matrixRun).toBe(MATRIX_URL);
+    expect(JSON.parse(h.repo.records![h.repo.recordBranch!]!)).toMatchObject({ matrix_run: MATRIX_URL });
+    expect(parseStableRecord(h.repo.records![h.repo.recordBranch!]!, '0.60.361.0')).toMatchObject({ ok: true, record: { matrix_run: MATRIX_URL } });
+    expect(h.repo.tags.stable!.message).toContain(`soak_run: ${RUN_URL}\nscoreboard: ${RUN_URL}\nmatrix_run: ${MATRIX_URL}\npromoted_by: `);
+    expect(parseTagMessage(h.repo.tags.stable!.message!)).toMatchObject({ matrixRun: MATRIX_URL });
+    expect(renderSummary(p)).toContain(MATRIX_URL);
+  });
+
+  test('a maintainer may promote without a matrix run, recorded as matrix_run null with the maintainer as promoted_by', async () => {
+    const h = harness();
+    await promote(h.deps, inputs());
+    expect(JSON.parse(h.repo.records![h.repo.recordBranch!]!)).toMatchObject({ matrix_run: null, promoted_by: 'alice-example' });
+    expect(h.logs.some(l => l.includes("promoted on alice-example's decision"))).toBe(true);
+  });
+
+  test('a red, foreign, unfinished, pull-request, partial or unreadable run is refused and nothing moves', async () => {
+    const red = { ...greenReceipt(), status: 'red', red: ['v0.60.241.0__postgres__keyed__repo'], cells: [{ id: 'v0.60.241.0__postgres__keyed__repo', from: 'v0.60.241.0', verdict: 'fail' }] };
+    const cases: Array<[Record<string, unknown>, MatrixReceipt | null, RegExp, string?]> = [
+      [{ ...greenRun, conclusion: 'failure' }, red, /is red on v0\.60\.361\.0 \(failing from v0\.60\.241\.0\)/],
+      [greenRun, { ...greenReceipt(), candidate: { tag: 'v0.60.360.0', sha: sha('a'), tree: sha('1') } }, /tested v0\.60\.360\.0 .*not v0\.60\.361\.0/],
+      [greenRun, { ...greenReceipt(), candidate: { tag: 'v0.60.361.0', sha: sha('b'), tree: sha('9') } }, /tree 9+\), not v0\.60\.361\.0/],
+      [greenRun, { ...greenReceipt(), harness: { sha: sha('e') } }, /receipt names harness e+, not the run's commit f+/],
+      [{ ...greenRun, event: 'pull_request', head_branch: 'fix/x' }, greenReceipt(), /is a pull_request run on fix\/x/],
+      [{ ...greenRun, status: 'in_progress', conclusion: null }, greenReceipt(), /is in_progress, not completed/],
+      [{ ...greenRun, path: '.github/workflows/soak.yml' }, greenReceipt(), /ran \.github\/workflows\/soak\.yml, not the upgrade matrix/],
+      [greenRun, { ...greenReceipt(), profile: 'explicit' }, /ran the explicit profile/],
+      [greenRun, { ...greenReceipt(), from: [{ tag: 'v0.60.360.0', roles: ['N-1'] }], skipped: [] }, /predates the stable-window from-versions/],
+      [greenRun, null, /has no upgrade-matrix-receipt artifact/],
+      [greenRun, greenReceipt(), /matrix_run_url names a run of acme-example\/gbrain/, 'https://github.com/acme-example/gbrain/actions/runs/777'],
+      [greenRun, greenReceipt(), /matrix_run_url names attempt 2/, `${MATRIX_URL}/attempts/2`],
+    ];
+    for (const [run, receipt, pattern, url] of cases) {
+      const h = withMatrix(run, receipt);
+      await refusedAsync(promote(h.deps, inputs({ matrixRunUrl: url ?? MATRIX_URL })), pattern);
+      expect(h.calls.filter(c => c.startsWith('push') || c.startsWith('tag -a'))).toEqual([]);
+    }
+  });
+});
+
+describe('promote-stable.yml', () => {
+  const workflowYml = readFileSync(join(ROOT, '.github/workflows/promote-stable.yml'), 'utf8');
+  const wf = load(workflowYml) as {
+    on: Record<string, { inputs: Record<string, { required?: boolean; type: string; default?: unknown }> }>;
+    concurrency: { group: string; 'cancel-in-progress': boolean };
+    permissions: Record<string, string>;
+    jobs: { promote: { steps: Array<{ uses?: string; with?: Record<string, unknown>; env?: Record<string, string>; run?: string }> } };
+  };
+
+  test('dispatch only, with the decided inputs, one serial group and scoped permissions', () => {
+    expect(Object.keys(wf.on)).toEqual(['workflow_dispatch']);
+    const i = wf.on.workflow_dispatch!.inputs;
+    expect(Object.keys(i)).toEqual(['version', 'soak_run_url', 'matrix_run_url', 'scoreboard_url', 'rollback', 'reason', 'withdraw', 'not_promotable', 'not_promotable_reason', 'not_promotable_fixed_in', 'not_promotable_remove']);
+    for (const k of ['matrix_run_url', 'withdraw', 'not_promotable', 'not_promotable_reason', 'not_promotable_fixed_in', 'not_promotable_remove']) expect(i[k]).toMatchObject({ required: false, type: 'string', default: '' });
+    expect([i.version!.required, i.soak_run_url!.required, i.scoreboard_url!.required]).toEqual([true, true, false]);
+    expect(i.rollback).toMatchObject({ type: 'boolean', default: false });
+    expect(wf.concurrency).toEqual({ group: 'promote-stable', 'cancel-in-progress': false });
+    expect(wf.permissions).toEqual({ contents: 'write', actions: 'read' });
+  });
+
+  test('inputs reach the script through env only; actions are pinned like release.yml; full history', () => {
+    const steps = wf.jobs.promote.steps;
+    const run = steps.find(s => s.run?.includes('scripts/promote-stable.ts'))!;
+    expect(run.env).toMatchObject({
+      GH_TOKEN: '${{ github.token }}', STABLE_SOAK_WORKFLOW: '${{ vars.STABLE_SOAK_WORKFLOW }}',
+      PROMOTE_VERSION: '${{ inputs.version }}', PROMOTE_SOAK_RUN_URL: '${{ inputs.soak_run_url }}', PROMOTE_SCOREBOARD_URL: '${{ inputs.scoreboard_url }}',
+      PROMOTE_ROLLBACK: '${{ inputs.rollback }}', PROMOTE_REASON: '${{ inputs.reason }}', PROMOTE_WITHDRAW: '${{ inputs.withdraw }}',
+      PROMOTE_NOT_PROMOTABLE: '${{ inputs.not_promotable }}', PROMOTE_NOT_PROMOTABLE_REASON: '${{ inputs.not_promotable_reason }}', PROMOTE_NOT_PROMOTABLE_FIXED_IN: '${{ inputs.not_promotable_fixed_in }}',
+      PROMOTE_NOT_PROMOTABLE_REMOVE: '${{ inputs.not_promotable_remove }}', PROMOTE_MATRIX_RUN_URL: '${{ inputs.matrix_run_url }}',
+    });
+    for (const s of steps) expect(s.run ?? '').not.toContain('${{');
+    const releaseYml = readFileSync(join(ROOT, '.github/workflows/release.yml'), 'utf8');
+    for (const s of steps.filter(x => x.uses)) {
+      expect(s.uses).toMatch(/@[0-9a-f]{40}$/);
+      expect(releaseYml).toContain(`uses: ${s.uses}`);
+    }
+    expect(steps[0]!.with).toMatchObject({ 'fetch-depth': 0 });
+    expect(workflowYml).not.toMatch(/bun install|ci-bun-install/);
+  });
+});
+
+describe('GitHub Latest release', () => {
+  const CHANGELOG = [
+    '# Changelog', '',
+    '## [0.60.362.0] - 2026-10-22', '', 'Newer than the release.', '',
+    '## [0.60.361.0] - 2026-10-21', '', 'Second change.', '',
+    '## [0.60.360.5] - 2026-10-21', '', 'First change since stable.', '',
+    '## [0.60.360.0] - 2026-10-20', '', 'The previous stable.', '',
+  ].join('\n');
+
+  test('rolledUpNotes takes every entry after the previous stable up to the release, newest first', () => {
+    const notes = rolledUpNotes(CHANGELOG, '0.60.360.0', '0.60.361.0', REPO);
+    expect(notes.split('\n')[0]).toBe('Stable release v0.60.361.0: every change since the previous stable release, v0.60.360.0, newest first.');
+    expect(notes).toContain('## [0.60.361.0] - 2026-10-21\n\nSecond change.');
+    expect(notes).toContain('## [0.60.360.5] - 2026-10-21\n\nFirst change since stable.');
+    expect(notes.indexOf('0.60.361.0] -')).toBeLessThan(notes.indexOf('0.60.360.5] -'));
+    expect(notes).not.toContain('Newer than the release.');
+    expect(notes).not.toContain('The previous stable.');
+  });
+
+  test('rolledUpNotes with no previous stable is the release entry; with no entry it is the CHANGELOG link', () => {
+    const first = rolledUpNotes(CHANGELOG, null, '0.60.361.0', REPO);
+    expect(first).toContain('Second change.');
+    expect(first).not.toContain('First change since stable.');
+    expect(rolledUpNotes('', '0.60.360.0', '0.60.361.0', REPO)).toBe(`See [CHANGELOG.md](https://github.com/${REPO}/blob/v0.60.361.0/CHANGELOG.md) for v0.60.361.0.\n`);
+  });
+
+  test('rolledUpNotes puts the behavior-change summary between the opening line and the entries', () => {
+    const notes = rolledUpNotes(CHANGELOG, '0.60.360.0', '0.60.361.0', REPO, ['What changed since v0.60.360.0: 1 change.', '', 'Needs you (1):', '- Run gbrain sync once.']);
+    expect(notes.split('\n').slice(0, 6)).toEqual([
+      'Stable release v0.60.361.0: every change since the previous stable release, v0.60.360.0, newest first.',
+      '',
+      'What changed since v0.60.360.0: 1 change.',
+      '',
+      'Needs you (1):',
+      '- Run gbrain sync once.',
+    ]);
+    expect(notes.indexOf('- Run gbrain sync once.')).toBeLessThan(notes.indexOf('## [0.60.361.0]'));
+  });
+
+  test('rolledUpNotes leaves out a summary that alone would pass GitHub\'s size limit', () => {
+    const summary = ['What changed since v0.60.360.0: 1000 changes.', '', 'Needs you (1000):', ...Array.from({ length: 1000 }, () => `- ${'x'.repeat(240)}`)];
+    const notes = rolledUpNotes(CHANGELOG, '0.60.360.0', '0.60.361.0', REPO, summary);
+    expect(notes.length).toBeLessThanOrEqual(RELEASE_NOTES_MAX);
+    expect(notes).not.toContain('Needs you (1000):');
+    expect(notes).toBe(rolledUpNotes(CHANGELOG, '0.60.360.0', '0.60.361.0', REPO));
+  });
+
+  test('rolledUpNotes drops the oldest entries past GitHub\'s size limit and links the rest', () => {
+    const big = (v: string) => [`## [${v}] - 2026-10-21`, '', 'x'.repeat(50_000), ''].join('\n');
+    const notes = rolledUpNotes(['0.60.363.0', '0.60.362.0', '0.60.361.0'].map(big).join('\n'), '0.60.360.0', '0.60.363.0', REPO);
+    expect(notes.length).toBeLessThanOrEqual(RELEASE_NOTES_MAX);
+    expect(notes).toContain('## [0.60.363.0]');
+    expect(notes).not.toContain('## [0.60.361.0]');
+    expect(notes).toContain(`1 older entry is in [CHANGELOG.md](https://github.com/${REPO}/blob/v0.60.363.0/CHANGELOG.md).`);
+  });
+
+  test('a forward promotion marks the release Latest, clears pre-release and writes the rolled-up notes, after the push', async () => {
+    const h = harness();
+    h.repo.changelog = CHANGELOG;
+    await promote(h.deps, inputs());
+    expect(h.writes).toHaveLength(1);
+    expect(h.writes[0]).toMatchObject({ method: 'PATCH', path: `repos/${REPO}/releases/42`, body: { prerelease: false, make_latest: 'true' } });
+    expect(h.writes[0]!.body.body).toBe(rolledUpNotes(CHANGELOG, '0.60.360.0', '0.60.361.0', REPO, upgradeSummary('0.60.360.0', '0.60.361.0')));
+    expect(h.writes[0]!.body.body).toContain('gbrain doctor --only behavior_changes');
+    expect(h.calls.findIndex(c => c.startsWith('push'))).toBeGreaterThanOrEqual(0);
+    expect(h.logs.at(-1)).toContain('the GitHub release v0.60.361.0 is now Latest, with notes rolled up');
+  });
+
+  test('a rollback marks the older release Latest and keeps its notes', async () => {
+    const h = harness({ run: { status: 'completed', conclusion: 'success', path: SOAK, head_sha: sha('c') } });
+    h.repo.tags['v0.60.359.0'] = { commit: sha('c') };
+    await promote(h.deps, inputs({ version: '0.60.359.0', rollback: true, reason: 'regression in 0.60.360.0' }));
+    expect(h.writes).toHaveLength(1);
+    expect(h.writes[0]!.body).toEqual({ prerelease: false, make_latest: 'true' });
+  });
+
+  test('a failed push marks nothing Latest; a failed release edit after the push says stable moved and names the repair', async () => {
+    const pushFails = harness();
+    pushFails.repo.failPush = true;
+    await refusedAsync(promote(pushFails.deps, inputs()), /Moving the stable tag failed/);
+    expect(pushFails.writes).toHaveLength(0);
+
+    const editFails = harness({ failWrite: true });
+    await refusedAsync(promote(editFails.deps, inputs()), /stable now points at v0\.60\.361\.0, but marking its GitHub release Latest failed \(gh api PATCH .* HTTP 502\); run `bun scripts\/release-channel\.ts backfill --apply`/);
+    expect(editFails.repo.remote!.stable).not.toBe('tagobj-stable-old');
+  });
+
+  test('rolledUpNotes keeps an entry\'s own ## sub-headings, like its upgrade steps', () => {
+    const changelog = ['## [0.60.361.0] - 2026-10-21', '', 'Lead.', '', '## To take advantage of v0.60.361.0', '', 'Run gbrain upgrade.', '', '### Itemized changes', '- one', '', '## [0.60.360.0] - 2026-10-20', 'old', ''].join('\n');
+    const notes = rolledUpNotes(changelog, '0.60.360.0', '0.60.361.0', REPO);
+    expect(notes).toContain('## To take advantage of v0.60.361.0\n\nRun gbrain upgrade.');
+    expect(notes).toContain('### Itemized changes\n- one');
+    expect(notes).not.toContain('old');
+  });
+
+  test('rolledUpNotes links the CHANGELOG instead of writing an entry too long for GitHub', () => {
+    const notes = rolledUpNotes(['## [0.60.361.0] - 2026-10-21', '', 'x'.repeat(125_000), ''].join('\n'), '0.60.360.0', '0.60.361.0', REPO);
+    expect(notes.length).toBeLessThan(1000);
+    expect(notes).toContain(`read them in [CHANGELOG.md](https://github.com/${REPO}/blob/v0.60.361.0/CHANGELOG.md)`);
+  });
+
+  test('a forward promotion never moves Latest back to an older release; a rollback does', async () => {
+    const forward = harness({ latest: 'v0.60.365.0' });
+    forward.repo.changelog = CHANGELOG;
+    await promote(forward.deps, inputs());
+    expect(forward.writes).toEqual([]);
+    expect(forward.logs.at(-1)).toContain("GitHub's Latest stays v0.60.365.0, which is newer than v0.60.361.0");
+
+    const same = harness({ latest: 'v0.60.360.0' });
+    await promote(same.deps, inputs());
+    expect(same.writes).toHaveLength(1);
+
+    const back = harness({ latest: 'v0.60.365.0', run: { status: 'completed', conclusion: 'success', path: SOAK, head_sha: sha('c') } });
+    back.repo.tags['v0.60.359.0'] = { commit: sha('c') };
+    await promote(back.deps, inputs({ version: '0.60.359.0', rollback: true, reason: 'regression in 0.60.360.0' }));
+    expect(back.writes).toHaveLength(1);
+  });
+
+  test('a forward promotion that cannot read the current Latest leaves it alone and says so (#9408)', async () => {
+    const h = harness();
+    const ghApi = h.deps.ghApi;
+    h.deps.ghApi = async path => { if (path.endsWith('/releases/latest')) throw new Error(`gh api ${path} failed: HTTP 502: Bad Gateway`); return ghApi(path); };
+    await refusedAsync(promote(h.deps, inputs()), /stable now points at v0\.60\.361\.0, but GitHub's current Latest release could not be read \(gh api .* HTTP 502.*\), so Latest was left alone; run `bun scripts\/release-channel\.ts backfill --apply`/);
+    expect(h.writes).toEqual([]);
+  });
+
+  test('a release with no id refuses before anything moves', async () => {
+    const h = harness({ release: { draft: false } });
+    await refusedAsync(promote(h.deps, inputs()), /has no id, so it cannot be marked Latest/);
+    expect(h.calls.some(c => c.startsWith('push'))).toBe(false);
+  });
+});

@@ -18,6 +18,7 @@
 import { describe, test, expect } from 'bun:test';
 import { runAdvisor } from '../src/core/advisor/run.ts';
 import type { AdvisorContext } from '../src/core/advisor/types.ts';
+import { withQueueMembers } from './helpers/queue-engine-members.ts';
 
 interface Fixture {
   name: string;
@@ -35,8 +36,8 @@ const HEALTHY_STATS = {
     page_count: 500, chunk_count: 0, embedded_count: 0, link_count: 0, tag_count: 0, timeline_entry_count: 0, pages_by_type: {},
   }),
   getHealth: async () => ({
-    page_count: 500, embed_coverage: 0.99, stale_pages: 0, orphan_pages: 0, missing_embeddings: 0,
-    brain_score: 95, dead_links: 0, link_coverage: 1, timeline_coverage: 1, most_connected: [],
+    page_count: 500, linkable_page_count: 500, embed_coverage: 0.99, stale_pages: 0, orphan_pages: 0, missing_embeddings: 0,
+    entity_page_count: 10, entity_types_status: 'resolved' as const, brain_score: 95, dead_links: 0, link_coverage: 1, timeline_coverage: 1, most_connected: [],
     embed_coverage_score: 35, link_density_score: 25, timeline_coverage_score: 15, no_orphans_score: 15, no_dead_links_score: 10,
   }),
   getConfig: async () => null,
@@ -55,8 +56,8 @@ const FIXTURES: Fixture[] = [
     engine: {
       ...HEALTHY_STATS,
       getHealth: async () => ({
-        page_count: 500, embed_coverage: 0.3, stale_pages: 0, orphan_pages: 12, missing_embeddings: 350,
-        brain_score: 40, dead_links: 2, link_coverage: 0.2, timeline_coverage: 0.2, most_connected: [],
+        page_count: 500, linkable_page_count: 500, embed_coverage: 0.3, stale_pages: 0, orphan_pages: 12, missing_embeddings: 350,
+        entity_page_count: 10, entity_types_status: 'resolved' as const, brain_score: 40, dead_links: 2, link_coverage: 0.2, timeline_coverage: 0.2, most_connected: [],
         embed_coverage_score: 10, link_density_score: 5, timeline_coverage_score: 3, no_orphans_score: 2, no_dead_links_score: 8,
       }),
     },
@@ -84,7 +85,7 @@ const FIXTURES: Fixture[] = [
 
 function ctxFor(fx: Fixture): AdvisorContext {
   return {
-    engine: fx.engine as AdvisorContext['engine'],
+    engine: withQueueMembers(fx.engine) as AdvisorContext['engine'],
     config: (fx.config ?? {}) as AdvisorContext['config'],
     version: '0.43.0.0',
     workspace: null,

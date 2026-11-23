@@ -14,7 +14,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { resolveSourceId, getDefaultSourcePath, __testing } from '../src/core/source-resolver.ts';
+import { resolveSourceId, getDefaultSourcePath, isResolverUserError, SourceTargetError, __testing } from '../src/core/source-resolver.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 // ── Stub engine ────────────────────────────────────────────
@@ -29,7 +29,9 @@ function makeStub(registeredSources: string[], paths: Array<{ id: string; local_
           ? [{ id: target } as unknown as T]
           : []);
       }
-      if (sql.includes('SELECT id, local_path FROM sources')) {
+      // Tier-4 registered-source query — old shape and the #3880 shape
+      // (`SELECT id, local_path, archived FROM sources ...`).
+      if (sql.includes('SELECT id, local_path FROM sources') || sql.includes(', archived FROM sources')) {
         return paths as unknown as T[];
       }
       return [];
@@ -198,7 +200,7 @@ describe('getDefaultSourcePath', () => {
           }
           return [];
         }
-        if (sql.includes('SELECT id, local_path FROM sources')) {
+        if (sql.includes('SELECT id, local_path FROM sources') || sql.includes(', archived FROM sources')) {
           return Object.entries(sourcePaths)
             .filter(([_, p]) => p !== null)
             .map(([id, local_path]) => ({ id, local_path }) as unknown as T);
@@ -283,5 +285,32 @@ describe('SOURCE_ID_RE', () => {
     for (const id of ['', 'a'.repeat(33), 'Upper', 'has_underscore', 'trailing-', '-leading', 'with spaces', 'with.dots']) {
       expect(__testing.SOURCE_ID_RE.test(id)).toBe(false);
     }
+  });
+});
+
+// ─── isResolverUserError — the ONE predicate the CLI commands classify with ───
+// Lives next to the messages it matches. Three commands (dream, agent, the
+// code-* scope resolver) once carried their own copies; one missed the
+// fail-closed ` not found or is archived.` wording and let an archived source
+// escape as a stack trace.
+describe('isResolverUserError', () => {
+  test('matches both assertSourceExists wordings (legacy + fail-closed)', () => {
+    expect(isResolverUserError(new Error('Source "x" not found.'))).toBe(true);
+    expect(isResolverUserError(new SourceTargetError(
+      'Source "x" not found or is archived. Available active sources: run `gbrain sources list`.',
+    ))).toBe(true);
+  });
+
+  test('matches the invalid --source / GBRAIN_SOURCE value throws', () => {
+    expect(isResolverUserError(new Error('Invalid --source value "A B". Must match [a-z0-9-]{1,32}.'))).toBe(true);
+    expect(isResolverUserError(new Error('Invalid GBRAIN_SOURCE value "A B". Must match [a-z0-9-]{1,32}.'))).toBe(true);
+  });
+
+  test('does NOT match programmer bugs, connection failures, or non-Error throws', () => {
+    expect(isResolverUserError(new TypeError('Cannot read properties of undefined'))).toBe(false);
+    expect(isResolverUserError(new Error('connect ECONNREFUSED 127.0.0.1:5432'))).toBe(false);
+    expect(isResolverUserError(new Error('Source "x" is fine'))).toBe(false);
+    expect(isResolverUserError('Source "x" not found.')).toBe(false);
+    expect(isResolverUserError(null)).toBe(false);
   });
 });

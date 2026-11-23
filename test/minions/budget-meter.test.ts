@@ -9,6 +9,9 @@ import {
   clientLockKey,
   BudgetExceededError,
   RESERVATION_TTL_MS,
+  GroupBudgetRefusal,
+  readGroupSpend,
+  reserveGroup,
 } from '../../src/core/minions/budget-meter.ts';
 
 let engine: PGLiteEngine;
@@ -31,7 +34,7 @@ async function seedClient(clientId: string, capUsd: number | null): Promise<void
   await engine.executeRaw(
     `INSERT INTO oauth_clients
        (client_id, client_name, client_secret_hash, scope, grant_types, redirect_uris, token_endpoint_auth_method, budget_usd_per_day, created_at, deleted_at)
-     VALUES ($1, $1, '', 'agent', ARRAY['client_credentials'], ARRAY[]::text[], 'client_secret_post', $2, now(), NULL)
+     VALUES ($1, $1, '', 'read', ARRAY['client_credentials'], ARRAY[]::text[], 'client_secret_post', $2, now(), NULL)
      ON CONFLICT (client_id) DO UPDATE SET budget_usd_per_day = EXCLUDED.budget_usd_per_day`,
     [clientId, capUsd],
   );
@@ -103,6 +106,36 @@ describe('minions/budget-meter (v0.38 Slice 2 — D3 reserve-then-settle)', () =
         }),
       ).rejects.toThrow(BudgetExceededError);
     });
+
+    it('admits only cap-fitting reservations under concurrent pressure', async () => {
+      const attempts = await Promise.allSettled(
+        Array.from({ length: 10 }, () => reserve(engine, {
+          clientId: 'alice', estimatedCents: 20, capCents: 100,
+          model: 'm', provider: 'p',
+        })),
+      );
+      const fulfilled = attempts.filter(r => r.status === 'fulfilled');
+      const rejected = attempts.filter(r => r.status === 'rejected');
+      expect(fulfilled).toHaveLength(5);
+      expect(rejected).toHaveLength(5);
+      for (const result of rejected) {
+        expect((result as PromiseRejectedResult).reason).toBeInstanceOf(BudgetExceededError);
+      }
+
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT COALESCE(SUM(estimated_cents), 0)::text AS total
+           FROM mcp_spend_reservations
+          WHERE client_id = 'alice' AND status = 'pending'`,
+      );
+      expect(Number(rows[0]?.total)).toBe(100);
+    });
+
+    it('rejects invalid numeric input before opening a transaction', async () => {
+      await expect(reserve(engine, {
+        clientId: 'alice', estimatedCents: Number.NaN, capCents: 100,
+        model: 'm', provider: 'p',
+      })).rejects.toThrow(TypeError);
+    });
   });
 
   describe('settle()', () => {
@@ -145,6 +178,84 @@ describe('minions/budget-meter (v0.38 Slice 2 — D3 reserve-then-settle)', () =
         ['alice'],
       );
       expect(Number(logCount[0]?.n)).toBe(1);
+    });
+
+    it('rolls reservation state back when the spend-log insert fails', async () => {
+      const r = await reserve(engine, {
+        clientId: 'alice', estimatedCents: 100, capCents: 500,
+        model: 'm', provider: 'p',
+      });
+
+      const failingEngine = Object.create(engine) as PGLiteEngine;
+      Object.defineProperty(failingEngine, 'transaction', {
+        value: <T>(fn: (tx: PGLiteEngine) => Promise<T>) => engine.transaction(async tx => {
+          const failingTx = Object.create(tx) as PGLiteEngine;
+          Object.defineProperty(failingTx, 'executeRaw', {
+            value: async (query: string, params?: unknown[]) => {
+              if (/INSERT\s+INTO\s+mcp_spend_log/i.test(query)) {
+                throw new Error('injected spend-log write failure');
+              }
+              return tx.executeRaw(query, params);
+            },
+          });
+          return fn(failingTx);
+        }),
+      });
+
+      await expect(settle(failingEngine, r.reservationId, 75))
+        .rejects.toThrow('injected spend-log write failure');
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT status, actual_cents FROM mcp_spend_reservations WHERE reservation_id = $1`,
+        [r.reservationId],
+      );
+      expect(rows[0]?.status).toBe('pending');
+      expect(rows[0]?.actual_cents).toBeNull();
+    });
+
+    it('preserves OAuth token attribution in the committed spend row', async () => {
+      const r = await reserve(engine, {
+        clientId: 'alice', estimatedCents: 100, capCents: 500,
+        model: 'm', provider: 'p',
+      });
+      await settle(engine, r.reservationId, 50, 'search_by_image', 'client-token');
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT token_name FROM mcp_spend_log WHERE client_id = 'alice'`,
+      );
+      expect(rows[0]?.token_name).toBe('client-token');
+    });
+
+    it('records a paid result that arrives after the reservation expired', async () => {
+      const r = await reserve(engine, {
+        clientId: 'alice', estimatedCents: 100, capCents: 500,
+        model: 'm', provider: 'p',
+      });
+      await engine.executeRaw(
+        `UPDATE mcp_spend_reservations
+            SET status = 'expired', actual_cents = 0
+          WHERE reservation_id = $1`,
+        [r.reservationId],
+      );
+
+      await settle(engine, r.reservationId, 75);
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT status, actual_cents::text AS actual
+           FROM mcp_spend_reservations
+          WHERE reservation_id = $1`,
+        [r.reservationId],
+      );
+      expect(rows[0]?.status).toBe('settled');
+      expect(Number(rows[0]?.actual)).toBe(75);
+      const logs = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT COALESCE(SUM(spend_cents), 0)::text AS total
+           FROM mcp_spend_log
+          WHERE client_id = 'alice'`,
+      );
+      expect(Number(logs[0]?.total)).toBe(75);
+    });
+
+    it('fails closed for an unknown reservation id', async () => {
+      await expect(settle(engine, '00000000-0000-0000-0000-000000000099', 1))
+        .rejects.toThrow('spend reservation not found');
     });
   });
 
@@ -194,9 +305,44 @@ describe('minions/budget-meter (v0.38 Slice 2 — D3 reserve-then-settle)', () =
     it('returns null for unknown client', async () => {
       expect(await getClientDailyCapCents(engine, 'nobody')).toBe(null);
     });
+    it('fails closed when the accounting read fails', async () => {
+      const unavailable = Object.create(engine) as PGLiteEngine;
+      Object.defineProperty(unavailable, 'executeRaw', {
+        value: async () => { throw new Error('accounting unavailable'); },
+      });
+      await expect(getClientDailyCapCents(unavailable, 'alice'))
+        .rejects.toThrow('accounting unavailable');
+    });
   });
 
   describe('committed spend feeds next reserve', () => {
+    it('TTL and a UTC day change never release unresolved liability', async () => {
+      await seedClient('client', 1);
+      const hold = await reserve(engine, { clientId: 'client', estimatedCents: 90, capCents: 100, model: 'm', provider: 'p' });
+      await engine.executeRaw("UPDATE mcp_spend_reservations SET created_at=now()-interval '2 days', expires_at=now()-interval '1 day' WHERE reservation_id=$1", [hold.reservationId]);
+      await sweepExpiredReservations(engine);
+      const rows = await engine.executeRaw<{ actual_cents: unknown; status: string }>('SELECT actual_cents,status FROM mcp_spend_reservations WHERE reservation_id=$1', [hold.reservationId]);
+      expect(rows[0]?.status).toBe('expired');
+      expect(rows[0]?.actual_cents).toBeNull();
+      await expect(reserve(engine, { clientId: 'client', estimatedCents: 11, capCents: 100, model: 'm', provider: 'p' })).rejects.toThrow(BudgetExceededError);
+      await settle(engine, hold.reservationId, 5);
+      await expect(reserve(engine, { clientId: 'client', estimatedCents: 90, capCents: 100, model: 'm', provider: 'p' })).resolves.toHaveProperty('reservationId');
+    });
+
+    it('unlimited unknown-price holds prevent later finite admission until reconciled', async () => {
+      await seedClient('client', null);
+      const hold = await reserve(engine, { clientId: 'client', estimatedCents: 0, estimateKnown: false, capCents: null, model: 'unknown', provider: 'p' });
+      await seedClient('client', 5);
+      await expect(reserve(engine, { clientId: 'client', estimatedCents: 1, capCents: null, model: 'm', provider: 'p' })).rejects.toThrow(BudgetExceededError);
+      await settle(engine, hold.reservationId, 20);
+      await expect(reserve(engine, { clientId: 'client', estimatedCents: 1, capCents: null, model: 'm', provider: 'p' })).resolves.toHaveProperty('reservationId');
+    });
+
+    it('a cap tightened after preflight wins inside the admission transaction', async () => {
+      await seedClient('client', 1);
+      await expect(reserve(engine, { clientId: 'client', estimatedCents: 101, capCents: 500, model: 'm', provider: 'p' })).rejects.toThrow(BudgetExceededError);
+    });
+
     it('settled spend pushes the next reserve over cap', async () => {
       await seedClient('alice', 1.00);
       const r1 = await reserve(engine, {
@@ -210,6 +356,65 @@ describe('minions/budget-meter (v0.38 Slice 2 — D3 reserve-then-settle)', () =
           model: 'm', provider: 'p',
         }),
       ).rejects.toThrow(BudgetExceededError);
+    });
+  });
+
+  describe('group budget key (lifetime window)', () => {
+    const key = 'group:0192a000-0000-7000-8000-000000000001';
+    const hold = (estimatedCents: number, capCents: number | null = 1000) =>
+      reserveGroup(engine, { budgetKey: key, estimatedCents, capCents, model: 'm', provider: 'p', jobId: undefined });
+
+    it('sums settled spend over the group lifetime, not the UTC day', async () => {
+      const r = await hold(300);
+      await settle(engine, r.reservationId, 900);
+      await engine.executeRaw(`UPDATE mcp_spend_log SET created_at = now() - interval '3 days' WHERE budget_key = $1`, [key]);
+      expect((await readGroupSpend(engine, key)).committedCents).toBe(900);
+      const next = await hold(300);
+      expect(next.estimatedCents).toBe(100);
+      await settle(engine, next.reservationId, 100);
+      const refused = await hold(1).catch(e => e);
+      expect(refused).toBeInstanceOf(GroupBudgetRefusal);
+      expect((refused as GroupBudgetRefusal).kind).toBe('exhausted');
+    });
+
+    it('live holds of siblings are pressure; settled spend under the cap admits again', async () => {
+      const a = await hold(800);
+      const refused = await hold(800).catch(e => e);
+      expect((refused as GroupBudgetRefusal).kind).toBe('pressure');
+      await settle(engine, a.reservationId, 100);
+      const b = await hold(800);
+      await settle(engine, b.reservationId, 100);
+      expect((await readGroupSpend(engine, key)).committedCents).toBe(200);
+    });
+
+    it('an overdue hold counts as spent until its usage is known', async () => {
+      await hold(1000);
+      await engine.executeRaw(`UPDATE mcp_spend_reservations SET expires_at = now() - interval '1 second' WHERE budget_key = $1`, [key]);
+      const refused = await hold(200).catch(e => e);
+      expect((refused as GroupBudgetRefusal).kind).toBe('exhausted');
+      expect((await readGroupSpend(engine, key)).overdueCents).toBe(1000);
+    });
+
+    it('a null cap ledgers without a check and group rows carry no client', async () => {
+      const r = await hold(5000, null);
+      await settle(engine, r.reservationId, 4000);
+      const rows = await engine.executeRaw<{ client_id: string | null; budget_key: string }>(
+        `SELECT client_id, budget_key FROM mcp_spend_log WHERE budget_key = $1`, [key]);
+      expect(rows).toEqual([{ client_id: null, budget_key: key }]);
+    });
+
+    it('a reservation names exactly one budget owner', async () => {
+      await expect(engine.executeRaw(
+        `INSERT INTO mcp_spend_reservations (reservation_id, client_id, budget_key, estimated_cents, model, provider, status, expires_at)
+         VALUES (gen_random_uuid(), 'alice', $1, 1, 'm', 'p', 'pending', now())`, [key])).rejects.toThrow();
+    });
+
+    it('client budgets ignore group spend', async () => {
+      await seedClient('alice', 1.00);
+      const g = await hold(900);
+      await settle(engine, g.reservationId, 900);
+      await expect(reserve(engine, { clientId: 'alice', estimatedCents: 90, capCents: 100, model: 'm', provider: 'p' }))
+        .resolves.toHaveProperty('reservationId');
     });
   });
 });

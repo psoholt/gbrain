@@ -26,7 +26,7 @@
  * `shutdownSignal` so deploy restarts don't interrupt them mid-flight.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from '../../spawn.ts';
 import { StringDecoder } from 'node:string_decoder';
 import type { MinionJobContext } from '../types.ts';
 import { UnrecoverableError } from '../types.ts';
@@ -34,6 +34,7 @@ import { deriveEnvKey, resolveInheritValue } from './shell-inherit.ts';
 import { validateShellJobParams } from './shell-validate.ts';
 import { redactSecretsInText } from './shell-redact.ts';
 import { loadConfig } from '../../config.ts';
+import { killProcessGroup, processGroupAlive, signalProcessTree } from '../job-isolation.ts';
 
 /** Environment variables passed through to shell children by default. Callers
  *  that need additional keys (e.g. a specific API token for a cron) must name
@@ -48,6 +49,11 @@ const STDERR_TAIL_MAX_BYTES = 16 * 1024;
 /** Grace period between SIGTERM and SIGKILL. Well-behaved scripts catch SIGTERM,
  *  flush state, exit cleanly; non-behaving scripts get reaped. */
 const KILL_GRACE_MS = 5000;
+
+/** After the job's process group is gone, how long to wait for stdout/stderr to reach EOF. `'exit'`
+ *  can fire before the last chunk is read; only `'close'` means the pipes ended. A process that left
+ *  the group (setsid) and still holds a pipe gets this long before the tails are taken without it. */
+const STDIO_DRAIN_MS = 2000;
 
 export interface ShellJobParams {
   /** Shell command. Spawned via `/bin/sh -c cmd`. Exactly one of cmd or argv is required. */
@@ -202,15 +208,38 @@ class TailBuffer {
   }
 }
 
+/** Poll `alive` every 50ms for up to `ms`; true once it reports dead. */
+async function waitUntilGone(alive: () => boolean, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (alive()) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return true;
+}
+
+/** SIGTERM what is left, escalate to SIGKILL after the grace window by
+ *  liveness, then wait for the kernel to confirm termination (bounded). */
+async function reapTree(alive: () => boolean, signal: (s: 'SIGTERM' | 'SIGKILL') => void): Promise<void> {
+  if (!alive()) return;
+  signal('SIGTERM');
+  if (await waitUntilGone(alive, KILL_GRACE_MS)) return;
+  signal('SIGKILL');
+  if (await waitUntilGone(alive, KILL_GRACE_MS)) return;
+  console.warn('[shell] job process group still present after SIGKILL; giving up the wait');
+}
+
 /** The shell handler itself. */
 export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResult> {
   if (process.env.GBRAIN_ALLOW_SHELL_JOBS !== '1') {
     const warning =
-      `[shell] Job #${ctx.id} rejected: GBRAIN_ALLOW_SHELL_JOBS=1 not set on this worker.\n` +
-      '        Shell jobs require the env var on the worker process.';
+      `[shell] Job #${ctx.id} rejected: shell jobs are not enabled on this worker.\n` +
+      '        Start it with `gbrain jobs work --allow-shell-jobs` (or export GBRAIN_ALLOW_SHELL_JOBS=1\n' +
+      '        from your shell; a .env in the working directory cannot set it).';
     console.warn(warning);
     throw new UnrecoverableError(
-      'shell handler disabled on this worker (set GBRAIN_ALLOW_SHELL_JOBS=1 to execute shell jobs)',
+      'shell handler disabled on this worker (start it with --allow-shell-jobs or ' +
+      'GBRAIN_ALLOW_SHELL_JOBS=1 to execute shell jobs)',
     );
   }
 
@@ -240,6 +269,11 @@ export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResul
 
   const startedAt = Date.now();
 
+  // #5062: on POSIX the job runs in its own process group, so termination
+  // reaches every descendant (a shell's children and grandchildren), not
+  // only the direct child. Windows signals the tree under the direct child
+  // with taskkill (signalProcessTree), and liveness is the direct child's.
+  const ownGroup = process.platform !== 'win32';
   let proc: ChildProcess;
   try {
     if (params.cmd) {
@@ -249,6 +283,7 @@ export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResul
         cwd: params.cwd,
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: ownGroup,
       });
     } else {
       const argv = params.argv!;
@@ -256,6 +291,7 @@ export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResul
         cwd: params.cwd,
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: ownGroup,
       });
     }
   } catch (err) {
@@ -265,11 +301,24 @@ export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResul
   }
 
   const pid = proc.pid ?? -1;
+  const pgid = ownGroup && pid > 1 ? pid : null;
+  const treeAlive = (): boolean => pgid !== null
+    ? processGroupAlive(pgid)
+    : pid > 0 && proc.exitCode === null && proc.signalCode === null;
+  const signalTree = (signal: 'SIGTERM' | 'SIGKILL'): void => {
+    if (pgid !== null) {
+      killProcessGroup(pgid, signal);
+      return;
+    }
+    if (process.platform === 'win32' && (signalProcessTree(pid, signal) !== 'failed' || signal === 'SIGTERM')) return;
+    try { proc.kill(signal); } catch { /* proc already exited */ }
+  };
   const stdoutTail = new TailBuffer(STDOUT_TAIL_MAX_BYTES);
   const stderrTail = new TailBuffer(STDERR_TAIL_MAX_BYTES);
 
   proc.stdout?.on('data', (c: Buffer) => stdoutTail.append(c));
   proc.stderr?.on('data', (c: Buffer) => stderrTail.append(c));
+  const stdioClosed = new Promise<void>(resolve => proc.on('close', () => resolve()));
 
   // Wire BOTH signals to the kill sequence. `ctx.signal` fires on timeout /
   // cancel / lock-loss; `ctx.shutdownSignal` fires only on worker SIGTERM/SIGINT.
@@ -280,13 +329,9 @@ export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResul
   const onAbort = (label: string) => () => {
     if (killTimer !== null) return; // already started
     killReason = label;
-    if (!proc.killed) {
-      try { proc.kill('SIGTERM'); } catch { /* proc already exited */ }
-    }
+    signalTree('SIGTERM');
     killTimer = setTimeout(() => {
-      if (!proc.killed) {
-        try { proc.kill('SIGKILL'); } catch { /* already exited */ }
-      }
+      if (treeAlive()) signalTree('SIGKILL');
     }, KILL_GRACE_MS);
   };
   const sigAbort = onAbort('signal');
@@ -310,11 +355,18 @@ export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResul
       else if (signal === 'SIGKILL') resolve(137);
       else resolve(-1);
     });
-  }).finally(() => {
+  }).finally(async () => {
     if (killTimer !== null) clearTimeout(killTimer);
     ctx.signal.removeEventListener('abort', sigAbort);
     ctx.shutdownSignal.removeEventListener('abort', shutdownAbort);
+    // #5062: the job is over once its leader exits; anything it left in its
+    // process group (a backgrounded child, a grandchild that ignored
+    // SIGTERM) is terminated and confirmed gone before the job settles.
+    await reapTree(treeAlive, signalTree);
   });
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([stdioClosed, new Promise<void>(resolve => { drainTimer = setTimeout(resolve, STDIO_DRAIN_MS); })]);
+  clearTimeout(drainTimer);
 
   const duration_ms = Date.now() - startedAt;
   // Assemble tails, then optionally scrub resolved inherit values out before

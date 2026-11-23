@@ -74,6 +74,8 @@ describe('runConversationParserNightlyProbe', () => {
       baseDeps({ hasLlmKey: () => false }),
     );
     expect(r.outcome).toBe('no_embedding_key');
+    expect(r.reason).toContain('no chat model available');
+    expect(r.reason).not.toContain('Anthropic');
   });
 
   test('happy path: all pass', async () => {
@@ -97,11 +99,22 @@ describe('runConversationParserNightlyProbe', () => {
     expect(r.adversarial_false_positives).toBe(1);
   });
 
-  test('fixture path missing → fail', async () => {
+  test('fixture path missing → skipped with fixture_unavailable, not a parser failure (C-N6)', async () => {
     const r = await runConversationParserNightlyProbe(
       baseDeps({ resolveFixturePath: () => '/nonexistent/path.jsonl' }),
     );
-    expect(r.outcome).toBe('fail');
-    expect(r.reason).toContain('missing');
+    expect(r.outcome).toBe('skipped');
+    expect(r.reason).toStartWith('fixture_unavailable: /nonexistent/path.jsonl is not readable');
+    expect(r.fixtures_total).toBe(0);
+  });
+
+  test('the embedded fixtures score as the committed corpus (C-N6)', async () => {
+    const { NIGHTLY_PROBE_FIXTURES } = await import('../../src/core/cycle/nightly-probe-fixtures.ts');
+    const r = await runConversationParserNightlyProbe(baseDeps({
+      resolveFixturePath: () => NIGHTLY_PROBE_FIXTURES.parserFormats,
+      resolveAdversarialPath: () => NIGHTLY_PROBE_FIXTURES.parserAdversarial,
+    }));
+    expect(r.outcome).not.toBe('skipped');
+    expect(r.fixtures_total).toBeGreaterThan(0);
   });
 });

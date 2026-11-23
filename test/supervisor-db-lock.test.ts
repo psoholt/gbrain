@@ -25,12 +25,14 @@ function snap(over: Partial<LockSnapshot>): LockSnapshot {
     id: 'gbrain-supervisor:default',
     holder_pid: 4242,
     holder_host: 'box',
+    acquisition_token: '00000000-0000-4000-8000-000000000001',
     acquired_at: new Date(),
     ttl_expires_at: new Date(),
     age_ms: 1000,
     ttl_expired: false,
     last_refreshed_at: new Date(),
     ms_since_last_refresh: 0,
+    db_now: new Date(),
     ...over,
   };
 }
@@ -216,6 +218,8 @@ describe('#1849 refresh-failure fails safe (F1A)', () => {
     let refreshCalls = 0;
     const failingLock: DbLockHandle = {
       id: 'x',
+      acquiredAt: 'test-fence',
+      acquisitionToken: '00000000-0000-4000-8000-000000000001',
       refresh: async () => { refreshCalls++; throw new Error('pooler down'); },
       release: async () => {},
     };
@@ -244,7 +248,9 @@ describe('#1849 refresh-failure fails safe (F1A)', () => {
     let mode: 'fail' | 'ok' = 'fail';
     const flakyLock: DbLockHandle = {
       id: 'x',
-      refresh: async () => { if (mode === 'fail') throw new Error('blip'); },
+      acquiredAt: 'test-fence',
+      acquisitionToken: '00000000-0000-4000-8000-000000000001',
+      refresh: async () => { if (mode === 'fail') throw new Error('blip'); return true; },
       release: async () => {},
     };
     sup._setDbLockForTests(flakyLock);
@@ -264,3 +270,32 @@ describe('#1849 refresh-failure fails safe (F1A)', () => {
     }
   });
 });
+
+  test('W0 (D5.10): fenced refresh returning false is CERTAIN loss — immediate LOCK_LOST, no threshold', async () => {
+    const sup = new MinionSupervisor(engine, { cliPath: '/bin/sh', healthInterval: 0, json: true });
+    const exitSpy = spyOn(process, 'exit').mockImplementation(((_code?: number) => {
+      throw new Error(`exit:${_code}`);
+    }) as never);
+
+    let refreshCalls = 0;
+    const stolenLock: DbLockHandle = {
+      id: 'x',
+      acquiredAt: 'test-fence',
+      acquisitionToken: '00000000-0000-4000-8000-000000000001',
+      refresh: async () => { refreshCalls++; return false; },
+      release: async () => {},
+    };
+    sup._setDbLockForTests(stolenLock);
+
+    try {
+      // FIRST tick exits — a fenced miss is proof of loss, not a blip to
+      // count toward SUPERVISOR_LOCK_REFRESH_MAX_FAILURES (pre-fix it was
+      // treated as SUCCESS and reset the failure counter while a second
+      // supervisor drained the same queue).
+      try { await sup._refreshDbLockForTests(); } catch { /* exit stub throws */ }
+      expect(exitSpy).toHaveBeenCalledWith(ExitCodes.LOCK_LOST);
+      expect(refreshCalls).toBe(1);
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });

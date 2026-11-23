@@ -19,13 +19,27 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-OUT_BIN="$(mktemp /tmp/gbrain-wasm-check.XXXXXX)"
-trap 'rm -f "$OUT_BIN"' EXIT
+# Build from a container-local copy. On Docker Desktop, Bun canonicalizes a
+# bind-mounted input to /run/host_virtiofs but keeps /app as the output path;
+# its final atomic rename then fails with ENOENT even though both names refer
+# to the same mount. Keeping inputs and output under /tmp avoids that alias.
+BUILD_DIR="$(mktemp -d /tmp/gbrain-wasm-check.XXXXXX)"
+OUT_BIN="$BUILD_DIR/chunker-smoketest"
+trap 'rm -rf "$BUILD_DIR"' EXIT
+mkdir -p "$BUILD_DIR/scripts"
+cp -R "$REPO_ROOT/src" "$BUILD_DIR/src"
+cp -R "$REPO_ROOT/vendor" "$BUILD_DIR/vendor"
+cp "$REPO_ROOT/package.json" "$BUILD_DIR/package.json"
+cp "$REPO_ROOT/scripts/chunker-smoketest.ts" "$BUILD_DIR/scripts/chunker-smoketest.ts"
+ln -s "$REPO_ROOT/node_modules" "$BUILD_DIR/node_modules"
 
 # Build a minimal smoketest binary that imports the chunker. We compile this
 # instead of the full gbrain CLI so the failure mode is laser-focused on
 # chunker + WASM path resolution, not unrelated CLI wiring.
-bun build --compile --outfile "$OUT_BIN" scripts/chunker-smoketest.ts >/dev/null 2>&1
+if ! (cd "$BUILD_DIR" && bun build --compile --no-compile-autoload-bunfig --outfile "$OUT_BIN" scripts/chunker-smoketest.ts >/dev/null); then
+  echo "[check-wasm-embedded] FAIL: bun could not compile the smoketest binary." >&2
+  exit 1
+fi
 
 # Run it and capture JSON output.
 OUTPUT="$("$OUT_BIN" 2>&1)"
@@ -38,23 +52,34 @@ OUTPUT="$("$OUT_BIN" 2>&1)"
 # - calculateScore by name: specific function that MUST appear as a
 #   top-level semantic node. If it's missing, the chunker either fell
 #   through to recursive or the TypeScript grammar didn't load.
-if ! echo "$OUTPUT" | grep -q '"has_symbol_names": true'; then
+# Plain bash substring tests, not `echo "$OUTPUT" | grep -q`: under
+# `set -o pipefail`, grep -q exits as soon as it finds a match and can
+# close its end of the pipe before echo finishes writing $OUTPUT, so
+# echo gets SIGPIPE and the pipeline's exit status goes non-zero even
+# though grep matched. False-fails the build. #3927.
+if [[ "$OUTPUT" != *'"has_symbol_names": true'* ]]; then
   echo "[check-wasm-embedded] FAIL: compiled binary returned no symbol names (fallback chunks)." >&2
   echo "[check-wasm-embedded] Output was:" >&2
   echo "$OUTPUT" >&2
   exit 1
 fi
 
-if ! echo "$OUTPUT" | grep -q '"has_typescript_header": true'; then
+if [[ "$OUTPUT" != *'"has_typescript_header": true'* ]]; then
   echo "[check-wasm-embedded] FAIL: chunk header missing TypeScript language tag." >&2
   echo "[check-wasm-embedded] Output was:" >&2
   echo "$OUTPUT" >&2
   exit 1
 fi
 
-if ! echo "$OUTPUT" | grep -q '"calculateScore"'; then
+if [[ "$OUTPUT" != *'"calculateScore"'* ]]; then
   echo "[check-wasm-embedded] FAIL: tree-sitter did not extract the calculateScore function symbol." >&2
   echo "[check-wasm-embedded] Output was:" >&2
+  echo "$OUTPUT" >&2
+  exit 1
+fi
+
+if [[ "$OUTPUT" != *'"has_bash_case_symbol": true'* ]]; then
+  echo "[check-wasm-embedded] FAIL: Bash case statement lost its function symbol." >&2
   echo "$OUTPUT" >&2
   exit 1
 fi

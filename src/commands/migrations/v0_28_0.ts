@@ -12,8 +12,8 @@
  *                   pre-existing fenced takes tables in markdown populate the
  *                   takes table without blocking the foreground upgrade.
  *                   Falls back to inline run on PGLite (no Minion worker).
- *   C. Re-chunk   — emit a pending-host-work TODO for `gbrain re-chunk
- *                   --where pages-with-takes` (Codex P0 #3 fix: pages with
+ *   C. Re-chunk   — emit a pending-host-work TODO for `gbrain reindex
+ *                   --markdown` (Codex P0 #3 fix: pages with
  *                   pre-v0.28 chunks still contain the fenced takes content;
  *                   the chunker strip only applies to NEW imports). Re-chunk
  *                   is heavy + per-page-disruptive, so we queue a TODO instead
@@ -21,7 +21,8 @@
  *   D. Record     — runner-owned ledger write (handled by apply-migrations.ts).
  *
  * No content mutation. No data loss. Operator runs `gbrain doctor` after
- * upgrade to verify takes_backfill_complete + takes_fence_chunk_leak checks.
+ * upgrade, then `gbrain reindex --markdown` for pages chunked before the
+ * fence strip.
  */
 
 import { existsSync, mkdirSync, appendFileSync, readFileSync } from 'node:fs';
@@ -30,8 +31,9 @@ import type {
   Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult,
 } from './types.ts';
 import type { BrainEngine } from '../../core/engine.ts';
-import { loadConfig, toEngineConfig, gbrainPath } from '../../core/config.ts';
-import { createEngine } from '../../core/engine-factory.ts';
+import { OperationError } from '../../core/ops/contract.ts';
+import { loadConfig, gbrainPath } from '../../core/config.ts';
+import { connectMigrationEngine } from './run-engine.ts';
 
 let testEngineOverride: BrainEngine | null = null;
 export function __setTestEngineOverride(engine: BrainEngine | null): void {
@@ -96,9 +98,10 @@ async function phaseBBackfill(
   if (!engine) return { name: 'backfill', status: 'skipped', detail: 'no_brain_configured' };
 
   try {
-    // Inline run on both engines for v0.28.0 simplicity. Larger brains can run
-    // `gbrain extract takes --rebuild` later; the migration's job is to get
-    // the table populated for upgrade-time doctor checks.
+    // Inline run on both engines for v0.28.0 simplicity. Re-running this
+    // backfill is `gbrain apply-migrations --migration 0.28.0`; one page's
+    // index rebuilds with `gbrain takes rebuild <slug>`. The migration's job
+    // is to get the table populated for upgrade-time doctor checks.
     const { extractTakes } = await import('../../core/cycle/extract-takes.ts');
     const result = await extractTakes(engine, { source: 'db' });
 
@@ -126,7 +129,8 @@ async function phaseBBackfill(
       : `extract-takes scanned ${result.pagesScanned} pages; ${result.pagesWithTakes} had fenced takes; upserted ${result.takesUpserted} rows`;
     return { name: 'backfill', status: 'complete', detail };
   } catch (e) {
-    return { name: 'backfill', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
+    const detail = e instanceof OperationError ? `${e.code}: ${e.message} ${e.suggestion ?? ''}`.trim() : e instanceof Error ? e.message : String(e);
+    return { name: 'backfill', status: 'failed', detail };
   }
 }
 
@@ -162,7 +166,7 @@ function phaseCRechunkTodo(opts: OrchestratorOpts): OrchestratorPhaseResult {
       ts: new Date().toISOString(),
       skill: 'skills/migrations/v0.28.0.md',
       reason: 'Pages with pre-v0.28 chunks still contain fenced takes content. Re-chunk so the new chunker strip rule is applied (Codex P0 #3 fix).',
-      command: "gbrain extract takes --rebuild  # forces re-chunk via reimport pipeline; see migration doc for the precise sweep command in your env",
+      command: 'gbrain reindex --markdown',
       _key: key,
     };
     appendFileSync(pendingHostWorkPath(), JSON.stringify(entry) + '\n');
@@ -188,18 +192,13 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
 
   // Acquire engine for phases that need it. Skip cleanly when none configured.
   let engine: BrainEngine | null = null;
-  let ownsEngine = false;
+  let close: (() => Promise<void>) | null = null;
   try {
     if (testEngineOverride) {
       engine = testEngineOverride;
     } else {
       const config = loadConfig();
-      if (config) {
-        const engineConfig = toEngineConfig(config);
-        engine = await createEngine(engineConfig);
-        await engine.connect(engineConfig);
-        ownsEngine = true;
-      }
+      if (config) ({ engine, close } = await connectMigrationEngine(config));
     }
 
     phases.push(await phaseASchema(engine, opts));
@@ -210,8 +209,8 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
     phases.push(await phaseBBackfill(engine, opts));
     phases.push(phaseCRechunkTodo(opts));
   } finally {
-    if (ownsEngine && engine) {
-      try { await engine.disconnect(); } catch { /* ignore */ }
+    if (close) {
+      try { await close(); } catch { /* ignore */ }
     }
   }
 
@@ -237,6 +236,7 @@ export const v0_28_0: Migration = {
       'chunks where the per-token allow-list cannot reach) catches up on legacy pages.',
   },
   orchestrator,
+  sharesRunEngine: true,
 };
 
 /** Exported for unit tests. */

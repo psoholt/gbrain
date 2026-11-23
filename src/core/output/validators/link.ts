@@ -9,11 +9,14 @@
  *     Dangling links emit an error.
  *   - Anything else (mailto:, internal anchors) → warning.
  *
- * We strip leading "../" components so a link from a daily file written as
- * `../../people/alice.md` resolves to the `people/alice` slug the engine
- * knows. This matches how engine.addLink is called downstream.
+ * Relative links resolve against the linking page's directory through the
+ * link extractor's own resolvers (pageRelativeMarkdownSlugs, then
+ * resolveMarkdownLinkSlug), so a link this
+ * validator accepts is a link the graph records, and a wrong-depth link is
+ * reported with the slug it actually resolves to.
  */
 
+import { pageRelativeMarkdownSlugs, resolveMarkdownLinkSlug } from '../../link-extraction.ts';
 import type { PageValidator, PageValidationContext, ValidationFinding } from '../writer.ts';
 
 const MD_LINK_RE = /\[([^\]]+)\]\(([^)]+)\)/g;
@@ -24,6 +27,12 @@ export const linkValidator: PageValidator = {
   async validate(ctx: PageValidationContext): Promise<ValidationFinding[]> {
     const findings: ValidationFinding[] = [];
     const body = `${ctx.compiledTruth}\n${ctx.timeline}`;
+
+    const sourceOpts = ctx.sourceIds && ctx.sourceIds.length > 0
+      ? { sourceIds: ctx.sourceIds }
+      : ctx.sourceId
+        ? { sourceId: ctx.sourceId }
+        : undefined;
 
     // Collect unique internal targets first to batch engine lookups.
     const internalTargets = new Set<string>();
@@ -44,7 +53,10 @@ export const linkValidator: PageValidator = {
         continue;
       }
 
-      const slug = normalizeToSlug(href);
+      let slug = resolveMarkdownLinkSlug(ctx.slug, href.trim());
+      for (const candidate of pageRelativeMarkdownSlugs(ctx.slug, href)) {
+        if (await ctx.engine.getPage(candidate, sourceOpts)) { slug = candidate; break; }
+      }
       if (!slug) {
         findings.push({
           slug: ctx.slug,
@@ -62,9 +74,9 @@ export const linkValidator: PageValidator = {
       linkPositions.set(slug, list);
     }
 
-    // Batch-check which targets exist.
+    // Batch-check which targets exist within the validation read scope.
     for (const slug of internalTargets) {
-      const page = await ctx.engine.getPage(slug);
+      const page = await ctx.engine.getPage(slug, sourceOpts);
       if (page) continue;
       const positions = linkPositions.get(slug) ?? [];
       for (const pos of positions) {
@@ -73,7 +85,9 @@ export const linkValidator: PageValidator = {
           validator: 'link',
           severity: 'error',
           line: pos.line,
-          message: `Dangling wikilink to ${slug} (no such page)`,
+          message: pos.raw.trim().replace(/\.md$/i, '').toLowerCase() === slug
+            ? `Dangling wikilink to ${slug} (no such page)`
+            : `Dangling wikilink to ${slug} (no such page; ${truncate(pos.raw, 80)} from ${ctx.slug} resolves there)`,
         });
       }
     }

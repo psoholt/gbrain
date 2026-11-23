@@ -13,6 +13,7 @@ import {
   getEmbeddingDimensions as gatewayGetDims,
 } from './ai/gateway.ts';
 import { lookupEmbeddingPrice } from './embedding-pricing.ts';
+import { isEmbeddingZeroNormError, mergeZeroNormErrors, type EmbeddingZeroNormError } from './ai/embedding-guard.ts';
 
 // v0.27.1: re-export multimodal embedding so callers can pull both text and
 // image embedding APIs from `src/core/embedding`. import-image-file consumes
@@ -39,21 +40,9 @@ export async function embed(text: string): Promise<Float32Array> {
   return gatewayEmbedOne(text);
 }
 
-/**
- * v0.35.0.0+: embed a single text on the QUERY side. For asymmetric providers
- * (ZE zembed-1, Voyage v3+) this routes `input_type: 'query'` through the
- * embed seam so the provider returns query-side vectors. For symmetric
- * providers (OpenAI text-3, DashScope, Zhipu) the field is dropped — no
- * behavior change. Used by hybrid.ts on the search hot path.
- *
- * v0.36 (D10): optional `embeddingModel` + `dimensions` overrides so the
- * dynamic-embedding-column path can embed via the column's provider rather
- * than the globally-configured default. Bare `embedQuery(text)` preserves
- * pre-v0.36 behavior.
- */
 export async function embedQuery(
   text: string,
-  opts?: { embeddingModel?: string; dimensions?: number; abortSignal?: AbortSignal },
+  opts?: { embeddingModel?: string; dimensions?: number; abortSignal?: AbortSignal; queryPrefix?: string },
 ): Promise<Float32Array> {
   return gatewayEmbedQuery(text, opts);
 }
@@ -103,14 +92,22 @@ export async function embedBatch(
   if (texts.length <= BATCH_SIZE && !options.onBatchComplete) {
     return gatewayEmbed(texts, gwOpts);
   }
-  const results: Float32Array[] = [];
+  // #4616: a degenerate vector fails only its item; later slices still run and
+  // the merged refusal carries every usable vector aligned with `texts`.
+  const slices: { offset: number; vectors: Float32Array[] | null; error?: EmbeddingZeroNormError }[] = [];
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
     const slice = texts.slice(i, i + BATCH_SIZE);
-    const out = await gatewayEmbed(slice, gwOpts);
-    results.push(...out);
-    options.onBatchComplete?.(results.length, texts.length);
+    try {
+      slices.push({ offset: i, vectors: await gatewayEmbed(slice, gwOpts) });
+    } catch (error) {
+      if (!isEmbeddingZeroNormError(error)) throw error;
+      slices.push({ offset: i, vectors: null, error });
+    }
+    options.onBatchComplete?.(Math.min(i + BATCH_SIZE, texts.length), texts.length);
   }
-  return results;
+  const refused = mergeZeroNormErrors(texts.length, slices, slices.find(s => s.error)?.error?.model ?? '');
+  if (refused) throw refused;
+  return slices.flatMap(s => s.vectors ?? []);
 }
 
 /** Currently-configured embedding model (short form without provider prefix). */
@@ -122,10 +119,6 @@ export function getEmbeddingModelName(): string {
 export function getEmbeddingDimensions(): number {
   return gatewayGetDims();
 }
-
-// Back-compat exports for tests that imported these from v0.13.
-export const EMBEDDING_MODEL = 'text-embedding-3-large';
-export const EMBEDDING_DIMENSIONS = 1536;
 
 /**
  * USD cost per 1k tokens for text-embedding-3-large. Retained for back-compat
@@ -144,7 +137,7 @@ export const EMBEDDING_COST_PER_1K_TOKENS = 0.00013;
 export function currentEmbeddingPricePerMTok(): number {
   let modelString: string;
   try {
-    modelString = gatewayGetModel(); // e.g. 'zeroentropyai:zembed-1'
+    modelString = gatewayGetModel();
   } catch {
     // Gateway not configured (e.g. unit tests, cost preview before connect).
     // Fall back to the OpenAI text-embedding-3-large default rate.
@@ -172,14 +165,17 @@ export function estimateEmbeddingCostUsd(tokens: number): number {
  * already tracked per-page via `pages.chunker_version` (used by sync +
  * doctor). This signature is strictly about the EMBEDDING space.
  *
- * Falls back to the OpenAI default signature when the gateway is
- * unconfigured (unit-test context), matching the other estimator fallbacks.
+ * Returns null when the gateway is unconfigured. The old fallback silently
+ * claimed the OpenAI default signature, which STAMPED A LIE onto pages
+ * embedded in a gateway-less context — a wrong signature is worse than none
+ * (NULL = "unknown provenance", which the includeNullSignature machinery
+ * already handles honestly). Callers skip stamping/signature-widening on null.
  */
-export function currentEmbeddingSignature(): string {
+export function currentEmbeddingSignature(): string | null {
   try {
     return `${gatewayGetModel()}:${gatewayGetDims()}`;
   } catch {
-    return `${EMBEDDING_MODEL}:${EMBEDDING_DIMENSIONS}`;
+    return null;
   }
 }
 
@@ -194,9 +190,9 @@ export function currentEmbeddingSignature(): string {
 export type SyncEmbedMode = 'deferred' | 'inline';
 
 /**
- * Resolve the embed mode from the same three signals sync.ts uses to
- * compute `effectiveNoEmbed`. Single source of truth so the cost gate and
- * the actual embed decision can never drift.
+ * Resolve the embed mode from the original public v2/serial contract.
+ * `./embedding` is a package export, so keep this call shape stable for
+ * downstream TypeScript and JavaScript consumers.
  *
  *   effectiveNoEmbed = v2Enabled && !serialFlag && !noEmbed ? true : noEmbed
  *
@@ -214,6 +210,15 @@ export function willEmbedSynchronously(opts: {
 }): SyncEmbedMode {
   const effectiveNoEmbed =
     opts.v2Enabled && !opts.serialFlag && !opts.noEmbed ? true : opts.noEmbed;
+  return effectiveNoEmbed ? 'deferred' : 'inline';
+}
+
+/** Internal worker-capability-aware mode used by the sync command boundary. */
+export function resolveWorkerBackedSyncEmbedMode(opts: {
+  deferEligible: boolean;
+  noEmbed: boolean;
+}): SyncEmbedMode {
+  const effectiveNoEmbed = opts.deferEligible || opts.noEmbed;
   return effectiveNoEmbed ? 'deferred' : 'inline';
 }
 

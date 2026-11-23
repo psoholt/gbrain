@@ -6,6 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { runCli } from './helpers/cli-spawn.ts';
 import {
   parseRunAllArgs,
   estimateRunCost,
@@ -25,10 +26,11 @@ afterAll(() => {
 });
 
 describe('parseRunAllArgs', () => {
-  test('defaults: all modes, longmemeval+replay suites, seed=42', () => {
+  test('defaults: all modes, the wired suites (brainbench), seed=42', () => {
     const opts = parseRunAllArgs([]);
     expect(opts.modes).toEqual(['conservative', 'balanced', 'tokenmax']);
-    expect(opts.suites).toEqual(['longmemeval', 'replay']);
+    expect(opts.suites).toEqual(['brainbench']);
+    expect(opts.suitesExplicit).toBe(false);
     expect(opts.seed).toBe(42);
     expect(opts.parallel).toBe(1);
     expect(opts.budgetUsdRetrieval).toBe(5);
@@ -48,6 +50,7 @@ describe('parseRunAllArgs', () => {
   test('--suites filters; rejects unknown', () => {
     const opts = parseRunAllArgs(['--suites', 'longmemeval']);
     expect(opts.suites).toEqual(['longmemeval']);
+    expect(opts.suitesExplicit).toBe(true);
     expect(() => parseRunAllArgs(['--suites', 'foo'])).toThrow(/not a recognized suite/);
   });
 
@@ -71,6 +74,32 @@ describe('parseRunAllArgs', () => {
     expect(parseRunAllArgs(['--yes']).yes).toBe(true);
     expect(parseRunAllArgs(['-y']).yes).toBe(true);
   });
+
+  // #5933 (absorbed in agent contract v1 D4): NaN/out-of-range numeric flags
+  // are invalid_params usage errors, so the cost guard can't be bypassed.
+  test('--limit requires a positive safe integer', () => {
+    for (const value of ['NaN', 'Infinity', '1.5', '0', '-1', '9007199254740992']) {
+      expect(() => parseRunAllArgs(['--limit', value]), `--limit ${value}`).toThrow(/--limit/);
+    }
+    expect(() => parseRunAllArgs(['--limit', 'NaN'])).toThrow(expect.objectContaining({ code: 'invalid_params' }));
+  });
+
+  test('--seed requires a safe integer and allows zero', () => {
+    expect(parseRunAllArgs(['--seed', '0']).seed).toBe(0);
+    for (const value of ['NaN', 'Infinity', '1.5', '9007199254740992']) {
+      expect(() => parseRunAllArgs(['--seed', value]), `--seed ${value}`).toThrow(/--seed/);
+    }
+  });
+
+  test('budget caps require finite non-negative amounts', () => {
+    expect(parseRunAllArgs(['--budget-usd-answer', '0']).budgetUsdAnswer).toBe(0);
+    expect(parseRunAllArgs(['--budget-usd-retrieval', '0.25']).budgetUsdRetrieval).toBe(0.25);
+    for (const flag of ['--budget-usd-retrieval', '--budget-usd-answer']) {
+      for (const value of ['NaN', 'Infinity', '-Infinity', '-1']) {
+        expect(() => parseRunAllArgs([flag, value]), `${flag} ${value}`).toThrow(new RegExp(flag));
+      }
+    }
+  });
 });
 
 describe('estimateRunCost', () => {
@@ -81,10 +110,10 @@ describe('estimateRunCost', () => {
     expect(est.retrieval_usd).toBeGreaterThan(0);
   });
 
-  test('tokenmax incurs expansion cost (Haiku per query)', () => {
+  test('expansion cost follows the mode bundle: no mode expands by default since GBRA-94', () => {
     const bal = estimateRunCost({ suites: ['replay'], modes: ['balanced'], limit: 100 });
     const tok = estimateRunCost({ suites: ['replay'], modes: ['tokenmax'], limit: 100 });
-    expect(tok.retrieval_usd).toBeGreaterThan(bal.retrieval_usd);
+    expect(tok.retrieval_usd).toBe(bal.retrieval_usd);
   });
 
   test('replay suite has zero answer cost', () => {
@@ -155,7 +184,7 @@ describe('persistRunRecord audit trail', () => {
 
   test('appends to eval-results.jsonl, creates dir if missing', () => {
     const record: EvalRunRecord = {
-      schema_version: 2,
+      schema_version: 3,
       run_id: 'abc123-longmemeval-conservative-42',
       ran_at: '2026-05-12T12:00:00Z',
       suite: 'longmemeval',
@@ -173,12 +202,12 @@ describe('persistRunRecord audit trail', () => {
     expect(content).toContain('abc123-longmemeval-conservative-42');
     const parsed = JSON.parse(content.trim());
     expect(parsed.mode).toBe('conservative');
-    expect(parsed.schema_version).toBe(2);
+    expect(parsed.schema_version).toBe(3);
   });
 
   test('appends multiple records (NDJSON)', () => {
     const base = {
-      schema_version: 2 as const,
+      schema_version: 3 as const,
       ran_at: '2026-05-12T12:00:00Z',
       suite: 'longmemeval' as const,
       commit: 'abc',
@@ -193,5 +222,86 @@ describe('persistRunRecord audit trail', () => {
     const content = readFileSync(join(tmp, 'eval-results.jsonl'), 'utf-8');
     const lines = content.trim().split('\n');
     expect(lines.length).toBe(3);
+  });
+
+  test('secrets in error text AND params string leaves are redacted on the write path (DB URL password, provider keys)', () => {
+    const record: EvalRunRecord = {
+      schema_version: 3,
+      run_id: 'abc123-longmemeval-balanced-zz',
+      ran_at: '2026-09-06T12:00:00Z',
+      suite: 'longmemeval',
+      mode: 'balanced',
+      commit: 'abc123',
+      seed: 0,
+      params: {
+        topK: 5,
+        output: 'postgres://brain_user:s3cr3t-pw@db.example.internal:5432/brain?sslmode=require',
+        nested: { note: 'anthropic sk-ant-api03-ABCDEFGHIJKLMNOP failed', n: 3 },
+        list: ['Authorization: Bearer abcdefghijklmnop.qrstuv', 'plain text'],
+      },
+      status: 'failed',
+      duration_ms: 1,
+      error: 'exit 1 | q1: connect failed: postgres://brain_user:s3cr3t-pw@db.example.internal:5432/brain; openai key sk-proj-abcdefghijklmnopqrstuvwxyz0123',
+    };
+    // No caller-side redaction here — the write path alone must scrub.
+    persistRunRecord(tmp, record, tmp);
+    const line = readFileSync(join(tmp, 'eval-results.jsonl'), 'utf-8').trim();
+    expect(line).not.toContain('s3cr3t-pw');
+    expect(line).not.toContain('brain_user:');
+    expect(line).not.toContain('sk-proj-abcdefghijklmnopqrstuvwxyz0123');
+    expect(line).not.toContain('ABCDEFGHIJKLMNOP');
+    expect(line).not.toContain('abcdefghijklmnop.qrstuv');
+    // The line is still valid JSON with the diagnostic shape + non-string leaves intact.
+    const parsed = JSON.parse(line);
+    expect(parsed.error).toContain('exit 1 | q1: connect failed: postgres://<redacted>@db.example.internal:5432/brain');
+    expect(parsed.error).toContain('sk-<redacted>');
+    expect(parsed.params.output).toBe('postgres://<redacted>@db.example.internal:5432/brain?sslmode=require');
+    expect(parsed.params.nested.note).toBe('anthropic sk-ant-<redacted> failed');
+    expect(parsed.params.nested.n).toBe(3);
+    expect(parsed.params.topK).toBe(5);
+    expect(parsed.params.list).toEqual(['Authorization: Bearer <redacted>', 'plain text']);
+    expect(parsed.status).toBe('failed');
+  });
+
+  test("v3: brainbench records carry mode 'n/a' (decision 16 — no params.mode_independent hack)", () => {
+    const record: EvalRunRecord = {
+      schema_version: 3,
+      run_id: 'abc123-brainbench-na-42',
+      ran_at: '2026-06-12T12:00:00Z',
+      suite: 'brainbench',
+      mode: 'n/a',
+      commit: 'abc123',
+      seed: 42,
+      params: { fixtures_hash: 'deadbeef', cells: {} },
+      status: 'completed',
+      duration_ms: 1,
+    };
+    persistRunRecord(tmp, record, tmp);
+    const parsed = JSON.parse(readFileSync(join(tmp, 'eval-results.jsonl'), 'utf-8').trim());
+    expect(parsed.mode).toBe('n/a');
+    expect(parsed.suite).toBe('brainbench');
+    expect(parsed.params.mode_independent).toBeUndefined();
+  });
+});
+
+describe('eval run-all with a suite it does not run (CLI)', () => {
+  test('explicit --suites longmemeval,replay exits 1 with eval_suite_unwired, the per-suite commands as fix, and no record', async () => {
+    const out = join(tmp, 'unwired');
+    const r = await runCli(['eval', 'run-all', '--suites', 'longmemeval,replay', '--modes', 'balanced', '--yes', '--json', '--output', out]);
+    expect(r.exitCode).toBe(1);
+    const env = JSON.parse(r.stdout);
+    expect(env.code).toBe('eval_suite_unwired');
+    expect(env.fix.argv.slice(0, 7)).toEqual(['gbrain', 'eval', 'longmemeval', '<dataset.jsonl>', '--mode', '<mode>', '--record']);
+    expect(env.fix.next).toBe('ask_user');
+    expect(env.fix.then.argv.slice(0, 5)).toEqual(['gbrain', 'eval', 'replay', '--mode', '<mode>']);
+    expect(r.stderr).toContain('Error [eval_suite_unwired]');
+    expect(existsSync(join(out, 'eval-results.jsonl'))).toBe(false);
+  });
+
+  test('gbrain errors eval_suite_unwired explains the code', async () => {
+    const r = await runCli(['errors', 'eval_suite_unwired']);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain('eval_suite_unwired (caller, exit 1)');
+    expect(r.stdout).toContain('does not run in-process');
   });
 });

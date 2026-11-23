@@ -30,6 +30,9 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import type { BrainEngine } from '../core/engine.ts';
+import { jsonGuardActive, jsonRequested, writeJsonLine } from '../core/cli-force-exit.ts';
+import { usageError, writeCliError, writeCliRefusal } from '../cli/cli-error.ts';
+import { opError } from '../core/ops/contract.ts';
 import {
   parseBaselineFile,
   type BaselineFile,
@@ -40,7 +43,7 @@ import {
   parseQrelsFile,
   type QrelsFile,
 } from '../core/bench/qrels-file.ts';
-import { runCorrectnessGate, type CorrectnessResult } from '../core/bench/correctness-gate.ts';
+import { runCorrectnessGate, type CorrectnessGateOpts, type CorrectnessResult } from '../core/bench/correctness-gate.ts';
 import { replayCore, type ReplaySummary } from './eval-replay.ts';
 
 interface GateOpts {
@@ -55,6 +58,18 @@ interface GateOpts {
   thresholdRecallAtK?: number;
   thresholdFirstRelevantHit?: number;
   thresholdExpectedTop1?: number;
+  /**
+   * Hermetic embedder selector. The only accepted value is 'deterministic':
+   * query embeddings come from the qrels fixture's basis-vector dims
+   * (src/eval/deterministic-embed.ts) instead of the gateway, so the
+   * correctness gate runs with no API keys. Correctness-gate-only; rejected
+   * when combined with the baseline regression gate (replay re-embeds
+   * captured queries via the gateway). Cache safety: this path drives bare
+   * `hybridSearch`, which never reads or writes the semantic query cache
+   * (both live in `hybridSearchCached`), so deterministic runs cannot
+   * poison cached production results by construction.
+   */
+  embedder?: string;
 }
 
 interface Breach {
@@ -139,6 +154,10 @@ function parseArgs(args: string[]): GateOpts {
         opts.thresholdExpectedTop1 = Number(next);
         i++;
         break;
+      case '--embedder':
+        opts.embedder = next;
+        i++;
+        break;
       default:
         break;
     }
@@ -168,6 +187,13 @@ Thresholds (override baseline metadata; CLI > embedded > defaults):
                                      Correctness: first-relevant-hit-rate floor (default ${DEFAULT_QRELS_THRESHOLDS.first_relevant_hit})
   --threshold-expected-top1 FLOAT    Correctness: expected_top1-hit-rate floor (default ${DEFAULT_QRELS_THRESHOLDS.expected_top1})
   -k, --k N                          Top-K for recall@K (default ${DEFAULT_QRELS_THRESHOLDS.k})
+
+Hermetic mode (correctness gate only):
+  --embedder deterministic           Embed queries as the qrels fixture's basis
+                                     vectors instead of calling the gateway —
+                                     no API keys, fully reproducible (eval
+                                     canaries/CI). Rejected together with the
+                                     baseline regression gate.
 
 Output:
   --json                       Print JSON envelope to stdout
@@ -286,6 +312,7 @@ function runCorrectnessGateDispatch(
   qrelsPath: string,
   k: number,
   cliOverrides: Pick<GateOpts, 'thresholdRecallAtK' | 'thresholdFirstRelevantHit' | 'thresholdExpectedTop1'>,
+  searchFn?: CorrectnessGateOpts['searchFn'],
 ): Promise<GateResult['correctness_gate']> {
   return (async () => {
     let qrelsFile: QrelsFile;
@@ -312,7 +339,7 @@ function runCorrectnessGateDispatch(
 
     let result: CorrectnessResult;
     try {
-      result = await runCorrectnessGate(engine, qrelsFile, { k });
+      result = await runCorrectnessGate(engine, qrelsFile, { k, ...(searchFn ? { searchFn } : {}) });
     } catch (err) {
       return {
         ran: true,
@@ -433,19 +460,32 @@ export async function runEvalGate(engine: BrainEngine, args: string[]): Promise<
     return;
   }
 
+  const json = jsonRequested(args);
+  const usage: (message: string, suggestion: string) => never = (message, suggestion) =>
+    process.exit(writeCliRefusal(usageError(message, suggestion), 'eval', { json }));
   if (!opts.baseline && !opts.qrels) {
-    console.error('Error: at least one of --baseline or --qrels must be set\n');
     printHelp();
-    process.exit(2);
+    usage('Error: at least one of --baseline or --qrels must be set',
+      'Pass --qrels with a qrels fixture for the correctness gate (gbrain eval gate --qrels Y.qrels.json --json), --baseline with a published baseline for the regression gate, or both.');
   }
 
-  if (opts.baseline && !existsSync(opts.baseline)) {
-    console.error(`Error: baseline file not found: ${opts.baseline}`);
-    process.exit(2);
-  }
-  if (opts.qrels && !existsSync(opts.qrels)) {
-    console.error(`Error: qrels file not found: ${opts.qrels}`);
-    process.exit(2);
+  if (opts.baseline && !existsSync(opts.baseline)) usage(`Error: baseline file not found: ${opts.baseline}`, 'Pass an existing --baseline file (write one with `gbrain bench publish`).');
+  if (opts.qrels && !existsSync(opts.qrels)) usage(`Error: qrels file not found: ${opts.qrels}`, 'Pass an existing --qrels file.');
+
+  // Hermetic embedder validation. Only 'deterministic' is supported; the
+  // regression gate is out of scope (replay re-embeds captured queries via
+  // the gateway, which needs a provider key — defeating the hermetic point).
+  if (opts.embedder !== undefined) {
+    if (opts.embedder !== 'deterministic') {
+      usage(`Error: unsupported embedder "${opts.embedder}" — the only supported value is "deterministic".`,
+        'Example: gbrain eval gate --qrels Y.qrels.json --embedder deterministic');
+    }
+    if (opts.baseline) {
+      usage('Error: the deterministic embedder cannot be combined with the baseline regression gate ' +
+        '(replay re-embeds captured queries via the gateway). Use it with the qrels correctness gate only.',
+      'Run the deterministic embedder with --qrels only.');
+    }
+    if (!opts.qrels) usage('Error: the deterministic embedder requires a qrels file.', 'Example: gbrain eval gate --qrels Y.qrels.json --embedder deterministic');
   }
 
   const result: GateResult = {
@@ -468,23 +508,54 @@ export async function runEvalGate(engine: BrainEngine, args: string[]): Promise<
 
   if (opts.qrels) {
     const k = opts.k ?? DEFAULT_QRELS_THRESHOLDS.k;
+
+    // Deterministic embedder: build a searchFn that threads basis-vector
+    // query embeddings (derived from the qrels fixture itself) into bare
+    // hybridSearch via the queryEmbedFn seam. The rest of the pipeline
+    // (keyword/title/alias arms, RRF, boosts) runs exactly as production.
+    let deterministicSearchFn: CorrectnessGateOpts['searchFn'] | undefined;
+    if (opts.embedder === 'deterministic') {
+      let queryEmbedFn: (text: string) => Float32Array;
+      try {
+        const { buildQrelsQueryEmbedFn } = await import('../eval/deterministic-embed.ts');
+        queryEmbedFn = buildQrelsQueryEmbedFn(readFileSync(opts.qrels, 'utf-8'));
+      } catch (err) {
+        usage(`Error: could not build the deterministic embedder from ${opts.qrels}: ${(err as Error).message}`,
+          'Fix the qrels file (it must parse as a qrels fixture).');
+      }
+      const { hybridSearch } = await import('../core/search/hybrid.ts');
+      deterministicSearchFn = async (e, q, o) => {
+        const results = await hybridSearch(e, q, { limit: o.limit, queryEmbedFn });
+        return results.map(r => ({ source_id: r.source_id, slug: r.slug }));
+      };
+    }
+
     result.correctness_gate = await runCorrectnessGateDispatch(engine, opts.qrels, k, {
       thresholdRecallAtK: opts.thresholdRecallAtK,
       thresholdFirstRelevantHit: opts.thresholdFirstRelevantHit,
       thresholdExpectedTop1: opts.thresholdExpectedTop1,
-    });
+    }, deterministicSearchFn);
     if (result.correctness_gate.breaches && result.correctness_gate.breaches.length > 0) {
       result.verdict = 'fail';
     }
   }
 
   if (opts.json) {
-    console.log(JSON.stringify(result, null, 2));
+    // D2: one NDJSON line under the --json guard; the legacy pretty document otherwise.
+    await writeJsonLine(result, () => console.log(JSON.stringify(result, null, 2)));
   } else {
     printHumanOutput(result);
   }
 
-  if (result.verdict === 'fail') process.exit(1);
+  if (result.verdict !== 'fail') return;
+  // D2: under the --json guard the stream ends with the status:error line naming the failed gate.
+  if (jsonGuardActive()) {
+    const breached = [...(result.regression_gate.breaches ?? []), ...(result.correctness_gate.breaches ?? [])].map(b => b.metric);
+    process.exit(writeCliError(opError('gate_failed', `The eval gate failed: ${breached.join(', ') || 'thresholds breached'}.`,
+      'Read the result line\'s breaches. Fix the retrieval regression, or (if the change is intended) publish a new baseline with `gbrain bench publish`.'),
+    'eval', { json: true, stderr: false }));
+  }
+  process.exit(1);
 }
 
 // Exported for tests + e2e LOOP test

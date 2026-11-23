@@ -23,10 +23,12 @@
  * pure: input is text, output is text + outcome.
  */
 
+import { assertLegacySkillFilesystemWrite } from '../skillpack/writer-guard.ts';
 import * as fs from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../spawn.ts';
 import { dirname } from 'node:path';
 import type { EditOp, EditResult, EditRejectionReason } from './types.ts';
+import { gitChildEnv } from '../git-env.ts';
 
 // ─── Public API ───────────────────────────────────────────────────────────
 
@@ -288,12 +290,13 @@ export function getWorkingTreeStatusForFile(filePath: string): 'clean' | 'dirty'
     const cwd = dirname(filePath);
     // First check we're in a repo.
     try {
-      execFileSync('git', ['rev-parse', '--git-dir'], { cwd, stdio: 'pipe' });
+      execFileSync('git', ['rev-parse', '--git-dir'], { env: gitChildEnv(), cwd, stdio: 'pipe' });
     } catch {
       return 'not_a_repo';
     }
     // Then check status on this specific file.
     const out = execFileSync('git', ['status', '--porcelain', '--', filePath], {
+      env: gitChildEnv(),
       cwd,
       encoding: 'utf8',
       stdio: 'pipe',
@@ -309,7 +312,9 @@ export function getWorkingTreeStatusForFile(filePath: string): 'clean' | 'dirty'
  * but provided here for ad-hoc callers (orchestrator uses version-store).
  */
 export function atomicWrite(filePath: string, content: string): void {
+  assertLegacySkillFilesystemWrite(filePath);
   const tmp = filePath + '.tmp';
+  assertLegacySkillFilesystemWrite(tmp);
   const fd = fs.openSync(tmp, 'w');
   try {
     fs.writeFileSync(fd, content, { encoding: 'utf8' });
@@ -317,5 +322,6 @@ export function atomicWrite(filePath: string, content: string): void {
   } finally {
     fs.closeSync(fd);
   }
+  assertLegacySkillFilesystemWrite(filePath);
   fs.renameSync(tmp, filePath);
 }

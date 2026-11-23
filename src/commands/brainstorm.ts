@@ -24,10 +24,19 @@ import {
 } from '../core/brainstorm/orchestrator.ts';
 import { loadConfig } from '../core/config.ts';
 import { StructuredAgentError } from '../core/errors.ts';
-import { serializeMarkdown } from '../core/markdown.ts';
+import { parseMarkdown, serializeMarkdown } from '../core/markdown.ts';
 import { importFromContent } from '../core/import-file.ts';
-import { writePageThrough, type WriteThroughResult } from '../core/write-through.ts';
+import { privateRequestRefusal } from '../core/persistence/visibility-request.ts';
+import { misspelledReaderKeys, readersNoncanonicalRefusal } from '../core/persistence/readers-request.ts';
+import { isWriteThroughDisabled, resolvePageWriteTarget, writePageThrough, type WriteThroughResult } from '../core/write-through.ts';
+import { fileDatabaseDriftToken, replaceableFile } from '../core/facts/file-body-guard.ts';
+import { managedPersistenceEnabled } from '../core/persistence/ownership.ts';
+import { submitPageMutation } from '../core/persistence/page-mutations.ts';
+import { acceptPendingCovers, currentCliWriteWait, pendingReceiptOf, pollCommand } from '../core/persistence/write-wait.ts';
+import { PENDING_WRITE_EXIT_CODE } from '../core/exit-codes.ts';
 import { randomBytes } from 'crypto';
+import { legacyNestedErrorDocument } from '../core/agent-output.ts';
+import { CapFlagError, mergeCapFlag, parseCapFlag, type CapFlag } from '../core/budget/cap-flag.ts';
 
 export interface BrainstormCliArgs {
   question?: string;
@@ -35,8 +44,10 @@ export interface BrainstormCliArgs {
   save?: boolean;
   yes: boolean;
   limit?: number;
-  /** Cost ceiling in USD; aborts pre-run if estimate exceeds. Default $5. */
-  maxCost?: number;
+  /** Cost ceiling in USD (`--max-usd`, legacy `--max-cost`); null = off; undefined = the $5 default. */
+  maxCost?: number | null;
+  /** The cap flag spelling the user typed. */
+  maxCostFlag?: string;
   /** Hard cap on far-set prefix sampling. Default 50. */
   maxFarSet?: number;
   /** When true, abort mid-run if running spend exceeds 5× estimate. */
@@ -58,6 +69,7 @@ export interface BrainstormCliArgs {
 export function parseBrainstormArgs(args: string[]): BrainstormCliArgs {
   const out: BrainstormCliArgs = { json: false, yes: false, help: false };
   const positional: string[] = [];
+  let cap: CapFlag | undefined;
   let i = 0;
   while (i < args.length) {
     const arg = args[i];
@@ -79,14 +91,16 @@ export function parseBrainstormArgs(args: string[]): BrainstormCliArgs {
         return out;
       }
       out.limit = n;
-    } else if (arg === '--max-cost') {
-      const v = args[++i];
-      const n = v ? parseFloat(v) : NaN;
-      if (!Number.isFinite(n) || n <= 0) {
-        out.error = `--max-cost requires a positive number in USD (got ${v})`;
+    } else if (arg === '--max-usd' || arg === '--max-cost') {
+      try {
+        cap = mergeCapFlag(cap, parseCapFlag(arg, args[++i]));
+      } catch (err) {
+        if (!(err instanceof CapFlagError)) throw err;
+        out.error = err.message;
         return out;
       }
-      out.maxCost = n;
+      out.maxCost = cap.usd;
+      out.maxCostFlag = cap.flag;
     } else if (arg === '--max-far-set') {
       const v = args[++i];
       const n = v ? parseInt(v, 10) : NaN;
@@ -150,7 +164,11 @@ Options:
   --no-save                       Don't save; print only
   --yes, -y                       Skip the 10s cost-preview wait (TTY only)
   --limit N                       Override the far-bank size (default 6 brainstorm / 12 LSD)
-  --max-cost USD                  Abort if estimated cost exceeds USD (default 5)
+  --max-usd USD|off               Abort if estimated cost exceeds USD (default 5;
+                                  --max-cost is the legacy spelling). off runs
+                                  uncapped. A model with no price runs under the
+                                  default with a warning; an explicit cap refuses
+                                  it until you register its rate (gbrain pricing set)
   --max-far-set N                 Cap domain bank prefix sampling (default 50)
   --strict-budget                 Abort if running cost exceeds 5× the estimate
   --judge-model MODEL             Override the judge LLM (larger-context for big runs)
@@ -185,7 +203,11 @@ Options:
   --save                          Persist to wiki/ideas/<date>-lsd-<slug>.md (default OFF)
   --yes, -y                       Skip the 10s cost-preview wait (TTY only)
   --limit N                       Override the far-bank size (default 12)
-  --max-cost USD                  Abort if estimated cost exceeds USD (default 5)
+  --max-usd USD|off               Abort if estimated cost exceeds USD (default 5;
+                                  --max-cost is the legacy spelling). off runs
+                                  uncapped. A model with no price runs under the
+                                  default with a warning; an explicit cap refuses
+                                  it until you register its rate (gbrain pricing set)
   --max-far-set N                 Cap domain bank prefix sampling (default 50)
   --strict-budget                 Abort if running cost exceeds 5× the estimate
   --judge-model MODEL             Override the judge LLM (larger-context for big runs)
@@ -264,14 +286,24 @@ async function runBrainstormCli(
   // catch. Without this CLI formatter, the typed error reaches main()'s
   // generic catch which prints `e.message` only — losing the structured
   // `.hint` field that's the whole point of the orchestrator-level wrap.
+  // Save policy: brainstorm defaults to save-on; lsd defaults to save-off.
+  // CLI --save / --no-save overrides the default. The slug is minted BEFORE
+  // the run so the orchestrator can bank it in the checkpoint: a `--resume`
+  // after a judge failure then hands back the slug the failed run saved
+  // under, and the re-scored page overwrites it instead of forking a second
+  // page under a fresh nonce.
+  const shouldSave = parsed.save ?? profile.default_save;
+  const freshSlug = buildIdeaSlug(parsed.question, profile.label);
   let result;
   try {
     result = await runBrainstorm(engine, config, {
       question: parsed.question,
       profile: effectiveProfile,
       skipCostPreview: skipPreview,
+      ideaSlug: shouldSave ? freshSlug : undefined,
       // v0.39.0.0 T10 cost-cap surface — wired in master, preserved here.
       maxCostUsd: parsed.maxCost,
+      maxCostFlag: parsed.maxCostFlag,
       maxFarSet: parsed.maxFarSet,
       strictBudget: parsed.strictBudget,
       judgeModel: parsed.judgeModel,
@@ -284,7 +316,7 @@ async function runBrainstormCli(
       if (parsed.json) {
         // Agents reading --json get the structured envelope (matches
         // serializeError shape from src/core/errors.ts).
-        console.log(JSON.stringify({ error: err.envelope }, null, 2));
+        console.log(JSON.stringify(legacyNestedErrorDocument(err.envelope), null, 2));
       } else {
         console.error(`Error [${err.envelope.code}]: ${err.envelope.message}`);
         if (err.envelope.hint) console.error(`  Hint: ${err.envelope.hint}`);
@@ -305,17 +337,14 @@ async function runBrainstormCli(
   const md = formatBrainstormMarkdown(result, { onlyPassed: true, includeMeta: true });
   console.log(md);
 
-  // Save policy: brainstorm defaults to save-on; lsd defaults to save-off.
-  // CLI --save / --no-save overrides the default.
-  const shouldSave = parsed.save ?? profile.default_save;
   if (shouldSave) {
-    const slug = buildIdeaSlug(parsed.question, profile.label);
+    const slug = result.idea_slug ?? freshSlug;
     const title = `${profile.label === 'lsd' ? 'LSD' : 'Brainstorm'}: ${parsed.question.slice(0, 100)}`;
     // Build ONE frontmatter object and render via the canonical serializer so
     // the saved file round-trips through `gbrain sync` byte-for-byte. Include
-    // filtered ideas (onlyPassed:false) so a future --retry-judge has the full
-    // set to re-score.
-    const fmObj = buildBrainstormFrontmatterObject(result);
+    // filtered ideas (onlyPassed:false) so a judge-failed run still shows every
+    // idea; `--resume <run_id>` re-scores and overwrites this same page.
+    const fmObj = { ...buildBrainstormFrontmatterObject(result), source_kind: profile.label };
     const body = formatBrainstormMarkdown(result, { onlyPassed: false, includeMeta: true });
     const content = serializeMarkdown(fmObj, body, '', { type: 'note', title, tags: [] });
 
@@ -335,6 +364,10 @@ export interface SaveOutcome {
   dbError?: string;
   /** Disk write-through result (rendered from the saved row). */
   writeThrough: WriteThroughResult;
+  /** Set when nothing was saved because the page's file holds content the database lacks (`file_database_drift`). */
+  held?: string;
+  /** G6: the door accepted the save and it was still pending when the CLI write wait ended; it may still commit. */
+  pending?: { requestId: string; poll: string; acceptPending: boolean };
 }
 
 export interface SaveMessage {
@@ -352,22 +385,61 @@ export interface SaveMessage {
  * embedding cost at save time) writes the DB row, then the shared
  * `writePageThrough` helper renders that row to disk. Rendering from the row
  * means the two sinks cannot diverge, and the row matches what `gbrain sync`
- * would produce — so a later sync doesn't churn it. The file is only attempted
- * when the DB write landed (it's rendered from the row).
+ * would produce — so a later sync doesn't churn it (the CLI puts `source_kind`
+ * in the content's frontmatter, so the row and the rendered file agree). The
+ * file is only attempted when the DB write landed (it's rendered from the row).
+ *
+ * #6982: before importing, the page's file (a `--resume` reuses the slug) must
+ * hold nothing the database lacks (`replaceableFile`); otherwise nothing is
+ * saved and `held` says why. The file write is bound to the bytes compared, so
+ * an edit landing during the save is kept (`skipped: 'file_changed'`).
  */
 export async function persistSavedIdea(
   engine: BrainEngine,
   args: { slug: string; content: string; sourceId?: string; provenanceVia: string },
 ): Promise<SaveOutcome> {
   const sourceId = args.sourceId ?? 'default';
+  const wait = currentCliWriteWait();
+  // G6: a managed brain refuses direct imports. put_page through the door publishes the file before the row; a --resume
+  // overwrite binds to the revision it read (expected_revision), and the door's compare-before-replace guards the file.
+  try {
+    if (await managedPersistenceEnabled(engine)) {
+      const snapshot = await engine.readPageSnapshot(args.slug, { sourceId, includeDeleted: true });
+      const response = await submitPageMutation({ engine, config: loadConfig() ?? { engine: engine.kind } as never, remote: false, dryRun: false, sourceId,
+        writeWaitMs: wait.waitMs,
+        logger: { info() {}, warn() {}, error() {} } }, { operation: 'put_page', params: { slug: args.slug, source_id: sourceId, content: args.content,
+        source_kind: args.provenanceVia, ...(snapshot ? { expected_revision: snapshot.revision } : {}) } });
+      const writeThrough = (response.write_through ?? { written: false }) as WriteThroughResult;
+      const target = writeThrough.written ? await resolvePageWriteTarget(engine, args.slug, sourceId) : null;
+      return { dbSaved: true, writeThrough: target?.ok ? { ...writeThrough, path: target.filePath } : writeThrough };
+    }
+  } catch (err) {
+    const receipt = pendingReceiptOf(err);
+    if (receipt) return { dbSaved: false, writeThrough: { written: false }, pending: { requestId: receipt.request_id,
+      poll: pollCommand(receipt.request_id, (err as { fix?: { argv?: readonly string[] } }).fix), acceptPending: wait.acceptPending && acceptPendingCovers(receipt) } };
+    return { dbSaved: false, dbError: err instanceof Error ? err.message : String(err), writeThrough: { written: false } };
+  }
   let dbSaved = false;
   let dbError: string | undefined;
+  let expectedFileBytes: string | null | undefined;
   try {
-    await importFromContent(engine, args.slug, args.content, {
+    const target = await isWriteThroughDisabled(engine) ? null : await resolvePageWriteTarget(engine, args.slug, sourceId);
+    const file = target?.ok ? await replaceableFile(engine, sourceId, args.slug, target.filePath) : null;
+    if (file && !file.ok) {
+      return { dbSaved: false, held: fileDatabaseDriftToken(args.slug, sourceId, 'before', 'the idea was not saved'), writeThrough: { written: false } };
+    }
+    expectedFileBytes = file?.expectedFileBytes;
+    const imported = await importFromContent(engine, args.slug, args.content, {
       noEmbed: true,
       sourceId,
       sourcePath: `${args.slug}.md`,
+      holdNoncanonicalPrivate: true,
     });
+    if (imported.refusal?.code === 'visibility_noncanonical') throw privateRequestRefusal({ slug: imported.slug, source_id: sourceId }, parseMarkdown(args.content, `${imported.slug}.md`).frontmatter);
+    if (imported.refusal?.code === 'readers_noncanonical') {
+      throw readersNoncanonicalRefusal({ slug: imported.slug, source_id: sourceId }, misspelledReaderKeys(args.content, parseMarkdown(args.content, `${imported.slug}.md`).frontmatter));
+    }
+    if (imported.refusal) throw new Error(imported.refusal.message);
     dbSaved = true;
   } catch (err) {
     dbError = err instanceof Error ? err.message : String(err);
@@ -376,6 +448,7 @@ export async function persistSavedIdea(
     ? await writePageThrough(engine, args.slug, {
         sourceId,
         frontmatterOverrides: { source_kind: args.provenanceVia },
+        expectedFileBytes,
       })
     : { written: false, skipped: 'page_not_found_after_write' };
   return { dbSaved, dbError, writeThrough };
@@ -394,6 +467,17 @@ export function formatSaveOutcome(
 ): SaveMessage {
   const { dbSaved, dbError, writeThrough } = outcome;
   const stderr: string[] = [];
+  if (outcome.held) {
+    stderr.push(`gbrain ${ctx.profileLabel}: save refused: ${outcome.held}. Rerun with --resume <run_id> once the page and its file agree.`);
+    return { stderr, exitCode: 1 };
+  }
+  if (outcome.pending) {
+    return {
+      stdout: `\n_Save of page \`${ctx.slug}\` accepted and still pending (request ${outcome.pending.requestId}); it may still commit. Check it with \`${outcome.pending.poll}\`._`,
+      stderr,
+      exitCode: outcome.pending.acceptPending ? 0 : PENDING_WRITE_EXIT_CODE,
+    };
+  }
   if (dbError) stderr.push(`gbrain ${ctx.profileLabel}: DB save failed: ${dbError}`);
   if (writeThrough.error) {
     stderr.push(`gbrain ${ctx.profileLabel}: file write failed: ${writeThrough.error}`);
@@ -415,7 +499,28 @@ export function formatSaveOutcome(
   }
   if (dbSaved && writeThrough.skipped === 'repo_not_found') {
     return {
-      stdout: `\n_Saved to DB page \`${ctx.slug}\` (\`sync.repo_path\` is not a directory — skipped file write)._`,
+      stdout: `\n_Saved to DB page \`${ctx.slug}\` (the source directory, \`sources.local_path\` or \`sync.repo_path\`, is relative or not a directory — skipped file write)._`,
+      stderr,
+      exitCode: 0,
+    };
+  }
+  if (dbSaved && writeThrough.skipped === 'file_changed') {
+    return {
+      stdout: `\n_Saved to DB page \`${ctx.slug}\` (its file changed during the save and was kept, not rewritten: file_changed; \`gbrain sync\` imports that edit, and page history keeps this save)._`,
+      stderr,
+      exitCode: 0,
+    };
+  }
+  if (dbSaved && writeThrough.skipped === 'mirror_read_only') {
+    return {
+      stdout: `\n_Saved to DB page \`${ctx.slug}\` (the source is a read-only mirror, \`gbrain sources mirror-readonly\` — kept database-only)._`,
+      stderr,
+      exitCode: 0,
+    };
+  }
+  if (dbSaved && writeThrough.skipped === 'url_clone') {
+    return {
+      stdout: `\n_Saved to DB page \`${ctx.slug}\` (the source is a clone gbrain pulls from upstream — kept database-only)._`,
       stderr,
       exitCode: 0,
     };

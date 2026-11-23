@@ -1,6 +1,6 @@
 # `gbrain eval takes-quality` — reproducible cross-modal quality eval
 
-v0.32+ ships a CI-able quality gate for the takes layer. Three frontier models
+`gbrain eval takes-quality` is a CI-able quality gate for the takes layer. Three frontier models
 score a sample of takes against a 5-dimension rubric, the runner aggregates to
 PASS / FAIL / INCONCLUSIVE, and the receipt persists to `eval_takes_quality_runs`
 so a follow-up `trend` or `regress` can compare against history.
@@ -28,10 +28,10 @@ receipt file from disk and re-renders it. The other modes need the brain.
 |---|---|---|
 | `--limit N` | 100 | Random sample of N takes from the brain. |
 | `--cycles N` | 3 (TTY) / 1 (non-TTY) | Up to N panel calls before giving up; early-stop on PASS or INCONCLUSIVE. |
-| `--budget-usd N` | unset | Abort before next call's projected cost would exceed cap. Models without a `pricing.ts` entry fail loud (codex #4). |
-| `--source db|fs` | `db` | `fs` is reserved for v0.33+. |
+| `--budget-usd N` | unset | Abort before next call's projected cost would exceed cap. Models without a `pricing.ts` entry fail loud rather than silently blowing the budget. |
+| `--source db|fs` | `db` | `fs` is reserved; the runner refuses it and asks for `--source db`. |
 | `--slug-prefix P` | unset | Filter takes to pages whose slug starts with P. |
-| `--models a,b,c` | `openai:gpt-4o,anthropic:claude-opus-4-7,google:gemini-1.5-pro` | Comma-separated panel. |
+| `--models a,b,c` | `openai:gpt-5.2,anthropic:claude-opus-4-7,google:gemini-3.5-flash-lite` | Comma-separated panel. |
 | `--json` | off | Emit the full receipt to stdout. |
 
 ## Receipt JSON shape (`schema_version: 1`)
@@ -50,7 +50,7 @@ receipt file from disk and re-renders it. The other modes need the brain.
   },
   "prompt_sha8": "abcd1234",
   "models_sha8": "abcd1234",
-  "models": ["openai:gpt-4o", "anthropic:claude-opus-4-7", "google:gemini-1.5-pro"],
+  "models": ["openai:gpt-5.2", "anthropic:claude-opus-4-7", "google:gemini-3.5-flash-lite"],
   "cycles_run": 3,
   "successes_per_cycle": [3, 3, 2],
   "verdict": "pass",
@@ -65,7 +65,12 @@ receipt file from disk and re-renders it. The other modes need the brain.
   "cost_usd": 1.85,
   "improvements": ["..."],
   "errors": [],
-  "verdictMessage": "PASS: every dim mean >=7 and min >=5 ..."
+  "verdictMessage": "PASS: every dim mean >=7 and min >=5 ...",
+  "protocol_version": 2,
+  "correction_selection_rule": "corrected_if_valid",
+  "corrections": [
+    { "cycle": 0, "modelId": "google:gemini-3.5-flash-lite", "first_error": "incomplete_scores: missing dim(s) [accuracy]", "corrected": "valid" }
+  ]
 }
 ```
 
@@ -73,8 +78,8 @@ receipt file from disk and re-renders it. The other modes need the brain.
 
 - `schema_version` — locks the contract. Adding optional fields is additive
   and compatible. Renaming, removing, or changing semantics bumps the version.
-- `rubric_version` + `rubric_sha8` — segregate trend rows by rubric epoch
-  (codex review #3). When the rubric definition changes, both fields update,
+- `rubric_version` + `rubric_sha8` — segregate trend rows by rubric epoch.
+  When the rubric definition changes, both fields update,
   and trend mode groups runs accordingly so a stricter rubric doesn't
   silently look like a quality drop.
 - `corpus.corpus_sha8` — fingerprint over the joined takes-text the judge
@@ -83,21 +88,37 @@ receipt file from disk and re-renders it. The other modes need the brain.
   models in `--models` doesn't change the sha (sort is stable).
 - `successes_per_cycle` — count of contributing models per cycle. A model
   contributes when (a) its JSON parsed AND (b) every declared rubric dim
-  has a finite score (codex review #5 — missing-dim drops the contribution).
+  has a finite score (a missing dim drops the whole contribution).
 - `verdict` — `pass` if every dim mean >= 7 AND every dim min across
   contributing models >= 5; `fail` otherwise; `inconclusive` if fewer than
   2/3 models contributed complete scores.
-- `cost_usd` — sum of per-call cost via `pricing.ts`. Unknown models when
-  `--budget-usd` is set produce a `PricingNotFoundError` before any call
-  fires.
+- `protocol_version` — the eval protocol (absent on older receipts, read as
+  1). Protocol 2 runs every judge with thinking off (so a judge-sized output
+  cap is not spent on reasoning) and re-asks a malformed slot once. `regress`
+  lists a protocol change among the dissimilar inputs.
+- `corrections` — one entry per slot whose reply was malformed: unparseable
+  (`parse_failed`, including an empty reply) or missing a dimension
+  (`incomplete_scores`). The same model gets the same sample once more with
+  the validator's error appended. `first_error` is the first attempt's
+  failure; `corrected` is `valid`, `invalid` (with `corrected_error`), or
+  `null` when the correction was not sent (`skipped_reason`: `budget` when the
+  cap could not cover it, `aborted`). Under `correction_selection_rule:
+  corrected_if_valid` a corrected reply replaces the first attempt only when
+  it validates. Provider errors and valid low scores are never re-asked.
+  Correction calls count toward `cost_usd` and the budget cap.
+- `cost_usd` — sum of per-call cost via `pricing.ts` (a rate registered with
+  `gbrain pricing set`, else the canonical table). An unpriced model with
+  `--budget-usd` set refuses with `no_pricing` before any call fires; its fix
+  is `gbrain pricing set <model> --input <usd/1M> --output <usd/1M> --source
+  <url>`. Without a cap it runs with a warning and its spend is not counted.
 
 ## Receipt persistence
 
-Receipts persist to **`eval_takes_quality_runs`** (DB-authoritative per
-codex review #6) AND to disk at `~/.gbrain/eval-receipts/takes-quality-<corpus>-<prompt>-<models>-<rubric>.json`
+Receipts persist to **`eval_takes_quality_runs`** (the DB is authoritative)
+AND to disk at `~/.gbrain/eval-receipts/takes-quality-<corpus>-<prompt>-<models>-<rubric>.json`
 as a best-effort artifact. The DB row carries the full receipt JSON in the
 `receipt_json` JSONB column, so when the disk artifact is gone, `replay`
-can still reconstruct via `loadReceiptFromDb` (v0.33+ flag wiring).
+can still reconstruct via `loadReceiptFromDb`.
 
 The 4-sha primary key is unique (`UNIQUE` constraint) so re-running an
 identical eval is `INSERT ... ON CONFLICT DO NOTHING` — idempotent.
@@ -142,7 +163,7 @@ gbrain eval takes-quality regress --against .ci/takes-quality-baseline.json \
 The threshold is the per-dim-mean drop counting as regression. Default 0.5.
 Regress reuses the **same** model panel + slug prefix + source as the prior
 receipt for an apples-to-apples compare. Diffs in `corpus_sha8` /
-`prompt_sha8` / `rubric_sha8` are surfaced as informational warnings (the
+`prompt_sha8` / `rubric_sha8` / `protocol_version` are surfaced as informational warnings (the
 runner doesn't refuse — that's the caller's call).
 
 ## Contract stability

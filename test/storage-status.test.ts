@@ -19,6 +19,8 @@ const baseResult: StorageStatusResult = {
     db_only: ['media/x/', 'media/articles/'],
   },
   repoPath: '/data/brain',
+  restoreSource: null,
+  restoreRefusal: null,
   totalPages: 12500,
   pagesByTier: { db_tracked: 2156, db_only: 10100, unspecified: 244 },
   missingFiles: [],
@@ -79,7 +81,29 @@ describe('formatStorageStatusHuman', () => {
     expect(out).toContain('media/x/tweet-9'); // 10th
     expect(out).not.toContain('media/x/tweet-10'); // 11th truncated
     expect(out).toContain('and 15 more');
-    expect(out).toContain('gbrain export --restore-only --repo "/data/brain"');
+    expect(out).toContain('gbrain export --restore-only --repo /data/brain');
+  });
+
+  test.each([
+    { name: 'names the restore source', restore: { restoreSource: 'connector-a' },
+      has: 'Use: gbrain export --restore-only --source connector-a --repo /data/brain', lacks: 'Cannot suggest' },
+    // Pasting the hint must not run anything the repo path spells.
+    { name: 'shell-quotes a repo path with quotes and substitutions',
+      restore: { restoreSource: 'default', repoPath: "/data/b\"r$(touch x)`id`'s brain" },
+      has: "Use: gbrain export --restore-only --source default --repo '/data/b\"r$(touch x)`id`'\\''s brain'", lacks: 'Cannot suggest' },
+    { name: 'prints a refused restore target instead of a command', restore: { restoreRefusal: 'Pass --source <id>.' },
+      has: 'Cannot suggest a restore command: Pass --source <id>.', lacks: 'Use: gbrain export' },
+  ])('restore hint: $name', ({ restore, has, lacks }) => {
+    const missingFiles = [{ slug: 'media/x/clip', expectedPath: '/data/brain/media/x/clip.md' }];
+    const out = formatStorageStatusHuman({ ...baseResult, ...restore, missingFiles });
+    expect(out).toContain(has);
+    expect(out).not.toContain(lacks);
+  });
+
+  test('prints a restore refusal even when no file is missing', () => {
+    const out = formatStorageStatusHuman({ ...baseResult, restoreRefusal: 'Pass --source <id>.', missingFiles: [] });
+    expect(out).toContain('Cannot suggest a restore command: Pass --source <id>.');
+    expect(out).not.toContain('Missing Files');
   });
 
   test('shows configuration listing for both tiers', () => {

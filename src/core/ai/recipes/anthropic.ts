@@ -17,19 +17,38 @@ export const anthropic: Recipe = {
   touchpoints: {
     // No embedding model available.
     expansion: {
-      models: ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6'],
+      models: ['claude-haiku-4-5-20251001', 'claude-sonnet-5', 'claude-sonnet-4-6'],
       cost_per_1m_tokens_usd: 0.25,
       price_last_verified: '2026-05-10',
     },
     chat: {
       models: [
+        'claude-fable-5',
+        'claude-fable-5-1',
+        'claude-opus-5-5',
+        'claude-opus-5',
+        'claude-opus-4-8',
         'claude-opus-4-7',
+        'claude-sonnet-5-5',
+        'claude-sonnet-5',
         'claude-sonnet-4-6',
+        'claude-haiku-5-5',
         'claude-haiku-4-5-20251001',
       ],
       supports_tools: true,
       supports_subagent_loop: true,
       supports_prompt_cache: true,
+      model_context_tokens: {
+        'claude-fable-5': 1_000_000,
+        'claude-fable-5-1': 1_000_000,
+        'claude-opus-5-5': 1_000_000,
+        'claude-opus-5': 1_000_000,
+        'claude-sonnet-5-5': 1_000_000,
+        'claude-sonnet-5': 1_000_000,
+        'claude-opus-4-8': 1_000_000,
+        'claude-opus-4-7': 1_000_000,
+        'claude-opus-4-6': 1_000_000,
+      },
       max_context_tokens: 200000,
       cost_per_1m_input_usd: 3.0, // sonnet-class baseline
       cost_per_1m_output_usd: 15.0,

@@ -238,7 +238,7 @@ function printAutoFixHuman(autoFix: AutoFixReport, dryRun: boolean): void {
   const label = dryRun ? 'fixes proposed' : 'fixes applied';
   console.log(`${n} ${label}${s > 0 ? `, ${s} skipped:` : '.'}`);
   for (const sk of autoFix.skipped) {
-    const hint = sk.reason === 'working_tree_dirty' ? ' (run `git stash` first)' : '';
+    const hint = sk.reason === 'working_tree_dirty' ? ' (commit or discard your edits to those files first)' : '';
     console.log(`  - ${sk.skillPath}: ${sk.reason}${hint}`);
   }
   if (dryRun && n > 0) console.log('Run without --dry-run to apply.\n');
@@ -298,10 +298,10 @@ export async function runCheckResolvable(args: string[]): Promise<void> {
       );
       process.exit(1);
     }
-    autoFix = autoFixDryViolations(skillsDir, { dryRun: flags.dryRun });
+    autoFix = autoFixDryViolations(skillsDir, { dryRun: flags.dryRun, insertMissingRules: false });
   }
 
-  const report = checkResolvable(skillsDir);
+  const report = checkResolvable(skillsDir, { skillsDirSource: source === 'explicit' ? null : source });
 
   // Exit semantics (D-CX-3):
   //   default mode: fail iff any errors

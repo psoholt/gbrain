@@ -16,10 +16,10 @@
  * always reserving 1 connection for HNSW + heartbeat + doctor probes.
  */
 
+import type { BrainEngine } from '../core/engine.ts';
 import { resolveDirectPoolSize } from '../core/connection-manager.ts';
 import { listBackfills, getBackfill } from '../core/backfill-registry.ts';
 import { runBackfill, clearBackfillCheckpoint } from '../core/backfill-base.ts';
-import { loadConfig, toEngineConfig } from '../core/config.ts';
 
 interface BackfillArgs {
   kind?: string;
@@ -91,7 +91,7 @@ Flags:
                      (default 3 - 1 = 2). Always reserves 1 conn for HNSW +
                      heartbeat + doctor probes.
   --resume           Pick up from last checkpoint (auto-detected; default on).
-  --fresh            Restart from id=0, ignoring checkpoint.
+  --fresh            Restart from id=0, ignoring checkpoint; retries held rows.
   --dry-run          Report what WOULD happen; no writes.
   --keep-index       Skip HNSW drop-rebuild for embedding backfills.
   --max-errors N     Bail after N total errors (default 200).
@@ -114,7 +114,14 @@ function clampConcurrency(requested: number | undefined): { effective: number; w
   return { effective: requested };
 }
 
-export async function runBackfillCommand(args: string[]): Promise<void> {
+/**
+ * #1963 (same class as reindex-frontmatter): takes the ALREADY-CONNECTED
+ * engine from cli.ts's dispatch. Building a second engine here deadlocked on
+ * the PGLite data-dir lock (cli.ts's `connectEngine()` already holds it in
+ * this same process) — every `gbrain backfill <kind>` on PGLite timed out
+ * after 30s. Engine lifecycle belongs to cli.ts's connect + teardown.
+ */
+export async function runBackfillCommand(engine: BrainEngine, args: string[]): Promise<void> {
   const cli = parseArgs(args);
   if (cli.help) { printHelp(); return; }
 
@@ -144,19 +151,9 @@ export async function runBackfillCommand(args: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const config = loadConfig();
-  if (!config) {
-    console.error('No brain configured. Run: gbrain init');
-    process.exit(2);
-  }
-
   // X5 admission control — clamp concurrency to direct-pool capacity.
   const { effective: concurrency, warning } = clampConcurrency(cli.concurrency);
   if (warning) console.warn(warning);
-
-  const { createEngine } = await import('../core/engine-factory.ts');
-  const engine = await createEngine(toEngineConfig(config));
-  await engine.connect(toEngineConfig(config));
 
   if (cli.fresh) {
     await clearBackfillCheckpoint(engine, reg.spec.name);
@@ -189,10 +186,15 @@ export async function runBackfillCommand(args: string[]): Promise<void> {
   console.log(`  errors:   ${result.errors}`);
   console.log(`  lastId:   ${result.lastId}`);
   console.log(`  duration: ${result.durationSec.toFixed(2)}s`);
+  if (result.skipped.length > 0) {
+    const held = result.skipped.filter(s => s.state === 'held').length;
+    console.log(`  skipped:  ${result.skipped.length} row(s) recorded in backfill.${reg.spec.name}.skipped (${held} held); each later run retries them`);
+    for (const s of result.skipped.slice(0, 20)) console.log(`    id ${s.id}: ${s.code} (${s.state} after ${s.attempts} run(s)); retry: ${s.fix}`);
+    if (result.skipped.length > 20) console.log(`    ... ${result.skipped.length - 20} more`);
+  }
   if (result.cappedByMaxRows) console.log(`  ⚠️  Capped by --max-rows; more remain.`);
   if (result.cappedByErrors) console.log(`  ⚠️  Capped by --max-errors at ${result.errors}.`);
 
-  await engine.disconnect();
   if (result.cappedByErrors) process.exit(1);
 }
 

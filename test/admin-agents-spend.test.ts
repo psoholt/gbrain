@@ -15,7 +15,8 @@ import { queryAgentClientSpend } from '../src/commands/serve-http.ts';
  *   - Excludes soft-deleted (deleted_at IS NOT NULL) clients
  *   - Excludes clients with neither scope=agent nor bindings
  *   - Sums today's mcp_spend_log entries (UTC-day-aligned)
- *   - Sums pending mcp_spend_reservations (status='pending', non-expired)
+ *   - Sums unresolved mcp_spend_reservations, including overdue holds
+ *   - Reports unpriced unresolved calls without pretending their cost is zero
  *   - Counts active subagent jobs by __owner_client_id JSONB field
  *   - Returns ORDER BY client_name ASC (deterministic)
  *   - Null cap_usd_per_day surfaces as null (not 0)
@@ -52,15 +53,15 @@ async function seedClient(opts: {
        (client_id, client_name, client_secret_hash, scope, grant_types,
         redirect_uris, token_endpoint_auth_method,
         bound_tools, bound_max_concurrent, budget_usd_per_day,
-        created_at, deleted_at)
+        created_at, deleted_at, source_id, federated_read, bound_source_id, delegated_namespace)
      VALUES ($1, $2, '', $3, ARRAY['client_credentials'],
              ARRAY[]::text[], 'client_secret_post',
-             $4, 1, $5, now(), $6)`,
+             $4, 1, $5, now(), $6, 'default', ARRAY['default'], 'default', 'job')`,
     [
       opts.id,
       opts.name ?? opts.id,
       opts.scope ?? 'read',
-      opts.bound_tools ?? null,
+      opts.bound_tools !== undefined ? opts.bound_tools : opts.scope?.split(' ').includes('agent') ? ['search'] : null,
       opts.budget_usd_per_day ?? null,
       opts.deleted ? new Date() : null,
     ],
@@ -80,8 +81,9 @@ describe('queryAgentClientSpend (v0.38 Slice 4 — /admin/api/agents/spend SQL)'
     expect(rows).toEqual([]);
   });
 
-  it('includes a client with scope=agent (even without bindings)', async () => {
-    await seedClient({ id: 'agent-only', scope: 'read agent' });
+  it('rejects incomplete agent grants and includes a valid agent-only binding', async () => {
+    await expect(seedClient({ id: 'agent-invalid', scope: 'agent', bound_tools: null })).rejects.toThrow('oauth_clients_complete_agent_grant');
+    await seedClient({ id: 'agent-only', scope: 'agent' });
     const rows = await queryAgentClientSpend(engine);
     expect(rows.length).toBe(1);
     expect(rows[0].client_id).toBe('agent-only');
@@ -150,6 +152,41 @@ describe('queryAgentClientSpend (v0.38 Slice 4 — /admin/api/agents/spend SQL)'
     expect(rows[0].spent_cents_today).toBe(50);
   });
 
+  it('day boundary is a UTC INSTANT, independent of the session timezone', async () => {
+    // Regression pin for the snapshot-timezone incident: the old predicate
+    // compared created_at against a NAIVE date_trunc result, which the
+    // session timezone reinterpreted — a non-UTC session (host-tz PGLite,
+    // tz-configured Postgres role, snapshot-restored engine pre-parity-fix)
+    // shifted the day boundary by its offset and underreported evening spend.
+    //
+    // Deterministic at ANY wall-clock hour: rows exactly AT UTC midnight and
+    // 1s BEFORE it must classify identically under sessions ±12h from UTC.
+    // Under the old predicate, Etc/GMT+12 excluded the midnight row and
+    // Etc/GMT-12 included the pre-midnight row — one of the two always broke.
+    await seedClient({ id: 'tz-edge', scope: 'read agent' });
+    await engine.executeRaw(
+      `INSERT INTO mcp_spend_log (client_id, operation, spend_cents, created_at)
+       VALUES
+         ('tz-edge', 'subagent_loop', 7,
+          date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'),
+         ('tz-edge', 'subagent_loop', 999,
+          (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') - interval '1 second')`,
+    );
+    const original = (await engine.executeRaw<{ TimeZone: string }>(`SHOW timezone`))[0].TimeZone;
+    for (const zone of ['Etc/GMT+12', 'Etc/GMT-12', 'UTC']) {
+      await engine.executeRaw(`SELECT set_config('TimeZone', '${zone}', false)`);
+      try {
+        const rows = await queryAgentClientSpend(engine);
+        const edge = rows.find(r => r.client_id === 'tz-edge')!;
+        // Only the exactly-at-midnight row (7¢) counts as today — never the
+        // 1s-before row (999¢) — regardless of session zone.
+        expect(`${zone}:${edge.spent_cents_today}`).toBe(`${zone}:7`);
+      } finally {
+        await engine.executeRaw(`SELECT set_config('TimeZone', $1, false)`, [original]);
+      }
+    }
+  });
+
   it('isolates spend by client_id (no cross-client leakage)', async () => {
     await seedClient({ id: 'alice', scope: 'read agent' });
     await seedClient({ id: 'bob', scope: 'read agent' });
@@ -179,7 +216,7 @@ describe('queryAgentClientSpend (v0.38 Slice 4 — /admin/api/agents/spend SQL)'
     expect(rows[0].pending_cents).toBe(70);
   });
 
-  it('excludes expired pending reservations from pending_cents', async () => {
+  it('includes overdue pending and expired reservations until reconciliation', async () => {
     await seedClient({ id: 'expired-pending', scope: 'read agent' });
     const past = new Date(Date.now() - 60 * 1000);
     const future = new Date(Date.now() + 60 * 1000);
@@ -187,11 +224,22 @@ describe('queryAgentClientSpend (v0.38 Slice 4 — /admin/api/agents/spend SQL)'
       `INSERT INTO mcp_spend_reservations
          (reservation_id, client_id, estimated_cents, model, provider, status, expires_at)
        VALUES ('00000000-0000-0000-0000-000000000003', 'expired-pending', 99, 'm', 'p', 'pending', $1),
-              ('00000000-0000-0000-0000-000000000004', 'expired-pending', 11, 'm', 'p', 'pending', $2)`,
+              ('00000000-0000-0000-0000-000000000004', 'expired-pending', 11, 'm', 'p', 'pending', $2),
+              ('00000000-0000-0000-0000-000000000007', 'expired-pending', 17, 'm', 'p', 'expired', $1)`,
       [past, future],
     );
     const rows = await queryAgentClientSpend(engine);
-    expect(rows[0].pending_cents).toBe(11); // only the non-expired one
+    expect(rows[0].pending_cents).toBe(127);
+  });
+
+  it('reports unresolved unknown estimates explicitly', async () => {
+    await seedClient({ id: 'unknown-cost', scope: 'agent' });
+    await engine.executeRaw(`INSERT INTO mcp_spend_reservations
+      (reservation_id, client_id, estimated_cents, estimate_known, model, provider, status, expires_at)
+      VALUES ('00000000-0000-0000-0000-000000000008', 'unknown-cost', 0, false, 'm', 'p', 'expired', now() - interval '2 days')`);
+    const [row] = await queryAgentClientSpend(engine);
+    expect(row.unknown_count).toBe(1);
+    expect(row.pending_cents).toBe(0); // Known subtotal only; unknown_count prevents a false zero total.
   });
 
   it('excludes settled reservations from pending_cents', async () => {
@@ -207,25 +255,25 @@ describe('queryAgentClientSpend (v0.38 Slice 4 — /admin/api/agents/spend SQL)'
     expect(rows[0].pending_cents).toBe(0);
   });
 
-  it('counts active+waiting subagent jobs as inflight_count', async () => {
+  it('counts every nonterminal subagent state as inflight_count', async () => {
     await seedClient({ id: 'busy-client', scope: 'read agent' });
     // 1 active + 1 waiting + 1 waiting-children + 1 completed (excluded)
-    for (const status of ['active', 'waiting', 'waiting-children', 'completed']) {
+    for (const status of ['active', 'waiting', 'waiting-children', 'delayed', 'paused', 'completed']) {
       await engine.executeRaw(
-        `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-         VALUES ('subagent', $1, $2::jsonb, 'default', 0, now())`,
+        `INSERT INTO minion_jobs (submission_authority, name, status, data, queue, priority, created_at)
+         VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', $1, $2::jsonb, 'default', 0, now())`,
         [status, JSON.stringify({ prompt: 'x', __owner_client_id: 'busy-client' })],
       );
     }
     const rows = await queryAgentClientSpend(engine);
-    expect(rows[0].inflight_count).toBe(3); // active + waiting + waiting-children
+    expect(rows[0].inflight_count).toBe(5);
   });
 
   it('only counts subagent jobs (not shell/other minion jobs)', async () => {
     await seedClient({ id: 'shell-too', scope: 'read agent' });
     await engine.executeRaw(
-      `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-       VALUES ('shell', 'active', $1::jsonb, 'default', 0, now())`,
+      `INSERT INTO minion_jobs (submission_authority, name, status, data, queue, priority, created_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'shell', 'active', $1::jsonb, 'default', 0, now())`,
       [JSON.stringify({ cmd: 'echo', __owner_client_id: 'shell-too' })],
     );
     const rows = await queryAgentClientSpend(engine);
@@ -261,8 +309,8 @@ describe('queryAgentClientSpend (v0.38 Slice 4 — /admin/api/agents/spend SQL)'
       [future],
     );
     await engine.executeRaw(
-      `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-       VALUES ('subagent', 'active', $1::jsonb, 'default', 0, now())`,
+      `INSERT INTO minion_jobs (submission_authority, name, status, data, queue, priority, created_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'active', $1::jsonb, 'default', 0, now())`,
       [JSON.stringify({ prompt: 'x', __owner_client_id: 'full-data' })],
     );
     const rows = await queryAgentClientSpend(engine);
@@ -272,6 +320,7 @@ describe('queryAgentClientSpend (v0.38 Slice 4 — /admin/api/agents/spend SQL)'
       cap_usd_per_day: 10.5,
       spent_cents_today: 250,
       pending_cents: 50,
+      unknown_count: 0,
       inflight_count: 1,
     });
   });

@@ -1,6 +1,8 @@
-import { describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { runBackfill, ensureBackfillIndex, clearBackfillCheckpoint } from '../src/core/backfill-base.ts';
 import type { BackfillSpec } from '../src/core/backfill-base.ts';
+import { getBackfill, listBackfills } from '../src/core/backfill-registry.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
 interface FakeRow {
   id: number;
@@ -144,6 +146,71 @@ describe('runBackfill — error handling', () => {
   });
 });
 
+/**
+ * #5730: a write batch runs inside BEGIN on a reserved connection. Its
+ * statements are buffered and applied only on COMMIT, like a real backend,
+ * and `fail` injects one error per statement prefix.
+ */
+class TransactionalFakeEngine extends FakeEngine {
+  fail = new Map<string, Error>();
+  private pending: number[] | null = null;
+
+  override async executeRaw<T = unknown>(sql: string, params?: unknown[]): Promise<T[]> {
+    const injected = [...this.fail.entries()].find(([prefix]) => sql.startsWith(prefix));
+    if (injected) {
+      this.fail.delete(injected[0]);
+      throw injected[1];
+    }
+    if (sql === 'BEGIN' || sql === 'BEGIN READ WRITE') { this.pending = []; return []; }
+    if (sql === 'ROLLBACK') { this.pending = null; return []; }
+    if (sql === 'COMMIT') {
+      for (const id of this.pending ?? []) await super.executeRaw(`UPDATE pages`, [id]);
+      this.pending = null;
+      return [];
+    }
+    if (sql.startsWith('UPDATE') && this.pending) { this.pending.push(params?.[0] as number); return []; }
+    return super.executeRaw<T>(sql, params);
+  }
+}
+
+const sqlError = (code: string, message: string) => Object.assign(new Error(message), { code });
+
+describe('runBackfill — transaction failures (#5730)', () => {
+  test('a failed ROLLBACK stops the run with a typed error naming both failures', async () => {
+    const engine = new TransactionalFakeEngine();
+    engine.rows = [{ id: 1, needs_backfill: true }];
+    engine.fail.set('UPDATE', sqlError('23505', 'duplicate key value'));
+    engine.fail.set('ROLLBACK', sqlError('08006', 'connection failure'));
+    const error = await runBackfill(engine as never, makeSpec(), { batchSize: 10 }).catch(e => e);
+    expect(error.name).toBe('BackfillRollbackError');
+    expect(error.code).toBe('backfill_rollback_failed');
+    expect(error.message).toContain('batch error: 23505 duplicate key value');
+    expect(error.message).toContain('rollback error: 08006 connection failure');
+    expect(error.fix).toBe('gbrain backfill test_backfill --resume');
+    expect(engine.rows[0].needs_backfill).toBe(true);
+    expect(engine.config.get('backfill.test_backfill.last_id')).toBeUndefined();
+  });
+
+  test('a failed SET LOCAL aborts the batch instead of running it in an aborted transaction', async () => {
+    const engine = new TransactionalFakeEngine();
+    engine.rows = [{ id: 1, needs_backfill: true }];
+    engine.fail.set('SET LOCAL', sqlError('42501', 'permission denied to set parameter'));
+    const error = await runBackfill(engine as never, makeSpec(), { batchSize: 10 }).catch(e => e);
+    expect(error?.code).toBe('42501');
+    expect(engine.rows[0].needs_backfill).toBe(true);
+  });
+
+  test('rows of a rolled-back batch are not counted as updated', async () => {
+    const engine = new TransactionalFakeEngine();
+    engine.rows = [{ id: 1, needs_backfill: true }, { id: 2, needs_backfill: true }];
+    engine.fail.set('COMMIT', sqlError('57014', 'canceling statement due to statement timeout'));
+    const result = await runBackfill(engine as never, makeSpec(), { batchSize: 10 });
+    expect(result.errors).toBe(1);
+    expect(result.updated).toBe(2);
+    expect(engine.rows.every(r => !r.needs_backfill)).toBe(true);
+  });
+});
+
 describe('clearBackfillCheckpoint', () => {
   test('removes the config key', async () => {
     const engine = new FakeEngine();
@@ -175,4 +242,39 @@ describe('ensureBackfillIndex — P2/X4', () => {
     expect(result.existed).toBe(true);
     expect(result.created).toBe(false);
   });
+});
+
+describe('backfill registry', () => {
+  test('listBackfills returns the canonical registry entries', () => {
+    const names = listBackfills().map(e => e.spec.name).sort();
+    expect(names).toEqual(['effective_date', 'embedding_voyage', 'emotional_weight', 'modality']);
+  });
+
+  test('embedding_voyage is declared-only', () => {
+    expect(getBackfill('embedding_voyage')?.v030_1_status).toBe('declared-only');
+  });
+});
+
+describe('implemented backfills against a freshly initialized PGLite brain', () => {
+  let engine: PGLiteEngine;
+
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+  });
+
+  afterAll(async () => {
+    await engine.disconnect();
+  });
+
+  for (const name of ['effective_date', 'emotional_weight', 'modality']) {
+    test(`${name} finds every column it reads and has no work on an empty brain`, async () => {
+      const reg = getBackfill(name);
+      expect(reg?.v030_1_status).toBe('implemented');
+      const result = await runBackfill(engine, reg!.spec, { batchSize: 100 });
+      expect(result.examined).toBe(0);
+      expect(result.errors).toBe(0);
+    });
+  }
 });

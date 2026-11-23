@@ -28,9 +28,11 @@
  * if precision@HIGH < 0.75; fail PR if < 0.50.
  */
 
+import { gbrainPath } from '../core/config.ts';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from 'fs';
+import { isInteractive, readLine } from '../core/interaction.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { join, resolve } from 'path';
-import { homedir } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
 
 const DEFAULT_TARGETS = { high: 20, medium: 20, low: 10 } as const;
@@ -66,12 +68,12 @@ interface MineOpts {
 
 /** Resolve the path where mining writes its candidates JSONL. */
 export function defaultMiningOutPath(): string {
-  return join(homedir(), '.gbrain', 'eval', 'notability-mining-candidates.jsonl');
+  return gbrainPath('eval', 'notability-mining-candidates.jsonl');
 }
 
 /** Resolve the path where review writes confirmed cases. */
 export function defaultReviewOutPath(): string {
-  return join(homedir(), '.gbrain', 'eval', 'notability-real.jsonl');
+  return gbrainPath('eval', 'notability-real.jsonl');
 }
 
 /**
@@ -238,6 +240,7 @@ async function classifyBatch(paragraphs: string[]): Promise<Array<'high' | 'medi
   if (paragraphs.length === 0) return [];
 
   const { chat } = await import('../core/ai/gateway.ts');
+  const { resolveTierDefault } = await import('../core/model-config.ts');
 
   const system = [
     'Classify each paragraph into HIGH, MEDIUM, or LOW notability for personal-knowledge memory:',
@@ -245,6 +248,7 @@ async function classifyBatch(paragraphs: string[]): Promise<Array<'high' | 'medi
     '  relationship status changes, health changes, emotional breakthroughs, financial decisions.',
     '- MEDIUM: Durable preferences, beliefs, strong opinions that reveal character.',
     '- LOW: Logistical noise, restaurant orders, routine scheduling.',
+    '  Label honestly — LOW is a real classification, not a skip; every paragraph gets a tier.',
     '',
     'Output strictly one JSON object: {"tiers":["high"|"medium"|"low",...]} ',
     'with one entry per input in order. No prose, no fences.',
@@ -256,10 +260,12 @@ async function classifyBatch(paragraphs: string[]): Promise<Array<'high' | 'medi
 
   try {
     const result = await chat({
-      model: 'anthropic:claude-haiku-4-5-20251001',
+      // #3813: key-aware tier default, not a hardcoded Anthropic model.
+      model: resolveTierDefault('utility'),
       system,
       messages: [{ role: 'user', content: userMsg }],
       maxTokens: 200,
+      allowFallback: false,
     });
     const text = result.text.trim().replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '');
     const parsed = JSON.parse(text) as { tiers?: string[] };
@@ -342,36 +348,40 @@ export async function runNotabilityEval(args: RunNotabilityEvalArgs): Promise<vo
         console.error(`No candidates found at ${inPath}. Run mine first.`);
         return;
       }
-      // The interactive TTY review loop is implemented as a thin shim
-      // over readline. Tests cover the pure mining path; the TTY loop
-      // gets a smoke-only test that injects answers via process.stdin.
+      // Hand-confirming tiers is a human task: with no one at the terminal
+      // (an agent, a pipe, closed stdin) refuse up front instead of reading
+      // EOF as answers or hanging on a silent pipe (C5). Prompts go through
+      // interaction.readLine: EOF or a 5-minute silence ends the review and
+      // keeps what was confirmed so far.
+      if (!isInteractive()) {
+        console.error(
+          `notability-eval review needs a person at a terminal to confirm each tier; nothing was read or written. `
+          + `Ask the user to run: gbrain notability-eval review --in ${inPath}`,
+        );
+        setCliExitVerdict(1);
+        return;
+      }
       const confirmed: ConfirmedCase[] = [];
-      const { default: readline } = await import('readline');
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      const ask = (q: string) => new Promise<string>(r => rl.question(q, a => r(a)));
-
-      try {
+      // eslint-disable-next-line no-console
+      console.log(`Reviewing ${candidates.length} candidates. Press q to quit early.`);
+      // eslint-disable-next-line no-console
+      console.log(`Confirmed cases will write to ${outPath}.`);
+      const now = () => new Date().toISOString();
+      for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
         // eslint-disable-next-line no-console
-        console.log(`Reviewing ${candidates.length} candidates. Press q to quit early.`);
+        console.log(`\n--- ${i + 1}/${candidates.length} (${c.path}) ---`);
         // eslint-disable-next-line no-console
-        console.log(`Confirmed cases will write to ${outPath}.`);
-        const now = () => new Date().toISOString();
-        for (let i = 0; i < candidates.length; i++) {
-          const c = candidates[i];
-          // eslint-disable-next-line no-console
-          console.log(`\n--- ${i + 1}/${candidates.length} (${c.path}) ---`);
-          // eslint-disable-next-line no-console
-          console.log(c.paragraph);
-          // eslint-disable-next-line no-console
-          console.log(`Predicted: ${c.predicted_tier}`);
-          const ans = (await ask('Confirm tier (h/m/l) or q to quit, s to skip: ')).trim().toLowerCase();
-          if (ans === 'q') break;
-          if (ans === 's') continue;
-          const tier = ans === 'h' ? 'high' : ans === 'l' ? 'low' : 'medium';
-          confirmed.push({ ...c, confirmed_tier: tier, confirmed_at: now() });
-        }
-      } finally {
-        rl.close();
+        console.log(c.paragraph);
+        // eslint-disable-next-line no-console
+        console.log(`Predicted: ${c.predicted_tier}`);
+        const read = await readLine({ prompt: 'Confirm tier (h/m/l) or q to quit, s to skip: ' });
+        if (read.kind !== 'line') break;
+        const ans = read.text.trim().toLowerCase();
+        if (ans === 'q') break;
+        if (ans === 's') continue;
+        const tier = ans === 'h' ? 'high' : ans === 'l' ? 'low' : 'medium';
+        confirmed.push({ ...c, confirmed_tier: tier, confirmed_at: now() });
       }
       writeJsonlCases(outPath, confirmed);
       // eslint-disable-next-line no-console

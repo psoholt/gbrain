@@ -50,6 +50,38 @@ describe('parseMarkdown validation surface', () => {
       const e = parsed.errors!.find(e => e.code === 'MISSING_CLOSE');
       expect(e).toBeDefined();
     });
+
+    test('YAML # comment at top of closed frontmatter does NOT trigger MISSING_CLOSE', () => {
+      // Real-world repro: research-note templates often lead with `#` comment
+      // lines as YAML comments inside the fence. The parser previously read
+      // these as markdown H1s and false-positived MISSING_CLOSE even when the
+      // closing `---` was present.
+      const md = `${fence}
+# Research Template
+# This file serves as a template for all research findings
+
+research_id: "R19"
+title: "iOS App Clip security limitations"
+${fence}
+
+body`;
+      const parsed = parseMarkdown(md, undefined, { validate: true });
+      expect(parsed.errors!.map(e => e.code)).not.toContain('MISSING_CLOSE');
+    });
+
+    test('YAML # comments interleaved with keys do NOT trigger MISSING_CLOSE', () => {
+      const md = `${fence}
+type: concept
+# section: identifiers
+research_id: "R19"
+# section: routing
+slug: research/r19
+${fence}
+
+body`;
+      const parsed = parseMarkdown(md, undefined, { validate: true });
+      expect(parsed.errors!.map(e => e.code)).not.toContain('MISSING_CLOSE');
+    });
   });
 
   describe('YAML_PARSE', () => {
@@ -158,6 +190,20 @@ describe('parseMarkdown validation surface', () => {
       const md = `${fence}\ntype: concept\ntitle: x\ntags: ["Men''s Fashion", "yc"]\n${fence}\n\nbody`;
       const parsed = parseMarkdown(md, undefined, { validate: true });
       expect(parsed.errors!.filter(e => e.code === 'NESTED_QUOTES')).toHaveLength(0);
+    });
+
+    // #6157: a block-scalar continuation line can look like `Key: "a", "b"`.
+    // When the whole block parses, the per-line heuristic must not run.
+    test('folded block-scalar continuation that looks like key: "a" "b" does NOT trigger (#6157)', () => {
+      const md = `${fence}\ntype: concept\ntitle: Interview notes\nclaim: >-\n  The founder said\n  Reply: "Ship it", then "measure it" twice\n${fence}\n\nbody`;
+      const parsed = parseMarkdown(md, undefined, { validate: true });
+      expect(parsed.errors!.filter(e => e.code === 'NESTED_QUOTES' || e.code === 'YAML_PARSE')).toHaveLength(0);
+    });
+
+    test('literal block-scalar lines with Key: "a" "b" do NOT trigger (#6157)', () => {
+      const md = `${fence}\ntype: concept\ntitle: x\nnotes: |\n  Q: "why" and "how"\n  A: "later" "maybe"\n${fence}\n\nbody`;
+      const parsed = parseMarkdown(md, undefined, { validate: true });
+      expect(parsed.errors!.filter(e => e.code === 'NESTED_QUOTES' || e.code === 'YAML_PARSE')).toHaveLength(0);
     });
 
     test('genuinely broken nested quotes STILL trigger', () => {

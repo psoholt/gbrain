@@ -9,8 +9,10 @@
 //
 // Three modes:
 //   --check    (default): print plan, no submission
-//   --auto:               submit auto_apply tier (requires --max-usd)
-//   --auto --yes:         also submit prompt_required tier
+//   --auto:               run the plan's job steps (requires --max-usd); a
+//                         manual-only step (unify-types, takes bootstrap) is
+//                         never submitted and is reported with the user's
+//                         own command instead
 //   --history:            show recent migration_impact_log entries
 //
 // `--json` switches to the stable JSON envelope. No CLI mode → human render.
@@ -19,6 +21,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { computeRemediationPlan, runRemediation } from '../core/remediation/index.ts';
 import { runAllOnboardChecks } from '../core/onboard/checks.ts';
 import { buildOnboardReport, renderHuman } from '../core/onboard/render.ts';
+import { CapFlagError, mergeCapFlag, parseCapFlag, type CapFlag } from '../core/budget/cap-flag.ts';
 
 function parseInt10(args: string[], flag: string): number | null {
   const i = args.indexOf(flag);
@@ -27,17 +30,9 @@ function parseInt10(args: string[], flag: string): number | null {
   return isNaN(v) ? null : v;
 }
 
-function parseFloat10(args: string[], flag: string): number | null {
-  const i = args.indexOf(flag);
-  if (i === -1 || i === args.length - 1) return null;
-  const v = parseFloat(args[i + 1] ?? '');
-  return isNaN(v) ? null : v;
-}
-
 export async function runOnboard(engine: BrainEngine, args: string[]): Promise<void> {
   const check = args.includes('--check') || (!args.includes('--auto') && !args.includes('--history'));
   const auto = args.includes('--auto');
-  const yes = args.includes('--yes');
   const history = args.includes('--history');
   const jsonOutput = args.includes('--json');
   // v0.42 (T16): --explain extends --check with per-cluster narrative
@@ -49,11 +44,20 @@ export async function runOnboard(engine: BrainEngine, args: string[]): Promise<v
   // stays undefined, which runRemediation already treats as no ceiling (skips the
   // est-cost refusal + BudgetTracker runs uncapped); `maxUsdOff` lifts the
   // missing-cap refusal below. Spend is still ledgered.
-  const maxUsdIdx = args.indexOf('--max-usd');
-  const maxUsdVal = maxUsdIdx >= 0 ? (args[maxUsdIdx + 1] ?? '').trim().toLowerCase() : '';
-  const maxUsdOff = ['off', 'unlimited', 'none'].includes(maxUsdVal);
-  const maxUsdRaw = parseFloat10(args, '--max-usd');
-  const maxUsd = maxUsdRaw === null ? undefined : maxUsdRaw;
+  // D19 shared parser: a malformed, 0 or conflicting --max-usd is refused
+  // before any plan or paid call instead of silently dropping the cap.
+  let cap: CapFlag | undefined;
+  try {
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === '--max-usd') cap = mergeCapFlag(cap, parseCapFlag('--max-usd', args[i + 1]));
+    }
+  } catch (e) {
+    if (!(e instanceof CapFlagError)) throw e;
+    process.stderr.write(`gbrain onboard: ${e.message}\n`);
+    process.exit(2);
+  }
+  const maxUsdOff = cap?.usd === null;
+  const maxUsd = cap?.usd ?? undefined;
 
   // --history shows the impact log directly; no plan computation.
   if (history) {
@@ -77,7 +81,7 @@ export async function runOnboard(engine: BrainEngine, args: string[]): Promise<v
       delta: (r.metric_before === null || r.metric_after === null)
         ? null
         : Number(r.metric_after) - Number(r.metric_before),
-      applied_at: r.applied_at,
+      applied_at: new Date(r.applied_at).toISOString(),
     }));
     if (jsonOutput) {
       process.stdout.write(JSON.stringify({
@@ -125,11 +129,15 @@ export async function runOnboard(engine: BrainEngine, args: string[]): Promise<v
   if (check && !auto) {
     const plan = await computeRemediationPlan(engine, { targetScore, extraRemediations });
     const report = buildOnboardReport(plan);
+    const { mutedFirstRunDecisionsNotice } = await import('../core/onboard/mcp-onboarding.ts');
+    const muted = await mutedFirstRunDecisionsNotice(engine).catch(() => null);
     if (jsonOutput) {
-      process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+      const { cliRenderContext, renderNotice } = await import('../core/agent-output.ts');
+      process.stdout.write(JSON.stringify(muted ? { ...report, notices: [renderNotice(muted, cliRenderContext())] } : report, null, 2) + '\n');
       return;
     }
     process.stdout.write(renderHuman(report) + '\n');
+    if (muted) (await import('../core/interop-notices.ts')).writeCliNotices([muted]);
     // v0.42 (T16): --explain extension. Per-cluster narrative for the
     // pack_upgrade_available recommendation. Runs unify-types in dry-run
     // mode and renders the per-rule diff. No-op when no pack upgrade
@@ -142,19 +150,14 @@ export async function runOnboard(engine: BrainEngine, args: string[]): Promise<v
 
   // --auto path: runs through the T2 library orchestrator. Hooks emit CLI
   // progress to stderr; the final result lands as JSON on stdout (or human
-  // summary).
+  // summary). extraRemediations (gathered above from runAllOnboardChecks)
+  // is threaded into the runner so the onboard-check remediations
+  // (extract-ner, extract-timeline-from-meetings, etc.) reach the planner
+  // — the same wiring the --check path uses above. The runner never submits
+  // a manual-only step; it returns them as `manual_only_skipped`.
   const result = await runRemediation(
     engine,
-    {
-      targetScore,
-      maxUsd,
-      // --auto --yes opts into the prompt_required tier too; library
-      // doesn't distinguish auto_apply vs prompt_required, it just runs
-      // every remediation in the plan. The plan-building side (T12 render)
-      // does the tier distinction; for --auto without --yes, the CLI shell
-      // would pre-filter the extras to auto_apply only. For now: pass
-      // everything; CLI documents this is "everything" behavior.
-    },
+    { targetScore, maxUsd, extraRemediations },
     {
       onTargetUnreachable: (target, ceiling) => {
         process.stderr.write(
@@ -163,7 +166,7 @@ export async function runOnboard(engine: BrainEngine, args: string[]): Promise<v
         );
       },
       onNothingToDo: (score, target) => {
-        process.stdout.write(
+        (jsonOutput ? process.stderr : process.stdout).write(
           `Brain at score ${score}/100, target ${target}/100. Nothing to do.\n`,
         );
       },
@@ -187,16 +190,28 @@ export async function runOnboard(engine: BrainEngine, args: string[]): Promise<v
     },
   );
 
-  if (result.target_unreachable) process.exit(2);
-
   if (jsonOutput) {
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
-  } else if (result.submitted.length > 0) {
-    process.stdout.write(
-      `\nBrain score: ${result.brain_score_initial} → ${result.brain_score_final} (target ${targetScore})\n` +
-      `Submitted: ${result.submitted.length} job(s), ${result.aborted_count} aborted/failed\n`,
-    );
+  } else {
+    if (result.submitted.length > 0) {
+      process.stdout.write(
+        `\nBrain score: ${result.brain_score_initial} → ${result.brain_score_final} (target ${targetScore})\n` +
+        `Submitted: ${result.submitted.length} job(s), ${result.aborted_count} aborted/failed\n`,
+      );
+    }
+    const manual = result.manual_only_skipped ?? [];
+    if (manual.length > 0) {
+      process.stdout.write(`\nNot run: ${manual.length} manual-only step(s). Review them with gbrain onboard --check, then run the ones you want yourself:\n`);
+      for (const m of manual) {
+        process.stdout.write(`  - ${m.job}${(m.est_usd_cost ?? 0) > 0 ? ` (~$${(m.est_usd_cost ?? 0).toFixed(2)})` : ''}: ${m.fix.command}\n`);
+        for (const q of m.queued_jobs ?? []) {
+          process.stdout.write(`    job #${q.id} (${q.status}) was queued by an earlier run and still runs; cancel it with gbrain jobs cancel ${q.id}\n`);
+        }
+      }
+    }
   }
+
+  if (result.target_unreachable) process.exit(2);
 
   const anyFailed = result.submitted.some(
     (s) => s.status !== 'completed' && s.status !== 'submitted' && s.status !== 'dry_run',
@@ -247,7 +262,7 @@ async function renderPackUpgradeExplain(
       `  Page-to-link:        ${result.per_phase.page_to_link.would_convert} edges across ${result.per_phase.page_to_link.rules} rules\n` +
       `  Page-to-alias:       ${result.per_phase.page_to_alias.would_alias} aliases across ${result.per_phase.page_to_alias.rules} rules\n` +
       `\nRun the migration with:\n` +
-      `  gbrain jobs submit unify-types --allow-protected --params '${JSON.stringify({ target_pack: targetPack })}'\n`,
+      `  gbrain jobs submit unify-types --params '${JSON.stringify({ target_pack: targetPack, apply: true })}'\n`,
     );
     if (result.warnings.length > 0) {
       process.stdout.write(`\nWarnings:\n`);

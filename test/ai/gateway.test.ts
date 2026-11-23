@@ -2,8 +2,11 @@ import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
 import {
   configureGateway,
   resetGateway,
+  __unconfigureGatewayForTests,
   isAvailable,
   embed,
+  embedOne,
+  __setEmbedTransportForTests,
   getEmbeddingModel,
   getEmbeddingDimensions,
   getExpansionModel,
@@ -16,7 +19,10 @@ import {
 // (capture / ingest-capture tests), where it produced "Incorrect API key
 // provided: openai-fake" against the real OpenAI endpoint and wedged
 // the shard. Reset once at file teardown so no caller sees the residue.
-afterAll(() => resetGateway());
+afterAll(() => {
+  resetGateway();
+  __setEmbedTransportForTests(null);
+});
 import { parseModelId, resolveRecipe } from '../../src/core/ai/model-resolver.ts';
 import {
   dimsProviderOptions,
@@ -40,14 +46,43 @@ describe('gateway configuration', () => {
     expect(getExpansionModel()).toBe('anthropic:claude-haiku-4-5-20251001');
   });
 
-  test('defaults are ZE 1280d as of v0.36.0.0 (D3)', () => {
+  test('defaults are Voyage 1024d as of v0.36.0.0 (D3)', () => {
     // The default flipped from openai:text-embedding-3-large 1536d to
-    // zeroentropyai:zembed-1 1280d in v0.36.0.0. The cost story is in
+    // voyage:voyage-4 1024d in v0.36.0.0. The cost story is in
     // CHANGELOG.md; the rationale lives in src/core/ai/gateway.ts:45-54.
     configureGateway({ env: {} });
-    expect(getEmbeddingModel()).toBe('zeroentropyai:zembed-1');
-    expect(getEmbeddingDimensions()).toBe(1280);
+    expect(getEmbeddingModel()).toBe('voyage:voyage-4');
+    expect(getEmbeddingDimensions()).toBe(1024);
     expect(getExpansionModel()).toBe('anthropic:claude-haiku-4-5-20251001');
+  });
+});
+
+describe('gateway.embedOne options', () => {
+  beforeEach(() => {
+    resetGateway();
+    __setEmbedTransportForTests(null);
+  });
+
+  test('passes maxRetries=0 to the provider transport for health probes', async () => {
+    let observedMaxRetries: number | undefined;
+    configureGateway({
+      embedding_model: 'google:gemini-embedding-001',
+      embedding_dimensions: 3,
+      env: { GOOGLE_GENERATIVE_AI_API_KEY: 'fake-google' },
+    });
+    __setEmbedTransportForTests(async (args: any) => {
+      observedMaxRetries = args.maxRetries;
+      return {
+        embeddings: [new Array(3).fill(0.1)],
+        usage: { tokens: 1 },
+      } as any;
+    });
+
+    const vector = await embedOne('health probe', { maxRetries: 0 });
+
+    expect(observedMaxRetries).toBe(0);
+    expect(vector.length).toBe(3);
+    __setEmbedTransportForTests(null);
   });
 });
 
@@ -55,6 +90,9 @@ describe('gateway.isAvailable (silent-drop regression surface)', () => {
   beforeEach(() => resetGateway());
 
   test('returns false when gateway not configured', () => {
+    // resetGateway() restores the preload's test baseline (#3554); go
+    // genuinely unconfigured for this one assertion.
+    __unconfigureGatewayForTests();
     expect(isAvailable('embedding')).toBe(false);
   });
 
@@ -110,6 +148,23 @@ describe('gateway.isAvailable (silent-drop regression surface)', () => {
     });
     expect(isAvailable('expansion')).toBe(true);
   });
+
+  // #1135 — an explicit expansion_model pointed at a chat-capable
+  // OpenAI-compatible provider used to silently yield no expansion because
+  // the recipe declared no expansion touchpoint.
+  test('expansion available for chat-capable openai-compat providers (deepseek/groq/together/openrouter)', () => {
+    const cases: Array<[string, Record<string, string>]> = [
+      ['deepseek:deepseek-chat', { DEEPSEEK_API_KEY: 'fake' }],
+      ['groq:llama-3.1-8b-instant', { GROQ_API_KEY: 'fake' }],
+      ['together:meta-llama/Llama-3.3-70B-Instruct-Turbo', { TOGETHER_API_KEY: 'fake' }],
+      ['openrouter:google/gemini-3-flash-preview', { OPENROUTER_API_KEY: 'fake' }],
+    ];
+    for (const [model, env] of cases) {
+      resetGateway();
+      configureGateway({ expansion_model: model, env });
+      expect(isAvailable('expansion'), `${model} expansion should be available`).toBe(true);
+    }
+  });
 });
 
 describe('model-resolver', () => {
@@ -161,6 +216,19 @@ describe('dims.dimsProviderOptions', () => {
   test('Google gemini-embedding returns outputDimensionality', () => {
     const opts = dimsProviderOptions('native-google', 'gemini-embedding-001', 768);
     expect(opts).toEqual({ google: { outputDimensionality: 768 } });
+  });
+
+  test('OpenAI-compatible gemini-embedding returns dimensions', () => {
+    const opts = dimsProviderOptions('openai-compatible', 'google/gemini-embedding-001', 1024);
+    expect(opts).toEqual({ openaiCompatible: { dimensions: 1024 } });
+  });
+
+  test('OpenAI-compatible text-embedding-004 (legacy Gemini id via a router) returns dimensions', () => {
+    // Routers serve the 768-native legacy id alongside gemini-embedding-*;
+    // without the branch a narrower brain gets the native width and fails on
+    // its first embed with a dim mismatch.
+    const opts = dimsProviderOptions('openai-compatible', 'text-embedding-004', 768);
+    expect(opts).toEqual({ openaiCompatible: { dimensions: 768 } });
   });
 
   test('Anthropic returns undefined (no embedding model)', () => {
@@ -235,6 +303,63 @@ describe('Voyage openai-compatible request shim', () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  // #6061: the Vercel AI Gateway reads the width from providerOptions.voyage;
+  // Voyage's own API rejects providerOptions with HTTP 400.
+  async function captureVoyageRequest(baseUrl: string | undefined, returnedDims = 2048) {
+    const originalFetch = globalThis.fetch;
+    let requestBody: Record<string, unknown> | undefined;
+    let requestUrl = '';
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      requestUrl = String(url instanceof Request ? url.url : url);
+      requestBody = JSON.parse(String(init?.body ?? '{}'));
+      return new Response(JSON.stringify({
+        object: 'list',
+        data: [{ object: 'embedding', index: 0, embedding: new Array(returnedDims).fill(0.01) }],
+        model: 'voyage-4-large',
+        usage: { total_tokens: 3 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as unknown as typeof fetch;
+    try {
+      configureGateway({
+        embedding_model: 'voyage:voyage-4-large',
+        embedding_dimensions: 2048,
+        env: { VOYAGE_API_KEY: 'voyage-fake' },
+        ...(baseUrl ? { base_urls: { voyage: baseUrl } } : {}),
+      });
+      const result = await embed(['dimension probe']).then((v) => ({ vectors: v, error: null }), (error: unknown) => ({ vectors: null, error }));
+      return { requestBody, requestUrl, ...result };
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
+  test('through the Vercel AI Gateway the width also rides providerOptions.voyage.outputDimension', async () => {
+    const { requestBody, requestUrl } = await captureVoyageRequest('https://ai-gateway.vercel.sh/v1');
+    expect(new URL(requestUrl).hostname).toBe('ai-gateway.vercel.sh');
+    expect(requestBody?.output_dimension).toBe(2048);
+    expect(requestBody?.providerOptions).toEqual({ voyage: { outputDimension: 2048 } });
+  });
+
+  test('the direct Voyage API and look-alike hosts never get providerOptions (Voyage answers 400 on it)', async () => {
+    for (const baseUrl of [undefined, 'https://api.voyageai.com/v1', 'https://ai-gateway.vercel.sh.attacker.example/v1', 'https://my-ai-gateway.vercel.sh/v1', 'https://proxy.example/ai-gateway.vercel.sh/v1']) {
+      const { requestBody } = await captureVoyageRequest(baseUrl);
+      expect(requestBody?.output_dimension).toBe(2048);
+      expect(requestBody && 'providerOptions' in requestBody).toBe(false);
+    }
+  });
+
+  test('a width mismatch through a custom base URL names the proxy as the likely cause; the default route keeps the migrate hint', async () => {
+    const proxied = await captureVoyageRequest('https://ai-gateway.vercel.sh/v1', 1024);
+    const err = proxied.error as { message: string; fix?: string };
+    expect(err.message).toContain('returned 1024 but schema expects 2048');
+    expect(err.message).toContain('ai-gateway.vercel.sh (provider_base_urls.voyage)');
+    expect(err.fix).toContain('gbrain doctor --only embedding_provider --probe --json');
+    const direct = await captureVoyageRequest(undefined, 1024);
+    const directErr = direct.error as { message: string; fix?: string };
+    expect(directErr.message).not.toContain('base_urls');
+    expect(directErr.fix).toContain('gbrain migrate --embedding-model');
   });
 });
 

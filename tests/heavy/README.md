@@ -38,6 +38,21 @@ The runner is `scripts/run-heavy.sh`. It discovers every `tests/heavy/*.sh`
 file at this directory's top level (NOT recursive), runs them in lexical
 order, fails on the first non-zero exit.
 
+## Database name floor (#3485)
+
+Heavy scripts run destructive operations (schema drops, migration replays,
+parallel syncs) against whatever database URL the environment names. The
+runner sources `tests/heavy/_db_floor.sh` once for the whole lane, and every
+database-touching script sources it itself: it refuses (exit 2) unless the
+database name in `DATABASE_URL` / `GBRAIN_DATABASE_URL` carries "test" as a
+word segment (e.g. `gbrain_test`), or the exact name is opted in one-shot via
+`GBRAIN_E2E_ALLOW_DB=<name>`. The PGLite-based scripts (`measure_rss.sh`,
+`read_latency_under_sync.sh`, `sync_timeout_rescue.sh`) unset the URL instead.
+When adding a script that touches the database, add
+`source "$(dirname "$0")/_db_floor.sh"` before it does — scripts are
+documented for direct invocation, so the runner-level floor alone is not
+enough.
+
 ## Naming convention
 
 - `tests/heavy/<name>.sh` — top-level test script, picked up by the runner.
@@ -59,6 +74,26 @@ Each script writes a per-run log to `~/.gbrain/audit/heavy-<script>-<ts>.log`
 containing subprocess stdout/stderr, environment state, and any captured
 metrics. The CI workflow uploads these as artifacts on failure for triage
 without re-running locally.
+
+## Sync lock regression
+
+`sync_lock_regression.sh` runs `test/e2e/sync-lock-overlap-postgres.test.ts`
+against an isolated test database. A reserved Postgres connection holds a
+write barrier on `pages`; a real CLI sync must acquire its source lease and
+reach that barrier before contenders start. Every contender must fail with
+lock-busy while the owner and its acquisition tokens remain unchanged.
+Only then does the test release the barrier, verify the import and lock
+cleanup, and allow a later sync to succeed. `NUM_PARALLEL` defaults to 4
+(allowed range 2–32). Fixtures use a unique source, not the default source.
+
+Counting successful exits from tiny concurrent syncs without a barrier is
+not an exclusion test: several can legitimately finish sequentially. The
+current source key is `gbrain-sync:<source>`, alongside the filesystem lease,
+not the obsolete global `gbrain-sync` key. The existing crash/recovery tests
+remain separate. This script prints its complete log path in a fresh temporary
+directory, leaving the operator's real brain untouched. Set
+`GBRAIN_HEAVY_LOG_DIR` to choose a retained output directory. CI uses its runner
+temporary directory and stages that output with the other heavy artifacts.
 
 ## Style
 

@@ -8,7 +8,7 @@ The whole walkthrough takes about 5 minutes. You'll see something working by ste
 
 ## What you'll need
 
-- gbrain v0.40.7.0 or later (`gbrain --version` to check)
+- gbrain installed (`gbrain --version` to check)
 - A brain that's been initialized (`gbrain init` already run; either PGLite or Postgres is fine)
 - A terminal you can paste commands into
 
@@ -17,22 +17,21 @@ That's it. No API keys required for this tutorial — every step works against t
 ## Step 1: See what pack is active today
 
 ```bash
-gbrain schema active --json
+gbrain schema active
 ```
 
 You'll see something like:
 
-```json
-{
-  "pack_name": "gbrain-base",
-  "version": "1.0.0",
-  "sha8": "...",
-  "page_types_count": 22,
-  "source_tier": "default"
-}
+```text
+Active pack: gbrain-base v1.0.0
+Source: default
+Pack identity: ...
+Page types: 22
+Link verbs: 12
+Takes kinds: hot, warm, cold
 ```
 
-`source_tier: "default"` means you haven't customized anything — you're on the bundled pack. `page_types_count: 22` is the universal starter (person, company, meeting, note, etc.).
+`Source: default` means you haven't customized anything — you're on the bundled pack. `Page types: 22` is the universal starter (person, company, meeting, note, etc.). (Agents needing this as JSON use the MCP op `get_active_schema_pack` — the CLI subcommand prints human output only.)
 
 **You can't mutate bundled packs directly.** Step 2 forks it so you have something writable.
 
@@ -54,7 +53,7 @@ gbrain schema use mine
 
 Output: `Pack: mine (json) ... Active.`
 
-Run `gbrain schema active --json` again to confirm `pack_name` is now `mine` and `source_tier` is `home-config` (read from `~/.gbrain/config.json`).
+Run `gbrain schema active` again to confirm `Active pack:` now says `mine` and `Source:` is `home-config` (read from `~/.gbrain/config.json`).
 
 **You've already accomplished something visible** — the active pack changed, and any future query will route through your fork. The next four steps add a custom type and prove it works.
 
@@ -172,7 +171,7 @@ gbrain whoknows "machine learning"
 
 If your researcher pages contain ML-related content, they'll surface in the ranked results — even though they're typed `researcher`, not `person` or `company`.
 
-**This is the load-bearing demonstration of T1.5 wiring.** Pre-v0.40.7.0, `whoknows` hardcoded `['person', 'company']` as the eligible types and would have ignored your `researcher` pages entirely. The v0.40.7.0 wiring consults the active pack's `expert_routing: true` types via `expertTypesFromPack(pack.manifest)`, so your custom type now routes through expert search.
+**This is the load-bearing demonstration of the pack-aware wiring.** `whoknows` consults the active pack's `expert_routing: true` types via `expertTypesFromPack(pack.manifest)` rather than a hardcoded `['person', 'company']` list, so your custom type routes through expert search instead of being ignored.
 
 ## What you built
 
@@ -185,6 +184,14 @@ You now have:
 You also exercised the full mutation skeleton: bundled-pack guard, per-pack lock, validation gate, atomic write, audit log, cache invalidation. Every step was idempotent — re-running any of them is a no-op.
 
 ## Next steps
+
+**Add a type set by frontmatter only.** Some types don't live in one directory: an `archive` page can sit anywhere and is typed by its frontmatter `type: archive`. Declare it with `--no-prefix` instead of `--prefix`:
+
+```bash
+gbrain schema add-type archive --primitive concept --no-prefix
+```
+
+The pack records `path_prefixes: []`, so pages get this type only from frontmatter. Leaving out both `--prefix` and `--no-prefix` is refused (exit 2, `invalid_params`), and `--no-prefix` can't be combined with `--extractable` or `--expert` (lint rules `extractable_empty_corpus`, `expert_routing_without_prefix`).
 
 **Add a link verb.** A `researcher` can `author` a `paper`. To model that:
 
@@ -204,7 +211,7 @@ gbrain schema add-alias researcher person
 
 Read [`skills/conventions/schema-evolution.md`](../skills/conventions/schema-evolution.md) for the decision tree on when to add types vs aliases vs prefixes. The short version: <20 pages → don't pack-codify; 20-100 → alias on existing type; 100+ → first-class type.
 
-**Lint your pack before shipping.** The 11-rule lint surface (with the optional `--with-db` flag for DB-aware checks) catches dangling references, prefix collisions, and dead-corpus warnings:
+**Lint your pack before shipping.** The 14-rule lint surface (with the optional `--with-db` flag for DB-aware checks, including the stored-type alias/undeclared rules) catches dangling references, prefix collisions, and dead-corpus warnings:
 
 ```bash
 gbrain schema lint --with-db
@@ -212,13 +219,12 @@ gbrain schema lint --with-db
 
 **Commit your pack to source control.** If `~/.gbrain/schema-packs/mine/` is a git repo, commit `pack.json` and push. Your pack survives across machines, and the `mutation_count_anomaly` lint rule will nudge you when you hit >50 mutations in a week (the "you should be committing this" signal).
 
-**For agents (MCP):** the same operations are reachable over HTTPS MCP via 9 new ops. Register an admin-scope OAuth client and `schema_apply_mutations` lets a remote agent compose multi-step refactors as one atomic batch. The batched MCP op + per-pack lock + audit log are the load-bearing primitives that make remote schema authoring safe. See [`skills/schema-author/SKILL.md`](../skills/schema-author/SKILL.md) for the agent dispatcher.
+**For agents (MCP):** the same operations are reachable over HTTPS MCP as schema ops. Register an admin-scope OAuth client and `schema_apply_mutations` lets a remote agent compose multi-step refactors as one atomic batch. The batched MCP op + per-pack lock + audit log are the load-bearing primitives that make remote schema authoring safe. See [`skills/schema-author/SKILL.md`](../skills/schema-author/SKILL.md) for the agent dispatcher.
 
-**Undo a mistake.** Every mutation primitive has an inverse (`remove-type`, `remove-alias`, `remove-prefix`, `remove-link-type`, `set-extractable false`, etc.). If you fork twice and want to revert, `gbrain schema downgrade` restores the previous active pack from `~/.gbrain/schema-pack-history.jsonl`.
+**Undo a mistake.** Every mutation primitive has an inverse (`remove-type`, `remove-alias`, `remove-prefix`, `remove-link-type`, `set-extractable false`, etc.). If you fork twice and want to revert, `gbrain schema downgrade --to <pack>` re-activates the pack you name (e.g. `--to gbrain-base`). The bare history-based form depends on `~/.gbrain/schema-pack-history.jsonl`, which nothing writes today — always pass `--to`.
 
 ## Related docs
 
-- **Reference:** `gbrain schema --help` for the full 22-verb CLI surface; CLAUDE.md's "Schema Cathedral v3 (v0.40.7.0)" section for the module-by-module architecture.
+- **Reference:** `gbrain schema --help` for the full CLI surface (30+ subcommands); the "Schema packs: mutation surface" section of `docs/architecture/KEY_FILES.md` for the module-by-module architecture.
 - **How-to:** [`skills/schema-author/SKILL.md`](../skills/schema-author/SKILL.md) — the agent dispatcher with the 7-phase workflow (brain → assess → propose → apply → sync → verify → commit).
 - **Explanation:** [`skills/conventions/schema-evolution.md`](../skills/conventions/schema-evolution.md) — when to add a type vs alias vs prefix.
-- **Plan + decisions:** the original design captured 21 decisions including the bundled-pack guard rationale (D6), the empty-filter fallback contract (D4), and the MCP non-localOnly trust posture (D2). Lives in `~/.claude/plans/system-instruction-you-are-working-recursive-thacker.md` (private).

@@ -1,256 +1,146 @@
-/**
- * v0.41.8.0 — PGLiteEngine.disconnect() lifecycle regression tests.
- *
- * Pins the invariants the v0.41.8.0 hang fix wave depends on:
- *
- *   1. ORDERING: `db.close()` is called BEFORE the file lock is
- *      released. A sibling process must not be able to acquire the
- *      lock and try to connect to a still-closing brain. PR #1337's
- *      original diff swapped this to release-then-close — we
- *      explicitly REJECTED that ordering. This test fails if a
- *      future maintainer reads the PR and applies the swap.
- *
- *   2. SNAPSHOT + EARLY-NULL: `this._db` is nulled BEFORE awaiting
- *      `close()`, so a concurrent `connect()` cannot observe a
- *      partial mid-close state. PR #1337's load-bearing contribution
- *      that we DID take.
- *
- *   3. LOCK LEAK GUARD: if `db.close()` throws, the file lock STILL
- *      releases. Codex outside-voice finding #7 in the eng review:
- *      without try/finally, a close-throw would wedge every next
- *      gbrain invocation on the stale lock.
- *
- *   4. IDEMPOTENCY: calling disconnect() twice is a clean no-op on
- *      the second call (no throw, no double-close attempt).
- *
- *   5. DOUBLE-DISCONNECT THEN CONNECT: after disconnect, a fresh
- *      connect() sees clean state and succeeds.
- *
- * Marked .serial because PGLite WASM cold-start dominates wallclock
- * for fresh-engine-per-test cases — running these in the parallel
- * shard pool would starve other PGLite tests of cold-start time.
- */
-
-import { describe, test, expect } from 'bun:test';
-import { mkdtempSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
+/** Actual PGLite shutdown ownership, including delayed and failed close. */
+import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { acquireLock, releaseLock, PgliteBusyError, type LockHandle } from '../src/core/pglite-lock.ts';
+import { PgliteClosingError } from '../src/core/pglite-lifecycle.ts';
+import { pgliteCloseTimeoutMs } from '../src/core/background-work.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { assertPersistenceAccepting, disposePersistenceConsumer, startPersistenceConsumer } from '../src/core/persistence/service.ts';
 
-function newTempDataDir(): string {
-  return mkdtempSync(join(tmpdir(), 'gbrain-disconnect-test-'));
+const roots: string[] = [], engines: PGLiteEngine[] = [];
+function deferred<T = void>() { let resolve!: (value: T | PromiseLike<T>) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
+function make() {
+  const root = mkdtempSync(join(tmpdir(), 'gbrain-datastore-lifecycle-')); roots.push(root);
+  const dataDir = join(root, 'store'), engine = new PGLiteEngine(); engines.push(engine);
+  return { engine, dataDir };
 }
-
-describe('PGLiteEngine.disconnect() — v0.41.8.0 lifecycle invariants', () => {
-  test('ORDERING: db.close() is called BEFORE releaseLock()', async () => {
-    const dataDir = newTempDataDir();
-    try {
-      const engine = new PGLiteEngine();
-      await engine.connect({ database_path: dataDir });
-      await engine.initSchema();
-
-      // Record the actual call order. We spy by replacing the db
-      // handle's close + the lock handle's release with timestamped
-      // wrappers.
-      const calls: string[] = [];
-      const eng = engine as unknown as {
-        _db: { close: () => Promise<void> } | null;
-        _lock: { lockDir: string; acquired: boolean } | null;
-      };
-
-      const realClose = eng._db!.close.bind(eng._db!);
-      eng._db!.close = async () => {
-        // Tiny delay so a flipped ordering would actually show up
-        // (release-before-close would beat us if we returned instantly).
-        await new Promise((r) => setTimeout(r, 10));
-        calls.push('db.close');
-        return realClose();
-      };
-
-      // releaseLock is module-level in pglite-lock.ts — to spy we have
-      // to swap the lock object's `acquired` flag detection won't
-      // route through us. Easier: monkey-patch by replacing the lock
-      // ref with one whose presence forces releaseLock to no-op (so
-      // we just measure that the close ran during disconnect and that
-      // the no-op happened in the same call).
-      //
-      // For the ORDERING test specifically, we wrap close and
-      // measure that the lockDir mkdir is still present immediately
-      // before close runs and gone after disconnect returns. The
-      // lockDir's existence is observable on disk.
-      const { existsSync } = await import('fs');
-      const lockDir = eng._lock!.lockDir;
-      expect(existsSync(lockDir)).toBe(true);
-
-      // Spy on the lock-release moment by polling lockDir existence
-      // from another timer: when close completes, the lock should
-      // STILL be present (close-then-release contract).
-      let lockStillPresentAtCloseFinish = false;
-      const origClose = eng._db!.close;
-      eng._db!.close = async () => {
-        await origClose();
-        // Right after close resolves, the lock has NOT yet been
-        // released (the finally branch hasn't run yet). Check
-        // synchronously before yielding the event loop again.
-        lockStillPresentAtCloseFinish = existsSync(lockDir);
-      };
-
-      await engine.disconnect();
-
-      expect(calls).toContain('db.close');
-      expect(lockStillPresentAtCloseFinish).toBe(true);
-      expect(existsSync(lockDir)).toBe(false);
-    } finally {
-      rmSync(dataDir, { recursive: true, force: true });
-    }
-  });
-
-  test('SNAPSHOT + EARLY-NULL: _db is nulled before await close', async () => {
-    const dataDir = newTempDataDir();
-    try {
-      const engine = new PGLiteEngine();
-      await engine.connect({ database_path: dataDir });
-      await engine.initSchema();
-
-      const eng = engine as unknown as {
-        _db: { close: () => Promise<void> } | null;
-      };
-
-      let dbWasNullWhenCloseRan = false;
-      const realClose = eng._db!.close.bind(eng._db!);
-      eng._db!.close = async () => {
-        // Inside close, the engine's _db field should ALREADY be null
-        // (snapshot pattern). If it's not, the partial-state race is
-        // back.
-        dbWasNullWhenCloseRan = eng._db === null;
-        return realClose();
-      };
-
-      await engine.disconnect();
-      expect(dbWasNullWhenCloseRan).toBe(true);
-    } finally {
-      rmSync(dataDir, { recursive: true, force: true });
-    }
-  });
-
-  test('LOCK LEAK GUARD: if db.close() throws, lock still releases', async () => {
-    const dataDir = newTempDataDir();
-    try {
-      const engine = new PGLiteEngine();
-      await engine.connect({ database_path: dataDir });
-      await engine.initSchema();
-
-      const eng = engine as unknown as {
-        _db: { close: () => Promise<void> } | null;
-        _lock: { lockDir: string; acquired: boolean } | null;
-      };
-
-      const { existsSync } = await import('fs');
-      const lockDir = eng._lock!.lockDir;
-      expect(existsSync(lockDir)).toBe(true);
-
-      // Force close to throw. The lock MUST still release.
-      eng._db!.close = async () => {
-        throw new Error('synthetic close failure');
-      };
-
-      // The throw will propagate out of disconnect — that's fine.
-      // The contract is "lock releases regardless."
-      let threw = false;
-      try {
-        await engine.disconnect();
-      } catch (e) {
-        threw = true;
-        expect(e instanceof Error && e.message).toContain('synthetic close failure');
-      }
-      expect(threw).toBe(true);
-      // CRITICAL: lock must be gone even though close threw.
-      expect(existsSync(lockDir)).toBe(false);
-    } finally {
-      rmSync(dataDir, { recursive: true, force: true });
-    }
-  });
-
-  test('IDEMPOTENCY: double disconnect is a clean no-op on the second call', async () => {
-    const dataDir = newTempDataDir();
-    try {
-      const engine = new PGLiteEngine();
-      await engine.connect({ database_path: dataDir });
-      await engine.initSchema();
-
-      let closeCallCount = 0;
-      const eng = engine as unknown as {
-        _db: { close: () => Promise<void> } | null;
-      };
-      const realClose = eng._db!.close.bind(eng._db!);
-      eng._db!.close = async () => {
-        closeCallCount++;
-        return realClose();
-      };
-
-      await engine.disconnect();
-      expect(closeCallCount).toBe(1);
-
-      // Second call: no throw, no second close
-      await engine.disconnect();
-      expect(closeCallCount).toBe(1);
-    } finally {
-      rmSync(dataDir, { recursive: true, force: true });
-    }
-  });
-
-  test('RECONNECT after disconnect sees clean state', async () => {
-    const dataDir = newTempDataDir();
-    try {
-      const engine = new PGLiteEngine();
-      await engine.connect({ database_path: dataDir });
-      await engine.initSchema();
-      await engine.disconnect();
-
-      // Same dataDir, fresh connect. Must succeed without lock contention.
-      await engine.connect({ database_path: dataDir });
-      await engine.initSchema();
-      // Smoke: a SELECT 1 round-trip proves the new handle is alive.
-      const result = await engine.executeRaw<{ ok: number }>('SELECT 1 AS ok');
-      expect(result[0].ok).toBe(1);
-      await engine.disconnect();
-    } finally {
-      rmSync(dataDir, { recursive: true, force: true });
-    }
-  });
+async function waitUntil(predicate: () => boolean) {
+  const deadline = performance.now() + 5000;
+  while (!predicate() && performance.now() < deadline) await delay(5);
+  expect(predicate()).toBe(true);
+}
+afterEach(async () => {
+  for (const engine of engines.splice(0)) { await disposePersistenceConsumer(engine); try { await engine.disconnect(); } catch { /* poisoned fixtures confirm actual close in their own finally */ } }
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-// ─────────────────────────────────────────────────────────────────
-// #2084 — preservingProcessExitCode behavioral containment
-// ─────────────────────────────────────────────────────────────────
-describe('PGLiteEngine: Emscripten process.exitCode containment (#2084)', () => {
-  test('connect() leaves process.exitCode pinned at 0, not the Emscripten 99', async () => {
-    const prev = process.exitCode;
-    const eng = new PGLiteEngine();
+describe('PGLite datastore lifecycle', () => {
+  test('concurrent connects share one open and disconnect is idempotent', async () => {
+    const { engine, dataDir } = make();
+    await Promise.all([engine.connect({ database_path: dataDir }), engine.connect({ database_path: dataDir })]);
+    expect((await engine.executeRaw<{ value: number }>('SELECT 1 AS value'))[0].value).toBe(1);
+    let closes = 0;
+    const close = engine.db.close;
+    engine.db.close = async () => { closes++; await close(); };
+    await Promise.all([engine.disconnect(), engine.disconnect()]);
+    await engine.disconnect();
+    expect(closes).toBe(1);
+  });
+  test('committed data survives close and a fresh engine reopen', async () => {
+    const { engine, dataDir } = make();
+    await engine.connect({ database_path: dataDir });
+    await engine.executeRaw('CREATE TABLE lifecycle_fixture (value INTEGER)');
+    await engine.transactionDirect(async tx => { await tx.executeRaw('INSERT INTO lifecycle_fixture VALUES (17)'); });
+    await engine.disconnect();
+    const next = new PGLiteEngine(); engines.push(next);
+    await next.connect({ database_path: dataDir });
+    expect((await next.executeRaw<{ value: number }>('SELECT value FROM lifecycle_fixture'))[0].value).toBe(17);
+  });
+  test('mandatory resident stop runs before database admission closes', async () => {
+    const { engine, dataDir } = make();
+    await engine.connect({ database_path: dataDir });
+    const stop = deferred(), entered = deferred();
+    const unregister = engine.registerBeforeDisconnect(async () => {
+      entered.resolve(); await stop.promise;
+      await engine.executeRaw('SELECT 1');
+    });
+    const close = engine.disconnect();
+    await entered.promise;
+    await expect(engine.connect({ database_path: dataDir })).rejects.toBeInstanceOf(PgliteClosingError);
+    await expect(acquireLock(dataDir, { timeoutMs: 30 })).rejects.toBeInstanceOf(PgliteBusyError);
+    stop.resolve(); await close; unregister();
+    await engine.connect({ database_path: dataDir });
+    await engine.disconnect(); // removed hook never blocks a later close
+  });
+  test('already-admitted statements drain before close; captured handles reject new work', async () => {
+    const { engine, dataDir } = make();
+    await engine.connect({ database_path: dataDir });
+    const captured = engine.db, gate = deferred(), entered = deferred();
+    const pending = engine.transaction(async tx => {
+      entered.resolve(); await gate.promise; await tx.executeRaw('SELECT 1');
+    });
+    await entered.promise;
+    let closed = false;
+    const close = captured.close;
+    captured.close = async () => { closed = true; await close(); };
+    const closing = engine.disconnect();
+    await expect(captured.query('SELECT 2')).rejects.toThrow('closing');
+    expect(closed).toBe(false);
+    gate.resolve();
+    await pending;
+    await closing;
+    expect(closed).toBe(true);
+  });
+  test('a close deadline retains the kernel lock until the actual close succeeds', async () => {
+    await withEnv({ GBRAIN_PGLITE_CLOSE_TIMEOUT_MS: '1000' }, async () => {
+      const { engine, dataDir } = make();
+      await engine.connect({ database_path: dataDir });
+      startPersistenceConsumer(engine, { engine: 'pglite', database_path: dataDir });
+      const lock = (engine as unknown as { _lock: LockHandle })._lock;
+      const close = engine.db.close, gate = deferred();
+      engine.db.close = async () => { await gate.promise; await close(); };
+      const started = performance.now();
+      try {
+        await expect(engine.disconnect()).rejects.toBeInstanceOf(PgliteClosingError);
+        expect(performance.now() - started).toBeLessThan(4000);
+        expect(lock.acquired).toBe(true);
+        expect(() => assertPersistenceAccepting(engine)).toThrow('closing');
+        expect(() => startPersistenceConsumer(engine, { engine: 'pglite', database_path: dataDir })).toThrow('closing');
+        await expect(engine.reconnect()).rejects.toBeInstanceOf(PgliteClosingError);
+        await expect(acquireLock(dataDir, { timeoutMs: 30 })).rejects.toBeInstanceOf(PgliteBusyError);
+      } finally { gate.resolve(); await waitUntil(() => !lock.acquired); }
+      await engine.connect({ database_path: dataDir });
+      expect(() => assertPersistenceAccepting(engine)).not.toThrow();
+    });
+  }, 15000);
+  test('a failed close poisons reconnect and never releases ownership', async () => {
+    const { engine, dataDir } = make();
+    await engine.connect({ database_path: dataDir });
+    startPersistenceConsumer(engine, { engine: 'pglite', database_path: dataDir });
+    const lock = (engine as unknown as { _lock: LockHandle })._lock, close = engine.db.close;
+    engine.db.close = async () => { throw new Error('injected close failure'); };
     try {
-      await eng.connect({ engine: 'pglite' });
-      // Emscripten writes 99 during create; the wrapper pins explicit 0 when
-      // nothing was set before (undefined cannot be restored — the accessor
-      // falls back to the WASM status).
-      expect(Number(process.exitCode)).toBe(0);
+      await expect(engine.disconnect()).rejects.toThrow('injected close failure');
+      expect(lock.acquired).toBe(true);
+      expect(() => assertPersistenceAccepting(engine)).toThrow('closing');
+      expect(() => startPersistenceConsumer(engine, { engine: 'pglite', database_path: dataDir })).toThrow('closing');
+      await expect(engine.connect({ database_path: dataDir })).rejects.toBeInstanceOf(PgliteClosingError);
+      await expect(acquireLock(dataDir, { timeoutMs: 30 })).rejects.toBeInstanceOf(PgliteBusyError);
     } finally {
-      await eng.disconnect();
-      process.exitCode = prev;
+      // Fixture cleanup confirms the real close. Production recovery requires
+      // process termination because an actual failed close offers no such proof.
+      await close(); await releaseLock(lock);
     }
-  }, 60_000);
-
-  test('a pre-call verdict survives the create-throw path (finally restores)', async () => {
-    const prev = process.exitCode;
-    const eng = new PGLiteEngine();
+  });
+  test('a failed mandatory stop retains ownership and never calls close', async () => {
+    const { engine, dataDir } = make();
+    await engine.connect({ database_path: dataDir });
+    const lock = (engine as unknown as { _lock: LockHandle })._lock, close = engine.db.close;
+    let closes = 0;
+    engine.db.close = async () => { closes++; await close(); };
+    engine.registerBeforeDisconnect(async () => { throw new Error('consumer still active'); });
     try {
-      process.exitCode = 3;
-      // A dataDir under a regular FILE cannot be created — PGlite.create rejects.
-      await expect(
-        eng.connect({ engine: 'pglite', database_path: '/dev/null/nope/brain' }),
-      ).rejects.toThrow();
-      expect(Number(process.exitCode)).toBe(3);
-    } finally {
-      process.exitCode = prev;
-    }
-  }, 60_000);
+      await expect(engine.disconnect()).rejects.toThrow('consumer still active');
+      expect(closes).toBe(0);
+      await expect(acquireLock(dataDir, { timeoutMs: 30 })).rejects.toBeInstanceOf(PgliteBusyError);
+    } finally { await close(); await releaseLock(lock); }
+  });
+  test('close timeout budgets clamp overflow and enforce the one-second minimum', async () => {
+    await withEnv({ GBRAIN_PGLITE_CLOSE_TIMEOUT_MS: '1' }, async () => { expect(pgliteCloseTimeoutMs()).toBe(1000); });
+    await withEnv({ GBRAIN_PGLITE_CLOSE_TIMEOUT_MS: '99000000000000' }, async () => { expect(pgliteCloseTimeoutMs()).toBe(2 ** 31 - 1); });
+  });
 });

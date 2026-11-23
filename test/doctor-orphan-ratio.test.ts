@@ -17,6 +17,7 @@ import { runDoctor, type DoctorReport } from '../src/commands/doctor.ts';
 import { setCliOptions } from '../src/core/cli-options.ts';
 import { runOrphanRatioCheck } from '../src/core/doctor-remote.ts';
 import { readFileSync } from 'fs';
+import { doctorSource } from './helpers/doctor-source.ts';
 
 let engine: PGLiteEngine;
 let stdoutBuffer: string[];
@@ -41,7 +42,7 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-  setCliOptions({ quiet: true, progressJson: false, progressInterval: 1000, explain: false, timeoutMs: null });
+  setCliOptions({ quiet: true, progressJson: false, progressInterval: 1000, explain: false, timeoutMs: null, brain: null });
 }, 60_000);
 
 afterAll(async () => {
@@ -177,6 +178,38 @@ describe('runDoctor — orphan_ratio check (local surface, D5)', () => {
     expect(check!.message).toContain('gbrain extract links --by-mention');
   });
 
+  test('#2264 — auto_chronicle life/events/ volume is excluded, so it does not trip orphan_ratio', async () => {
+    // Healthy knowledge graph: 100 fully-linked entity pages (no real decay).
+    for (let i = 0; i < 100; i++) {
+      await engine.putPage(`people/person-${i}`, {
+        type: 'person', title: `Person ${i}`, compiled_truth: 'b', timeline: '', frontmatter: {},
+      });
+    }
+    await engine.putPage('writing/index', {
+      type: 'note', title: 'Index', compiled_truth: 'index', timeline: '', frontmatter: {},
+    });
+    const links = [];
+    for (let i = 0; i < 100; i++) {
+      links.push({
+        from_slug: 'writing/index',
+        to_slug: `people/person-${i}`,
+        link_type: 'mentions', link_source: 'markdown', context: '',
+      });
+    }
+    await engine.addLinksBatch(links);
+    // Machine chronicle volume: 500 life/events/ pages, no inbound links by
+    // design. Without the exclusion these swamp the denominator (~83% orphan
+    // → FAIL); excluded, orphan_ratio reflects the healthy knowledge graph.
+    for (let i = 0; i < 500; i++) {
+      await engine.putPage(`life/events/2026-08-${i}-evt`, {
+        type: 'event', title: `Event ${i}`, compiled_truth: 'e', timeline: '', frontmatter: {},
+      });
+    }
+    const report = await runDoctorJson();
+    const check = findCheck(report, 'orphan_ratio');
+    expect(check!.status).toBe('ok');
+  });
+
   test('zero entity pages → vacuous status ok', async () => {
     const report = await runDoctorJson();
     const check = findCheck(report, 'orphan_ratio');
@@ -210,21 +243,21 @@ describe('runOrphanRatioCheck — thin-client surface (D11)', () => {
 
 describe('cross-surface parity contract', () => {
   test('source greps: orphan_ratio check name appears in BOTH local doctor and remote doctor', () => {
-    const doctor = readFileSync('src/commands/doctor.ts', 'utf8');
+    const doctor = doctorSource();
     const remote = readFileSync('src/core/doctor-remote.ts', 'utf8');
     expect(doctor.includes("name: 'orphan_ratio'")).toBe(true);
     expect(remote.includes("name: 'orphan_ratio'")).toBe(true);
   });
 
   test('source greps: both surfaces reference the same fix command', () => {
-    const doctor = readFileSync('src/commands/doctor.ts', 'utf8');
+    const doctor = doctorSource();
     const remote = readFileSync('src/core/doctor-remote.ts', 'utf8');
     expect(doctor).toContain('gbrain extract links --by-mention');
     expect(remote).toContain('gbrain extract links --by-mention');
   });
 
   test('source greps: local hint is self-fix; thin-client hint points at operator', () => {
-    const doctor = readFileSync('src/commands/doctor.ts', 'utf8');
+    const doctor = doctorSource();
     const remote = readFileSync('src/core/doctor-remote.ts', 'utf8');
     // Local hint: just the command (user can run it).
     expect(doctor).toContain('Run: gbrain extract links --by-mention');

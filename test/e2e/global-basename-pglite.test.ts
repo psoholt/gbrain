@@ -28,6 +28,8 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { runExtract } from '../../src/commands/extract.ts';
+import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
+import type { OperationContext } from '../../src/core/operations.ts';
 
 let engine: PGLiteEngine;
 let brainDir: string;
@@ -43,6 +45,7 @@ afterAll(async () => {
 });
 
 async function truncateAll() {
+  await disposePersistenceConsumer(engine);
   for (const t of [
     'content_chunks', 'links', 'tags', 'raw_data',
     'timeline_entries', 'page_versions', 'ingest_log', 'pages',
@@ -50,6 +53,11 @@ async function truncateAll() {
   ]) {
     try { await (engine as any).db.exec(`DELETE FROM ${t}`); } catch { /* ok */ }
   }
+}
+
+function writeContext(): OperationContext {
+  return { engine, remote: false, config: { engine: 'pglite' }, dryRun: false,
+    sourceId: 'default', logger: { info() {}, warn() {}, error() {} } };
 }
 
 beforeEach(async () => {
@@ -172,6 +180,63 @@ describe('issue #972 — DB-source (gbrain extract links --source db)', () => {
     expect(strk!.link_type).toBe('wikilink_basename');
   });
 
+  test('flag ON → path-qualified wikilink outside DIR_PATTERN resolves via DB path', async () => {
+    // `[[notes/struktura]]` — `notes` is not in DIR_PATTERN, so the ref
+    // reaches the generic pass with its dirname intact. Regression: the DB
+    // path queried the basename index with the raw literal (which is keyed
+    // by final segments only), so path-qualified wikilinks outside
+    // DIR_PATTERN silently produced zero edges while the FS path resolved
+    // the identical content.
+    await engine.putPage('notes/struktura', {
+      type: 'concept' as any, title: 'Struktura Notes',
+      compiled_truth: '', timeline: '',
+    });
+    await engine.putPage('concepts/knowledge-graph', {
+      type: 'concept', title: 'Knowledge Graph',
+      compiled_truth: 'Background in [[notes/struktura]].', timeline: '',
+    });
+    await engine.setConfig('link_resolution.global_basename', 'true');
+
+    await runExtract(engine, ['links', '--source', 'db']);
+
+    const outLinks = await engine.getLinks('concepts/knowledge-graph');
+    const strk = outLinks.find(l => l.to_slug === 'notes/struktura');
+    expect(strk).toBeDefined();
+    // #2576: an exact-path wikilink to an existing page now produces the
+    // direct verb-typed edge (parity with whitelisted dirs), no longer a
+    // wikilink_basename demotion.
+    expect(strk!.link_type).toBe('mentions');
+    expect(strk!.link_source).toBe('markdown');
+  });
+
+  test('path-qualified wikilink never attaches to a basename-only sibling', async () => {
+    // Both notes/struktura and wiki/struktura exist. The author wrote
+    // `[[notes/struktura]]` — the written path must exclude wiki/struktura
+    // (a bare `[[struktura]]` would legitimately match both).
+    await engine.putPage('notes/struktura', {
+      type: 'concept' as any, title: 'Struktura Notes',
+      compiled_truth: '', timeline: '',
+    });
+    await engine.putPage('wiki/struktura', {
+      type: 'concept' as any, title: 'Struktura Wiki',
+      compiled_truth: '', timeline: '',
+    });
+    await engine.putPage('concepts/x', {
+      type: 'concept', title: 'X',
+      compiled_truth: 'See [[notes/struktura]].', timeline: '',
+    });
+    await engine.setConfig('link_resolution.global_basename', 'true');
+
+    await runExtract(engine, ['links', '--source', 'db']);
+
+    const outLinks = await engine.getLinks('concepts/x');
+    // #2576: the exact-path edge is now direct + verb-typed. The invariant
+    // under test is unchanged: the written path binds to notes/struktura and
+    // NEVER to the basename-only sibling wiki/struktura.
+    expect(outLinks.map(l => l.to_slug)).toContain('notes/struktura');
+    expect(outLinks.map(l => l.to_slug)).not.toContain('wiki/struktura');
+  });
+
   test('flag OFF → no basename edges via DB path (back-compat)', async () => {
     await engine.putPage('projects/struktura', {
       type: 'project', title: 'Struktura',
@@ -218,7 +283,7 @@ describe('issue #972 — put_page auto-link', () => {
     const { operations } = await import('../../src/core/operations.ts');
     const putPage = operations.find(op => op.name === 'put_page')!;
     await putPage.handler(
-      { engine, remote: false } as never,
+      writeContext(),
       {
         slug: 'concepts/knowledge-graph',
         content: PUT_PAGE_MARKDOWN_WITH_WIKILINK,
@@ -242,7 +307,7 @@ describe('issue #972 — put_page auto-link', () => {
     const { operations } = await import('../../src/core/operations.ts');
     const putPage = operations.find(op => op.name === 'put_page')!;
     await putPage.handler(
-      { engine, remote: false } as never,
+      writeContext(),
       {
         slug: 'concepts/knowledge-graph',
         content: PUT_PAGE_MARKDOWN_WITH_WIKILINK,
@@ -265,15 +330,17 @@ describe('issue #972 — put_page auto-link', () => {
     const putPage = operations.find(op => op.name === 'put_page')!;
 
     // 1. Write the page WITH the wikilink → edge lands.
-    await putPage.handler({ engine, remote: false } as never, {
+    await putPage.handler(writeContext(), {
       slug: 'concepts/knowledge-graph', content: PUT_PAGE_MARKDOWN_WITH_WIKILINK,
     });
     let outLinks = await engine.getLinks('concepts/knowledge-graph');
     expect(outLinks.find(l => l.to_slug === 'projects/struktura')).toBeDefined();
 
     // 2. Re-write the page WITHOUT the wikilink → edge must be reconciled away.
-    await putPage.handler({ engine, remote: false } as never, {
+    const snapshot = await engine.readPageSnapshot('concepts/knowledge-graph');
+    await putPage.handler(writeContext(), {
       slug: 'concepts/knowledge-graph',
+      expected_revision: snapshot!.revision,
       content: '---\ntitle: Knowledge Graph\ntype: concept\n---\n\nNo links here anymore.\n',
     });
     outLinks = await engine.getLinks('concepts/knowledge-graph');

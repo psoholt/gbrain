@@ -95,6 +95,77 @@ describe('runFactsPipeline (extract_facts MCP op path) — response shape stabil
     for (const id of r.fact_ids) {
       expect(id).toBeGreaterThan(0);
     }
+    // Cathedral 5 (additive): entity_slugs = fence-written slugs only.
+    // These facts are unparented (entity: null) → legacy DB-only path →
+    // never a fence write → the truthful-links list stays empty.
+    expect(r.entity_slugs).toEqual([]);
+  });
+
+  test('#4755: a null-like entity STRING from the extractor lands unparented, never under entity_slug=\'null\'', async () => {
+    // The extractor prompt asks for JSON null on subjectless statements; LLMs
+    // routinely emit the string "null" / "None" instead. Pre-fix that token
+    // reached the resolver, fell back to itself as the slug, and the facts
+    // were filed under a page that cannot exist.
+    chatStub([
+      { fact: 'a gap statement with no subject', kind: 'fact', notability: 'medium', entity: 'null' },
+      { fact: 'a second subjectless statement', kind: 'fact', notability: 'medium', entity: 'None' },
+    ]);
+    const r = await runFactsPipeline('turn with no subject', {
+      engine,
+      sourceId: 'default',
+      sessionId: 'null-entity-test',
+      source: 'mcp:extract_facts',
+    });
+    expect(r.inserted).toBe(2);
+    for (const id of r.fact_ids) {
+      const rows = await engine.executeRaw<{ entity_slug: string | null }>(
+        'SELECT entity_slug FROM facts WHERE id = $1', [id],
+      );
+      expect(rows[0].entity_slug).toBeNull();
+    }
+    expect(r.entity_slugs).toEqual([]);
+  });
+
+  test('unresolved entity references stay unparented with provenance in every storage mode', async () => {
+    const { mkdtempSync, readdirSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { _resetWriteThroughCacheForTest } = await import('../src/core/write-through.ts');
+    const dir = mkdtempSync(join(tmpdir(), 'unresolved-facts-'));
+    try {
+      for (const mode of ['thin-client', 'local', 'disabled']) {
+        await engine.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+          [mode === 'thin-client' ? null : dir]);
+        await engine.setConfig('sync.write_through', mode === 'disabled' ? 'false' : 'true');
+        _resetWriteThroughCacheForTest();
+        chatStub(['Unresolved Example', 'people/missing-example'].map(entity => ({
+          fact: `${mode}: ${entity} supplied a useful fact`, entity, kind: 'fact', notability: 'high',
+        })));
+        const result = await runFactsPipeline('A conversation with unresolved entities', {
+          engine, sourceId: 'default', sessionId: `unresolved-${mode}`, source: 'mcp:extract_facts',
+          sourceSlug: 'meetings/provenance-example',
+        });
+        expect(result.inserted).toBe(2);
+        expect(result.entity_slugs).toEqual([]);
+        const rows = await engine.executeRaw<{
+          entity_slug: string | null; source: string; context: string | null; row_num: number | null;
+        }>(`SELECT entity_slug, source, context, row_num FROM facts WHERE source_id = 'default' AND source_session = $1`,
+          [`unresolved-${mode}`]);
+        expect(rows).toHaveLength(2);
+        for (const row of rows) {
+          expect(row.entity_slug).toBeNull();
+          expect(row.source).toBe('mcp:extract_facts');
+          expect(row.context).toBe('meetings/provenance-example');
+          expect(row.row_num).toBeNull();
+        }
+        expect(readdirSync(dir)).toEqual([]);
+      }
+    } finally {
+      await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+      await engine.unsetConfig('sync.write_through');
+      _resetWriteThroughCacheForTest();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('empty extraction → zero counts (no NaN, no undefined)', async () => {
@@ -109,6 +180,7 @@ describe('runFactsPipeline (extract_facts MCP op path) — response shape stabil
     expect(r.duplicate).toBe(0);
     expect(r.superseded).toBe(0);
     expect(r.fact_ids).toEqual([]);
+    expect(r.entity_slugs).toEqual([]);
   });
 });
 
@@ -218,42 +290,41 @@ describe('queue-mode → drains successfully on happy path', () => {
     expect(counters.failed).toBe(0);
   });
 
-  test('extract.ts absorbs gateway errors silently — net effect is empty extraction', async () => {
-    // The contract: extract.ts catches gateway errors and returns [] without
-    // re-throwing (only AbortError re-throws). Backstop's catch only sees
-    // errors from layers ABOVE extract — resolver, dedup, insert. Document
-    // this here so future work that wants chat-error visibility knows to
-    // rewire extract.ts itself rather than the backstop catch.
+  test('gateway errors PROPAGATE as typed FactsExtractionError in inline mode (silent-absorb contract retired)', async () => {
+    // The old contract deliberately swallowed gateway errors into empty
+    // extraction ("net effect is empty extraction") and left a note that
+    // future visibility work should rewire extract.ts. That work landed:
+    // transport-class failures (provider_error / truncated_output) now throw
+    // a typed FactsExtractionError — the queue-mode catch maps it to precise
+    // absorb-log codes, the durable minion retries, and the inline
+    // extract_facts op surfaces a real error instead of lying `inserted: 0`.
     __setChatTransportForTests(async () => {
       throw new Error('429 rate limit');
     });
 
-    const slug = 'meetings/silent-absorb-' + Math.random().toString(36).slice(2, 8);
-    const r = await runFactsBackstop(
-      {
-        slug,
-        type: 'meeting',
-        compiled_truth: LONG_BODY,
-        frontmatter: {},
-      },
-      {
-        engine,
-        sourceId: 'silent-source',
-        sessionId: 'silent-session',
-        source: 'mcp:put_page',
-        mode: 'inline',
-      },
-    );
-
-    // Inline-mode envelope returns zero counts; no error thrown.
-    expect(r.mode).toBe('inline');
-    if (r.mode === 'inline') {
-      expect(r.inserted).toBe(0);
-      expect(r.duplicate).toBe(0);
+    const slug = 'meetings/typed-throw-' + Math.random().toString(36).slice(2, 8);
+    let thrown: unknown;
+    try {
+      await runFactsBackstop(
+        {
+          slug,
+          type: 'meeting',
+          compiled_truth: LONG_BODY,
+          frontmatter: {},
+        },
+        {
+          engine,
+          sourceId: 'silent-source',
+          sessionId: 'silent-session',
+          source: 'mcp:put_page',
+          mode: 'inline',
+        },
+      );
+    } catch (e) {
+      thrown = e;
     }
-
-    // Note for future work: writeFactsAbsorbLog from extract.ts itself
-    // would close this visibility gap — surface gateway errors via
-    // ingest_log without changing extract's "best-effort" return contract.
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).name).toBe('FactsExtractionError');
+    expect((thrown as { reason?: string }).reason).toBe('provider_error');
   });
 });

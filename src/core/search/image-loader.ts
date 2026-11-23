@@ -27,9 +27,9 @@
  *     conservative for v1.
  */
 
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
-import { SSRFError, fetchWithSSRFGuard } from '../ssrf-validate.ts';
+import { SSRFError, HttpBodyError, HttpProxyError, fetchWithSSRFGuard, type GuardedHttpResponse } from '../ssrf-validate.ts';
 
 /** Max bytes for input image. Configurable via `search.image_query.max_bytes`. */
 export const DEFAULT_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
@@ -71,6 +71,8 @@ export interface ImageLoadOpts {
   timeoutMs?: number;
   /** Max redirect hops (URLs only). Defaults to 3. */
   maxRedirects?: number;
+  /** Accept file:// URIs and absolute paths. Only trusted local callers set it; defaults to false. */
+  allowLocalPath?: boolean;
 }
 
 /**
@@ -96,6 +98,9 @@ export async function loadImageInput(
     return loadHttpUrl(input, { maxBytes, timeoutMs: opts.timeoutMs ?? 5000, maxRedirects: opts.maxRedirects ?? 3 });
   }
   if (input.startsWith('file://') || isAbsolute(input)) {
+    if (!opts.allowLocalPath) {
+      throw new ImageLoadError('INVALID_URL', 'Local file paths are not accepted here: pass an http(s):// URL or a data: URI.');
+    }
     const path = input.startsWith('file://') ? input.slice(7) : input;
     return loadLocalPath(path, maxBytes);
   }
@@ -108,8 +113,12 @@ export async function loadImageInput(
 async function loadLocalPath(path: string, maxBytes: number): Promise<LoadedImage> {
   let bytes: Buffer;
   try {
+    const info = await stat(path);
+    if (!info.isFile()) throw new ImageLoadError('FETCH_FAILED', `${path} is not a regular file`);
+    if (info.size > maxBytes) throw new ImageLoadError('OVERSIZED', `Image at ${path} is ${info.size} bytes; cap is ${maxBytes}`);
     bytes = await readFile(path);
   } catch (err) {
+    if (err instanceof ImageLoadError) throw err;
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes('ENOENT')) {
       throw new ImageLoadError('NOT_FOUND', `File not found: ${path}`);
@@ -163,48 +172,40 @@ async function loadHttpUrl(
   url: string,
   opts: { maxBytes: number; timeoutMs: number; maxRedirects: number },
 ): Promise<LoadedImage> {
-  let res: Response;
+  let res: GuardedHttpResponse;
   try {
     res = await fetchWithSSRFGuard(url, {
       maxRedirects: opts.maxRedirects,
       timeoutMs: opts.timeoutMs,
+      maxBytes: opts.maxBytes,
     });
   } catch (err) {
+    if (err instanceof HttpBodyError && err.code === 'BODY_TOO_LARGE') {
+      throw new ImageLoadError('OVERSIZED', err.message);
+    }
     if (err instanceof SSRFError) {
+      if (err.code === 'REQUEST_TIMEOUT' || err.code === 'REQUEST_ABORTED') {
+        throw new ImageLoadError('TIMEOUT', `Fetch timeout (${opts.timeoutMs}ms)`);
+      }
       throw new ImageLoadError('SSRF_BLOCKED', `SSRF: ${err.message}`);
+    }
+    if (err instanceof HttpProxyError || err instanceof HttpBodyError) {
+      throw new ImageLoadError('FETCH_FAILED', err.message);
     }
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes('abort')) {
-      throw new ImageLoadError('TIMEOUT', `Fetch timeout (${opts.timeoutMs}ms): ${url}`);
+      throw new ImageLoadError('TIMEOUT', `Fetch timeout (${opts.timeoutMs}ms)`);
     }
-    throw new ImageLoadError('FETCH_FAILED', `Fetch failed: ${msg}`);
+    throw new ImageLoadError('FETCH_FAILED', 'Fetch failed: request failed');
   }
   if (!res.ok) {
     throw new ImageLoadError(
       'FETCH_FAILED',
-      `Fetch returned HTTP ${res.status}: ${res.statusText || ''}`,
+      `Fetch returned HTTP ${res.status}`,
     );
   }
-  // Pre-flight: reject oversized responses before reading the body.
-  const contentLengthHeader = res.headers.get('content-length');
-  if (contentLengthHeader) {
-    const declared = parseInt(contentLengthHeader, 10);
-    if (Number.isFinite(declared) && declared > opts.maxBytes) {
-      throw new ImageLoadError(
-        'OVERSIZED',
-        `Response Content-Length ${declared} exceeds cap ${opts.maxBytes}`,
-      );
-    }
-  }
-  // Read the body; second guard against lying Content-Length.
-  const arrayBuf = await res.arrayBuffer();
-  const bytes = Buffer.from(arrayBuf);
-  if (bytes.length > opts.maxBytes) {
-    throw new ImageLoadError(
-      'OVERSIZED',
-      `Response body is ${bytes.length} bytes; cap is ${opts.maxBytes} (lying Content-Length?)`,
-    );
-  }
+  // The transport already bounded the decoded stream under the same deadline.
+  const bytes = res.body;
   const contentType = sniffContentType(bytes);
   return finalize(bytes, contentType);
 }

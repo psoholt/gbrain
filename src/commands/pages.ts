@@ -1,56 +1,102 @@
 /**
  * gbrain pages — page-level operator commands. v0.26.5+.
  *
- * The first subcommand: `pages purge-deleted [--older-than HOURS] [--dry-run]`.
+ * The first subcommand: `pages purge-deleted [--older-than HOURS|Nh|Nd] [--retry-parked] [--dry-run] [--json] [--yes]`.
+ * `pages unsearchable` (#6696 B3) lists embedding-state rows; its body is pages-unsearchable.ts.
+ * `pages ghosts [--source <id>] [--json]` (#6696 B5, pages-ghosts.ts) lists ghost pages, read-only.
+ * `pages status <slug...> [--source <id>] [--json]` (#7179, pages-status.ts) says whether each page is searchable and why, read-only.
  * Manual escape hatch alongside the autopilot purge phase. Hard-deletes pages
  * whose `deleted_at` is older than the cutoff; cascades to content_chunks,
  * page_links, chunk_relations via existing FKs.
  */
 import type { BrainEngine } from '../core/engine.ts';
+import { notHeld, purgeConsentRequest, purgeDeletedPagesCoordinated, rebuildNote, selectPurgeCandidates } from '../core/persistence/purge-deleted.ts';
+import { PURGE_PARK_LIMIT } from '../core/persistence/purge-parks.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
+import { consentGate } from '../core/consent-cli.ts';
+import { strictArgsRefusal } from '../cli/strict-args.ts';
+import { PAGES_SUBCOMMANDS, ROUTERS, subcommandHelpRequested } from '../cli/subcommands.ts';
 
 const SOFT_DELETE_TTL_HOURS_DEFAULT = 72;
 
-function parseOlderThanHours(args: string[]): number {
-  const idx = args.indexOf('--older-than');
-  if (idx === -1 || idx === args.length - 1) return SOFT_DELETE_TTL_HOURS_DEFAULT;
-  const raw = args[idx + 1];
-  // Accept bare numbers (hours) or `<N>h` / `<N>d`. Reject anything ambiguous.
-  const trimmed = raw.trim();
-  const dayMatch = trimmed.match(/^(\d+)d$/);
-  if (dayMatch) return Math.max(0, parseInt(dayMatch[1], 10) * 24);
-  const hourMatch = trimmed.match(/^(\d+)h?$/);
-  if (hourMatch) return Math.max(0, parseInt(hourMatch[1], 10));
-  console.error(`Invalid --older-than value: "${raw}". Expected hours (e.g. 72 or 72h) or days (e.g. 3d).`);
-  process.exit(2);
+export { PAGES_SUBCOMMANDS as SUBCOMMANDS } from '../cli/subcommands.ts';
+
+export interface PurgeArgs { olderThanHours: number; dryRun: boolean; json: boolean; retryParked: boolean }
+
+/**
+ * Strict `purge-deleted` arguments (#6114): exactly `--dry-run`, `--json`,
+ * `--retry-parked` (#6741), `--yes` (read by the consent gate) and one `--older-than <HOURS|Nh|Nd>` (also `--older-than=N`).
+ * Anything else throws `invalid_params` before the engine is touched; cli.ts
+ * refuses the same tokens earlier through the same table.
+ */
+export function parsePurgeArgs(args: readonly string[]): PurgeArgs {
+  const refusal = strictArgsRefusal('pages', ['purge-deleted', ...args]);
+  if (refusal) throw refusal;
+  let olderThanHours = SOFT_DELETE_TTL_HOURS_DEFAULT;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    const raw = a === '--older-than' ? args[++i]! : a.startsWith('--older-than=') ? a.slice('--older-than='.length) : null;
+    if (raw === null) continue;
+    const n = parseInt(raw, 10);
+    olderThanHours = raw.endsWith('d') ? n * 24 : n;
+  }
+  return { olderThanHours, dryRun: args.includes('--dry-run'), json: args.includes('--json'), retryParked: args.includes('--retry-parked') };
 }
 
 async function runPurgeDeleted(engine: BrainEngine, args: string[]): Promise<void> {
-  const olderThanHours = parseOlderThanHours(args);
-  const dryRun = args.includes('--dry-run');
-  const json = args.includes('--json');
+  const { olderThanHours, dryRun, json, retryParked } = parsePurgeArgs(args);
+  // #6741: one selector for the preview, the consent and the run (selectPurgeCandidates): the same cutoff, rename
+  // holds, writer state and parks; --retry-parked puts the parked pages the cutoff selects back among the candidates.
+  // GST-2689: the preview reads ahead what the run's carry does (forecastCarry, read-only), so it lists the parked origins
+  // the run releases and leaves out the ones it parks; nothing is labelled before the consent.
+  const forecast = await (await import('../core/repair/origin-carry.ts')).forecastCarry(engine, olderThanHours);
+  const selection = await selectPurgeCandidates(engine, olderThanHours, { retryParked, forecast, model: (await import('../core/ai/gateway.ts')).isAvailable('chat') });
+  const retried = selection.parked.filter(park => park.retried).length;
+  const notes = { ...(selection.parked.length ? { parked: selection.parked, retry_parked: retryParked } : {}), ...(selection.blocked.length ? { blocked: selection.blocked } : {}),
+    ...(selection.released_origins.length ? { released_origins: selection.released_origins } : {}),
+    ...(selection.rebuild.held.length ? { rebuild: selection.rebuild, rebuild_note: rebuildNote(selection.rebuild, true) } : {}) };
 
   if (dryRun) {
-    // Use listPages with includeDeleted to enumerate the recoverable set, then
-    // count how many would be purged given the cutoff. Stays read-only.
-    const candidates = await engine.listPages({ includeDeleted: true, limit: 10000 });
-    const cutoff = Date.now() - olderThanHours * 60 * 60 * 1000;
-    const wouldPurge = candidates.filter(
-      (p) => p.deleted_at && p.deleted_at instanceof Date && p.deleted_at.getTime() < cutoff,
-    );
+    // Read-only: the same predicate and DB now() clock as the real purge; only the verb differs.
     if (json) {
-      console.log(JSON.stringify({ dry_run: true, older_than_hours: olderThanHours, count: wouldPurge.length, slugs: wouldPurge.map((p) => p.slug) }, null, 2));
+      console.log(JSON.stringify({ dry_run: true, older_than_hours: olderThanHours, count: selection.count, slugs: selection.slugs, sync_unreviewed: selection.sync_unreviewed, ...notes }, null, 2));
       return;
     }
-    console.log(`(dry-run) Would purge ${wouldPurge.length} page(s) soft-deleted more than ${olderThanHours}h ago.`);
-    for (const p of wouldPurge) console.log(`  ${p.slug}  deleted_at=${p.deleted_at?.toISOString()}`);
+    console.log(`(dry-run) Would purge ${selection.count} page(s) soft-deleted more than ${olderThanHours}h ago.`);
+    // #7130: the automatic purge keeps these; a purged page can only come back from a backup.
+    if (selection.sync_unreviewed) console.log(`  ${selection.sync_unreviewed} of them were deleted by a managed sync, not a person, and no live page has their content; restore any you need first (gbrain restore <slug> --source-id <id> --force). A purged page can only come back from a backup.`);
+    for (const p of selection.pages ?? []) console.log(`  ${p.slug}  deleted_at=${p.deleted_at.toISOString()}`);
+    for (const c of selection.candidates) console.log(`  ${c.source_id}/${c.slug}${c.park ? ' (parked; retried once more)' : ''}${c.sync_unreviewed ? ' (deleted by a managed sync; no live twin)' : ''}`);
+    for (const p of selection.parked.filter(park => !park.retried)) console.log(`  parked: ${p.source_id}/${p.slug} after ${p.failures} failures (${p.code ?? 'error'}); skipped unless --retry-parked`);
+    for (const b of selection.blocked.filter(entry => entry.code === 'writer_not_active')) console.log(`  waiting: ${b.source_id}/${b.slug}: ${b.reason}`);
+    if (selection.rebuild.held.length) console.log(rebuildNote(selection.rebuild, true).split('\n').map(line => `  ${line}`).join('\n'));
+    for (const o of selection.released_origins) console.log(`  released: ${o.source_id}/${o.slug} is parked (gbrain doctor: derived_origin_parked); the run labels the pages derived from it private first and keeps it parked if that fails`);
     return;
   }
 
-  const result = await engine.purgeDeletedPages(olderThanHours);
-  if (json) {
-    console.log(JSON.stringify({ older_than_hours: olderThanHours, count: result.count, slugs: result.slugs }, null, 2));
+  // D6: a hard purge is irreversible and brain-wide, so the CLI asks first
+  // (a TTY prompt, `--yes`, or exit 3 with the consent payload). The
+  // autopilot purge phase calls the library directly and is unaffected.
+  if (selection.count === 0) {
+    if (json) console.log(JSON.stringify({ older_than_hours: olderThanHours, count: 0, slugs: [], ...notes }, null, 2));
+    else {
+      console.log(`No pages to purge (older than ${olderThanHours}h).`);
+      for (const b of selection.blocked) console.error(`Not purged: ${b.source_id}/${b.slug}: ${b.reason}`);
+    }
     return;
   }
+  const authorized = await consentGate(purgeConsentRequest(selection.count, olderThanHours, json, args, retryParked, retried, selection.sync_unreviewed), { json });
+  if (!authorized) return;
+
+  const result = await purgeDeletedPagesCoordinated(engine, olderThanHours, { retryParked, release: forecast.release.map(origin => origin.id), only: notHeld(forecast) });
+  if (json) {
+    console.log(JSON.stringify({ older_than_hours: olderThanHours, count: result.count, slugs: result.slugs,
+      ...(result.capacity_deferred ? { capacity_deferred: result.capacity_deferred } : {}), ...(result.blocked.length ? { blocked: result.blocked } : {}) }, null, 2));
+    if (result.error) setCliExitVerdict(1);
+    return;
+  }
+  for (const b of result.blocked) console.error(`Not purged: ${b.source_id}/${b.slug}: ${b.reason}`);
+  if (result.error) setCliExitVerdict(1);
   if (result.count === 0) {
     console.log(`No pages to purge (older than ${olderThanHours}h).`);
   } else {
@@ -59,36 +105,65 @@ async function runPurgeDeleted(engine: BrainEngine, args: string[]): Promise<voi
   }
 }
 
-function printHelp(): void {
-  console.log(`gbrain pages — page-level operator commands (v0.26.5)
+export function printUsage(): void {
+  console.log(`gbrain pages — page-level operator commands
 
 Subcommands:
-  purge-deleted [--older-than HOURS|Nd] [--dry-run] [--json]
+  ghosts [--source <id>] [--json]   List live pages whose canonical file is missing on the
+                                    owner host (ghost pages). Read-only; remove them with
+                                    gbrain repair ghost-pages --source <id> (preview first).
+  purges list [--source <id>] [--json]
+                                    List page purge tombstones (slug, hash, request, time).
+  unpurge <slug> [--source <id>] [--json]
+                                    Clear a page's purge tombstones so its old content can be
+                                    imported again. Restores nothing.
+  purge-deleted [--older-than HOURS|Nh|Nd] [--retry-parked] [--dry-run] [--json] [--yes]
                                     Hard-delete soft-deleted pages older than the cutoff
-                                    (default 72h). Cascades to chunks/links/edges.
-                                    Mirror of the autopilot purge phase.
+                                    (default 72h) in every source of the brain (per-source
+                                    purge is not supported). Cascades to chunks/links/edges.
+                                    Asks first: a TTY prompt, --yes, or exit 3 with the
+                                    consent payload. Preview with --dry-run --json.
+                                    Mirror of the autopilot purge phase. On a managed brain a
+                                    page whose purge failed ${PURGE_PARK_LIMIT} times is parked;
+                                    --retry-parked tries each parked page once more.
+  unsearchable --source <id> [--state <state>] [--limit N] [--json]
+                                    Read-only: pages search cannot fully see, one row per
+                                    page and embedding state (pending, keyword_only,
+                                    quarantined, empty, deleted_page_chunks,
+                                    chunkless_healable; embedded only via --state) with
+                                    reason, chunks, bytes and each state's fix. --limit
+                                    defaults to 50; complete:false means more rows exist.
+  status <slug...> [--source <id>] [--json]
+                                    Read-only: per page, whether search can find it (state,
+                                    searchable true|keyword|false), its chunks and vector-less
+                                    chunks, any large-page embedding hold or sync hold on its
+                                    file, whether the file is in the synced commit, why, and
+                                    the fix. A page that is not searchable still exits 0.
 
 Notes:
-  Soft-delete a page via the MCP \`delete_page\` op. Restore via \`restore_page\`.
+  Soft-delete a page via \`gbrain delete <slug> --force\`; restore via \`gbrain restore <slug> --force\`
+  (the delete_page / restore_page ops, equally reachable over MCP). Deleting also removes
+  the page's markdown file from the source working tree; restoring re-creates it.
   This command is the manual operator escape hatch — the autopilot cycle's
   purge phase already calls the same library function on every run.
 `);
 }
 
 export async function runPages(engine: BrainEngine, args: string[]): Promise<void> {
-  const sub = args[0];
-  const rest = args.slice(1);
-
+  if (subcommandHelpRequested(args, ROUTERS.pages)) { printUsage(); return; }
+  const sub = args[0] as (typeof PAGES_SUBCOMMANDS)[number] | undefined;
   switch (sub) {
-    case 'purge-deleted': return runPurgeDeleted(engine, rest);
+    case 'purge-deleted': return runPurgeDeleted(engine, args.slice(1));
+    case 'purges': case 'unpurge': return (await import('./pages-purges.ts')).runPagePurges(engine, sub, args.slice(1));
+    case 'unsearchable': return (await import('./pages-unsearchable.ts')).runPagesUnsearchable(engine, args.slice(1));
+    case 'ghosts': return (await import('./pages-ghosts.ts')).runPagesGhosts(engine, args.slice(1));
+    case 'status': return (await import('./pages-status.ts')).runPagesStatus(engine, args.slice(1));
     case undefined:
-    case '--help':
-    case '-h':
-      printHelp();
+      printUsage();
       return;
     default:
       console.error(`Unknown subcommand: ${sub}`);
-      printHelp();
+      printUsage();
       process.exit(2);
   }
 }

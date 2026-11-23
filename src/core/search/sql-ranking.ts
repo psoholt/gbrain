@@ -18,6 +18,11 @@
  */
 
 import { quarantineFilterFragment } from '../quarantine.ts';
+import { unverifiedExtractionFragment } from '../extraction-review.ts';
+import { privatePagesFilterForCaller } from './private-visibility.ts';
+import { chunkVisibleFilter, requiresSafeChunks, safeChunksFilter, servedTextProjectionFilter } from './safe-chunks.ts';
+import { pageEligibleSql } from '../eligibility/sql.ts';
+import type { TrustTier } from '../trust/tier.ts';
 
 /**
  * Escape `%`, `_`, and `\` so a string can be used as a LIKE prefix literal.
@@ -63,6 +68,7 @@ export function buildSourceFactorCase(
   slugColumn: string,
   boostMap: Record<string, number>,
   detail: 'low' | 'medium' | 'high' | undefined,
+  unverifiedGuardColumn?: string,
 ): string {
   // Loose-string guard: agents passing `"HIGH"` or `"high "` over MCP/JSON
   // should still hit the temporal-bypass path. TypeScript narrows `detail`
@@ -80,7 +86,26 @@ export function buildSourceFactorCase(
     `WHEN ${slugColumn} LIKE ${buildLikePrefixLiteral(prefix)} THEN ${factor}`
   ).join(' ');
 
-  return `(CASE ${whens} ELSE 1.0 END)`;
+  // Extraction quarantine lane (issue #160): unverified auto-extracted stubs
+  // never receive the namespace-authority factor (people/ / companies/ 1.2x)
+  // — they rank as ordinary content until promoted. Two forms:
+  //   - table-qualified slug column ('p.slug'): reference the sibling
+  //     `frontmatter` column inline via unverifiedExtractionFragment.
+  //   - bare column + `unverifiedGuardColumn`: the vector arm's re-rank CTE
+  //     has no frontmatter column, so its inner hnsw_candidates CTE projects
+  //     the predicate as a boolean (`... AS unverified_stub`) and passes the
+  //     column name here. Without this the 1.2x would apply INSIDE the
+  //     scored/best_per_page pipeline pre-LIMIT — an unverified stub could
+  //     outrank AND evict a legitimate page from the candidate pool, which
+  //     nothing downstream can restore.
+  const alias = slugColumn.includes('.') ? slugColumn.split('.')[0] : null;
+  const unverifiedGuard = unverifiedGuardColumn
+    ? `WHEN ${unverifiedGuardColumn} THEN 1.0 `
+    : alias
+      ? `WHEN ${unverifiedExtractionFragment(alias)} THEN 1.0 `
+      : '';
+
+  return `(CASE ${unverifiedGuard}${whens} ELSE 1.0 END)`;
 }
 
 /**
@@ -148,11 +173,48 @@ export function buildHardExcludeClause(slugColumn: string, prefixes: string[]): 
  * @returns raw SQL fragment, e.g.
  *   `AND p.deleted_at IS NULL AND NOT s.archived AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'quarantine')`
  */
-export function buildVisibilityClause(pageAlias: string, sourceAlias: string): string {
+export function buildVisibilityClause(
+  pageAlias: string,
+  sourceAlias: string,
+  opts?: {
+    /**
+     * #4352 — untrusted-caller predicate: hide pages whose frontmatter
+     * carries `visibility: private` (absent visibility defaults to 'world',
+     * or to 'private' on derived atoms and synthesized concepts).
+     * Set from SearchOpts.excludePrivate by both engines; callers resolve
+     * trust + the config gate via resolveExcludePrivatePages
+     * (search/private-visibility.ts). Off by default — trusted local reads
+     * are unchanged.
+     */
+    excludePrivate?: boolean;
+    requireSafeChunks?: boolean;
+    /** #5575: the read floor and proactive activation control (eligibility/sql.ts), applied before LIMIT. */
+    minTrust?: TrustTier;
+    suppressFlagged?: boolean;
+    /**
+     * Wave B: the chunk table alias when the statement reads `content_chunks`
+     * rows joined to the page; adds the live body generation predicate
+     * (`chunkVisibleFilter`) in place of the page-only projection filter.
+     */
+    chunkAlias?: string;
+  },
+): string {
   // Single source of truth for the quarantine SQL lives in quarantine.ts so
   // the marker key + filter can't drift from the search filter (#1699).
   const quarantine = quarantineFilterFragment(pageAlias);
-  return `AND ${pageAlias}.deleted_at IS NULL AND NOT ${sourceAlias}.archived AND ${quarantine}`;
+  // #4352 remediation: the predicate text lives ONCE in private-visibility.ts
+  // (shared with listPages + the relational-arm hydrate) so it cannot drift.
+  const privateClause = opts?.excludePrivate
+    ? ` AND ${privatePagesFilterForCaller(pageAlias)}`
+    : '';
+  const chunksClause = requiresSafeChunks(opts) ? ` AND ${safeChunksFilter(pageAlias)}` : '';
+  // C4: a pinned question's page holds only the question and owner notes; it is
+  // read through questions_* and never ranks in retrieval (questions/pages.ts).
+  const pinnedQuestion = ` AND NOT (COALESCE(${pageAlias}.frontmatter, '{}'::jsonb) ? 'pinned_question')`;
+  const trustClause = opts?.minTrust || opts?.suppressFlagged
+    ? ` AND ${pageEligibleSql(pageAlias, { floor: opts.minTrust, suppressFlagged: opts.suppressFlagged })}` : '';
+  const projection = opts?.chunkAlias ? chunkVisibleFilter(pageAlias, opts.chunkAlias) : servedTextProjectionFilter(pageAlias);
+  return `AND ${pageAlias}.deleted_at IS NULL AND ${projection} AND NOT ${sourceAlias}.archived AND ${quarantine}${pinnedQuestion}${privateClause}${chunksClause}${trustClause}`;
 }
 
 // ============================================================
@@ -204,6 +266,123 @@ export function buildBestPerPagePoolCte(candidateCte: string): string {
         FROM ${candidateCte}
         ORDER BY COALESCE(source_id, 'default'), slug, score DESC, page_id ASC, chunk_id ASC
       )`;
+}
+
+// ============================================================
+// websearch_to_tsquery input bounds
+// ============================================================
+
+export const MAX_WEBSEARCH_QUERY_CHARS = 64_000;
+export const MAX_WEBSEARCH_QUERY_TERMS = 256;
+
+/** Longest run of dash negations `websearch_to_tsquery` parses: its operator stack holds 32 entries. */
+export const MAX_WEBSEARCH_DASH_RUN = 31;
+
+/**
+ * Collapse runs of more than MAX_WEBSEARCH_DASH_RUN dash negations to their
+ * parity. websearch_to_tsquery reads every `-` before a term as one more NOT
+ * (`x ---- y` is `'x' & !!!!'y'`), so a markdown rule or setext underline of
+ * 32+ dashes (`-----...` or `- - - ...`) overflows its operator stack and
+ * raises `tsquery stack too small`, failing the keyword and title arms for
+ * the whole query. An even run becomes a space and an odd run a single `-`:
+ * the tsquery a deeper stack would build. Shorter runs, and so every query
+ * that parses today, pass through unchanged.
+ */
+export function collapseWebsearchDashRuns(query: string): string {
+  return query.replace(/-(?:\s*-){31,}/g, run => ((run.match(/-/g)!.length % 2) === 1 ? ' -' : ' '));
+}
+
+/**
+ * Bound caller text before feeding it to `websearch_to_tsquery`.
+ *
+ * Postgres can hit `stack depth limit exceeded` when websearch parses very
+ * large, high-term-count strings. Keep ordinary exact-title/body searches
+ * untouched, but cap pasted grounding blobs before they reach SQL.
+ */
+export function boundWebsearchQuery(raw: string): string {
+  const query = collapseWebsearchDashRuns(raw);
+  if (query.length <= MAX_WEBSEARCH_QUERY_CHARS) {
+    let terms = 0;
+    for (const _ of query.matchAll(/[\p{L}\p{N}]+/gu)) {
+      terms++;
+      if (terms > MAX_WEBSEARCH_QUERY_TERMS) break;
+    }
+    if (terms <= MAX_WEBSEARCH_QUERY_TERMS) return query;
+  }
+
+  let end = Math.min(query.length, MAX_WEBSEARCH_QUERY_CHARS);
+  let terms = 0;
+  for (const match of query.matchAll(/[\p{L}\p{N}]+/gu)) {
+    if (match.index >= MAX_WEBSEARCH_QUERY_CHARS) {
+      end = Math.min(end, match.index);
+      break;
+    }
+    terms++;
+    if (terms > MAX_WEBSEARCH_QUERY_TERMS) {
+      end = Math.min(end, match.index);
+      break;
+    }
+  }
+
+  const bounded = query.slice(0, end).trim();
+  return bounded.length > 0 ? bounded : query.slice(0, MAX_WEBSEARCH_QUERY_CHARS).trim();
+}
+
+// ============================================================
+// AND→OR keyword-recall fallback (fix/title-retrieval-arm, D2)
+// ============================================================
+
+/**
+ * Build a relaxed OR-of-terms websearch string for the keyword-arm recall
+ * fallback.
+ *
+ * `websearch_to_tsquery('english', query)` joins unquoted terms with `&`
+ * (AND). At chunk grain, one query token that doesn't co-occur in any
+ * single chunk zeroes keyword recall with no fallback. When the strict
+ * AND query returns zero rows, engines retry ONCE with the string this
+ * builder returns — the same tokens joined with websearch's `OR` keyword,
+ * which compiles to `|`.
+ *
+ * Why rebuild via websearch syntax instead of hand-assembling a tsquery:
+ * websearch_to_tsquery never raises on malformed input, applies the same
+ * stemming/stopword pipeline as the document side, and an all-stopword
+ * token list degrades to an empty tsquery (matches nothing) instead of a
+ * SQL error — the empty-tsquery guard comes free.
+ *
+ * Returns null when relaxation is pointless or unsafe:
+ *   - fewer than 2 tokens survive tokenization (OR of one term is the same
+ *     query as AND of one term);
+ *   - the raw query uses websearch OPERATORS (Reviewer F3): a `-term`
+ *     negation would be RESURRECTED as a positive OR term, and a quoted
+ *     phrase would degrade to a bag of words — both invert caller intent,
+ *     so operator queries get no fallback at all.
+ * Tokenization splits on non-alphanumeric runs (Unicode-aware). Literal
+ * OR/AND words are dropped so they can't be re-parsed as operators
+ * mid-list.
+ */
+export function buildOrFallbackWebsearchQuery(query: string): string | null {
+  // F3 operator guard: any double quote, or a dash LEADING a token
+  // (whitespace/start boundary — interior hyphens like "foo-bar" are fine).
+  if (query.includes('"') || /(^|\s)-\S/.test(query)) return null;
+  const tokens = orFallbackTokens(query);
+  return tokens.length < 2 ? null : tokens.join(' OR ');
+}
+
+/**
+ * The OR fallback's terms: word tokens without the literal OR/AND words, each
+ * once (case-insensitive, first spelling kept). A repeated word adds no match
+ * and only makes ts_rank evaluate the lexeme again on every matching row:
+ * 4.5 s against 0.55 s over a 16,840-page match set, with identical scores
+ * (#7135, diagnosed by @veltri-23 in #7136). Callers apply the operator guard.
+ */
+export function orFallbackTokens(query: string): string[] {
+  const seen = new Set<string>();
+  return query
+    .normalize('NFKC')
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean)
+    .filter(t => { const u = t.toUpperCase(); return u !== 'OR' && u !== 'AND'; })
+    .filter(t => { const k = t.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
 }
 
 // ============================================================
@@ -289,4 +468,18 @@ export function buildRecencyComponentSql(opts: {
 }
 
 // Exported for unit tests
+/**
+ * #7175: keyword ranking has no phrase term, so a chunk holding the query's words as one contiguous phrase
+ * (a rare exact phrase in a long transcript) ranked like any chunk that merely repeats them. A chunk that
+ * matches the query as a phrase (`phraseto_tsquery`, stemmed, stopword gaps kept) scores this many times higher.
+ * A one-word query matches every candidate equally, so its order is unchanged. Opt-in: `search.keyword_phrase true` turns it on.
+ */
+export const KEYWORD_PHRASE_FACTOR = 2;
+
+/** The phrase multiplier on a chunk's ts_rank; `param` is the SQL placeholder holding the rank query text. */
+export function keywordPhraseFactorSql(ftsLang: string, param: string, enabled = false, vector = 'cc.search_vector'): string {
+  if (!enabled) return '1';
+  return `(CASE WHEN ${vector} @@ phraseto_tsquery('${ftsLang}', ${param}) THEN ${KEYWORD_PHRASE_FACTOR} ELSE 1 END)`;
+}
+
 export const __test__ = { escapeLikePattern, escapeSqlLiteral, buildLikePrefixLiteral };

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { generateText, jsonSchema } from 'ai';
 import { MockLanguageModelV3 } from 'ai/test';
-import { toModelMessages, type ChatMessage } from '../../src/core/ai/gateway.ts';
+import { toAISDKTools, toModelMessages, type ChatMessage } from '../../src/core/ai/gateway.ts';
 
 // v0.42 AI SDK v6 fix — the regression guard that the original bug evaded.
 // Every gateway/toolLoop test stubs the chat transport, which short-circuits
@@ -36,13 +36,13 @@ const internalMessages: ChatMessage[] = [
 describe('gateway tool schema + message shape (real AI SDK v6)', () => {
   it('jsonSchema()-wrapped tools + adapted messages pass generateText without throwing', async () => {
     const model = mockModel();
-    // Built exactly as gateway.chat() builds it (the primary fix).
-    const tools = {
-      search: {
+    const tools = toAISDKTools([
+      {
+        name: 'search',
         description: 'search the brain',
-        inputSchema: jsonSchema({ type: 'object', properties: { q: { type: 'string' } } } as any),
+        inputSchema: { type: 'object', properties: { q: { type: 'string' } } },
       },
-    };
+    ]);
 
     const result = await generateText({
       model: model as any,
@@ -92,5 +92,30 @@ describe('gateway tool schema + message shape (real AI SDK v6)', () => {
     await expect(
       generateText({ model: model as any, tools: tools as any, messages: preFixMessages as any }),
     ).rejects.toThrow();
+  });
+
+  it('FIX: a tool-call with undefined toolCallId (GLM omission) is coerced to a non-empty string', () => {
+    // The exact poisoned shape z.ai/GLM produced: a tool-call part with NO
+    // toolCallId. Replayed as assistant history on turn N+1, pre-fix this threw
+    // "The messages do not match the ModelMessage[] schema" (toolCallId: z.string())
+    // and wedged the job across all 528 autopilot retries. ensureToolCallId()
+    // synthesizes a stable id so the v6 ModelMessage schema no longer rejects it.
+    // (chat() applies the SAME coercion at the source, so the id it emits flows
+    // to BOTH the assistant tool-call block AND its matching tool-result block —
+    // a complete matched conversation is covered by the first test above.)
+    const poisoned: ChatMessage[] = [
+      { role: 'user', content: 'find foo' },
+      { role: 'assistant', content: [{ type: 'tool-call', toolCallId: undefined as unknown as string, toolName: 'search', input: { q: 'foo' } }] },
+    ];
+    const converted = toModelMessages(poisoned) as any[];
+    const asst = converted.find((m) => m.role === 'assistant');
+    const toolCallPart = asst.content.find((p: any) => p.type === 'tool-call');
+    expect(typeof toolCallPart.toolCallId).toBe('string');
+    expect(toolCallPart.toolCallId.length).toBeGreaterThan(0);
+    // An empty-string id must also be coerced (not just undefined).
+    const emptyId = toModelMessages([
+      { role: 'assistant', content: [{ type: 'tool-call', toolCallId: '', toolName: 'search', input: {} }] },
+    ]) as any[];
+    expect(emptyId[0].content[0].toolCallId.length).toBeGreaterThan(0);
   });
 });

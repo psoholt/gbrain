@@ -8,6 +8,11 @@
  * is the runtime source of truth; the markdown file at
  * `skills/migrations/vX.Y.Z.md` remains as the host-agent instruction
  * manual (read on demand when pending-host-work.jsonl is non-empty).
+ *
+ * These are version-upgrade orchestrators (`gbrain apply-migrations`), not
+ * database schema migrations. Schema DDL migrations live one per file in
+ * src/core/schema-migrations/ with the generated registry
+ * src/core/schema-migrations/registry.generated.ts (run by src/core/migrate.ts).
  */
 
 import type { Migration } from './types.ts';
@@ -26,6 +31,10 @@ import { v0_28_0 } from './v0_28_0.ts';
 import { v0_29_1 } from './v0_29_1.ts';
 import { v0_31_0 } from './v0_31_0.ts';
 import { v0_32_2 } from './v0_32_2.ts';
+import { v0_43_0 } from './v0_43_0.ts';
+import { v0_46_3 } from './v0_46_3.ts';
+import { v0_60_31 } from './v0_60_31.ts';
+import { sharedContentMigration } from './shared-content.ts';
 
 export const migrations: Migration[] = [
   v0_11_0,
@@ -43,6 +52,10 @@ export const migrations: Migration[] = [
   v0_29_1,
   v0_31_0,
   v0_32_2,
+  v0_43_0,
+  v0_46_3,
+  sharedContentMigration,
+  v0_60_31,
 ];
 
 /** Look up a migration by exact version string. */
@@ -52,19 +65,7 @@ export function getMigration(version: string): Migration | null {
 
 export type { Migration, FeaturePitch, OrchestratorOpts, OrchestratorResult } from './types.ts';
 
-/**
- * Compare two semver strings (MAJOR.MINOR.PATCH). Returns -1 / 0 / 1.
- * Extracted from src/commands/upgrade.ts#isNewerThan for shared use across
- * the migration runner + post-upgrade pitch path.
- */
-export function compareVersions(a: string, b: string): -1 | 0 | 1 {
-  const va = a.split('.').map(n => parseInt(n, 10) || 0);
-  const vb = b.split('.').map(n => parseInt(n, 10) || 0);
-  for (let i = 0; i < 3; i++) {
-    const da = va[i] ?? 0;
-    const db = vb[i] ?? 0;
-    if (da > db) return 1;
-    if (da < db) return -1;
-  }
-  return 0;
-}
+// Canonical home moved to src/core/migration-ledger.ts (shared with the
+// get_health migrations block without pulling this registry into the ops
+// layer). Re-exported so every existing importer is unchanged.
+export { compareVersions } from '../../core/migration-ledger.ts';

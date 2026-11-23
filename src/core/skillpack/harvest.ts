@@ -23,6 +23,7 @@
  * skill after a manual scrub).
  */
 
+import { assertLegacySkillFilesystemWrite } from './writer-guard.ts';
 import {
   existsSync,
   mkdirSync,
@@ -33,7 +34,8 @@ import {
   writeFileSync,
 } from 'fs';
 import { homedir } from 'os';
-import { dirname, join, relative } from 'path';
+import { dirname, join, relative, sep } from 'path';
+import { resolvedPrefixContained } from '../path-confine.ts';
 
 import { copyArtifacts, walkSourceDir } from './copy.ts';
 import { loadSkillSources } from './bundle.ts';
@@ -97,6 +99,7 @@ const DEFAULT_PRIVATE_PATTERNS_PATH = join(
 
 export function runHarvest(opts: HarvestOptions): HarvestResult {
   const dryRun = opts.dryRun ?? false;
+  if (!dryRun) assertLegacySkillFilesystemWrite(opts.gbrainRoot);
   const hostSkillDir = join(opts.hostRepoRoot, 'skills', opts.slug);
   const hostSkillMd = join(hostSkillDir, 'SKILL.md');
 
@@ -134,29 +137,40 @@ export function runHarvest(opts: HarvestOptions): HarvestResult {
     });
   }
 
-  // Copy with D13 confinement + symlink reject. The confinement root is
-  // the HOST skill dir (every source must canonicalize inside it). For
-  // paired sources outside the skill dir, fall through to symlink-only
-  // protection (the host repo is user-trusted at this granularity).
-  const skillItems = items.filter(i => i.source.startsWith(hostSkillDir));
-  const pairedItems = items.filter(i => !i.source.startsWith(hostSkillDir));
+  // Copy with D13 confinement + symlink reject. Skill-dir sources must
+  // canonicalize inside the HOST skill dir; paired sources must
+  // canonicalize inside the host repo, so a linked folder cannot pull in
+  // a file from outside it.
+  // "Inside" is separator-aware: a sibling folder that starts with the
+  // slug (skills/foo-extra/ next to skills/foo/) is a paired source.
+  const inSkillDir = (p: string) => resolvedPrefixContained(p, hostSkillDir, sep);
+  const skillItems = items.filter(i => inSkillDir(i.source));
+  const pairedItems = items.filter(i => !inSkillDir(i.source));
 
   let filesCopied: string[] = [];
   try {
+    // Validate both batches before writing either, so a refused paired
+    // source cannot leave a half-copied skill dir behind. The real copies
+    // below re-run the same gates.
+    copyArtifacts(skillItems, {
+      rejectSymlinks: true,
+      confineRealpath: hostSkillDir,
+      dryRun: true,
+    });
+    copyArtifacts(pairedItems, {
+      rejectSymlinks: true,
+      confineRealpath: opts.hostRepoRoot,
+      dryRun: true,
+    });
     if (!dryRun) {
       copyArtifacts(skillItems, {
         rejectSymlinks: true,
         confineRealpath: hostSkillDir,
       });
-      copyArtifacts(pairedItems, { rejectSymlinks: true });
-    } else {
-      // Dry-run still validates safety gates but doesn't copy.
-      copyArtifacts(skillItems, {
+      copyArtifacts(pairedItems, {
         rejectSymlinks: true,
-        confineRealpath: hostSkillDir,
-        dryRun: true,
+        confineRealpath: opts.hostRepoRoot,
       });
-      copyArtifacts(pairedItems, { rejectSymlinks: true, dryRun: true });
     }
     filesCopied = items.map(i => i.target);
   } catch (err) {
@@ -231,6 +245,7 @@ function readHostSkillSources(hostRoot: string, slug: string): string[] {
 
 /** Delete everything we just wrote. */
 function rollbackHarvest(gbrainSkillDir: string, pairedTargets: string[]): void {
+  for (const target of [gbrainSkillDir, ...pairedTargets]) assertLegacySkillFilesystemWrite(target);
   try {
     if (existsSync(gbrainSkillDir)) {
       rmSync(gbrainSkillDir, { recursive: true, force: true });
@@ -264,6 +279,7 @@ export function addToBundleManifest(gbrainRoot: string, slug: string): boolean {
   if (manifest.skills.includes(skillRel)) return false;
   manifest.skills.push(skillRel);
   manifest.skills.sort();
+  assertLegacySkillFilesystemWrite(manifestPath);
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
   return true;
 }

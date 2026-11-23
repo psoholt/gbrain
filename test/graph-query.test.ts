@@ -62,6 +62,29 @@ function captureBoth(fn: () => Promise<void>): Promise<{ out: string[]; err: str
   })();
 }
 
+/** captureBoth + a process.exit sentinel, for the refusal paths. */
+async function runWithExit(argv: string[]): Promise<{ code: number; out: string[]; err: string[] }> {
+  const savedExit = process.exit;
+  class ExitSentinel extends Error { constructor(public readonly code: number) { super(`exit ${code}`); } }
+  (process as unknown as { exit: (code?: number) => never }).exit = ((code?: number) => {
+    throw new ExitSentinel(code ?? 0);
+  }) as never;
+  let code = 0;
+  try {
+    const { out, err } = await captureBoth(async () => {
+      try {
+        await runGraphQuery(engine, argv);
+      } catch (e) {
+        if (e instanceof ExitSentinel) { code = e.code; return; }
+        throw e;
+      }
+    });
+    return { code, out, err };
+  } finally {
+    (process as unknown as { exit: typeof savedExit }).exit = savedExit;
+  }
+}
+
 describe('graph-query command', () => {
   beforeEach(async () => {
     await truncateAll();
@@ -170,6 +193,74 @@ describe('graph-query foreign-edge footer (#1153)', () => {
     expect(joined).toMatch(/--include-foreign/);
   });
 
+  // #4765: the walk itself was never scoped, so carol (other-src) was in the
+  // tree while the footer claimed her edge was hidden, and --include-foreign
+  // only silenced the footer. The default walk is now scoped to the resolved
+  // source; --include-foreign genuinely widens it.
+  test('default traversal is scoped: foreign-source edge is not in the tree (#4765)', async () => {
+    const { out } = await captureBoth(async () => {
+      await runGraphQuery(engine, ['people/alice', '--depth', '1']);
+    });
+    const joined = out.join('\n');
+    expect(joined).toContain('people/bob');
+    expect(joined).not.toContain('people/carol');
+  });
+
+  test('--include-foreign walks the foreign edge', async () => {
+    const { out } = await captureBoth(async () => {
+      await runGraphQuery(engine, ['people/alice', '--depth', '1', '--include-foreign']);
+    });
+    const joined = out.join('\n');
+    expect(joined).toContain('people/bob');
+    expect(joined).toContain('people/carol');
+  });
+
+  test('--source <id> scopes the root (alice is not in other-src)', async () => {
+    const { out } = await captureBoth(async () => {
+      await runGraphQuery(engine, ['people/alice', '--depth', '1', '--source', 'other-src']);
+    });
+    expect(out.join('\n').toLowerCase()).toContain('no edges found');
+  });
+
+  test('--source __all__ spans every source (sentinel never scopes literally)', async () => {
+    const { out, err } = await captureBoth(async () => {
+      await runGraphQuery(engine, ['people/alice', '--depth', '1', '--source=__all__']);
+    });
+    expect(out.join('\n')).toContain('people/carol');
+    // An unscoped walk hid nothing, so the footer must not claim it did.
+    expect(err.join('\n')).not.toMatch(/foreign-source pages hidden/);
+  });
+
+  test('an unknown --source is rejected loudly', async () => {
+    await expect(runGraphQuery(engine, ['people/alice', '--source', 'nope-source'])).rejects.toThrow(/nope-source/);
+  });
+
+  // Wave review: the footer counts foreign edges of the ROOT AS RESOLVED
+  // (source_id, slug), not of every same-slug page in the brain — alice is
+  // not in other-src, so a walk scoped there hid nothing.
+  test('--source <id> footer is relative to the resolved source (no phantom hidden edges)', async () => {
+    const { err } = await captureBoth(async () => {
+      await runGraphQuery(engine, ['people/alice', '--depth', '1', '--source', 'other-src']);
+    });
+    expect(err.join('\n')).not.toMatch(/foreign-source pages hidden/);
+  });
+
+  test('--source <id> with --include-foreign is refused (exit 1), not silently widened', async () => {
+    const r = await runWithExit(['people/alice', '--depth', '1', '--source', 'other-src', '--include-foreign']);
+    expect(r.code).toBe(1);
+    expect(r.err.join('\n')).toMatch(/--include-foreign/);
+    expect(r.out).toHaveLength(0);
+  });
+
+  test('a valueless --source (last arg) or --source= is refused, never read as ambient scope', async () => {
+    for (const argv of [['people/alice', '--depth', '1', '--source'], ['people/alice', '--source=', '--depth', '1']]) {
+      const r = await runWithExit(argv);
+      expect(r.code).toBe(1);
+      expect(r.err.join('\n')).toContain('`--source` requires a value');
+      expect(r.out).toHaveLength(0);
+    }
+  });
+
   test('--include-foreign suppresses the footer', async () => {
     const { err } = await captureBoth(async () => {
       await runGraphQuery(engine, ['people/alice', '--depth', '1', '--include-foreign']);
@@ -203,5 +294,39 @@ describe('graph-query foreign-edge footer (#1153)', () => {
     });
     const joined = err.join('\n');
     expect(joined).toMatch(/2 edges to foreign-source pages hidden/);
+  });
+});
+
+describe('graph-query --hop (typed chains)', () => {
+  beforeEach(async () => {
+    await truncateAll();
+    for (const [slug, type] of [['people/alice', 'person'], ['people/bob', 'person'], ['companies/acme', 'company']] as const) {
+      await engine.putPage(slug, { type, title: slug, compiled_truth: '', timeline: '' });
+    }
+    await engine.addLink('people/alice', 'companies/acme', 'alice backed acme', 'invested_in', 'markdown');
+    await engine.addLink('companies/acme', 'people/bob', 'founded by bob', 'founded', 'markdown');
+  });
+
+  test('prints each answer with the edges that prove it', async () => {
+    const r = await runWithExit(['people/alice', '--hop', 'invested_in:object', '--hop', 'founded:subject']);
+    expect(r.code).toBe(0);
+    const out = r.out.join('\n');
+    expect(out).toContain('1 answer for people/alice');
+    expect(out).toContain('people/bob');
+    expect(out).toContain('companies/acme -founded-> people/bob (written on the other page): "founded by bob"');
+  });
+
+  test('--hop with --type/--depth is refused; a malformed hop names the fix', async () => {
+    const conflict = await runWithExit(['people/alice', '--hop', 'invested_in:object', '--depth', '2']);
+    expect(conflict.code).toBe(1);
+    expect(conflict.err.join('\n')).toContain('--hop cannot be combined with --depth');
+    const bad = await runWithExit(['people/alice', '--hop', 'invested_in']);
+    expect(bad.code).toBe(1);
+    expect(bad.err.join('\n')).toContain('toward');
+  });
+
+  test('no answers names the empty hop and the inspection command', async () => {
+    const r = await runWithExit(['people/alice', '--hop', 'invested_in:object', '--hop', 'advises:subject']);
+    expect(r.out.join('\n')).toContain('hop 2 (advises:subject) found no typed edges');
   });
 });

@@ -40,7 +40,9 @@ Show the user the results. Get feedback.
 - Revise the process based on what you learned.
 
 **Step 4: Codify into a Skill.**
-Write the SKILL.md. Either:
+Write the SKILL.md (`gbrain skillify scaffold <name>` scaffolds the tree for
+you; `gbrain skillopt` optimizes an existing skill against a benchmark).
+Either:
 - **New skill** -- genuinely new capability
 - **Add to existing skill** -- variation of something that exists (parameterize it)
 
@@ -63,7 +65,8 @@ Skills should be **Mutually Exclusive, Collectively Exhaustive**:
 - Each signal source has exactly ONE owner skill
 - Two skills creating the same brain page = MECE violation
 
-**Example ownership (no overlap):**
+**Example ownership (no overlap — illustrative; your skill roster will
+differ):**
 
 | Signal Source | Owner Skill | Creates |
 |--------------|-------------|---------|
@@ -80,7 +83,7 @@ A skill is ready when:
 
 - [ ] Ran successfully on 3-10 real items with good output
 - [ ] User reviewed output and approved
-- [ ] SKILL.md is under 500 lines (use references for overflow)
+- [ ] SKILL.md is within its size budget: 16 KB unless `skills/skill-budgets.tsv` gives it a ceiling, description within 1 KB (use references for overflow; `bun run check:skill-health`)
 - [ ] Checks notability before creating brain pages (don't create pages for nobodies)
 - [ ] Has citation enforcement (every fact has a source)
 - [ ] Doesn't overlap with existing skills (MECE)

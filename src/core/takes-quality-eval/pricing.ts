@@ -1,23 +1,20 @@
 /**
- * takes-quality-eval/pricing — fail-closed model pricing for budget
- * enforcement.
+ * takes-quality-eval/pricing — model pricing for `eval takes-quality run`.
  *
- * The KEY SET here is an intentional allowlist — only the default panel and a
- * handful of likely overrides. Passing a model NOT in this list to
- * `eval takes-quality run --budget-usd N` aborts with an actionable error
- * rather than guessing (codex review #4 fail-closed posture vs
- * cross-modal-eval/runner.ts which silently estimates zero on unknown models).
+ * Every model the canonical table prices (`src/core/model-pricing.ts`) is
+ * budget-gateable; an operator rate registered with `gbrain pricing set`
+ * (`pricing.overrides`) wins over the table. Rates are never hand-copied here.
  *
- * The VALUES come from the canonical table (`src/core/model-pricing.ts`) — do
- * NOT hand-edit rates here; update canonical and they flow through. This keeps
- * the allowlist's fail-closed curation while removing the duplicated numbers
- * that let Opus 4.7 drift to a stale $15/$75 here.
- *
- * Schema is `{model_id: {input_per_1m, output_per_1m}}` so callers can compute
- *   (in_tokens * input_per_1m + out_tokens * output_per_1m) / 1_000_000.
+ * Miss policy (new models must run): an unpriced model runs with a warning when
+ * no `--budget-usd` cap is set, and its spend is not counted. Under a user-set
+ * cap it refuses with `no_pricing`, whose fix is the `gbrain pricing set`
+ * registration, because the cap could not be enforced.
  */
 
 import { canonicalLookup } from '../model-pricing.ts';
+import { overrideFor, type PricingOverrides } from '../budget/reservation-cost.ts';
+import { noPricingFix, noPricingGuidance, noPricingMessage, noPricingSteps, pricingSetCommand } from '../budget/no-pricing.ts';
+import { opError, type OperationError } from '../ops/contract.ts';
 
 export interface ModelPricing {
   /** USD per 1M input tokens. */
@@ -26,64 +23,29 @@ export interface ModelPricing {
   output_per_1m: number;
 }
 
-/**
- * The curated allowlist of models takes-quality will budget-gate. Each must
- * exist in CANONICAL_PRICING; the map below fails fast at module load if one
- * is missing (a programmer error caught immediately, not at run time).
- */
-const SUPPORTED_MODELS = [
-  'openai:gpt-4o',
-  'openai:gpt-5',
-  'openai:gpt-5.5',
-  'anthropic:claude-opus-4-8',
-  'anthropic:claude-opus-4-7',
-  'anthropic:claude-sonnet-4-6',
-  'anthropic:claude-haiku-4-5',
-  'google:gemini-1.5-pro',
-  'google:gemini-2-flash',
-] as const;
-
-export const MODEL_PRICING: Record<string, ModelPricing> = Object.fromEntries(
-  SUPPORTED_MODELS.map((id) => {
-    const p = canonicalLookup(id);
-    if (!p) {
-      throw new Error(
-        `takes-quality allowlist model "${id}" is missing from CANONICAL_PRICING ` +
-        `(src/core/model-pricing.ts). Add it there.`,
-      );
-    }
-    return [id, { input_per_1m: p.input, output_per_1m: p.output }];
-  }),
-);
-
-export class PricingNotFoundError extends Error {
-  constructor(public readonly modelId: string) {
-    super(
-      `Model "${modelId}" has no pricing entry. Add it to CANONICAL_PRICING in ` +
-      `src/core/model-pricing.ts AND to the SUPPORTED_MODELS allowlist in ` +
-      `src/core/takes-quality-eval/pricing.ts, OR pass --budget-usd 0 to disable ` +
-      `budget enforcement (you'll still see the cost printed to stderr but the ` +
-      `runner won't abort).`,
-    );
-    this.name = 'PricingNotFoundError';
-  }
+/** The model's rate: registered override first, then the canonical table; null when unpriced. */
+export function getPricing(modelId: string, overrides?: PricingOverrides): ModelPricing | null {
+  const p = overrideFor(modelId, overrides) ?? canonicalLookup(modelId);
+  return p ? { input_per_1m: p.input, output_per_1m: p.output } : null;
 }
 
-/**
- * Look up pricing for a model. Throws PricingNotFoundError when the model
- * isn't in the table — caller catches and surfaces the actionable message.
- */
-export function getPricing(modelId: string): ModelPricing {
-  const p = MODEL_PRICING[modelId];
-  if (!p) throw new PricingNotFoundError(modelId);
-  return p;
+/** USD for a call's token usage; null when the model is unpriced. */
+export function estimateCost(modelId: string, inTokens: number, outTokens: number, overrides?: PricingOverrides): number | null {
+  const p = getPricing(modelId, overrides);
+  return p ? (inTokens * p.input_per_1m + outTokens * p.output_per_1m) / 1_000_000 : null;
 }
 
-/**
- * Estimate cost in USD for a given model + token usage. Uses fail-closed
- * lookup; throws on unknown model.
- */
-export function estimateCost(modelId: string, inTokens: number, outTokens: number): number {
-  const p = getPricing(modelId);
-  return (inTokens * p.input_per_1m + outTokens * p.output_per_1m) / 1_000_000;
+/** The refusal for an unpriced model under a user-set `--budget-usd` cap. */
+export function unpricedUnderCapError(modelId: string, capUsd: number): OperationError {
+  const g = noPricingGuidance(modelId, 'chat');
+  return opError('no_pricing', noPricingMessage(g, { label: 'eval takes-quality', capUsd }), noPricingSteps(g), {
+    fix: noPricingFix(g),
+    docs: g.docs,
+  });
+}
+
+/** The warning for an unpriced model with no cap: it runs, its spend is not counted. */
+export function unpricedWarning(modelId: string): string {
+  return `[eval takes-quality] warning: gbrain has no price for ${modelId}; it runs, but its spend is not counted in cost_usd. ` +
+    `Look up its rate and register it: ${pricingSetCommand(modelId, 'chat')}`;
 }

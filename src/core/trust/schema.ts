@@ -1,0 +1,315 @@
+/**
+ * Memory trust tiers (#5575) in the database: the `trust_tier` and
+ * `write_origin` columns, the BEFORE ROW trigger that stamps and guards them,
+ * the page_versions snapshot, the per-token `min_trust` read floor and the
+ * `trust_proposals` decision record. One canonical copy used by the trust
+ * tiers schema migration. Like the attribution DDL it is not in the schema
+ * blob: a fresh install replays every migration.
+ *
+ * The writer's tier reaches the trigger through transaction-local settings
+ * that the attribution seam sets (persistence/context.ts):
+ *   gbrain.write_trust_tier       the effective tier (trust/tier.ts computes it once)
+ *   gbrain.write_origin           its origin record, JSON text
+ *   gbrain.write_trust_promotion  a tier ceiling for an explicit raise (owner confirmation, CEO-9)
+ *   gbrain.write_trust_backfill   'on' for the deterministic backfill (CEO-10)
+ *   gbrain.write_trust_keep       comma list of tables whose content rewrites in this scope keep the
+ *                                 stored tier: a gbrain-managed fence edit (remember/takes fence append,
+ *                                 forget or accept strike) rewrites the page body without authoring it,
+ *                                 and the fence row carries its own tier (ENG-1)
+ *
+ * Trigger semantics (CEO-12, CEO-16, CEO-10, ENG-13):
+ * - INSERT: the row gets the writer's tier, or `unknown` without one; a
+ *   supplied value is honored only under the backfill setting (never above
+ *   operator_curated without promotion).
+ * - UPDATE that changes a TRUST_CONTENT_COLUMNS column: an owner-tier writer
+ *   (operator_curated or higher) restamps the row to its tier; any lower
+ *   writer (or none, read as `unknown`) sets min(prior tier, writer tier).
+ * - UPDATE that changes no content column keeps the stored tier, and so does
+ *   a content change on a table named by gbrain.write_trust_keep (a fence
+ *   edit; it can still lower, never raise).
+ * - An UPDATE that sets a higher tier is honored under a covering promotion
+ *   ceiling, or under the backfill setting from `unknown` to anything below
+ *   user_confirmed. Inside a writer scope it is otherwise clamped back; with
+ *   no writer scope it raises `trust_raise_refused`. Lowering is always allowed.
+ * - A writer tier above operator_curated needs a covering promotion ceiling.
+ * - Guest sources (GBRA-504, guest-notes migration): a pages row in a source listed in
+ *   guest_sources never ends above that source's trust_ceiling, on every exit;
+ *   creating it or changing its content needs the principal of
+ *   gbrain.write_principal_kind/_id on the source's writer list; facts, takes
+ *   and timeline rows there are refused. GUEST_AWARE_STAMP_TIER_FUNCTION.
+ *
+ * `gbrain.write_trust_promotion` protects against bugs, not against a process
+ * holding a raw database connection, which can set any setting.
+ */
+import { HASH_EPHEMERAL_FRONTMATTER_KEYS } from '../utils.ts';
+import { OWNER_TIER_FLOOR, TRUST_TIERS, trustRankSql } from './tier.ts';
+import { requireMaintainerPoliciesSql } from '../derived-state-maintainers.ts';
+
+export type TrustTable = 'facts' | 'takes' | 'timeline_entries' | 'pages';
+export const TRUST_TABLES: readonly TrustTable[] = ['facts', 'takes', 'timeline_entries', 'pages'];
+/** Config key: when the last complete backfill apply finished (doctor `trust_tiers` stops recommending the backfill). */
+export const TRUST_BACKFILL_COMPLETED_KEY = 'trust.backfill_completed_at';
+
+/**
+ * Frontmatter keys whose change is not a content change for the tier rule:
+ * the hash-ephemeral keys (timestamps and gate-owned markers re-derived on
+ * every import) and the stored quarantine override. The lower-only
+ * `trust_tier` marker is content on purpose: deleting it by hand is the
+ * owner act that lets the next owner sync restamp the page (CEO-21).
+ */
+export const TRUST_EPHEMERAL_FRONTMATTER_KEYS: readonly string[] = [...HASH_EPHEMERAL_FRONTMATTER_KEYS.filter(key => key !== 'trust_tier'), 'quarantine_override'];
+
+/**
+ * ENG-2: the columns whose change is a content rewrite. Lifecycle and
+ * placement columns (expiry, supersession, consolidation, row numbers,
+ * visibility, notability, confidence, active, resolution, weight, source)
+ * keep the stored tier. Pages use the pages_knowledge_revision tuple
+ * (page-state/schema.ts) with the ephemeral frontmatter keys removed.
+ * Pinned by test/trust-tier-schema.test.ts.
+ */
+export const TRUST_CONTENT_COLUMNS: Readonly<Record<TrustTable, readonly string[]>> = {
+  facts: ['fact', 'entity_slug', 'kind', 'claim_metric', 'claim_value', 'claim_unit', 'claim_period', 'value', 'event_type', 'dimension', 'context'],
+  takes: ['claim', 'kind', 'holder'],
+  timeline_entries: ['summary', 'detail', 'date'],
+  pages: ['source_id', 'slug', 'type', 'page_kind', 'title', 'compiled_truth', 'timeline', 'frontmatter', 'deleted_at'],
+};
+
+/** Columns the migration adds to every trust table (and to page_versions, nullable there). */
+export const TRUST_ROW_COLUMNS = ['trust_tier', 'write_origin'] as const;
+
+export const TRUST_TIER_TRIGGER = 'trust_tier_stamp';
+export const TRUST_VERSION_TRIGGER = 'page_versions_trust_snapshot';
+/** Triggers that must fire before the tier trigger on the same row (PostgreSQL fires same-timing triggers by name). */
+export const TRUST_TIER_TRIGGER_PREDECESSORS: Readonly<Record<TrustTable, readonly string[]>> = {
+  facts: ['facts_preserve_withdrawal', 'gbrain_write_attribution', 'managed_writer_guard'],
+  takes: ['gbrain_write_attribution', 'managed_writer_guard'],
+  timeline_entries: ['gbrain_write_attribution', 'managed_writer_guard'],
+  pages: ['managed_writer_guard', 'pages_knowledge_revision', 'pages_revision_attribution', 'trg_pages_search_vector'],
+};
+
+const tierList = TRUST_TIERS.map(tier => `'${tier}'`).join(',');
+const rank = trustRankSql;
+const lowerOf = (a: string, b: string) => `(CASE WHEN ${rank(a)} <= ${rank(b)} THEN ${a} ELSE ${b} END)`;
+const contentExpr = (row: 'NEW' | 'OLD', table: TrustTable, columns: readonly string[]) => columns
+  .map(column => table === 'pages' && column === 'frontmatter'
+    // A non-object frontmatter (legacy or raw-SQL rows) has no keys to drop; jsonb `-` would raise on it.
+    ? `(CASE WHEN jsonb_typeof(${row}.frontmatter) = 'object' THEN ${row}.frontmatter - ARRAY[${TRUST_EPHEMERAL_FRONTMATTER_KEYS.map(key => `'${key}'`).join(',')}]::text[] ELSE ${row}.frontmatter END)`
+    : `${row}.${column}`)
+  .join(', ');
+const contentChanged = (table: TrustTable, columns: readonly string[] = TRUST_CONTENT_COLUMNS[table]) =>
+  `(${contentExpr('NEW', table, columns)}) IS DISTINCT FROM (${contentExpr('OLD', table, columns)})`;
+const refuse = (message: string, detail: string) => `RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='trust_raise_refused: ${message}',
+      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='trust_tier_guard', DETAIL=${detail}`;
+const SETTINGS = `
+  writer := NULLIF(current_setting('gbrain.write_trust_tier', true), '');
+  origin_text := NULLIF(current_setting('gbrain.write_origin', true), '');
+  promo := NULLIF(current_setting('gbrain.write_trust_promotion', true), '');
+  backfill := COALESCE(current_setting('gbrain.write_trust_backfill', true), '') = 'on';
+  keep := TG_TABLE_NAME = ANY(string_to_array(COALESCE(current_setting('gbrain.write_trust_keep', true), ''), ','));
+  IF ${rank('writer')} = 0 AND writer IS NOT NULL OR ${rank('promo')} = 0 AND promo IS NOT NULL THEN
+    RAISE EXCEPTION USING ERRCODE='22023', MESSAGE='gbrain trust setting names no tier', CONSTRAINT='trust_tier_guard';
+  END IF;`;
+
+/** A guest page's content for the writer backstop: every content column but deleted_at, so soft delete and restore pass. */
+const GUEST_PAGE_CONTENT_COLUMNS = TRUST_CONTENT_COLUMNS.pages.filter(column => column !== 'deleted_at');
+const guestRefuse = (code: string, message: string) => `RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='${code}: ${message}',
+      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='guest_source_guard', DETAIL=jsonb_build_object('op',TG_OP)::text`;
+const CHANGED_CHAIN = `${TRUST_TABLES.map((table, index) => `${index === 0 ? 'IF' : 'ELSIF'} TG_TABLE_NAME = '${table}' THEN
+    changed := ${contentChanged(table)};`).join('\n  ')}
+  ELSE
+    RAISE EXCEPTION 'gbrain_stamp_trust_tier is not classified for table %', TG_TABLE_NAME;
+  END IF;`;
+/**
+ * GBRA-504: the guest-source rules, run before anything else. A page in a guest
+ * source (guest_sources, one primary-key probe) may be inserted, or have a
+ * content column other than deleted_at changed (moves in or out included), only
+ * by a principal on the source's writer list, read from the attribution
+ * settings, and only by a guest note: its publication sets gbrain.guest_note to
+ * its gbrain.write_request (guests/admission.ts assertGuestWriterAtPublication), so a
+ * listed writer's plain write admitted before the source became a guest source
+ * is refused here (guest_attribution_missing) without a read of its own. A
+ * fact, take or timeline row in a guest source is refused on INSERT and on a
+ * content change; lifecycle updates and deletes pass. Other tables skip the
+ * probe while guest_sources is empty. `failClosed` (follow-up 3 of #9354) first refuses, with
+ * writer_coordinator_required (unreadable_state, state guest_sources), a role that row-level security keeps from
+ * reading guest_sources, which would otherwise read it empty and pass every write as if no source were a guest source.
+ */
+const guestGuard = (failClosed: boolean) => `
+  IF TG_OP = 'UPDATE' THEN
+    ${CHANGED_CHAIN.replace(/\n/g, '\n  ')}
+  END IF;
+  IF TG_TABLE_NAME = 'pages' THEN${failClosed ? `
+    ${requireMaintainerPoliciesSql('guest_sources', ['SELECT'], '    ')}` : ''}
+    SELECT g.trust_ceiling, g.writers INTO guest_ceiling, guest_writers FROM guest_sources g WHERE g.source_id = NEW.source_id;
+    guest := FOUND;
+    IF NOT guest AND TG_OP = 'UPDATE' AND OLD.source_id IS DISTINCT FROM NEW.source_id THEN
+      SELECT g.writers INTO guest_writers FROM guest_sources g WHERE g.source_id = OLD.source_id;
+      guest := FOUND;
+    END IF;
+    IF guest AND NOT COALESCE(NULLIF(current_setting('gbrain.write_principal_kind', true), '') || ':'
+        || NULLIF(current_setting('gbrain.write_principal_id', true), '') = ANY(guest_writers), false) THEN
+      IF TG_OP = 'INSERT' THEN
+        ${guestRefuse('source_writer_restricted', 'only the listed writers of a guest source may create its pages')};
+      ELSIF ${contentChanged('pages', GUEST_PAGE_CONTENT_COLUMNS)} THEN
+        ${guestRefuse('source_writer_restricted', 'only the listed writers of a guest source may change its pages')};
+      END IF;
+    ELSIF guest AND (TG_OP = 'INSERT' OR ${contentChanged('pages', GUEST_PAGE_CONTENT_COLUMNS)}) AND NOT COALESCE(
+        NULLIF(current_setting('gbrain.guest_note', true), '') = current_setting('gbrain.write_request', true), false) THEN
+      ${guestRefuse('guest_attribution_missing', 'a listed writer creates or changes a guest page only as a guest note')};
+    END IF;
+  ELSIF (TG_OP = 'INSERT' OR changed)${failClosed ? ` THEN
+    ${requireMaintainerPoliciesSql('guest_sources', ['SELECT'], '    ')}
+  END IF;
+  IF TG_TABLE_NAME <> 'pages' AND (TG_OP = 'INSERT' OR changed)` : ''} AND EXISTS (SELECT 1 FROM guest_sources) THEN
+    IF TG_TABLE_NAME = 'facts' THEN
+      guest := EXISTS (SELECT 1 FROM guest_sources g WHERE g.source_id = NEW.source_id);
+    ELSE
+      guest := EXISTS (SELECT 1 FROM pages p JOIN guest_sources g ON g.source_id = p.source_id WHERE p.id = NEW.page_id);
+    END IF;
+    IF guest THEN
+      ${guestRefuse('guest_page_immutable', 'a guest source holds no facts, takes or timeline entries')};
+    END IF;
+  END IF;`;
+/** Every exit of the guest-aware function caps a guest page at its source ceiling. */
+const GUEST_CEILING_RETURN = `IF guest_ceiling IS NOT NULL AND ${rank('NEW.trust_tier')} > ${rank('guest_ceiling')} THEN NEW.trust_tier := guest_ceiling; END IF; RETURN NEW;`;
+
+/**
+ * The tier trigger function. `'none'` is the v226 body, kept
+ * byte-identical (the migration golden pins it, and migrations between v226 and
+ * the guest-notes migration run before guest_sources exists). `'guest'` adds the guest-source rules
+ * (guestGuard) and the per-source ceiling on every RETURN NEW, as the guest-notes migration installed it (byte-identical
+ * too); `'guest_fail_closed'` adds the unreadable guest_sources refusal, and any later migration that re-creates this
+ * function uses it.
+ */
+const stampTierFunction = (mode: 'none' | 'guest' | 'guest_fail_closed') => {
+  const guestSources = mode !== 'none';
+  const ret = guestSources ? GUEST_CEILING_RETURN : 'RETURN NEW;';
+  return `CREATE OR REPLACE FUNCTION gbrain_stamp_trust_tier() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $fn$
+DECLARE writer text; origin_text text; promo text; backfill boolean; keep boolean; changed boolean; effective text;${guestSources ? ' guest boolean := false; guest_ceiling text; guest_writers text[];' : ''}
+BEGIN${SETTINGS}${guestSources ? guestGuard(mode === 'guest_fail_closed') : ''}
+  IF ${rank('writer')} > ${rank(`'${OWNER_TIER_FLOOR}'`)} AND (promo IS NULL OR ${rank('writer')} > ${rank('promo')}) THEN
+    ${refuse('a write declared a tier above operator_curated without owner confirmation', `jsonb_build_object('op',TG_OP,'writer',writer)::text`)};
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    IF backfill THEN
+      IF ${rank('NEW.trust_tier')} > ${rank(`'${OWNER_TIER_FLOOR}'`)} AND (promo IS NULL OR ${rank('NEW.trust_tier')} > ${rank('promo')}) THEN
+        ${refuse('a copied row named a tier above operator_curated without owner confirmation', `jsonb_build_object('op',TG_OP,'to',NEW.trust_tier)::text`)};
+      END IF;
+      ${ret}
+    END IF;
+    NEW.trust_tier := COALESCE(writer, 'unknown');
+    NEW.write_origin := origin_text::jsonb;
+    ${ret}
+  END IF;
+  IF ${rank('NEW.trust_tier')} > ${rank('OLD.trust_tier')} THEN
+    IF promo IS NOT NULL AND ${rank('NEW.trust_tier')} <= ${rank('promo')} THEN
+      ${ret}
+    ELSIF backfill AND OLD.trust_tier = 'unknown' AND NEW.trust_tier <> 'user_confirmed' THEN
+      ${ret}
+    ELSIF writer IS NULL THEN
+      ${refuse('raising a tier needs owner confirmation', `jsonb_build_object('op',TG_OP,'from',OLD.trust_tier,'to',NEW.trust_tier,'backfill',backfill)::text`)};
+    END IF;
+    NEW.trust_tier := OLD.trust_tier;
+  END IF;${guestSources ? '' : `
+  ${CHANGED_CHAIN}`}
+  IF changed AND NOT keep THEN
+    effective := COALESCE(writer, 'unknown');
+    IF ${rank('effective')} < ${rank(`'${OWNER_TIER_FLOOR}'`)} THEN effective := ${lowerOf('OLD.trust_tier', 'effective')}; END IF;
+    IF ${rank('NEW.trust_tier')} < ${rank('OLD.trust_tier')} THEN effective := ${lowerOf('NEW.trust_tier', 'effective')}; END IF;
+    NEW.trust_tier := effective;
+    IF NEW.write_origin IS NOT DISTINCT FROM OLD.write_origin THEN NEW.write_origin := origin_text::jsonb; END IF;
+  END IF;
+  ${ret}
+END $fn$`;
+};
+const STAMP_TIER_FUNCTION = stampTierFunction('none');
+/** The tier trigger function as the guest-notes migration installed it (its body is pinned there). */
+export const GUEST_AWARE_STAMP_TIER_FUNCTION = stampTierFunction('guest');
+/** The current tier trigger function: guest-source rules that refuse a role unable to read guest_sources. */
+export const GUEST_FAIL_CLOSED_STAMP_TIER_FUNCTION = stampTierFunction('guest_fail_closed');
+
+/**
+ * A version row snapshots the page before the archiving write changes it, in
+ * the same transaction, so the page row still carries the snapshotted tier
+ * (ENG-10). A supplied value is honored only under the backfill setting.
+ * Under RLS the archiving writer needs the page (#7637, derived-state-maintainers.ts).
+ */
+export const SNAPSHOT_VERSION_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_snapshot_version_trust() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $fn$
+BEGIN
+  IF COALESCE(current_setting('gbrain.write_trust_backfill', true), '') = 'on' AND NEW.trust_tier IS NOT NULL THEN RETURN NEW; END IF;
+  ${requireMaintainerPoliciesSql('pages', ['SELECT'])}
+  SELECT p.trust_tier, p.write_origin INTO NEW.trust_tier, NEW.write_origin FROM pages p WHERE p.id = NEW.page_id;
+  RETURN NEW;
+END $fn$`;
+
+/** NOT VALID first (no scan under the ADD), then a separate validation pass. */
+const checkConstraint = (table: string, name: string, predicate: string) => [
+  `DO $do$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '${name}' AND conrelid = '${table}'::regclass) THEN
+      ALTER TABLE ${table} ADD CONSTRAINT ${name} CHECK (${predicate}) NOT VALID;
+    END IF;
+  END $do$`,
+  `ALTER TABLE ${table} VALIDATE CONSTRAINT ${name}`,
+];
+
+export const TRUST_PROPOSAL_ACTIONS = ['supersede_fact', 'supersede_take', 'forget', 'lower_page', 'confirm'] as const;
+export const TRUST_PROPOSAL_STATUSES = ['pending', 'accepted', 'rejected', 'undone', 'superseded'] as const;
+const list = (values: readonly string[]) => values.map(value => `'${value}'`).join(',');
+const TRUST_TABLE_LIST = list(TRUST_TABLES);
+
+/**
+ * ENG-4: one typed trust-decision record. Handlers (lane L1) reuse the
+ * decide_proposals coordinator primitives; CLI refs are `tp<id>`. `target`
+ * is the row the decision changes; `related` is the row that caused it (the
+ * contested lower-tier fact of a guarded supersession, the agent version of a
+ * lowered page). before_state/after_state hold tiers, ids and revisions, the
+ * exact state the accept path re-checks under lock.
+ */
+const TRUST_PROPOSALS_DDL = `CREATE TABLE IF NOT EXISTS trust_proposals (
+  id BIGSERIAL PRIMARY KEY,
+  action TEXT NOT NULL CHECK (action IN (${list(TRUST_PROPOSAL_ACTIONS)})),
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  target_table TEXT NOT NULL CHECK (target_table IN (${TRUST_TABLE_LIST})),
+  target_id BIGINT NOT NULL,
+  related_table TEXT CHECK (related_table IN (${TRUST_TABLE_LIST})),
+  related_id BIGINT,
+  before_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+  after_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+  proposer TEXT NOT NULL,
+  proposer_principal_kind TEXT,
+  proposer_principal_id TEXT,
+  write_request_id UUID,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (${list(TRUST_PROPOSAL_STATUSES)})),
+  decided_at TIMESTAMPTZ,
+  decided_principal_kind TEXT,
+  decided_principal_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK ((related_table IS NULL) = (related_id IS NULL))
+)`;
+
+export const TRUST_SCHEMA_STATEMENTS = [
+  ...TRUST_TABLES.map(table => `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS trust_tier TEXT NOT NULL DEFAULT 'unknown', ADD COLUMN IF NOT EXISTS write_origin JSONB`),
+  ...TRUST_TABLES.flatMap(table => checkConstraint(table, `${table}_trust_tier_check`, `trust_tier IN (${tierList})`)),
+  `ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS trust_tier TEXT, ADD COLUMN IF NOT EXISTS write_origin JSONB`,
+  ...checkConstraint('page_versions', 'page_versions_trust_tier_check', `trust_tier IS NULL OR trust_tier IN (${tierList})`),
+  ...['oauth_clients', 'access_tokens'].flatMap(table => [
+    `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS min_trust TEXT`,
+    ...checkConstraint(table, `${table}_min_trust_check`, `min_trust IS NULL OR min_trust IN (${tierList})`),
+  ]),
+  TRUST_PROPOSALS_DDL,
+  `CREATE INDEX IF NOT EXISTS trust_proposals_pending_idx ON trust_proposals (source_id, created_at) WHERE status = 'pending'`,
+  `CREATE INDEX IF NOT EXISTS trust_proposals_target_idx ON trust_proposals (target_table, target_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS trust_proposals_pending_unique ON trust_proposals
+    (action, target_table, target_id, COALESCE(related_table, ''), COALESCE(related_id, 0)) WHERE status = 'pending'`,
+  STAMP_TIER_FUNCTION,
+  SNAPSHOT_VERSION_FUNCTION,
+  ...TRUST_TABLES.flatMap(table => [
+    `DROP TRIGGER IF EXISTS ${TRUST_TIER_TRIGGER} ON ${table}`,
+    `CREATE TRIGGER ${TRUST_TIER_TRIGGER} BEFORE INSERT OR UPDATE ON ${table} FOR EACH ROW EXECUTE FUNCTION gbrain_stamp_trust_tier()`,
+  ]),
+  `DROP TRIGGER IF EXISTS ${TRUST_VERSION_TRIGGER} ON page_versions`,
+  `CREATE TRIGGER ${TRUST_VERSION_TRIGGER} BEFORE INSERT ON page_versions FOR EACH ROW EXECUTE FUNCTION gbrain_snapshot_version_trust()`,
+] as const;
+
+export const TRUST_SCHEMA_SQL = `${TRUST_SCHEMA_STATEMENTS.join(';\n')};\n`;

@@ -4,12 +4,12 @@
  * redirected to a tmp dir; installCron:false so the suite never touches launchd.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, chmodSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 import {
-  hardenBrainRepo, unhardenBrainRepo, acceptPat,
+  hardenBrainRepo, unhardenBrainRepo, acceptPat, maintainPushLog,
 } from '../src/core/brain-repo-durability.ts';
 
 const PAT = 'ghp_TESTSECRETTOKEN0123456789abcdef';
@@ -53,7 +53,9 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'brd-'));
   oldHome = process.env.HOME; oldGbrainHome = process.env.GBRAIN_HOME;
   process.env.HOME = mkdtempSync(join(root, 'home-'));
-  process.env.GBRAIN_HOME = join(process.env.HOME, '.gbrain');
+  // CX2-8: GBRAIN_HOME is a PARENT dir (config.ts semantics — `.gbrain` is
+  // appended by the resolver), so the effective home is $HOME/.gbrain.
+  process.env.GBRAIN_HOME = process.env.HOME;
   process.env.GBRAIN_GIT_ALLOW_FILE_TRANSPORT = '1';
   makePair();
 });
@@ -124,7 +126,7 @@ describe('hardenBrainRepo', () => {
 
   test('D11 — writes a repo-scoped credential (0600 store, local config, ownership key)', async () => {
     await harden();
-    const store = join(process.env.GBRAIN_HOME!, 'git-credentials');
+    const store = join(process.env.HOME!, '.gbrain', 'git-credentials');
     expect(existsSync(store)).toBe(true);
     expect(statSync(store).mode & 0o077).toBe(0); // not group/other readable
     expect(git(work, 'config', '--local', '--get', 'credential.helper')).toContain('store --file');
@@ -134,7 +136,7 @@ describe('hardenBrainRepo', () => {
   test('D11 — reuses an existing credential.helper (no plaintext store written)', async () => {
     git(work, 'config', 'credential.helper', 'osxkeychain');
     await harden();
-    const store = join(process.env.GBRAIN_HOME!, 'git-credentials');
+    const store = join(process.env.HOME!, '.gbrain', 'git-credentials');
     expect(existsSync(store)).toBe(false);
     expect(git(work, 'config', '--local', '--get', 'credential.helper')).toBe('osxkeychain');
   });
@@ -168,6 +170,121 @@ describe('hardenBrainRepo', () => {
     await harden({ dryRun: true });
     expect(commitCount(work)).toBe(before);
     expect(existsSync(join(work, 'scripts', 'brain-commit-push.sh'))).toBe(false);
+  });
+
+  test('dry-run does not fetch or pull from origin', async () => {
+    const secondClone = mkdtempSync(join(root, 'pusher-'));
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'clone', '-q', bare, secondClone], { stdio: 'ignore' });
+    execFileSync('git', ['-C', secondClone, 'config', 'user.email', 't@t.t'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', secondClone, 'config', 'user.name', 'tester'], { stdio: 'ignore' });
+    writeFileSync(join(secondClone, 'upstream.md'), 'new upstream content\n');
+    execFileSync('git', ['-C', secondClone, 'add', 'upstream.md'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', secondClone, 'commit', '-qm', 'advance origin'], { stdio: 'ignore' });
+    execFileSync('git', ['-c', 'protocol.file.allow=always', '-C', secondClone, 'push', '-q', 'origin', 'main'], { stdio: 'ignore' });
+
+    const headBefore = git(work, 'rev-parse', 'HEAD');
+    const trackingBefore = git(work, 'rev-parse', 'refs/remotes/origin/main');
+    const report = await harden({ dryRun: true });
+
+    expect(git(work, 'rev-parse', 'HEAD')).toBe(headBefore);
+    expect(existsSync(join(work, 'upstream.md'))).toBe(false);
+    expect(git(work, 'rev-parse', 'refs/remotes/origin/main')).toBe(trackingBefore);
+    expect(existsSync(join(work, '.git', 'FETCH_HEAD'))).toBe(false);
+    expect(report.steps.find(step => step.step === 'pull')?.status).toBe('skipped');
+  });
+
+  test('dry-run does not chmod an already-current helper (#3736)', async () => {
+    await harden(); // real run installs scripts/brain-commit-push.sh at 0o755
+    const helperPath = join(work, 'scripts', 'brain-commit-push.sh');
+    chmodSync(helperPath, 0o644); // simulate perms drifting away from +x, content unchanged
+    await harden({ dryRun: true });
+    expect(statSync(helperPath).mode & 0o777).toBe(0o644); // untouched — preview must not mutate
+  });
+
+  test('non-dry-run restores the exec bit on an already-current helper', async () => {
+    await harden();
+    const helperPath = join(work, 'scripts', 'brain-commit-push.sh');
+    chmodSync(helperPath, 0o644);
+    await harden();
+    expect(statSync(helperPath).mode & 0o111).toBeTruthy(); // exec bit restored
+  });
+
+  test('CX2-3 — parent-repo-aware: a subdirectory target hardens the repo ROOT', async () => {
+    // Workspace layout: the source dir is `repo/brain` while the enclosing
+    // repo owns `.git`. Pre-fix the `.git` assertion failed on the subdir.
+    const sub = join(work, 'brain');
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(join(sub, 'note.md'), '# note\n');
+    git(work, 'add', 'brain/note.md'); git(work, 'commit', '-qm', 'brain dir');
+    const r = await hardenBrainRepo({ repoPath: sub, sourceId: 'wiki', pat: PAT, installCron: false });
+    expect(r.repo_path).toBe(git(work, 'rev-parse', '--show-toplevel'));
+    // scaffolding landed at the ROOT, not inside brain/
+    expect(existsSync(join(work, 'scripts', 'brain-commit-push.sh'))).toBe(true);
+    expect(existsSync(join(sub, 'scripts'))).toBe(false);
+    expect(r.needs_attention).toEqual([]);
+  });
+
+  test('S3#10 — maintainPushLog chmods 0600 and rotates at 1MB', async () => {
+    const home = join(process.env.HOME!, '.gbrain');
+    mkdirSync(home, { recursive: true });
+    const log = join(home, 'brain-push.log');
+    writeFileSync(log, 'x'.repeat(1024 * 1024 + 1), { mode: 0o644 });
+    maintainPushLog();
+    // rotated: predecessor kept as .1, fresh log is empty + 0600
+    expect(existsSync(`${log}.1`)).toBe(true);
+    expect(readFileSync(log, 'utf-8')).toBe('');
+    expect(statSync(log).mode & 0o077).toBe(0);
+    // small log: chmod only, no rotation
+    rmSync(`${log}.1`);
+    writeFileSync(log, 'small\n', { mode: 0o644 });
+    maintainPushLog();
+    expect(existsSync(`${log}.1`)).toBe(false);
+    expect(readFileSync(log, 'utf-8')).toBe('small\n');
+    expect(statSync(log).mode & 0o077).toBe(0);
+  });
+
+  test('#5436 — core.hooksPath=.githooks: hook is excluded via info/exclude and stays untracked', async () => {
+    git(work, 'config', 'core.hooksPath', '.githooks');
+    await harden({ verify: false });
+    const hookPath = join(work, '.githooks', 'post-commit');
+    expect(existsSync(hookPath)).toBe(true);
+    const exclude = readFileSync(join(work, '.git', 'info', 'exclude'), 'utf-8');
+    expect(exclude).toContain('.githooks/post-commit');
+    // Ignored → the hook never shows up as untracked in git status.
+    const st = git(work, 'status', '--porcelain', '--untracked-files=all', '--', '.githooks/post-commit');
+    expect(st).toBe('');
+  });
+
+  test('#5436 — re-harden repairs the exclusion for a hook installed before the fix', async () => {
+    git(work, 'config', 'core.hooksPath', '.githooks');
+    await harden({ verify: false });
+    const exclude = join(work, '.git', 'info', 'exclude');
+    writeFileSync(exclude, readFileSync(exclude, 'utf-8').replace('.githooks/post-commit\n', ''));
+    expect(git(work, 'status', '--porcelain', '--untracked-files=all', '--', '.githooks/post-commit')).toBe('?? .githooks/post-commit');
+    await harden({ verify: false });
+    expect(readFileSync(exclude, 'utf-8').split('\n').filter(line => line === '.githooks/post-commit')).toHaveLength(1);
+    expect(git(work, 'status', '--porcelain', '--untracked-files=all', '--', '.githooks/post-commit')).toBe('');
+  });
+
+  test('#5436 — a hooks dir outside the working tree gets no exclude entry', async () => {
+    const outside = join(root, 'shared-hooks');
+    git(work, 'config', 'core.hooksPath', outside);
+    await harden({ verify: false });
+    expect(existsSync(join(outside, 'post-commit'))).toBe(true);
+    expect(readFileSync(join(work, '.git', 'info', 'exclude'), 'utf-8')).not.toContain('post-commit');
+  });
+
+  test('#5436 — a hooksPath whose repo path contains ".git" (site.github.io) is still excluded', async () => {
+    const weird = join(root, 'site.github.io', 'repo');
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'clone', '-q', bare, weird], { stdio: 'ignore' });
+    git(weird, 'config', 'user.email', 't@t.t');
+    git(weird, 'config', 'user.name', 'tester');
+    git(weird, 'config', 'core.hooksPath', 'myhooks');
+    await hardenBrainRepo({ repoPath: weird, sourceId: 'wiki', pat: PAT, installCron: false, verify: false });
+    const exclude = readFileSync(join(weird, '.git', 'info', 'exclude'), 'utf-8');
+    expect(exclude).toContain('myhooks/post-commit');
+    const st = git(weird, 'status', '--porcelain', '--untracked-files=all', '--', 'myhooks/post-commit');
+    expect(st).toBe('');
   });
 });
 

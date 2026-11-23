@@ -1,0 +1,322 @@
+/**
+ * Param normalization + validation for MCP tool dispatch (WP3).
+ *
+ * Extracted from src/mcp/dispatch.ts so the branch-heavy validation logic has
+ * a direct unit-test surface (amendment 12). Call order is load-bearing and
+ * preserved from the dispatch layer: `normalizeOptionalParams` FIRST (absent
+ * idioms become truly absent), THEN `validateParams` (types + enums), THEN
+ * `findUnknownParams` (strict/warn unknown-key detection on the normalized
+ * object — so a null/'' optional idiom is never mistaken for an unknown key).
+ *
+ * dispatch.ts re-exports `normalizeOptionalParams` and `validateParams` so
+ * existing imports keep working.
+ */
+
+import type { Operation } from '../core/operations.ts';
+import type { BrainEngine } from '../core/engine.ts';
+import type { GBrainConfig } from '../core/config.ts';
+import { suggestNearest } from '../core/levenshtein.ts';
+import { engineKey } from '../core/engine-key.ts';
+import type { OperationError } from '../core/ops/contract.ts';
+import { invalidParam } from '../core/ops/op-fix.ts';
+import type { Action } from '../core/agent-output.ts';
+
+/** One validation failure: the message (never echoes the caller's value) and the param it names. */
+export interface ParamValidationFailure { message: string; param: string }
+
+/** Validate required params exist and have the expected type. Returns the first failure, or null. */
+export function findInvalidParam(op: Operation, params: Record<string, unknown>): ParamValidationFailure | null {
+  for (const [key, def] of Object.entries(op.params)) {
+    const fail = (message: string) => ({ message, param: key });
+    if (def.required && (params[key] === undefined || params[key] === null)) {
+      return fail(`Missing required parameter: ${key}`);
+    }
+    if (params[key] !== undefined && params[key] !== null) {
+      const val = params[key];
+      const expected = def.type;
+      if (expected === 'string' && typeof val !== 'string') return fail(`Parameter "${key}" must be a string`);
+      if (expected === 'number' && typeof val !== 'number') return fail(`Parameter "${key}" must be a number`);
+      if (expected === 'integer' && !Number.isInteger(val)) return fail(`Parameter "${key}" must be a whole number`);
+      if (expected === 'boolean' && typeof val !== 'boolean') return fail(`Parameter "${key}" must be a boolean`);
+      if (expected === 'object' && (typeof val !== 'object' || Array.isArray(val))) return fail(`Parameter "${key}" must be an object`);
+      if (expected === 'array' && !Array.isArray(val)) return fail(`Parameter "${key}" must be an array`);
+      // WP3: enum membership is a TYPE error, enforced in BOTH strict modes
+      // (warn and reject). The message names the declared values only — the
+      // caller's raw value is never echoed (it can land in persistent logs
+      // via the error_message column; declared values are safe by definition).
+      if (def.enum && typeof val === 'string' && !def.enum.includes(val)) {
+        return fail(`Parameter "${key}" must be one of: ${def.enum.join(', ')}`);
+      }
+    }
+  }
+  return null;
+}
+
+/** Validate required params exist and have the expected type. Returns null on success, error message on failure. */
+export function validateParams(op: Operation, params: Record<string, unknown>): string | null {
+  return findInvalidParam(op, params)?.message ?? null;
+}
+
+/**
+ * B3: the `invalid_params` error for a schema failure — the param's type,
+ * description, valid choices and one example call on the caller's surface
+ * (from the op's ParamDef), never the caller's raw value in `message`.
+ * Over MCP, a read op's wrong-typed or out-of-enum param also gets a `fix`:
+ * the same call with the caller's other arguments and a valid value for the
+ * param (H1a: a caller mistake returns a fix the agent can run).
+ */
+export function schemaInvalidParams(
+  op: Operation,
+  failure: ParamValidationFailure,
+  ctx: { remote?: boolean; transport?: 'stdio' | 'http' },
+  params?: Record<string, unknown>,
+): OperationError {
+  const fix = params && ctx.remote !== false ? retryWithValidParam(op, failure, params) : undefined;
+  return invalidParam({ remote: ctx.remote ?? true, transport: ctx.transport }, op.cliHints?.name && ctx.remote === false ? op.cliHints.name : op.name,
+    failure.param, failure.message, { def: op.params[failure.param], ...(fix ? { fix } : {}) });
+}
+
+/**
+ * The corrected call, or undefined when no safe one exists: never for a
+ * mutating op (an example value could change what gets written), a missing
+ * required param (only the caller knows its value), or a param whose valid
+ * value is not a closed choice, number or boolean. Arguments that are not
+ * short scalars are dropped; if a required one would be dropped, no fix.
+ */
+function retryWithValidParam(op: Operation, failure: ParamValidationFailure, params: Record<string, unknown>): Action | undefined {
+  if (op.mutating !== false) return undefined;
+  const def = op.params[failure.param];
+  if (!def || params[failure.param] === undefined || params[failure.param] === null) return undefined;
+  const value = def.enum?.length ? (def.default !== undefined && def.enum.includes(String(def.default)) ? def.default : def.enum[0])
+    : def.type === 'number' || def.type === 'integer' ? (typeof def.default === 'number' ? def.default : 10)
+      : def.type === 'boolean' ? (typeof def.default === 'boolean' ? def.default : true)
+        : undefined;
+  if (value === undefined) return undefined;
+  const args: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(params)) {
+    if (key === failure.param || !(key in op.params)) continue;
+    const scalar = typeof val === 'number' || typeof val === 'boolean' || (typeof val === 'string' && val.length <= 200);
+    if (scalar) args[key] = val;
+    else if (op.params[key]?.required) return undefined;
+  }
+  args[failure.param] = value;
+  return {
+    mcp: { tool: op.name, arguments: args },
+    consent: [], actor: 'agent', requires_exclusive: false,
+    why: `The call failed validation before it ran, so nothing changed. This is the same call with your other arguments kept and \`${failure.param}\` set to ${JSON.stringify(value)}.`,
+  };
+}
+
+/**
+ * Normalize the absent-idioms real MCP clients send for OPTIONAL params
+ * before validation and dispatch: `null` (any type), `''` (string-typed
+ * params) and the schema-ruled-out empty values in `isAbsentValue` (GST-927)
+ * become "not provided"; then a param declared `appliesWith` another one that
+ * is absent is dropped too (get_page `context` without `grep`).
+ *
+ * Why: non-Claude models routinely fill optional params with `""` or `null`
+ * instead of omitting them. `validateParams` already reads null as absent
+ * for the required-param check (see above); handlers do not — some guard
+ * with `typeof p.x === 'string' && p.x.length > 0` (entity / session_id in
+ * `recall`), others with `p.x !== undefined` (since in `recall`), so
+ * `recall {since: ""}` silently returned zero facts where the same call
+ * with `since` omitted returns rows. Normalizing once at the shared
+ * dispatch layer gives every handler one canonical absence instead of
+ * per-handler guards.
+ *
+ * Deliberately narrow:
+ *   - Required params are untouched — null on a required param still fails
+ *     validation loudly, and `''` on a required string still reaches the
+ *     handler exactly as before.
+ *   - Type-mismatched junk is untouched — `limit: ""` keeps its loud
+ *     "must be a number" error rather than silently succeeding.
+ *   - A value inside the param's valid range is never dropped, except that an
+ *     `appliesWith` param is dropped whatever its value when its partner is
+ *     absent, because it has no effect then. Nothing is dropped from a param
+ *     that declares none of these: the result is always a call the caller
+ *     could have sent by leaving the argument out.
+ *   - Undeclared keys are untouched (they were already ignored).
+ * Copy-on-write: callers' param objects are never mutated.
+ */
+export function normalizeOptionalParams(op: Operation, params: Record<string, unknown>): Record<string, unknown> {
+  let out: Record<string, unknown> | null = null;
+  const drop = (key: string) => {
+    if (out === null) out = { ...params };
+    delete out[key];
+  };
+  for (const [key, def] of Object.entries(op.params)) {
+    if (!def.required && isAbsentValue(op, def, params[key])) drop(key);
+  }
+  for (const [key, def] of Object.entries(op.params)) {
+    const current = out ?? params;
+    if (!def.required && def.appliesWith && current[key] !== undefined && current[def.appliesWith] === undefined) drop(key);
+  }
+  return out ?? params;
+}
+
+/**
+ * GST-927: a value that can only mean "not provided" for this param's schema. `null` anywhere and `''` on a string
+ * (GST-923), plus the empty values GPT-style callers fill in that the schema rules out: 0 below a numeric range that
+ * excludes it, `[]` where the list must be non-empty, `{}` where a read op's object requires a member, and `false` on a
+ * flag that acts only when true. Every other value, including any value inside the valid range, is kept.
+ */
+function isAbsentValue(op: Operation, def: Operation['params'][string], val: unknown): boolean {
+  if (val === null) return true;
+  if (val === '') return def.type === 'string';
+  if (val === 0) return (def.minimum ?? 0) > 0 || (def.exclusiveMinimum ?? -1) >= 0;
+  if (val === false) return def.actsWhenTrue === true;
+  if (Array.isArray(val)) return val.length === 0 && (def.minItems ?? 0) >= 1;
+  if (typeof val === 'object' && def.type === 'object' && op.mutating === false) {
+    return Object.keys(val as object).length === 0 && Object.values(def.properties ?? {}).some(member => member.required);
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// WP3 — strict/warn unknown-argument validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Top-level keys that are legitimate on ANY tool call without being declared
+ * in the op's params: `_meta` is the MCP client metadata slot (several
+ * clients fold it into `arguments`; dispatch reads `_meta.session_id` from
+ * it), and `dry_run` is the contract-wide preview flag consumed by
+ * buildOperationContext.
+ */
+export const UNKNOWN_PARAM_ALLOWLIST: ReadonlySet<string> = new Set(['_meta', 'dry_run']);
+
+/**
+ * #5970: names clients send for a declared param that edit distance cannot
+ * reach. The suggestion names only the op's own declared params (checked at
+ * use), so an alias can never point at another op's surface.
+ */
+const PARAM_ALIAS_HINTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  add_timeline_entry: { content: 'detail', text: 'detail', body: 'detail' },
+  remember: { facts: 'items', text: 'fact', source: 'provenance' },
+};
+
+/** GBRA-431: source-scope spellings edit distance ties or misses (`sources` is as near `source_id` as `source_ids`). */
+const SOURCE_PARAM_ALIASES: Readonly<Record<string, string>> = { source: 'source_id', sourceid: 'source_id', sources: 'source_ids', sourceids: 'source_ids' };
+
+/**
+ * `_meta.warnings` entry shape (amendment 13) — documented in
+ * docs/protocol/MCP_META_CHANNELS.md. `suggestion` is the nearest DECLARED
+ * param name when one is within edit distance; the candidates are ONLY the
+ * op's declared params, so a suggestion can never leak another op's surface.
+ */
+export interface UnknownParamWarning {
+  code: 'unknown_param';
+  param: string;
+  suggestion?: string;
+}
+
+/**
+ * Detect submitted top-level keys the op does not declare. Runs on the
+ * NORMALIZED params object (normalizeOptionalParams only deletes DECLARED
+ * optional keys, so null/'' absent-idioms are never reported here).
+ *
+ * Privacy note (amendment 11 / C8 class): the raw unknown key names returned
+ * here reach the CALLER (warn block, `_meta.warnings`, reject `suggestion`)
+ * but must NEVER be written to `mcp_request_log` — the redacted summarizer
+ * counts unknown keys without naming them, and the reject-mode envelope keeps
+ * the raw key out of `message` (the one field serve-http persists to
+ * error_message).
+ */
+export function findUnknownParams(op: Operation, params: Record<string, unknown>): UnknownParamWarning[] {
+  const declared = Object.keys(op.params);
+  const declaredSet = new Set(declared);
+  const aliases = PARAM_ALIAS_HINTS[op.name];
+  const warnings: UnknownParamWarning[] = [];
+  for (const key of Object.keys(params)) {
+    if (declaredSet.has(key) || UNKNOWN_PARAM_ALLOWLIST.has(key)) continue;
+    const alias = aliases?.[key] ?? SOURCE_PARAM_ALIASES[key.toLowerCase().replace(/[^a-z]/g, '')];
+    const nearest = alias && declaredSet.has(alias) ? alias : suggestNearest(key, declared);
+    warnings.push({ code: 'unknown_param', param: key, ...(nearest ? { suggestion: nearest } : {}) });
+  }
+  return warnings;
+}
+
+/** The families of parameter names that narrow a read's result: a source scope or a type, tag, entity, date, trust or visibility filter. */
+const NARROWING_FAMILIES: readonly RegExp[] = [
+  /^sources?(id|ids|name|names)?$/, /^(types?|kinds?)$/, /^tags?$/, /^(entity|entities)$/,
+  /^(since|until|after|before)$/, /^(min)?trust$/, /^visibility$/,
+];
+
+function narrowingFamily(name: string): RegExp | undefined {
+  const normalized = name.toLowerCase().replace(/[^a-z]/g, '');
+  return NARROWING_FAMILIES.find(family => family.test(normalized));
+}
+
+/**
+ * GBRA-431: the unknown keys a read must refuse whatever `mcp.strict_params` says, because ignoring them answers
+ * unnarrowed: a key whose nearest declared param is a scope or filter (`source` for `source_id`, `type` for `types`),
+ * or whose own name is in a scope or filter family the op declares (`source_name` on an op declaring `source_id`,
+ * `kind` on one declaring `types`). A key whose family the op does not declare cannot narrow it, so it keeps the warn
+ * grace period like any other unknown key (a client adding `source_id` to every call).
+ */
+export function narrowingUnknownParams(warnings: readonly UnknownParamWarning[], declared: readonly string[]): UnknownParamWarning[] {
+  const declaredFamilies = new Set(declared.map(narrowingFamily).filter(family => family !== undefined));
+  return warnings.filter(w => {
+    if (w.suggestion !== undefined && narrowingFamily(w.suggestion)) return true;
+    const family = narrowingFamily(w.param);
+    return family !== undefined && declaredFamilies.has(family);
+  });
+}
+
+/**
+ * The warn-mode notice lines (one per unknown key) hosts before GST-900 appended
+ * as an extra content block. Dispatch no longer sends it (the warning lives in
+ * `_meta.warnings` only, so harnesses never store it in a turn); it stays the
+ * reference for the old-host block `ignoredRemoteParams` still parses.
+ */
+export function buildUnknownParamWarnBlock(warnings: UnknownParamWarning[]): string {
+  return warnings
+    .map(w => w.suggestion
+      ? `warning: unknown parameter "${w.param}" ignored — did you mean "${w.suggestion}"? A future release rejects unknown parameters.`
+      : `warning: unknown parameter "${w.param}" ignored. A future release rejects unknown parameters.`)
+    .join('\n');
+}
+
+export type StrictParamsMode = 'warn' | 'reject';
+
+/** Strict value parse: anything but the two known modes resolves null. */
+export function parseStrictParamsMode(v: unknown): StrictParamsMode | null {
+  return v === 'warn' || v === 'reject' ? v : null;
+}
+
+/**
+ * Dual-plane resolution for `mcp.strict_params`: DB plane (`engine.getConfig`)
+ * wins, file plane (`config.mcp.strict_params`) is the fallback, absent or
+ * unparseable on both = 'warn' (the grace-period default). A failed DB read
+ * holds the LAST successfully resolved DB mode (per engine) before falling
+ * to the file plane — a transient config outage on a reject-mode server must
+ * not silently re-open the warn-mode grace period. Validation posture never
+ * takes a tool call down. Resolved once per dispatch (amendment 12);
+ * serve-http's tools/list also reads it per request so `gbrain config set
+ * mcp.strict_params reject` flips the advertised schema without a restart
+ * (stdio + the legacy bearer transport resolve once at startup — restart to
+ * flip there, deliberate).
+ */
+let lastKnownDbStrictMode = new WeakMap<object, StrictParamsMode | null>();
+
+/** Test seam: clear the last-known-good DB mode between cases. */
+export function resetStrictParamsModeCache(): void {
+  lastKnownDbStrictMode = new WeakMap();
+}
+
+export async function resolveStrictParamsMode(
+  engine: BrainEngine,
+  config: GBrainConfig | null | undefined,
+): Promise<StrictParamsMode> {
+  try {
+    const dbMode = parseStrictParamsMode(await engine.getConfig('mcp.strict_params'));
+    lastKnownDbStrictMode.set(engineKey(engine), dbMode);
+    if (dbMode) return dbMode;
+  } catch {
+    // Engine without a config table / transient error: last-known-good DB
+    // mode wins; with no prior successful read, the file plane decides.
+    const lastKnown = lastKnownDbStrictMode.get(engineKey(engine));
+    if (lastKnown) return lastKnown;
+  }
+  return parseStrictParamsMode(config?.mcp?.strict_params) ?? 'warn';
+}

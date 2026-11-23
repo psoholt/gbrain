@@ -24,7 +24,8 @@ This skill guarantees:
 - MECE check: no overlap with existing skills' triggers
 - Manifest.json updated
 - RESOLVER.md updated with routing entry
-- Skill passes conformance tests (`bun test test/skills-conformance.test.ts`)
+- Skill passes conformance tests (`bun test test/skills-conformance.test.ts`) and `bun run check:skill-health` (no drift from the CLI, SKILL.md within 16 KB, description within 1 KB)
+- Improving a skill follows the update ladder (CONTRIBUTING.md, "Changing a skill"): fix it below the skill first, then edit the existing line instead of appending
 
 ## Phases
 
@@ -58,6 +59,10 @@ mutating: {true|false}
 ## Output Format
 {What good output looks like}
 
+## When it fails
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+{2-5 concrete failures this skill hits — error codes, refusals, notices — and what to do and tell the user}
+
 ## Anti-Patterns
 {What NOT to do — 3-5 items}
 
@@ -72,6 +77,13 @@ mutating: {true|false}
 ## Output Format
 
 New `skills/{name}/SKILL.md` file + updated manifest + updated resolver.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `bun test test/skills-conformance.test.ts` fails: the new SKILL.md lacks a required section (Contract, Anti-Patterns, Output Format, When it fails) or frontmatter; add it and re-run.
+- `gbrain check-resolvable` reports the skill unreachable: add the RESOLVER row in a fitting category, then re-run.
 
 ## Anti-Patterns
 

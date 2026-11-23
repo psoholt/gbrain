@@ -1,13 +1,20 @@
 import { describe, test, expect } from 'bun:test';
-import { parseSemver, isMinorOrMajorBump, extractChangelogBetween } from '../src/commands/check-update.ts';
+import {
+  parseSemver,
+  isMinorOrMajorBump,
+  isNewerVersion,
+  extractChangelogBetween,
+} from '../src/commands/check-update.ts';
+import { surfaceSource } from './helpers/source-surface.ts';
+import { fileURLToPath } from 'node:url';
 
 describe('parseSemver', () => {
   test('parses standard version', () => {
-    expect(parseSemver('0.4.0')).toEqual([0, 4, 0]);
+    expect(parseSemver('0.4.0')).toEqual([0, 4, 0, 0]);
   });
 
   test('strips v prefix', () => {
-    expect(parseSemver('v0.5.0')).toEqual([0, 5, 0]);
+    expect(parseSemver('v0.5.0')).toEqual([0, 5, 0, 0]);
   });
 
   test('returns null for malformed version', () => {
@@ -16,8 +23,31 @@ describe('parseSemver', () => {
     expect(parseSemver('')).toBeNull();
   });
 
-  test('handles 4-part versions (takes first 3)', () => {
-    expect(parseSemver('0.2.0.1')).toEqual([0, 2, 0]);
+  test('preserves the 4th micro segment', () => {
+    expect(parseSemver('0.2.0.1')).toEqual([0, 2, 0, 1]);
+  });
+});
+
+describe('isNewerVersion', () => {
+  test('detects the patch segment used by the gbrain release train', () => {
+    expect(isNewerVersion('0.42.10.0', '0.42.66.0')).toBe(true);
+  });
+
+  test('detects a micro follow-up release', () => {
+    expect(isNewerVersion('0.42.66.0', '0.42.66.1')).toBe(true);
+  });
+
+  test('orders legacy 3-segment against 4-segment: 0.42.67.0 > 0.42.66.1 > 0.42.66', () => {
+    expect(isNewerVersion('0.42.66.1', '0.42.67.0')).toBe(true);
+    expect(isNewerVersion('0.42.66', '0.42.66.1')).toBe(true);
+    expect(isNewerVersion('0.42.66', '0.42.66.0')).toBe(false); // 3-segment == its .0 micro
+    expect(isNewerVersion('0.42.67.0', '0.42.66.1')).toBe(false);
+  });
+
+  test('rejects equal, older, and malformed versions', () => {
+    expect(isNewerVersion('0.42.66.0', '0.42.66.0')).toBe(false);
+    expect(isNewerVersion('0.42.66.1', '0.42.66.0')).toBe(false);
+    expect(isNewerVersion('0.42.66.0', 'garbage')).toBe(false);
   });
 });
 
@@ -119,19 +149,31 @@ describe('extractChangelogBetween', () => {
     expect(result).toContain('Major 2');
     expect(result).not.toContain('Minor 5');
   });
+
+  test('distinguishes micro releases', () => {
+    const micro = `# Changelog
+
+## [0.42.66.1] - 2026-07-26
+- Follow-up fix
+
+## [0.42.66.0] - 2026-07-25
+- Original release
+`;
+    const result = extractChangelogBetween(micro, '0.42.66.0', '0.42.66.1');
+    expect(result).toContain('Follow-up fix');
+    expect(result).not.toContain('Original release');
+  });
 });
 
 describe('check-update CLI', () => {
   test('check-update is in CLI_ONLY set', async () => {
-    const source = await Bun.file(
-      new URL('../src/cli.ts', import.meta.url).pathname
-    ).text();
+    const source = surfaceSource('cli');
     expect(source).toContain("'check-update'");
   });
 
   test('--help prints usage and exits 0', async () => {
     const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', 'check-update', '--help'], {
-      cwd: new URL('..', import.meta.url).pathname,
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -143,7 +185,7 @@ describe('check-update CLI', () => {
 
   test('--json returns valid JSON with required fields', async () => {
     const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', 'check-update', '--json'], {
-      cwd: new URL('..', import.meta.url).pathname,
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
       stdout: 'pipe',
       stderr: 'pipe',
     });

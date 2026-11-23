@@ -9,7 +9,7 @@ starting point.
 
 ```
 my-skillpack/
-├── skillpack.json                # manifest (cathedral fields declared)
+├── skillpack.json                # manifest (all fields declared)
 ├── skills/
 │   └── <skill-slug>/
 │       ├── SKILL.md              # frontmatter + body, agent-readable
@@ -105,8 +105,23 @@ gbrain skillpack scaffold <source>    # owner/repo, https, ./dir, ./*.tgz
 gbrain skillpack registry --url X     # point at a custom registry
 ```
 
+## Brain-resident packs
+
+A brain/source repo can carry its own publishable skillpack (`brain_resident: true`
+in `skillpack.json`, plus a `schema_pack` declaration). Scaffold one with:
+
+```bash
+gbrain skillpack init-brain-pack <name>   # inside the brain repo; --dry-run to preview
+```
+
+Connecting harnesses discover the pack on `gbrain sources add`, and remote
+agents reach it over MCP via the source-scoped `list_brain_skillpack` op +
+`get_skill --source_id` (gated by the `mcp.publish_skills` config key). The
+anatomy above applies unchanged — a brain-resident pack is a normal pack that
+happens to live inside a brain repo.
+
 ## See also
 
 - `examples/skillpack-reference/` — the live 10/10 reference pack
 - `docs/designs/SKILLPACK_REGISTRY_V1_SPEC.md` — strategic spec + decisions
-- `docs/guides/skillpacks-as-scaffolding.md` — v0.36 scaffold/reference model
+- `docs/guides/skillpacks-as-scaffolding.md` — the scaffold/reference model

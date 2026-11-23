@@ -61,6 +61,13 @@ export const MAX_OUTPUT_TOKENS_CEIL = 32_000;
  * (with a readable error) instead of the provider's opaque HTTP 400.
  */
 export const ANTHROPIC_OUTPUT_CAPS: Record<string, number> = {
+  'claude-fable-5': 64_000,
+  'claude-fable-5-1': 64_000,
+  'claude-opus-5-5': 32_000,
+  'claude-opus-5': 32_000,
+  'claude-sonnet-5-5': 64_000,
+  'claude-sonnet-5': 64_000,
+  'claude-opus-4-8': 32_000,
   'claude-opus-4-7': 32_000,
   'claude-sonnet-4-6': 64_000,
   'claude-haiku-4-5': 64_000,
@@ -535,6 +542,7 @@ async function runJudgeChunk(
     // (judge truncation at default 36-96 idea batches).
     maxTokens: computeJudgeMaxTokens(ideas.length, options.modelOverride),
     abortSignal: options.abortSignal,
+    allowFallback: false,
   });
 
   const parsed = parseJudgeJSON(result.text);

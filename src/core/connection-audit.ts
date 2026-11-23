@@ -30,17 +30,10 @@ export interface ConnectionEvent {
   error?: { code?: string; message: string };
 }
 
-let _auditDirCache: string | null = null;
 let _auditEnabled = true;
 
 export function setAuditEnabled(enabled: boolean): void {
   _auditEnabled = enabled;
-}
-
-function getAuditDir(): string {
-  if (_auditDirCache) return _auditDirCache;
-  _auditDirCache = gbrainPath('audit');
-  return _auditDirCache;
 }
 
 function getIsoWeekFilename(d: Date = new Date()): string {
@@ -58,12 +51,15 @@ function getIsoWeekFilename(d: Date = new Date()): string {
 export function logConnectionEvent(event: ConnectionEvent): void {
   if (!_auditEnabled) return;
   try {
-    const dir = getAuditDir();
+    const dir = gbrainPath('audit');
     mkdirSync(dir, { recursive: true });
     const path = join(dir, getIsoWeekFilename());
     const line = {
-      ts: event.ts ?? new Date().toISOString(),
       ...event,
+      // The stamp must come AFTER the spread: `ts` is optional, so a caller
+      // passing an explicit `ts: undefined` would otherwise overwrite the
+      // stamp and JSON.stringify would drop the key entirely.
+      ts: event.ts ?? new Date().toISOString(),
       // Defensive: if a caller passes a full URL by mistake, redact.
       host: event.host ? redactPgUrl(event.host) : undefined,
     };
@@ -84,7 +80,7 @@ export function logConnectionEvent(event: ConnectionEvent): void {
  */
 export function tailRecentErrors(limit: number = 5): ConnectionEvent[] {
   try {
-    const dir = getAuditDir();
+    const dir = gbrainPath('audit');
     if (!existsSync(dir)) return [];
     const path = join(dir, getIsoWeekFilename());
     if (!existsSync(path)) return [];

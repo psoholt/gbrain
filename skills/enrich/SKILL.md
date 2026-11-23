@@ -165,11 +165,25 @@ the raw data shows exactly what the API returned.
 #### CREATE path
 
 1. Check notability gate (see `skills/_brain-filing-rules.md`)
-2. Check filing rules -- where does this entity go?
-3. Create page with the appropriate template (below)
+2. Resolve the entity's type, directory and subtype from the ACTIVE schema
+   pack, never from the templates below: follow
+   `skills/brain-taxonomist/SKILL.md` (`gbrain schema show --json`, or MCP
+   `get_active_schema_pack`; `schema_explain_type` for one type). When the
+   pack declares an entity type the evidence fits better than `person` or
+   `company` (an investment firm, a protocol foundation), file it under that
+   type's directory with its subtype. If no declared type fits, say so and
+   ask; don't fall back to `companies/`.
+3. Create the page from the template below, with the `type` and directory
+   from step 2. Frontmatter carries only keys the pack declares for the type or
+   that existing pages of the type already use, and only with known values:
+   omit an unknown field entirely, never write `null`, an empty value or a
+   placeholder.
 4. Fill compiled truth with citations
 5. Add first timeline entry
-6. Leave empty sections as `[No data yet]` (don't fill with boilerplate)
+6. Omit sections with nothing to put under them (`gbrain lint` flags empty ones)
+7. In a batch, create the pages other pages will link to first. A link to a
+   page that doesn't exist yet is recorded as a wanted page and becomes an
+   edge once that page is written (`gbrain wanted` lists them).
 
 #### UPDATE path
 
@@ -190,10 +204,7 @@ updated: YYYY-MM-DD
 tags: []
 company: Current Company
 relationship: How the user knows them
-email:
-linkedin:
-twitter:
-location:
+# email, linkedin, twitter, location: add each only when you know it
 ---
 
 # Full Name
@@ -212,6 +223,14 @@ Current projects, recent launches, what they're focused on.
 
 ## What Motivates Them
 Ambition, career arc, what drives them.
+
+## Communication Style
+How they like to communicate, how they handle disagreement, what energizes
+them in a conversation. Write only what you observed directly (meetings,
+their emails or posts) or what they said about themselves; label each line
+observed, self-described or inferred. One data point is a timeline entry,
+not a pattern. Confidence follows interaction count: low after one, high
+after five or more.
 
 ## Hobby Horses
 Topics they return to obsessively. Recurring themes in their work/posts.
@@ -277,8 +296,14 @@ Active items, pending decisions, things to track.
 **Note (v0.10.1):** Links between brain pages are auto-created on every
 `put_page` call (auto-link post-hook). Step 7 focuses on content
 cross-references (updating related pages' compiled truth with new signal
-from this enrichment), not on creating links. Verify via the `auto_links`
-field in the put_page response (`{ created, removed, errors }`).
+from this enrichment), not on creating links. On a trusted local write the
+put_page response carries `auto_links: { created, removed, errors }`. MCP
+writes (stdio and HTTP) skip inline auto-link (`auto_links.skipped: "remote"`)
+but queue plain `mentions` edges to pages that already exist
+(`auto_links.mention_links: "queued"`). Typed and frontmatter edges
+(`works_at`, `invested_in`, `source`, ...) wait for a maintenance pass: the
+stdio serve sweep, or `gbrain sweep --once` on the host for an HTTP brain.
+Use `add_link` for a typed edge you need immediately.
 Timeline entries still need explicit `gbrain timeline-add` calls.
 
 ## Bulk Enrichment Rules
@@ -308,6 +333,14 @@ After enrichment sweeps, save a report:
 - Validation flags or API failures
 
 This creates an audit trail for brain enrichment over time.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- External enrichment APIs return `rate_limited` or an auth failure: back off for the stated delay; on auth failure stop and tell the user which key is missing. Never fill the gap with guessed facts.
+- `put_page` returns `revision_conflict`: re-read the entity page, merge, and save with the new revision.
+- `auto_links.errors` is non-empty on a write: the page saved but some links did not; list them in the report and add them with `add_link` after fixing the slugs.
 
 ## Anti-Patterns
 

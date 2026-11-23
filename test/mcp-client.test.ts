@@ -16,103 +16,135 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { createServer, Server, IncomingMessage, ServerResponse } from 'http';
 import {
   callRemoteTool,
+  forwardRemoteToolCall,
   unpackToolResult,
   RemoteMcpError,
   _clearMcpClientTokenCache,
 } from '../src/core/mcp-client.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
+import { discoverOAuth, mintClientCredentialsToken } from '../src/core/remote-mcp-probe.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { VERSION } from '../src/version.ts';
+import { pendingReceiptOf, writeErrorExitCode } from '../src/core/persistence/write-wait.ts';
+import { PENDING_WRITE_EXIT_CODE } from '../src/core/exit-codes.ts';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 
-let server: Server;
+let server: ReturnType<typeof Bun.serve>;
 let port: number;
 
 // Per-test response control
 let tokenStatus = 200;
 let mcpResponseFor: (req: { method: string; params?: unknown }) => unknown = () => ({});
-let mcpStatusOverride: number | null = null;
 let tokenMintCount = 0;
+type Stage = 'discovery' | 'token' | 'initialize' | 'notifications/initialized' | 'tools/call';
+let requests: Partial<Record<Stage, number>> = {};
+let statusFor: (stage: Stage, attempt: number) => number | undefined = () => undefined;
+let rejectionBody = 'fixture rejection';
+let hangingStage: Stage | undefined;
+let hangFromAttempt = 1;
+let hangAfterHeaders = false;
+let onHang: (() => void) | undefined;
+let onHangClosed: (() => void) | undefined;
+let toolExecutions = 0;
+let initializeTokens: string[] = [];
+let toolArguments: Record<string, unknown>[] = [];
+let clientHeaders: Array<string | null> = [];
 
-beforeAll(async () => {
-  server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    if (req.url === '/.well-known/oauth-authorization-server') {
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ token_endpoint: `http://127.0.0.1:${port}/token`, issuer: `http://127.0.0.1:${port}` }));
-      return;
+function intercept(stage: Stage, req: Request): Response | Promise<Response> | undefined {
+  requests[stage] = (requests[stage] ?? 0) + 1;
+  if (stage === hangingStage && requests[stage]! >= hangFromAttempt) {
+    const closed = onHangClosed;
+    onHang?.();
+    if (hangAfterHeaders) {
+      return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode('{')); },
+        cancel() { closed?.(); },
+      }), { headers: { 'Content-Type': 'application/json' } });
     }
-    if (req.url === '/token') {
-      tokenMintCount++;
-      res.statusCode = tokenStatus;
-      res.setHeader('Content-Type', 'application/json');
-      if (tokenStatus === 200) {
-        res.end(JSON.stringify({
+    return new Promise<Response>(resolve => {
+      req.signal.addEventListener('abort', () => {
+        closed?.();
+        resolve(new Response(null, { status: 499 }));
+      }, { once: true });
+    });
+  }
+  const status = statusFor(stage, requests[stage]!);
+  if (status !== undefined) return new Response(rejectionBody, { status });
+}
+
+beforeAll(() => {
+  server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    async fetch(req) {
+      const path = new URL(req.url).pathname;
+      if (path === '/.well-known/oauth-authorization-server') {
+        const intercepted = intercept('discovery', req);
+        if (intercepted) return intercepted;
+        return Response.json({ token_endpoint: `http://127.0.0.1:${port}/token`, issuer: `http://127.0.0.1:${port}` });
+      }
+      if (path === '/token') {
+        tokenMintCount++;
+        const intercepted = intercept('token', req);
+        if (intercepted) return intercepted;
+        return Response.json(tokenStatus === 200 ? {
           access_token: `token-${Date.now()}-${tokenMintCount}`,
-          token_type: 'bearer',
-          expires_in: 3600,
-          scope: 'read write admin',
-        }));
-      } else {
-        res.end(JSON.stringify({ error: 'invalid_client' }));
+          token_type: 'bearer', expires_in: 3600, scope: 'read write admin',
+        } : { error: 'invalid_client' }, { status: tokenStatus });
       }
-      return;
-    }
-    if (req.url === '/mcp' && req.method === 'POST') {
-      // Test-controlled status override (used to simulate 401 from MCP).
-      if (mcpStatusOverride !== null) {
-        res.statusCode = mcpStatusOverride;
-        res.end();
-        return;
+      if (path === '/mcp' && req.method === 'POST') {
+        const body = await req.json() as { id?: number; method: string; params?: { protocolVersion?: string } };
+        if (body.method === 'initialize') initializeTokens.push(req.headers.get('authorization') ?? '');
+        clientHeaders.push(req.headers.get('x-gbrain-client'));
+        if (body.method === 'tools/call') toolArguments.push((body.params as any)?.arguments ?? {});
+        const intercepted = intercept(body.method as Stage, req);
+        if (intercepted) return intercepted;
+        if (body.id === undefined) return new Response(null, { status: 202 });
+        let result: unknown;
+        if (body.method === 'initialize') {
+          result = {
+            protocolVersion: body.params?.protocolVersion ?? '2024-11-05',
+            capabilities: { tools: {} },
+            serverInfo: { name: 'mcp-client-test-fixture', version: '1' },
+          };
+        } else if (body.method === 'tools/call') {
+          toolExecutions++;
+          result = mcpResponseFor({ method: body.method, params: body.params });
+        } else {
+          result = {};
+        }
+        return Response.json({ jsonrpc: '2.0', id: body.id, result });
       }
-      // Read JSON-RPC body
-      const chunks: Buffer[] = [];
-      for await (const chunk of req) chunks.push(chunk as Buffer);
-      const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-      const isNotification = body.id === undefined;
-      // Notifications get 202 No Content
-      if (isNotification) {
-        res.statusCode = 202;
-        res.end();
-        return;
-      }
-      let result: unknown;
-      if (body.method === 'initialize') {
-        result = {
-          protocolVersion: body.params?.protocolVersion ?? '2024-11-05',
-          capabilities: { tools: {} },
-          serverInfo: { name: 'mcp-client-test-fixture', version: '1' },
-        };
-      } else if (body.method === 'tools/call') {
-        result = mcpResponseFor({ method: body.method, params: body.params });
-      } else {
-        result = {};
-      }
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, result }));
-      return;
-    }
-    res.statusCode = 404;
-    res.end();
+      return new Response(null, { status: path === '/mcp' ? 405 : 404 });
+    },
   });
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()));
-  const addr = server.address();
-  if (!addr || typeof addr === 'string') throw new Error('failed to bind fixture');
-  port = addr.port;
+  port = server.port!;
 });
 
 afterAll(async () => {
-  await new Promise<void>(resolve => server.close(() => resolve()));
+  await server.stop(true);
 });
 
 beforeEach(() => {
   tokenStatus = 200;
   tokenMintCount = 0;
-  mcpStatusOverride = null;
+  requests = {};
+  statusFor = () => undefined;
+  rejectionBody = 'fixture rejection';
+  hangingStage = undefined;
+  hangFromAttempt = 1;
+  hangAfterHeaders = false;
+  onHang = undefined;
+  onHangClosed = undefined;
+  toolExecutions = 0;
+  initializeTokens = [];
   mcpResponseFor = () => ({ content: [{ type: 'text', text: JSON.stringify({ ok: true }) }] });
   _clearMcpClientTokenCache();
+  toolArguments = [];
+  clientHeaders = [];
 });
 
 function makeConfig(): GBrainConfig {
@@ -126,6 +158,59 @@ function makeConfig(): GBrainConfig {
     },
   };
 }
+
+describe('durable mutation identity across OAuth refresh', () => {
+  test.each([[false, 'queued'], [true, 'queued'], [false, 'conflict'], [true, 'conflict']] as const)('received write receipt survives abort during cleanup (refresh=%s, state=%s)', async (refresh, state) => {
+    const controller = new AbortController();
+    const receipt = { request_id: 'd7599b95-65c2-4d54-aa4e-cb5745af90cf', state, retry_after_ms: state === 'queued' ? 1000 : null };
+    const code = state === 'queued' ? 'unavailable' : 'invalid_params';
+    const writeError = state === 'queued' ? 'write_pending' : 'revision_conflict';
+    if (refresh) statusFor = (stage, attempt) => stage === 'tools/call' && attempt === 1 ? 401 : undefined;
+    mcpResponseFor = () => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({
+      error: code, message: 'Accepted.', suggestion: 'Inspect the same request_id.', protocol_version: 1,
+      write_error: writeError, write_request: receipt,
+    }) }] });
+    const close = Client.prototype.close;
+    Client.prototype.close = async function () {
+      if (toolExecutions > 0) controller.abort(new DOMException('deadline', 'TimeoutError'));
+      return close.call(this);
+    };
+    try {
+      await expect(callRemoteTool(makeConfig(), 'remember', { fact: 'fixture', provenance: 'test', request_id: receipt.request_id }, { signal: controller.signal }))
+        .rejects.toMatchObject({ reason: 'tool_error', detail: {
+          code, protocol_version: 1, write_error: writeError, write_request: receipt,
+        } });
+      expect(toolExecutions).toBe(1);
+    } finally { Client.prototype.close = close; }
+  });
+
+  test('lost acknowledgment retains the generated UUID without claiming acceptance', async () => {
+    hangingStage = 'tools/call';
+    hangAfterHeaders = true;
+    const params: Record<string, unknown> = { fact: 'fixture', provenance: 'test' };
+    let error: unknown;
+    try { await callRemoteTool(makeConfig(), 'remember', params, { timeoutMs: 200 }); }
+    catch (caught) { error = caught; }
+    expect(toolArguments).toHaveLength(1);
+    expect(error).toMatchObject({ reason: 'network', detail: {
+      kind: 'timeout', request_id: params.request_id, submission_status: 'unknown',
+    } });
+    expect((error as RemoteMcpError).detail).not.toHaveProperty('write_request');
+  });
+
+  test('retains generated and explicit IDs through refresh and caller retries', async () => {
+    statusFor = (stage, attempt) => stage === 'tools/call' && attempt === 1 ? 401 : undefined;
+    const params: Record<string, unknown> = { slug: 'notes/refresh-fixture', content: 'fixture' };
+    await callRemoteTool(makeConfig(), 'put_page', params);
+    expect(params.request_id).toMatch(/^[0-9a-f-]{36}$/);
+    await callRemoteTool(makeConfig(), 'put_page', params);
+    expect(toolArguments).toHaveLength(3);
+    expect(toolArguments.every(args => args.request_id === params.request_id)).toBe(true);
+    const explicit = { ...params, request_id: 'c96cbb61-b862-4f8a-92bb-e79113f8ff19' };
+    await callRemoteTool(makeConfig(), 'put_page', explicit);
+    expect(toolArguments.at(-1)?.request_id).toBe(explicit.request_id);
+  });
+});
 
 describe('callRemoteTool — happy path', () => {
   test('returns the tool response for a simple call', async () => {
@@ -155,51 +240,224 @@ describe('callRemoteTool — happy path', () => {
   });
 });
 
-describe('callRemoteTool — 401 refresh-on-once', () => {
-  test('401 from /mcp → re-mint token + retry succeeds', async () => {
-    // Pre-seed cache with a fresh-but-server-rejected token by first
-    // succeeding once, then flipping the server to 401 just once.
-    await callRemoteTool(makeConfig(), 'first_success', {});
-    expect(tokenMintCount).toBe(1);
+describe('callRemoteTool — thin-client identity (C1)', () => {
+  test('every MCP request names gbrain\'s thin client so hosts keep full search rows', async () => {
+    await callRemoteTool(makeConfig(), 'search', { query: 'x' });
+    expect(clientHeaders.length).toBeGreaterThanOrEqual(2);
+    for (const h of clientHeaders) expect(h).toBe(`gbrain-remote-cli/${VERSION}`);
+  });
 
-    // Next call: the /mcp endpoint will return 401 on the first attempt;
-    // the client should re-mint and retry. We simulate "rejected once,
-    // accepted on retry" by counting requests.
-    let mcpCallCount = 0;
-    mcpStatusOverride = null;
-    const origResponse = mcpResponseFor;
-    mcpResponseFor = ({ method, params }) => {
-      if (method === 'tools/call') mcpCallCount++;
-      // First call: instruct fixture to return 401 by setting override THEN restore
-      // Actually simpler: throw on first attempt by setting mcpStatusOverride pre-emptively
-      return origResponse({ method, params });
-    };
-
-    // Easier path: install a once-only 401 on /mcp by setting mcpStatusOverride
-    // for one request; we need a counter. Use a flag.
-    let overrideUsed = false;
-    const realServer = server;
-    void realServer;
-    mcpStatusOverride = null;
-    // Wrap mcpResponseFor with a one-shot rejector — but the override is a
-    // status-line mechanism, not a body mechanism. Use a small hack: make
-    // the next /mcp request return a tool-error envelope that the client
-    // interprets as 401-equivalent. Actually the SDK throws on 401 status,
-    // so we need a real 401. Use mcpStatusOverride for one request.
-    // For test simplicity: expect that calling with stale-cached-token-then-
-    // 401 flow will re-mint. Achieve by setting tokenStatus to a failing
-    // value AFTER first success, then restoring. Skipped for this case;
-    // covered indirectly by the cache-reuse test above.
-
-    // Instead, assert that the cache invalidation API works: clear cache,
-    // call again, expect new token.
-    _clearMcpClientTokenCache();
-    await callRemoteTool(makeConfig(), 'after_clear', {});
-    expect(tokenMintCount).toBe(2);
+  test('the thin client never sends `fields`, so strict-params hosts of any version accept its calls', async () => {
+    await callRemoteTool(makeConfig(), 'search', { query: 'x' });
+    await callRemoteTool(makeConfig(), 'query', { query: 'x' });
+    for (const args of toolArguments) expect(args).not.toHaveProperty('fields');
   });
 });
 
+describe('callRemoteTool — HTTP authentication boundaries', () => {
+  for (const stage of ['initialize', 'tools/call'] as const) {
+    test(`${stage}: one HTTP 401 refreshes once and executes the tool once`, async () => {
+      statusFor = (current, attempt) => current === stage && attempt === 1 ? 401 : undefined;
+      const result = await callRemoteTool(makeConfig(), 'write_example', { value: 1 });
+      expect(unpackToolResult<{ ok: boolean }>(result)).toEqual({ ok: true });
+      expect(tokenMintCount).toBe(2);
+      expect(requests[stage]).toBe(2);
+      expect(initializeTokens).toHaveLength(2);
+      expect(initializeTokens[0]).not.toBe(initializeTokens[1]);
+      expect(toolExecutions).toBe(1);
+    });
+
+    test(`${stage}: repeated HTTP 401 stops after one refresh`, async () => {
+      statusFor = current => current === stage ? 401 : undefined;
+      await expect(callRemoteTool(makeConfig(), 'write_example')).rejects.toMatchObject({
+        reason: 'auth_after_refresh', detail: { status: 401 },
+      });
+      expect(tokenMintCount).toBe(2);
+      expect(requests[stage]).toBe(2);
+      expect(toolExecutions).toBe(0);
+    });
+
+    for (const status of [403, 500, 503]) {
+      test(`${stage}: HTTP ${status} is terminal and preserves status`, async () => {
+        statusFor = current => current === stage ? status : undefined;
+        await expect(callRemoteTool(makeConfig(), 'write_example')).rejects.toMatchObject({
+          reason: 'network', detail: { status },
+        });
+        expect(tokenMintCount).toBe(1);
+        expect(requests[stage]).toBe(1);
+        expect(toolExecutions).toBe(0);
+      });
+    }
+  }
+
+  for (const text of ['client abc401def may not write', 'unauthorized operation', 'invalid_token is a field name']) {
+    test(`application error is never retried: ${text}`, async () => {
+      mcpResponseFor = () => ({
+        isError: true,
+        content: [{ type: 'text', text: JSON.stringify({ error: 'permission_denied', message: text }) }],
+      });
+      await expect(callRemoteTool(makeConfig(), 'write_example')).rejects.toMatchObject({
+        reason: 'tool_error', detail: { code: 'permission_denied' },
+      });
+      expect(tokenMintCount).toBe(1);
+      expect(toolExecutions).toBe(1);
+    });
+  }
+
+  test('application error after a genuine refresh remains a tool error', async () => {
+    statusFor = (stage, attempt) => stage === 'tools/call' && attempt === 1 ? 401 : undefined;
+    mcpResponseFor = () => ({ isError: true, content: [{ type: 'text', text: 'unauthorized 401 operation' }] });
+    await expect(callRemoteTool(makeConfig(), 'write_example')).rejects.toMatchObject({ reason: 'tool_error' });
+    expect(tokenMintCount).toBe(2);
+    expect(toolExecutions).toBe(1);
+  });
+
+  test('a 401 naming access_member_disabled is relayed: the member is disabled, not the client revoked', async () => {
+    statusFor = current => current === 'tools/call' ? 401 : undefined;
+    rejectionBody = JSON.stringify({ error: 'invalid_token', code: 'access_member_disabled', message: 'This token is bound to a member who is disabled, removed or missing.' });
+    const error = await callRemoteTool(makeConfig(), 'write_example').then(() => null, (e: unknown) => e);
+    expect(error).toMatchObject({ reason: 'auth_after_refresh', detail: { status: 401, code: 'access_member_disabled' } });
+    expect((error as Error).message).toContain('bound to a member who is disabled, removed or missing');
+    expect(tokenMintCount).toBe(2);
+    expect(toolExecutions).toBe(0);
+  });
+
+  test('the OAuth host\'s own 401 body (error_description, no code key) is relayed as access_member_disabled', async () => {
+    statusFor = current => current === 'tools/call' ? 401 : undefined;
+    rejectionBody = JSON.stringify(new InvalidTokenError('access_member_disabled: this credential is bound to member "bob-example", which is disabled.').toResponseObject());
+    const error = await callRemoteTool(makeConfig(), 'write_example').then(() => null, (e: unknown) => e);
+    expect(error).toMatchObject({ reason: 'auth_after_refresh', detail: { status: 401, code: 'access_member_disabled' } });
+    expect(toolExecutions).toBe(0);
+  });
+
+  test('forwardRemoteToolCall relays access_member_disabled from the OAuth host\'s 401 body', async () => {
+    statusFor = current => current === 'tools/call' ? 401 : undefined;
+    rejectionBody = JSON.stringify(new InvalidTokenError('access_member_disabled: this credential is bound to member "bob-example", which is disabled.').toResponseObject());
+    const error = await forwardRemoteToolCall(makeConfig(), 'write_example', {}).then(() => null, (e: unknown) => e);
+    expect(error).toMatchObject({ reason: 'auth_after_refresh', detail: { status: 401, code: 'access_member_disabled' } });
+    expect(toolExecutions).toBe(0);
+  });
+
+  test('rejected token refresh stops before a second tool request', async () => {
+    statusFor = (stage, attempt) => stage === 'tools/call' ? 401 : stage === 'token' && attempt === 2 ? 401 : undefined;
+    await expect(callRemoteTool(makeConfig(), 'write_example')).rejects.toMatchObject({ reason: 'auth_after_refresh', detail: { status: 401 } });
+    expect(tokenMintCount).toBe(2);
+    expect(requests['tools/call']).toBe(1);
+    expect(toolExecutions).toBe(0);
+  });
+});
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function bounded<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('fixture did not settle')), 2_000); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+describe('callRemoteTool — cancellation across every network stage', () => {
+  test('the original call deadline also bounds token refresh', async () => {
+    statusFor = stage => stage === 'tools/call' ? 401 : undefined;
+    hangingStage = 'token';
+    hangFromAttempt = 2;
+    const closed = deferred();
+    onHangClosed = closed.resolve;
+    await expect(callRemoteTool(makeConfig(), 'write_example', {}, { timeoutMs: 200 })).rejects.toMatchObject({
+      reason: 'network', detail: { kind: 'timeout' },
+    });
+    await bounded(closed.promise);
+    expect(tokenMintCount).toBe(2);
+    expect(requests['tools/call']).toBe(1);
+    expect(toolExecutions).toBe(0);
+  });
+
+  for (const stage of ['discovery', 'token', 'initialize', 'notifications/initialized', 'tools/call'] as const) {
+    for (const cancel of ['timeout', 'external'] as const) {
+      test(`${cancel} closes a hanging ${stage} request`, async () => {
+        hangingStage = stage;
+        const started = deferred();
+        const closed = deferred();
+        onHang = started.resolve;
+        onHangClosed = closed.resolve;
+        const controller = new AbortController();
+        const pending = callRemoteTool(makeConfig(), 'write_example', {}, {
+          ...(cancel === 'timeout' ? { timeoutMs: 200 } : { signal: controller.signal }),
+        });
+        const outcome = pending.then(value => ({ value }), error => ({ error }));
+        await bounded(started.promise);
+        if (cancel === 'external') controller.abort(new Error('caller stopped'));
+        expect(await bounded(outcome)).toMatchObject({
+          error: { reason: 'network', detail: { kind: cancel === 'timeout' ? 'timeout' : 'aborted' } },
+        });
+        await bounded(closed.promise);
+        expect(requests[stage]).toBe(1);
+        expect(tokenMintCount).toBe(stage === 'discovery' ? 0 : 1);
+        expect(toolExecutions).toBe(0);
+      });
+    }
+  }
+
+  for (const stage of ['discovery', 'token', 'initialize', 'tools/call'] as const) {
+    test(`timeout closes a partial JSON response at ${stage}`, async () => {
+      hangingStage = stage;
+      hangAfterHeaders = true;
+      const closed = deferred();
+      onHangClosed = closed.resolve;
+      await expect(callRemoteTool(makeConfig(), 'write_example', {}, { timeoutMs: 200 })).rejects.toMatchObject({
+        reason: 'network', detail: { kind: 'timeout' },
+      });
+      await bounded(closed.promise);
+      expect(requests[stage]).toBe(1);
+      expect(toolExecutions).toBe(0);
+    });
+  }
+
+  test('already-aborted calls never contact discovery or MCP', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(callRemoteTool(makeConfig(), 'write_example', {}, { signal: controller.signal })).rejects.toMatchObject({
+      reason: 'network', detail: { kind: 'aborted' },
+    });
+    expect(requests).toEqual({});
+    expect(tokenMintCount).toBe(0);
+  });
+
+  for (const stage of ['discovery', 'token'] as const) {
+    test(`${stage} keeps its own timeout cap when no call-wide timeout is set`, async () => {
+      hangingStage = stage;
+      const closed = deferred();
+      onHangClosed = closed.resolve;
+      const base = `http://127.0.0.1:${port}`;
+      const result = stage === 'discovery'
+        ? await discoverOAuth(base, { timeoutMs: 30 })
+        : await mintClientCredentialsToken(`${base}/token`, 'cid', 'csecret', { timeoutMs: 30 });
+      expect(result).toMatchObject({ ok: false, reason: 'network', kind: 'timeout' });
+      await bounded(closed.promise);
+    });
+  }
+});
+
 describe('callRemoteTool — error surfaces', () => {
+  test('an unreachable MCP transport is terminal after one token mint', async () => {
+    const config = makeConfig();
+    config.remote_mcp!.mcp_url = 'http://127.0.0.1:1/mcp';
+    await expect(callRemoteTool(config, 'write_example')).rejects.toMatchObject({
+      reason: 'network', detail: { kind: 'unreachable' },
+    });
+    expect(tokenMintCount).toBe(1);
+    expect(toolExecutions).toBe(0);
+  });
+
   test('config has no remote_mcp → throws RemoteMcpError(config)', async () => {
     await expect(callRemoteTool({ engine: 'postgres' }, 'foo', {})).rejects.toThrow(RemoteMcpError);
   });
@@ -267,6 +525,34 @@ describe('callRemoteTool — error surfaces', () => {
       expect((e as RemoteMcpError).reason).toBe('tool_error');
     }
   });
+
+  test('an accepted write receipt survives the real HTTP MCP error envelope without replay', async () => {
+    const receipt = { request_id: 'd7599b95-65c2-4d54-aa4e-cb5745af90cf', state: 'queued', retry_after_ms: 1000 };
+    mcpResponseFor = () => ({
+      content: [{ type: 'text', text: JSON.stringify({ error: 'unavailable', protocol_version: 1,
+        message: 'Accepted and pending.', suggestion: 'Retry the same request_id.',
+        write_error: 'write_pending', write_request: receipt }) }],
+      isError: true,
+    });
+    await expect(callRemoteTool(makeConfig(), 'remember', { fact: 'fixture', provenance: 'test', request_id: receipt.request_id }))
+      .rejects.toMatchObject({ reason: 'tool_error', detail: {
+        code: 'unavailable', write_error: 'write_pending', write_request: receipt,
+      } });
+    expect(toolExecutions).toBe(1);
+    expect(tokenMintCount).toBe(1);
+  });
+
+  test('a write deferred behind a refresh, answered as a pending success, reaches the CLI as a pending write (exit 10)', async () => {
+    const receipt = { request_id: 'd7599b95-65c2-4d54-aa4e-cb5745af90cf', state: 'queued', retry_after_ms: 1000 };
+    mcpResponseFor = () => ({ content: [{ type: 'text', text: JSON.stringify({ status: 'pending', request_id: receipt.request_id, receipt,
+      deferred: { refresh_id: 'c0ffee00-0000-4000-8000-000000000000' }, next: { tool: 'get_write_request', arguments: { request_id: receipt.request_id } } }) }] });
+    const error = await callRemoteTool(makeConfig(), 'put_page', { slug: 'notes/x', content: 'x', request_id: receipt.request_id }).then(() => null, e => e);
+    expect(error).toBeInstanceOf(RemoteMcpError);
+    expect(error).toMatchObject({ reason: 'tool_error', detail: { write_error: 'write_pending', write_request: receipt } });
+    expect(pendingReceiptOf(error)?.request_id).toBe(receipt.request_id);
+    expect(writeErrorExitCode(error, false)).toBe(PENDING_WRITE_EXIT_CODE);
+    expect(toolExecutions).toBe(1);
+  });
 });
 
 describe('unpackToolResult', () => {
@@ -287,5 +573,18 @@ describe('unpackToolResult', () => {
   test('throws RemoteMcpError(parse) on wrong content type', () => {
     const wire = { content: [{ type: 'image', data: 'xxx' }] };
     expect(() => unpackToolResult(wire)).toThrow(RemoteMcpError);
+  });
+});
+
+describe('agent contract v1: tool_error body is content[0] alone', () => {
+  test('an extra block never joins the envelope; v1 fields survive', async () => {
+    mcpResponseFor = () => ({ isError: true, content: [
+      { type: 'text', text: JSON.stringify({ error: 'permission_denied', code: 'insufficient_scope', message: 'needs write', suggestion: 'ask the host', contract_version: 1 }) },
+      { type: 'text', text: '[gbrain notice backup_coverage kind=coaching]\nwhy: stray block' },
+    ] });
+    await expect(callRemoteTool(makeConfig(), 'get_page', { slug: 'notes/x' })).rejects.toMatchObject({
+      reason: 'tool_error',
+      detail: { code: 'permission_denied', canonical_code: 'insufficient_scope', suggestion: 'ask the host', contract_version: 1 },
+    });
   });
 });

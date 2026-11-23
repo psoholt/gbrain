@@ -9,13 +9,18 @@ import {
   RemoteUrlError,
   cloneRepo,
   pullRepo,
+  fetchRemote,
   GitOperationError,
   validateRepoState,
+  buildGitEnv,
+  GIT_ENV,
 } from '../src/core/git-remote.ts';
+import { execFileSync } from 'child_process';
 import { withEnv } from './helpers/with-env.ts';
+import { gitStderrLeads } from './helpers/git-stderr-probe.ts';
 
 // ---------------------------------------------------------------------------
-// Fake-git harness: write a shell script that records its argv to a log file,
+// Fake-git harness: write a Bun script that records its argv to a log file,
 // then prepend its dir to PATH for the test. Lets us assert exact argv shape
 // without invoking real git.
 // ---------------------------------------------------------------------------
@@ -30,17 +35,23 @@ function writeFakeGit(): void {
   writeFileSync(FAKE_GIT_MODE, 'ok');
   // Per-invocation argv goes into argv.log (one JSON array per line).
   writeFileSync(FAKE_GIT_LOG, '');
-  const script = `#!/usr/bin/env bash
-# Fake git for git-remote.test.ts
-{ printf '['; for arg in "$@"; do printf '%s,' "$(printf '%s' "$arg" | jq -Rs .)"; done; printf 'null]\\n'; } >> "${FAKE_GIT_LOG}"
-mode=$(cat "${FAKE_GIT_MODE}" 2>/dev/null || echo ok)
-case "$mode" in
-  fail) exit 1 ;;
-  url-drift) echo "https://github.com/different/url" ;;
-  url-match) echo "https://github.com/expected/url" ;;
-  *) ;;
-esac
-exit 0
+  const recorder = join(FAKE_GIT_DIR, 'record-argv.ts');
+  writeFileSync(recorder, `
+import { appendFileSync, readFileSync } from 'node:fs';
+appendFileSync(${JSON.stringify(FAKE_GIT_LOG)}, JSON.stringify(process.argv.slice(2)) + '\\n');
+const mode = readFileSync(${JSON.stringify(FAKE_GIT_MODE)}, 'utf8');
+if (mode === 'fail') process.exit(1);
+if (mode === 'url-drift') console.log('https://github.com/different/url');
+if (mode === 'url-match') console.log('https://github.com/expected/url');
+// #6530: pullRepo locates the checkout's commit lock with rev-parse --git-path.
+const gitPath = process.argv.indexOf('--git-path');
+if (gitPath !== -1) console.log(${JSON.stringify(FAKE_GIT_DIR)} + '/locks/' + process.argv[gitPath + 1]);
+`);
+  // Use the already-required Bun executable: optional host tools such as jq
+  // must not decide whether argv security assertions can run in CI.
+  const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  const script = `#!/bin/sh
+exec ${shellQuote(process.execPath)} --no-env-file ${shellQuote(recorder)} "$@"
 `;
   const path = join(FAKE_GIT_DIR, 'git');
   writeFileSync(path, script);
@@ -52,10 +63,7 @@ function readArgvLog(): string[][] {
   return raw
     .split('\n')
     .filter(Boolean)
-    .map(line => {
-      const arr = JSON.parse(line) as (string | null)[];
-      return arr.filter((x): x is string => x !== null);
-    });
+    .map(line => JSON.parse(line) as string[]);
 }
 
 function clearArgvLog(): void {
@@ -74,6 +82,12 @@ beforeEach(() => {
 });
 
 const fakePath = (): string => `${FAKE_GIT_DIR}:${process.env.PATH ?? ''}`;
+
+test('fake git records exact argument boundaries without external JSON tools', () => {
+  const args = ['', 'with spaces', 'quote"and\'slash\\', 'first\nsecond', '$(literal-command); &'];
+  execFileSync(join(FAKE_GIT_DIR, 'git'), args);
+  expect(readArgvLog()).toEqual([args]);
+});
 
 // ---------------------------------------------------------------------------
 // GIT_SSRF_FLAGS — pinned shape (snapshot test). If a future flag is added,
@@ -319,25 +333,27 @@ describe('cloneRepo', () => {
 // ---------------------------------------------------------------------------
 
 describe('pullRepo', () => {
-  test('happy path: invokes git -C path with GIT_SSRF_FLAGS + pull --ff-only', async () => {
+  test('happy path (#6530): fetch with GIT_SSRF_FLAGS, then merge --ff-only (merge.autoStash=false) under the commit lock; never git pull', async () => {
     const repo = join(FAKE_GIT_DIR, 'pull-target');
     mkdirSync(repo, { recursive: true });
     await withEnv({ PATH: fakePath() }, async () => {
-      pullRepo(repo);
+      await pullRepo(repo);
     });
-    const argv = readArgvLog()[0];
+    const calls = readArgvLog();
+    const argv = calls[0];
     expect(argv[0]).toBe('-C');
     expect(argv[1]).toBe(repo);
     expect(argv.slice(2, 2 + GIT_SSRF_FLAGS.length)).toEqual([...GIT_SSRF_FLAGS]);
-    expect(argv).toContain('pull');
-    expect(argv).toContain('--ff-only');
+    expect(argv).toContain('fetch');
     // v0.34 fix wave: subcommand flag position assertion.
-    const pullIdx = argv.indexOf('pull');
-    expect(pullIdx).toBeGreaterThan(-1);
+    const fetchIdx = argv.indexOf('fetch');
     for (const subFlag of GIT_SSRF_SUBCOMMAND_FLAGS) {
-      const flagIdx = argv.indexOf(subFlag);
-      expect(flagIdx).toBeGreaterThan(pullIdx);
+      expect(argv.indexOf(subFlag)).toBeGreaterThan(fetchIdx);
     }
+    expect(calls.some(call => call.includes('pull') || call.includes('rebase') || call.includes('stash'))).toBe(false);
+    const merge = calls.find(call => call.includes('merge'))!;
+    expect(merge.slice(merge.indexOf('merge'))).toContain('--ff-only');
+    expect(merge[merge.indexOf('merge.autoStash=false') - 1]).toBe('-c');
     rmSync(repo, { recursive: true, force: true });
   });
 
@@ -346,7 +362,7 @@ describe('pullRepo', () => {
     mkdirSync(repo, { recursive: true });
     setMode('fail');
     await withEnv({ PATH: fakePath() }, async () => {
-      expect(() => pullRepo(repo)).toThrow(GitOperationError);
+      await expect(pullRepo(repo)).rejects.toThrow(GitOperationError);
     });
     rmSync(repo, { recursive: true, force: true });
   });
@@ -380,13 +396,35 @@ describe('validateRepoState', () => {
     expect(validateRepoState(p)).toBe('no-git');
   });
 
-  test("returns 'corrupted' when git remote get-url fails", async () => {
+  test("returns 'corrupted' when git itself fails (get-url AND the rev-parse integrity probe)", async () => {
+    // #4559: with no expectedRemoteUrl, a get-url failure alone is no longer
+    // corruption — the rev-parse integrity probe decides. Fake-git mode
+    // 'fail' fails BOTH, so this still classifies as corrupted.
     const p = join(fixtureDir, 'corrupted-repo');
     mkdirSync(join(p, '.git'), { recursive: true });
     setMode('fail');
     await withEnv({ PATH: fakePath() }, async () => {
       expect(validateRepoState(p)).toBe('corrupted');
     });
+  });
+
+  test("returns 'healthy' for a local-only repo with no origin remote (#4559)", () => {
+    // Real git: a repo with no remotes is a supported local-only shape.
+    // `git remote get-url origin` exits non-zero, but the repository is
+    // intact — with no expectedRemoteUrl this must NOT read as corrupted.
+    const p = join(fixtureDir, 'local-only-repo');
+    mkdirSync(p, { recursive: true });
+    execFileSync('git', ['-C', p, 'init', '-q'], { stdio: 'pipe' });
+    expect(validateRepoState(p)).toBe('healthy');
+  });
+
+  test("still returns 'corrupted' when a remote WAS expected but origin is missing (#4559)", () => {
+    // Managed-clone semantics preserved: a configured expectedRemoteUrl with
+    // no origin remains corruption.
+    const p = join(fixtureDir, 'managed-clone-missing-origin');
+    mkdirSync(p, { recursive: true });
+    execFileSync('git', ['-C', p, 'init', '-q'], { stdio: 'pipe' });
+    expect(validateRepoState(p, 'https://github.com/expected/url')).toBe('corrupted');
   });
 
   test("returns 'url-drift' when remote differs from expected", async () => {
@@ -414,5 +452,108 @@ describe('validateRepoState', () => {
     await withEnv({ PATH: fakePath() }, async () => {
       expect(validateRepoState(p)).toBe('healthy');
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1315 — stderr-first git errors + platform-aware no-prompt env.
+//
+// (a) GitOperationError used to wrap Node's execFileSync envelope
+//     ("Command failed: git -C <path> -c http.followRedirects=false …"),
+//     so every downstream `.slice(0, N)` (sync's warn lines) cut the message
+//     off BEFORE the real `fatal: …` stderr. The wrapper now leads with the
+//     captured stderr.
+// (b) GIT_ENV hardcoded the POSIX-only `/bin/false` askpass, which on Windows
+//     makes git fail with a confusing "could not run askpass" instead of
+//     failing auth cleanly. buildGitEnv(platform) is pure so the win32 shape
+//     is testable on POSIX CI.
+// ---------------------------------------------------------------------------
+
+describe('#1315 — buildGitEnv platform shapes', () => {
+  test('POSIX keeps the /bin/false askpass confinement (unchanged)', () => {
+    for (const platform of ['linux', 'darwin'] as const) {
+      const env = buildGitEnv(platform);
+      expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+      expect(env.GCM_INTERACTIVE).toBe('never');
+      expect(env.GIT_ASKPASS).toBe('/bin/false');
+      expect(env.SSH_ASKPASS).toBe('/bin/false');
+      expect(env.SSH_ASKPASS_REQUIRE).toBeUndefined();
+    }
+  });
+
+  test('win32 drops the POSIX-only /bin/false and forbids ssh askpass instead', () => {
+    const env = buildGitEnv('win32');
+    expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+    expect(env.GCM_INTERACTIVE).toBe('never');
+    expect(env.GIT_ASKPASS).toBeUndefined();
+    expect(env.SSH_ASKPASS).toBeUndefined();
+    expect(env.SSH_ASKPASS_REQUIRE).toBe('never');
+  });
+
+  test('GIT_ENV is the current-platform build', () => {
+    expect(GIT_ENV).toEqual(buildGitEnv());
+  });
+});
+
+describe('#1315 — stderr-first GitOperationError (real git, file-origin repo)', () => {
+  const SANDBOX = join(tmpdir(), `gbrain-1315-stderr-${process.pid}`);
+
+  beforeAll(() => {
+    rmSync(SANDBOX, { recursive: true, force: true });
+    mkdirSync(SANDBOX, { recursive: true });
+  });
+  afterAll(() => {
+    rmSync(SANDBOX, { recursive: true, force: true });
+  });
+
+  /** Upstream repo + a mirror cloned via plain git (origin = local file path),
+   *  so pullRepo/fetchRemote deterministically fail on protocol.file.allow=never. */
+  function mkFileOriginMirror(): string {
+    const upstream = join(SANDBOX, `upstream-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(upstream, { recursive: true });
+    writeFileSync(join(upstream, 'a.md'), '# a');
+    execFileSync('git', ['-C', upstream, 'init', '-q']);
+    execFileSync('git', ['-C', upstream, 'config', 'user.email', 'test@example.com']);
+    execFileSync('git', ['-C', upstream, 'config', 'user.name', 'Test']);
+    execFileSync('git', ['-C', upstream, 'add', '-A']);
+    execFileSync('git', ['-C', upstream, 'commit', '-q', '-m', 'initial']);
+    const mirror = `${upstream}-mirror`;
+    execFileSync('git', ['clone', '-q', upstream, mirror]);
+    return mirror;
+  }
+
+  // skipIf: pins "git's own fatal: appears within the first 200 chars" —
+  // unrunnable behind an ambient git PATH shim that prints its own stderr
+  // first (e.g. Conductor's auth-broker wrapper). See helpers/git-stderr-probe.
+  test.skipIf(!gitStderrLeads())('pullRepo message leads with the real git stderr, not the Command-failed envelope', async () => {
+    const mirror = mkFileOriginMirror();
+    let threw: GitOperationError | undefined;
+    try {
+      await pullRepo(mirror);
+    } catch (e) {
+      threw = e as GitOperationError;
+    }
+    expect(threw).toBeInstanceOf(GitOperationError);
+    const msg = threw!.message;
+    expect(msg).toContain('git pull failed in');
+    // The real git error must survive a downstream 200-char warn slice.
+    expect(msg.slice(0, 200)).toMatch(/fatal:/);
+    // The Node envelope (full argv echo) must NOT be the message body.
+    expect(msg).not.toContain('Command failed');
+    // Cause preserved for timeout/code inspection (sync.ts reads .cause).
+    expect(threw!.cause).toBeDefined();
+  });
+
+  test.skipIf(!gitStderrLeads())('fetchRemote message is stderr-first too', () => {
+    const mirror = mkFileOriginMirror();
+    let threw: GitOperationError | undefined;
+    try {
+      fetchRemote(mirror, 'master');
+    } catch (e) {
+      threw = e as GitOperationError;
+    }
+    expect(threw).toBeInstanceOf(GitOperationError);
+    expect(threw!.message.slice(0, 200)).toMatch(/fatal:/);
+    expect(threw!.message).not.toContain('Command failed');
   });
 });

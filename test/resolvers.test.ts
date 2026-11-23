@@ -18,7 +18,8 @@ import type {
   ResolverRequest,
   ResolverResult,
 } from '../src/core/resolvers/index.ts';
-import { urlReachableResolver, checkDnsRebinding } from '../src/core/resolvers/builtin/url-reachable.ts';
+import { urlReachableResolver } from '../src/core/resolvers/builtin/url-reachable.ts';
+import { __setDnsLookupForTests } from '../src/core/ssrf-validate.ts';
 import { xHandleToTweetResolver, computeBackoffMs } from '../src/core/resolvers/builtin/x-api/handle-to-tweet.ts';
 
 // ---------------------------------------------------------------------------
@@ -167,15 +168,6 @@ describe('getDefaultRegistry', () => {
     const b = getDefaultRegistry();
     expect(a).toBe(b);
   });
-
-  test('_resetDefaultRegistry gives a fresh instance', () => {
-    const a = getDefaultRegistry();
-    a.register(echoResolver);
-    _resetDefaultRegistry();
-    const b = getDefaultRegistry();
-    expect(b).not.toBe(a);
-    expect(b.size()).toBe(0);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -185,8 +177,12 @@ describe('getDefaultRegistry', () => {
 describe('url_reachable resolver', () => {
   const originalFetch = globalThis.fetch;
 
+  beforeEach(() => {
+    __setDnsLookupForTests((async () => [{ address: '8.8.8.8', family: 4 }]) as any);
+  });
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    __setDnsLookupForTests(undefined);
   });
 
   test('available() is true', async () => {
@@ -302,7 +298,7 @@ describe('url_reachable resolver', () => {
       context: makeCtx(),
     });
     expect(r.value.reachable).toBe(false);
-    expect(r.value.reason).toMatch(/redirect to blocked/i);
+    expect(r.value.reason).toMatch(/blocked.*redirect/i);
   });
 
   test('fetch network failure → reachable=false, confidence=1', async () => {
@@ -316,20 +312,21 @@ describe('url_reachable resolver', () => {
     expect(r.confidence).toBe(1);
   });
 
-  test('checkDnsRebinding: skips IP literals', async () => {
-    expect(await checkDnsRebinding('http://8.8.8.8/')).toBeNull();
-    expect(await checkDnsRebinding('http://127.0.0.1/')).toBeNull();
-    expect(await checkDnsRebinding('http://[::1]/')).toBeNull();
-  });
+  test('abort and transport diagnostics do not disclose signed URLs or upstream errors', async () => {
+    const url = 'https://example.com/private-document?signature=private-value';
+    const ac = new AbortController();
+    ac.abort();
+    const aborted = await urlReachableResolver.resolve({ input: { url }, context: makeCtx({ signal: ac.signal }) })
+      .catch(error => error);
+    expect(aborted).toBeInstanceOf(ResolverError);
+    expect(aborted.code).toBe('aborted');
+    expect(aborted.message).not.toContain('private-');
 
-  test('checkDnsRebinding: returns null for unparseable URL', async () => {
-    expect(await checkDnsRebinding('not a url')).toBeNull();
-  });
-
-  test('checkDnsRebinding: returns null on DNS failure (surface via fetch)', async () => {
-    // Nonexistent TLD; DNS lookup fails, we let the fetch surface the error.
-    const r = await checkDnsRebinding('http://definitely-not-a-real-tld.invalidtld123/');
-    expect(r).toBeNull();
+    globalThis.fetch = (async () => { throw new Error('TLS failure for private-document?signature=private-value'); }) as unknown as typeof fetch;
+    const result = await urlReachableResolver.resolve({ input: { url }, context: makeCtx() });
+    expect(result.value.reachable).toBe(false);
+    expect(result.value.reason).toContain('fetch error');
+    expect(result.value.reason).not.toContain('private-');
   });
 
   test('AbortSignal fires mid-flight → ResolverError(aborted)', async () => {

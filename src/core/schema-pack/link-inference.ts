@@ -24,7 +24,9 @@
 //      pack link_type entry.
 //   2. Pack-declared regex matchers (in declaration order from the
 //      manifest; first match wins). Runs under PageRegexBudget for
-//      ReDoS protection.
+//      ReDoS protection. A rule marked `ner_only` runs only for NER
+//      (`opts.ner`): the bundled packs' sketch regexes label NER body
+//      mentions but never override markdown links (#5882).
 //   3. Fall-through to the caller's legacy `inferLinkType` for
 //      gbrain-base's production-quality matching of founded /
 //      invested_in / advises / works_at + page-role priors.
@@ -57,20 +59,22 @@ export function inferLinkTypeFromPack(
   pageType: string,
   context: string,
   budget?: PageRegexBudget,
+  targetType?: string,
+  opts: { ner?: boolean } = {},
 ): string | null {
-  // Pass 1: page-type-bound verbs (e.g. meeting → attended). These
-  // are deterministic; no regex needed.
-  for (const lt of pack.link_types) {
-    if (lt.inference?.page_type && lt.inference.page_type === pageType) {
-      return lt.name;
-    }
-  }
-  // Pass 2: regex matchers under the ReDoS guard.
-  // Caller passes a PageRegexBudget instance so cumulative regex
-  // time on this page stays capped at LINK_EXTRACTION_TOTAL_BUDGET_MS.
-  for (const lt of pack.link_types) {
-    const pattern = lt.inference?.regex;
-    if (!pattern) continue;
+  const rules = [
+    ...pack.link_types.filter(lt => lt.inference?.page_type),
+    ...pack.link_types.filter(lt => !lt.inference?.page_type),
+  ];
+  for (const lt of rules) {
+    const rule = lt.inference;
+    if (!rule || (!rule.page_type && !rule.target_type && !rule.regex)) continue;
+    // #5882: an NER-only sketch regex never pre-empts the tuned markdown matchers.
+    if (rule.ner_only && !opts.ner) continue;
+    if (rule.page_type && rule.page_type !== pageType) continue;
+    if (rule.target_type && rule.target_type !== targetType) continue;
+    const pattern = rule.regex;
+    if (!pattern) return lt.name;
     if (budget) {
       const match = budget.runBounded(lt.name, pattern, context);
       if (match === undefined) {
@@ -94,6 +98,17 @@ export function inferLinkTypeFromPack(
     }
   }
   return null;
+}
+
+/**
+ * True when a pack decides meeting attendance itself: one of its `attended`
+ * rules matches a phrase regex. A rule bound only to the meeting page type
+ * (and optionally a person target), as gbrain-base and company-brain ship,
+ * mirrors the in-code meeting prior, so meeting links follow canonical
+ * evidence-gated attendance (person -> meeting) instead.
+ */
+export function ownsAttendanceInference(pack: Pick<SchemaPackManifest, 'link_types'> | null | undefined): boolean {
+  return !!pack?.link_types.some(lt => lt.name === 'attended' && lt.inference?.regex);
 }
 
 /**

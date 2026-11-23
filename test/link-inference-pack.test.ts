@@ -132,3 +132,59 @@ describe('frontmatterLinkTypeFromPack (T7b)', () => {
     expect(frontmatterLinkTypeFromPack(pack, 'person', 'company')).toBeNull();
   });
 });
+
+// #2117 — the bundled gbrain-base-v2 pack routes the four legacy NER verbs
+// through pack-declared regexes. Pre-fix v2 declared zero inference regexes,
+// so extract-ner returned pack_unavailable for every v2 brain while the
+// same text routed fine on gbrain-base.
+import { readFileSync } from 'node:fs';
+import { parseYamlMini } from '../src/core/schema-pack/index.ts';
+import { inferNerLinkType } from '../src/core/extract-ner.ts';
+import { extractPageLinks } from '../src/core/link-extraction.ts';
+import { bundledPackPath } from '../src/core/schema-pack/bundled-assets.ts';
+
+describe('#2117: gbrain-base-v2 NER verb routes', () => {
+  // The bundled packs, loaded from the asset path the runtime resolves.
+  const bundled = (name: string) => {
+    const path = bundledPackPath(name)!;
+    return parseSchemaPackManifest(parseYamlMini(readFileSync(path, 'utf-8')), { path });
+  };
+  const v2 = bundled('gbrain-base-v2');
+  const v1 = bundled('gbrain-base');
+
+  test('founded/invested_in/advises/works_at resolve via pack regexes for NER', () => {
+    expect(inferNerLinkType(v2, 'person', 'co-founded Acme Corp last year')).toBe('founded');
+    expect(inferNerLinkType(v2, 'person', 'invested in Acme Series A')).toBe('invested_in');
+    expect(inferNerLinkType(v2, 'person', 'advises widget-co on hiring')).toBe('advises');
+    expect(inferNerLinkType(v2, 'person', 'works at widget-co')).toBe('works_at');
+  });
+
+  test('non-matching text still falls through to null', () => {
+    expect(inferNerLinkType(v2, 'person', 'a sentence with no verb signal')).toBeNull();
+  });
+
+  // #5882: the sketch regexes are NER-only, so markdown link typing falls
+  // through to the tuned in-code matchers instead of labelling a bare
+  // "started" founded or a bare "joined" works_at.
+  test('markdown extraction on gbrain-base-v2: a bare "started" or "joined" no longer types the link (#5882)', async () => {
+    const resolver = { resolve: async () => null };
+    const note = await extractPageLinks('notes/kickoff-example',
+      'The migration work [Acme](../companies/acme-example.md) started on Monday. [Alice](../people/alice-example.md) joined the call late.',
+      {}, 'note', resolver, { skipFrontmatter: true, pack: v2 });
+    const types = Object.fromEntries(note.candidates.map(c => [c.targetSlug, c.linkType]));
+    expect(types['companies/acme-example']).not.toBe('founded');
+    expect(types['people/alice-example']).not.toBe('works_at');
+    const founder = await extractPageLinks('people/bob-example', '[Bob](bob-example.md) co-founded [Acme](../companies/acme-example.md) in 2019.',
+      {}, 'person', resolver, { skipFrontmatter: true, pack: v2 });
+    expect(founder.candidates.find(c => c.targetSlug === 'companies/acme-example')?.linkType).toBe('founded');
+  });
+
+  test('the sketch regexes never claim a markdown link context', () => {
+    for (const pack of [v2, v1]) {
+      expect(inferLinkTypeFromPack(pack, 'meeting', 'the migration work started on Monday')).not.toBe('founded');
+      expect(inferLinkTypeFromPack(pack, 'note', 'the migration work started on Monday')).toBeNull();
+      expect(inferLinkTypeFromPack(pack, 'note', 'she joined the call late')).toBeNull();
+      expect(inferLinkTypeFromPack(pack, 'note', 'co-founded Acme Corp last year')).toBeNull();
+    }
+  });
+});

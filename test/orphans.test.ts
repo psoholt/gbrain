@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import {
   shouldExclude,
   deriveDomain,
@@ -9,6 +9,21 @@ import {
   type OrphanResult,
 } from '../src/commands/orphans.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+
+// --- findOrphans setup failure ---
+
+describe('findOrphans setup failure', () => {
+  test('a policy read that fails starts no heartbeat (nothing keeps writing to stderr after the throw)', async () => {
+    const intervals = spyOn(globalThis, 'setInterval');
+    try {
+      const engine = { getConfig: async () => { throw new Error('config read failed'); }, executeRaw: async () => [] };
+      await expect(findOrphans(engine as never)).rejects.toThrow('config read failed');
+      expect(intervals).not.toHaveBeenCalled();
+    } finally {
+      intervals.mockRestore();
+    }
+  });
+});
 
 // --- shouldExclude ---
 
@@ -66,6 +81,10 @@ describe('shouldExclude', () => {
     expect(shouldExclude('templates/meeting-note')).toBe(true);
   });
 
+  test('excludes deny-prefix: _templates/', () => {
+    expect(shouldExclude('_templates/meeting-note')).toBe(true);
+  });
+
   test('excludes deny-prefix: openclaw/config/', () => {
     expect(shouldExclude('openclaw/config/agent')).toBe(true);
   });
@@ -86,10 +105,44 @@ describe('shouldExclude', () => {
     expect(shouldExclude('entities/product-hunt')).toBe(true);
   });
 
+  test('excludes first-segment: skills, dreaming, and daily', () => {
+    expect(shouldExclude('skills/arya/source-check')).toBe(true);
+    expect(shouldExclude('dreaming/light/2026-07-20')).toBe(true);
+    expect(shouldExclude('daily/2026-07-20')).toBe(true);
+    expect(shouldExclude('agent-openclaw/daily/2026-07-20')).toBe(true);
+  });
+
+  test('excludes root date logs and agent workspace conventions', () => {
+    expect(shouldExclude('_brain-conventions')).toBe(true);
+    expect(shouldExclude('2026-07-20')).toBe(true);
+    expect(shouldExclude('2026-07-20-qa-sweep')).toBe(true);
+    expect(shouldExclude('agents/arya/identity')).toBe(true);
+    expect(shouldExclude('agents/arya/memory/dreaming/deep/2026-07-20')).toBe(true);
+  });
+
+  test('excludes generated extracts', () => {
+    expect(shouldExclude('extracts/2026-06-30/takes.proposed/round-single')).toBe(true);
+  });
+
+  test('brain-specific exclusions come from config overrides, not global defaults', () => {
+    // No baked-in defaults for these:
+    expect(shouldExclude('my-private-folder/some-secret-ref.md')).toBe(false);
+    expect(shouldExclude('one-off-fixture-page')).toBe(false);
+    // The per-brain config plane (orphans.exclude_prefixes / exclude_slugs):
+    const overrides = {
+      excludePrefixes: ['my-private-folder/'],
+      excludeSlugs: ['one-off-fixture-page'],
+    };
+    expect(shouldExclude('my-private-folder/some-secret-ref.md', overrides)).toBe(true);
+    expect(shouldExclude('one-off-fixture-page', overrides)).toBe(true);
+    expect(shouldExclude('people/jane-doe', overrides)).toBe(false);
+  });
+
   test('does NOT exclude a normal content page', () => {
     expect(shouldExclude('companies/acme')).toBe(false);
     expect(shouldExclude('people/jane-doe')).toBe(false);
     expect(shouldExclude('projects/gbrain')).toBe(false);
+    expect(shouldExclude('agents/arya/qa-reports/launch-review')).toBe(false);
   });
 
   test('does NOT exclude a page ending with log-like text that is not /log', () => {
@@ -222,10 +275,12 @@ describe('findOrphans (engine-injected)', () => {
     if (engine) await engine.disconnect();
   }, 60_000);
 
-  test('returns pages with no inbound links, excluding pseudo-pages', async () => {
-    // Build a tiny brain: alice links to bob. alice is an orphan (nothing
-    // points to her), bob is not (alice points to him). _atlas is a pseudo
-    // page that should be excluded by default.
+  test('default (islanded, #4524) excludes connected pages and pseudo-pages', async () => {
+    // Build a tiny brain: alice links to bob, carol is fully disconnected.
+    // Under the #4524 canonical 'islanded' default (= get_health's
+    // definition) alice is NOT an orphan (she links out) and bob is not
+    // (alice points to him) — only carol is. _atlas is a pseudo page that
+    // should be excluded by default.
     await engine.putPage('people/alice', {
       type: 'person',
       title: 'Alice',
@@ -236,6 +291,12 @@ describe('findOrphans (engine-injected)', () => {
       type: 'person',
       title: 'Bob',
       compiled_truth: 'Bob.',
+      timeline: '',
+    });
+    await engine.putPage('people/carol', {
+      type: 'person',
+      title: 'Carol',
+      compiled_truth: 'Carol is disconnected.',
       timeline: '',
     });
     await engine.putPage('_atlas', {
@@ -250,10 +311,15 @@ describe('findOrphans (engine-injected)', () => {
     const result = await findOrphans(engine);
 
     const slugs = result.orphans.map(o => o.slug).sort();
-    expect(slugs).toEqual(['people/alice']); // _atlas excluded by default; bob has a backlink
+    expect(slugs).toEqual(['people/carol']); // alice links out; bob has a backlink; _atlas excluded
     expect(result.total_orphans).toBe(1);
-    expect(result.total_pages).toBe(3);
+    expect(result.total_pages).toBe(4);
     expect(result.excluded).toBeGreaterThanOrEqual(1); // _atlas was filtered
+
+    // The legacy no-inbound-only view stays reachable via mode: 'inbound' —
+    // there alice (no backlinks, links out) counts again.
+    const inbound = await findOrphans(engine, { mode: 'inbound' });
+    expect(inbound.orphans.map(o => o.slug).sort()).toEqual(['people/alice', 'people/carol']);
   });
 
   test('includePseudo: true surfaces pseudo-pages too', async () => {
@@ -365,8 +431,14 @@ describe('findOrphans (engine-injected)', () => {
 
     const rows = await queryOrphanPages(engine);
     const slugs = rows.map(r => r.slug);
-    // alice is orphan (no inbound), bob is NOT (alice links to him).
-    expect(slugs).toContain('people/alice');
+    // #4524 islanded default: bob is NOT an orphan (live inbound from
+    // alice), and alice is NOT either — she links out to a live page.
+    expect(slugs).not.toContain('people/alice');
     expect(slugs).not.toContain('people/bob');
+    // The legacy inbound-only view still reports alice (no backlinks).
+    const inbound = await engine.findOrphanPages({ mode: 'inbound' });
+    const inboundSlugs = inbound.map(r => r.slug);
+    expect(inboundSlugs).toContain('people/alice');
+    expect(inboundSlugs).not.toContain('people/bob');
   });
 });

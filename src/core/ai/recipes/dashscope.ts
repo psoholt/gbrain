@@ -17,6 +17,13 @@ export const dashscope: Recipe = {
   name: 'Alibaba DashScope (灵积)',
   tier: 'openai-compat',
   implementation: 'openai-compatible',
+  // No shipped rate for these yet: they warn and run under a default cap; a
+  // user cap refuses them until `gbrain pricing set` registers one (X1 guard).
+  unpriced_models: [
+    'text-embedding-v3',
+    'text-embedding-v2',
+    'text-embedding-v1',
+  ],
   base_url_default: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
   auth_env: {
     required: ['DASHSCOPE_API_KEY'],
@@ -24,13 +31,28 @@ export const dashscope: Recipe = {
   },
   touchpoints: {
     embedding: {
-      models: ['text-embedding-v3', 'text-embedding-v2'],
+      models: ['text-embedding-v3', 'text-embedding-v2', 'text-embedding-v1'],
       default_dims: 1024,
+      // PR #5922 / #4530: DashScope's documented per-INPUT caps (Model Studio
+      // "Synchronous API for text embedding", read 2026-10-11): v1/v2 reject
+      // any single input over 2,048 tokens with a 400 that fails the whole
+      // batch; v3 accepts 8,192. The chunker splits to floor(cap × 0.6)
+      // (resolveMaxChunkTokens) and the heal pass splits stored rows.
+      max_input_tokens: {
+        'text-embedding-v1': 2048,
+        'text-embedding-v2': 2048,
+        'text-embedding-v3': 8192,
+      },
       dims_options: [64, 128, 256, 512, 768, 1024],
       // Alibaba doesn't publish a hard batch-token cap for the OpenAI-compat
       // path. Conservative declaration so the gateway pre-splits before
       // hitting whatever undocumented server-side limit exists.
       max_batch_tokens: 8192,
+      // DashScope's OpenAI-compat /embeddings endpoint rejects requests with
+      // more than 10 input items (documented Model Studio cap). The gateway's
+      // capBatchItems pre-split enforces this; max_batch_tokens above keeps
+      // guarding aggregate token size. Concept from community PRs #2643/#2405.
+      max_batch_items: 10,
       // text-embedding-v3 mixes English + CJK heavily; the tokenizer is
       // closer to Voyage density than OpenAI tiktoken for CJK-dominant
       // content. Conservative chars_per_token=2 leaves headroom.

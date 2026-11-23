@@ -18,8 +18,12 @@
 import type { BrainEngine } from './engine.ts';
 import type { LinkBatchInput } from './engine.ts';
 import { buildGazetteer, findMentionedEntities, type Gazetteer } from './by-mention.ts';
+import { isCrossSourceLinksEnabled } from './link-extraction.ts';
 import { inferLinkTypeFromPack } from './schema-pack/link-inference.ts';
-import { loadActivePackBestEffort } from './schema-pack/best-effort.ts';
+import { loadActivePackForLocalEngine, packSupportsNerInference } from './schema-pack/best-effort.ts';
+import { isQuarantined } from './quarantine.ts';
+import { renderFragment, sqlFragment } from './engine-sql/fragment.ts';
+import { entityTypePredicateSql, resolveEntityTypes } from './schema-pack/entity-types.ts';
 
 export interface ExtractNerOpts {
   /** When true: enumerate but don't write. */
@@ -44,7 +48,7 @@ export interface ExtractNerResult {
   pages: number;
   /** Typed-NER links created (or would-have-created in dry-run). */
   created: number;
-  /** Pages where the active schema pack had no link_types at all. */
+  /** The active schema pack had no NER inference rules, or a pack in scope did not load (entity types unknown). */
   pack_unavailable: boolean;
 }
 
@@ -81,7 +85,7 @@ export function inferNerLinkType(
 ): string | null {
   if (!targetType) return null;
   try {
-    return inferLinkTypeFromPack(pack, targetType, context);
+    return inferLinkTypeFromPack(pack, targetType, context, undefined, undefined, { ner: true });
   } catch {
     return null;
   }
@@ -103,27 +107,33 @@ export async function extractNerLinks(
 ): Promise<ExtractNerResult> {
   const dryRun = opts.dryRun ?? false;
 
-  // Pack best-effort: no pack → no inference → nothing to do.
-  const pack = await loadActivePackBestEffort({ engine } as never);
-  if (!pack || !pack.manifest?.link_types || pack.manifest.link_types.length === 0) {
+  // Pack best-effort: no pack, or no link_type with an inference.regex → NER
+  // has no patterns to match and we'd waste a full walk. `!pack` first so TS
+  // narrows pack to non-null for the rest of the function; packSupportsNerInference
+  // (shared with the onboard recommender) covers the no-link-types / no-regex cases.
+  //
+  // Resolves via loadActivePackForLocalEngine, the SAME path the onboard
+  // recommender uses, so the two cannot resolve different packs and then
+  // disagree about whether this job can help. The previous
+  // `loadActivePackBestEffort({ engine } as never)` shape ran this local job
+  // under REMOTE trust gating (that helper defaults `remote: ctx.remote ?? true`)
+  // and could not see a DB-side pack flip.
+  const pack = await loadActivePackForLocalEngine(engine);
+  if (!pack || !packSupportsNerInference(pack)) {
     return { pages: 0, created: 0, pack_unavailable: true };
   }
-  // Require at least one link_type with an inference.regex; otherwise NER
-  // has no patterns to match and we'd waste a full walk.
-  const hasRegex = pack.manifest.link_types.some(
-    (lt) => lt.inference && typeof lt.inference === 'object' && 'regex' in lt.inference,
-  );
-  if (!hasRegex) return { pages: 0, created: 0, pack_unavailable: true };
 
   const gazetteer = opts.gazetteer ?? await buildGazetteer(engine);
   if (gazetteer.size === 0) {
     return { pages: 0, created: 0, pack_unavailable: false };
   }
+  const allowCrossSource = await isCrossSourceLinksEnabled(engine);
 
   // Pre-fetch target entity types so inferLinkType has the type signal
   // without an N+1 getPage round-trip. Pulls the slug→type map from
   // listAllPageRefs + a single listPages projection.
   const targetTypeMap = await buildTargetTypeMap(engine);
+  if (!targetTypeMap) return { pages: 0, created: 0, pack_unavailable: true };
 
   const allRefs = opts.sourceIdFilter
     ? (await engine.listAllPageRefs()).filter((r) => r.source_id === opts.sourceIdFilter)
@@ -151,7 +161,7 @@ export async function extractNerLinks(
 
   for (const { slug, source_id } of allRefs) {
     const page = await engine.getPage(slug, { sourceId: source_id });
-    if (!page) continue;
+    if (!page || isQuarantined(page.frontmatter)) continue;
     if (opts.typeFilter && page.type !== opts.typeFilter) continue;
     if (sinceMs !== null) {
       const updatedMs = new Date(page.updated_at).getTime();
@@ -166,6 +176,7 @@ export async function extractNerLinks(
     const mentions = findMentionedEntities(body, gazetteer, {
       fromSlug: slug,
       fromSourceId: source_id,
+      allowCrossSource,
     });
     if (mentions.length === 0) continue;
 
@@ -194,23 +205,17 @@ export async function extractNerLinks(
 }
 
 /**
- * Helper: build a Map<sourceId::slug → type> for all entity-typed pages.
- * One round-trip via listPages. Targets cached at extraction-start so
- * inferNerLinkType doesn't pay an N+1 cost per mention.
+ * Helper: build a Map<sourceId::slug → type> for the entity-typed pages, by
+ * the active pack(s) per source (#4772, the get_health predicate bound in
+ * SQL). One round-trip; targets cached at extraction-start so
+ * inferNerLinkType doesn't pay an N+1 cost per mention. Null when a pack in
+ * scope did not load (entity types unknown); an engine error throws.
  */
-async function buildTargetTypeMap(engine: BrainEngine): Promise<Map<string, string>> {
-  const map = new Map<string, string>();
-  try {
-    const result = await engine.executeRaw<{ slug: string; source_id: string; type: string }>(
-      `SELECT slug, source_id, type FROM pages
-         WHERE type IN ('person', 'company', 'organization', 'entity')
-           AND deleted_at IS NULL`,
-    );
-    for (const row of result) {
-      map.set(`${row.source_id}::${row.slug}`, row.type);
-    }
-  } catch {
-    // Engine error → empty map; inferNerLinkType returns null for unknown types.
-  }
-  return map;
+async function buildTargetTypeMap(engine: BrainEngine): Promise<Map<string, string> | null> {
+  const entityTypes = await resolveEntityTypes(engine, null);
+  if (entityTypes.status === 'pack_unavailable') return null;
+  const sql = renderFragment(sqlFragment`SELECT p.slug, p.source_id, p.type FROM pages p
+    WHERE ${entityTypePredicateSql('p', entityTypes.filter)} AND p.deleted_at IS NULL`);
+  const rows = await engine.executeRaw<{ slug: string; source_id: string; type: string }>(sql.text, sql.params);
+  return new Map(rows.map((row) => [`${row.source_id}::${row.slug}`, row.type]));
 }

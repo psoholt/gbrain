@@ -25,7 +25,7 @@ import type { BrainEngine } from '../engine.ts';
 
 export interface ABRunInput {
   question: string;
-  /** Holder context for calibration. Default 'garry'. */
+  /** Holder context for calibration. Resolves via resolveOwnerHolder (config emotional_weight.user_holder, else 'self'). */
   holder?: string;
   /** Engine for DB write. */
   engine: BrainEngine;
@@ -149,7 +149,10 @@ export function formatAbReport(report: AbReportResult, days: number): string {
   lines.push(`A/B report (last ${days} days):`);
   lines.push(`  Total trials: ${report.total_trials}`);
   if (report.total_trials === 0) {
-    lines.push('  No data yet. Try: gbrain think --ab "<question>"');
+    // #3697: this used to suggest `gbrain think --ab`, a flag `think` never
+    // parses (the CLI trial-runner wiring never shipped; runAbTrial is
+    // API-only). Don't send the user to a silently-misparsed command.
+    lines.push('  No data yet. (A/B trials are recorded via the runAbTrial harness; a CLI trial-runner has not shipped.)');
     return lines.join('\n');
   }
   lines.push(`  Baseline wins:           ${report.baseline_wins}`);

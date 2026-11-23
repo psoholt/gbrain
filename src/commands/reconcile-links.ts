@@ -20,13 +20,24 @@
  * files, that's 5K ILIKE scans. A user-triggered batch pass on an
  * already-synced brain is one walk, fully indexed via the existing
  * slug lookup in addLink.
+ *
+ * A segmented page (Wave B) is read block by block (`bodyLines`): a code ref
+ * never spans a line, so it gets the refs the same text held as one string
+ * gets. A page a block read refuses is listed in `skipped` and the walk goes on.
  */
 
 import type { BrainEngine } from '../core/engine.ts';
-import { extractCodeRefs } from '../core/link-extraction.ts';
+import { PageMissingError } from '../core/engine-errors.ts';
+import type { Page } from '../core/types.ts';
+import { extractCodeRefs, type CodeRef } from '../core/link-extraction.ts';
+import { OperationError, opError } from '../core/ops/contract.ts';
+import { isSegmentedPage } from '../core/page-body/page-shape.ts';
+import { bodyLines } from '../core/page-body/segment-lines.ts';
 import { slugifyCodePath } from '../core/sync.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
+import { ALL_SOURCES, resolveSourceId } from '../core/source-resolver.ts';
+import { flagValueError } from '../cli/flag-values.ts';
 
 export interface ReconcileLinksResult {
   status: 'ok' | 'auto_link_disabled';
@@ -34,15 +45,39 @@ export interface ReconcileLinksResult {
   codeRefsFound: number;
   edgesAttempted: number;
   edgesTargetsMissing: number;
+  /** Pages a per-page refusal kept out of the scan (present only when there are any). */
+  skipped?: Array<{ slug: string; reason: string; message: string }>;
+}
+
+/**
+ * Code refs of a page's `${compiled_truth}\n${timeline}`, first occurrence of each path, in text order. A segmented
+ * page is read a block of lines at a time; `index` stays an offset into the joined text.
+ */
+async function pageCodeRefs(engine: BrainEngine, page: Page): Promise<CodeRef[]> {
+  if (!isSegmentedPage(page)) return extractCodeRefs((page.compiled_truth || '') + '\n' + (page.timeline || ''));
+  const seen = new Set<string>();
+  const refs: CodeRef[] = [];
+  let at = 0;
+  for await (const lines of bodyLines(engine, page)) {
+    const text = lines.join('\n');
+    for (const ref of extractCodeRefs(text)) {
+      if (seen.has(ref.path)) continue;
+      seen.add(ref.path);
+      refs.push({ path: Buffer.from(ref.path, 'utf8').toString('utf8'), line: ref.line, index: ref.index + at });
+    }
+    at += text.length + 1;
+  }
+  return refs;
 }
 
 export interface ReconcileLinksOpts {
+  /** The one source whose pages are scanned and linked; defaults to `default`, where addLink writes when none is named. */
   sourceId?: string;
   dryRun?: boolean;
 }
 
 /**
- * Scan every markdown page for code-path references (e.g.
+ * Scan one source's markdown pages for code-path references (e.g.
  * `src/core/sync.ts`, `lib/foo.py:42`) and create bidirectional
  * doc↔impl edges (`documents` + `documented_by`) for each hit
  * that resolves to a code page. Idempotent via ON CONFLICT DO
@@ -57,6 +92,12 @@ export async function runReconcileLinks(
   engine: BrainEngine,
   opts: ReconcileLinksOpts = {},
 ): Promise<ReconcileLinksResult> {
+  const sourceId = opts.sourceId ?? 'default';
+  if (sourceId === ALL_SOURCES) {
+    throw opError('invalid_params', `reconcile-links links pages inside one source; ${ALL_SOURCES} is not a source.`,
+      'Name one source with --source (gbrain sources list shows the ids).');
+  }
+
   // Respect auto_link config (same gate put_page uses). A user that
   // explicitly turned off auto-link doesn't want reconcile-links
   // writing edges back either.
@@ -73,11 +114,12 @@ export async function runReconcileLinks(
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
 
-  // Walk all markdown slugs. listPages(markdown-only filter) isn't exposed,
+  // Walk the source's markdown slugs. listPages(markdown-only filter) isn't exposed,
   // so filter at call time via page_kind. Not using getAllSlugs because we
   // also need compiled_truth + timeline for extractCodeRefs.
   const mdSlugs = (await engine.executeRaw<{ slug: string }>(
-    `SELECT slug FROM pages WHERE page_kind = 'markdown' ORDER BY slug`,
+    `SELECT slug FROM pages WHERE page_kind = 'markdown' AND source_id = $1 ORDER BY slug`,
+    [sourceId],
   )).map(r => r.slug);
 
   progress.start('reconcile_links.scan', mdSlugs.length);
@@ -85,6 +127,7 @@ export async function runReconcileLinks(
   let codeRefsFound = 0;
   let edgesAttempted = 0;
   let edgesTargetsMissing = 0;
+  const skipped: NonNullable<ReconcileLinksResult['skipped']> = [];
 
   // Fetch pages one at a time via getPage (no bulk read helper exists yet).
   // On a 47K-page brain this is the slow path; a v0.20.x follow-up can add
@@ -93,18 +136,23 @@ export async function runReconcileLinks(
   // intended-source row for `default`-vs-`<source>` ambiguity. The link
   // edges below also propagate the same sourceId (Data R1 MED 1: opt was
   // declared on ReconcileLinksOpts but ignored end-to-end).
-  const getPageOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
-  const linkOpts = opts.sourceId
-    ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
-    : undefined;
+  const getPageOpts = { sourceId };
+  const linkOpts = { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId };
   for (const mdSlug of mdSlugs) {
     const page = await engine.getPage(mdSlug, getPageOpts);
     if (!page) {
       progress.tick(1, mdSlug);
       continue;
     }
-    const haystack = (page.compiled_truth || '') + '\n' + (page.timeline || '');
-    const refs = extractCodeRefs(haystack);
+    let refs: CodeRef[];
+    try {
+      refs = await pageCodeRefs(engine, page);
+    } catch (e: unknown) {
+      if (!(e instanceof OperationError && e.code === 'page_body_segmented')) throw e;
+      skipped.push({ slug: mdSlug, reason: e.code, message: e.message });
+      progress.tick(1, `${mdSlug} (skipped)`);
+      continue;
+    }
     if (refs.length === 0) {
       progress.tick(1, mdSlug);
       continue;
@@ -128,14 +176,12 @@ export async function runReconcileLinks(
         await engine.addLink(mdSlug, codeSlug, ctx, 'documents', 'markdown', mdSlug, 'compiled_truth', linkOpts); // gbrain-allow-direct-insert: gbrain reconcile-links command — code-graph reconciliation from markdown references
         await engine.addLink(codeSlug, mdSlug, ref.path, 'documented_by', 'markdown', mdSlug, 'compiled_truth', linkOpts); // gbrain-allow-direct-insert: gbrain reconcile-links command — reverse documented_by edge
       } catch (e: unknown) {
-        // Per-link errors don't abort the batch. Track them for the summary.
-        const msg = e instanceof Error ? e.message : String(e);
-        if (/not found|does not exist/i.test(msg)) {
-          edgesTargetsMissing++;
-        } else {
-          // Real error — log but keep going. Agents can inspect progress events.
-          console.warn(`[reconcile-links] ${mdSlug} → ${codeSlug}: ${msg}`);
+        // A missing code page is expected and counted; any other write failure fails the run.
+        if (!(e instanceof PageMissingError)) {
+          progress.finish();
+          throw e;
         }
+        edgesTargetsMissing++;
       }
     }
     progress.tick(1, `${mdSlug} (+${refs.length} refs)`);
@@ -149,18 +195,26 @@ export async function runReconcileLinks(
     codeRefsFound,
     edgesAttempted,
     edgesTargetsMissing,
+    ...(skipped.length ? { skipped } : {}),
   };
 }
 
 /**
  * CLI entry. Parses argv, runs runReconcileLinks, prints a summary.
- * --dry-run reports counts without writing. --json emits machine output.
+ * --source <id> picks the source (else the usual chain: GBRAIN_SOURCE,
+ * .gbrain-source, registered path, brain default). --dry-run reports counts
+ * without writing. --json emits machine output.
  */
 export async function runReconcileLinksCli(engine: BrainEngine, args: string[]): Promise<void> {
   const dryRun = args.includes('--dry-run');
   const jsonOut = args.includes('--json');
 
-  const result = await runReconcileLinks(engine, { dryRun });
+  const sourceAt = args.indexOf('--source');
+  const explicit = sourceAt === -1 ? null : args[sourceAt + 1];
+  if (explicit !== null && (!explicit || explicit.startsWith('-'))) throw flagValueError('--source', explicit, 'a source id', 'default');
+  const sourceId = await resolveSourceId(engine, explicit);
+
+  const result = await runReconcileLinks(engine, { dryRun, sourceId });
 
   if (jsonOut) {
     console.log(JSON.stringify(result));
@@ -184,4 +238,5 @@ export async function runReconcileLinksCli(engine: BrainEngine, args: string[]):
       ? ` (${result.edgesTargetsMissing} targets missing code page)`
       : ''),
   );
+  for (const page of result.skipped ?? []) console.log(`[reconcile-links] skipped ${page.slug} (${page.reason}): ${page.message}`);
 }

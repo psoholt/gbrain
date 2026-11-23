@@ -12,13 +12,21 @@
  *   - model-id normalization (bare → provider-prefixed)
  *   - response-shape conversion (ChatResult → Anthropic.Message)
  *
- * These tests pin the four spec points. Hermetic — no real LLM call.
+ * These tests pin the four spec points. Hermetic — no real LLM call: the "unconfigured" fixtures use
+ * `__unconfigureGatewayForTests()` (since #3554 `resetGateway()` re-applies the preload's configured baseline, so
+ * it is NOT "unconfigured" and sent two real HTTPS requests to the provider with the fake key, #6514). Forced probe:
+ * `GBRAIN_TEST_NET_LOG=$L bun test --preload ./test/helpers/no-network-preload.ts test/think-gateway-adapter.test.ts`
+ * is 17/17 with an empty net log; the old fixtures were 16/17 with two provider URLs in the log.
  */
 
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, afterEach } from 'bun:test';
 import { __thinkAdapter } from '../src/core/think/index.ts';
-import { resetGateway } from '../src/core/ai/gateway.ts';
+import { resetGateway, __unconfigureGatewayForTests } from '../src/core/ai/gateway.ts';
+import { AIConfigError } from '../src/core/ai/errors.ts';
 import { withEnv, emptyHome } from './helpers/with-env.ts';
+
+// A filtered run must not leave the gateway empty for the next file's beforeAll (the #3554 baseline).
+afterEach(() => { resetGateway(); });
 
 describe('think gateway adapter — response shape conversion', () => {
   test('chatResultToMessage maps ChatResult.text to Anthropic.Message content[0].text', () => {
@@ -108,9 +116,11 @@ describe('think gateway adapter — #1698 slash form + explicit-model fork', () 
     ).rejects.toThrow(/not usable.*unknown_provider/);
   });
 
-  test('explicit typo native model THROWS (unknown_model)', async () => {
+  test('explicit chat-less-provider model THROWS (unknown_model)', async () => {
+    // voyage has no chat touchpoint. Unlisted ids on chat-capable providers
+    // pass local validation (no runtime allowlist) — the provider decides.
     await expect(
-      __thinkAdapter.tryBuildGatewayClient('anthropic:claude-bogus-9', { explicitModel: true }),
+      __thinkAdapter.tryBuildGatewayClient('voyage:voyage-3', { explicitModel: true }),
     ).rejects.toThrow(/not usable.*unknown_model/);
   });
 
@@ -131,7 +141,7 @@ describe('think gateway adapter — #1698 slash form + explicit-model fork', () 
     await withEnv({ ANTHROPIC_API_KEY: 'sk-test-fake' }, async () => {
       // Build valid clients (key present → probe ok) but leave the gateway UNCONFIGURED
       // so gateway.chat() throws AIConfigError (requireConfig) at create() time.
-      resetGateway();
+      __unconfigureGatewayForTests();
       const params: any = {
         model: 'anthropic:claude-sonnet-4-6',
         max_tokens: 16,
@@ -143,7 +153,8 @@ describe('think gateway adapter — #1698 slash form + explicit-model fork', () 
         'anthropic:claude-sonnet-4-6', { explicitModel: true },
       );
       expect(explicitClient).not.toBeNull();
-      await expect(explicitClient!.create(params)).rejects.toThrow();
+      // Specifically the config error: a network/auth error from a configured gateway must not satisfy this fork.
+      await expect(explicitClient!.create(params)).rejects.toBeInstanceOf(AIConfigError);
 
       const gracefulClient = await __thinkAdapter.tryBuildGatewayClient(
         'anthropic:claude-sonnet-4-6', { explicitModel: false },
@@ -166,7 +177,7 @@ describe('think gateway adapter — #1698 slash form + explicit-model fork', () 
     await withEnv(
       { ANTHROPIC_API_KEY: undefined, DEEPSEEK_API_KEY: undefined, OPENAI_API_KEY: undefined, GBRAIN_HOME: emptyHome() },
       async () => {
-        resetGateway();  // unconfigured → gateway.chat() throws AIConfigError at create()
+        __unconfigureGatewayForTests();  // unconfigured → gateway.chat() throws AIConfigError at create()
         // deepseek:deepseek-chat passes validateModelId (real recipe + chat touchpoint) — the
         // A9 non-anthropic model. probeChatModel returns ok (no anthropic key check) → builds.
         const client = await __thinkAdapter.tryBuildGatewayClient(
@@ -180,9 +191,26 @@ describe('think gateway adapter — #1698 slash form + explicit-model fork', () 
           messages: [{ role: 'user', content: 'hi' }],
         };
         // The backstop fires: explicit → AIConfigError rethrown, NOT the graceful sentinel.
-        await expect(client!.create(params)).rejects.toThrow();
+        await expect(client!.create(params)).rejects.toBeInstanceOf(AIConfigError);
       },
     );
+  });
+});
+
+describe('think gateway adapter — current-generation recipe models', () => {
+  test('builds clients for Opus 4.8 / Sonnet 5 / Fable 5 (recipe-list refresh)', async () => {
+    // Regression guard: these GA models were absent from the recipe allowlist,
+    // so a tier-configured deep model degraded think to the no-LLM stub.
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test-fake' }, async () => {
+      for (const id of [
+        'anthropic:claude-opus-4-8',
+        'anthropic:claude-sonnet-5',
+        'anthropic:claude-fable-5',
+      ]) {
+        const client = await __thinkAdapter.tryBuildGatewayClient(id);
+        expect(client).not.toBeNull();
+      }
+    });
   });
 });
 
@@ -197,5 +225,19 @@ describe('think gateway adapter — graceful fallback shape', () => {
     expect(m.usage.input_tokens).toBe(0);
     expect(m.usage.output_tokens).toBe(0);
     expect(m.stop_reason).toBe('end_turn');
+  });
+
+  test('the sentinel surfaces the AIConfigError cause, not generic key advice', () => {
+    // With no runtime model allowlist, a nonexistent model id reaches the
+    // provider and comes back as a 4xx wrapped in AIConfigError. The sentinel
+    // must name that cause — the generic text key-blamed model problems.
+    const err = new AIConfigError(
+      '[chat(openai:gpt-bogus)] The model `gpt-bogus` does not exist',
+      'Check your model id + provider options match the provider API.',
+    );
+    const m = __thinkAdapter.buildGracefulMessage('openai:gpt-bogus', err);
+    expect(m.content[0].text).toContain('does not exist');
+    expect(m.content[0].text).toContain('Check your model id');
+    expect(m.content[0].text).not.toContain('ANTHROPIC_API_KEY');
   });
 });

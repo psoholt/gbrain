@@ -30,6 +30,10 @@
 
 set -euo pipefail
 
+# #3485: shared name floor — these scripts mutate whatever DATABASE_URL names
+# and are documented for direct invocation, so each sources the floor itself.
+source "$(dirname "$0")/_db_floor.sh"
+
 cd "$(dirname "$0")/../.."
 
 WALLCLOCK_BUDGET_S="${WALLCLOCK_BUDGET_S:-15}"
@@ -81,29 +85,41 @@ echo "[fm_wallclock] fixture seeded in ${SEED_ELAPSED}s" | tee -a "$LOG"
 # Step 2: init brain + register the source.
 # `--no-embedding` opts out of the embedding-provider hard-require (v0.37 D9).
 # This script measures doctor's frontmatter-scan wallclock — it never embeds —
-# so the CI runner doesn't need OPENAI_API_KEY / ZEROENTROPY_API_KEY / VOYAGE_API_KEY.
+# so the CI runner doesn't need OPENAI_API_KEY / VOYAGE_API_KEY.
 echo "[fm_wallclock] init brain..." | tee -a "$LOG"
-timeout 120s bun run src/cli.ts init --pglite --yes --no-embedding >> "$LOG" 2>&1 || {
+timeout 120s bun run src/cli.ts init --pglite --non-interactive --no-embedding >> "$LOG" 2>&1 || {
   echo "[fm_wallclock] FAIL: gbrain init exited non-zero" >&2
   echo "Log tail:" >&2
   tail -30 "$LOG" >&2
   exit 1
 }
 
-# Register the brain dir as a source via the CLI so it lands in the SAME
-# persistent PGLite brain that `gbrain init` created and `gbrain doctor` reads.
-# (The earlier `bun run -e` + `new PGLiteEngine().connect({})` path resolved to
-# an in-memory DB — `database_path` unset means in-memory — so the INSERT
-# evaporated on disconnect and doctor saw "No registered sources to scan",
-# making the frontmatter scan assertion pass vacuously.)
+# Register the brain dir as a source. Use raw SQL since `gbrain sources add`
+# might not exist in this version-window; the schema is what doctor reads.
+# NOTE: must be `bun -e`, not `bun run -e` — `bun run` treats -e as an
+# unknown script name and dumps its usage/script listing with exit 0, so the
+# INSERT silently never ran and doctor scanned zero sources (vacuous pass).
+# Resolve the engine the same way the CLI does (config + env), so the source
+# lands in the DB doctor actually reads (Postgres when CI sets DATABASE_URL,
+# the PGLite brain otherwise) — a hardcoded `connect({})` is in-memory and
+# the INSERT would vanish.
 echo "[fm_wallclock] register source..." | tee -a "$LOG"
-bun run src/cli.ts sources add fm-wallclock \
-  --path "$BRAIN_DIR" \
-  --name "Frontmatter wallclock test" >> "$LOG" 2>&1 || {
-  echo "[fm_wallclock] FAIL: gbrain sources add exited non-zero" >&2
-  tail -30 "$LOG" >&2
-  exit 1
-}
+bun -e "
+import { loadConfig, toEngineConfig } from './src/core/config.ts';
+import { createEngine } from './src/core/engine-factory.ts';
+const cfg = loadConfig();
+if (!cfg) throw new Error('no gbrain config — init failed?');
+const engineConfig = toEngineConfig(cfg);
+const e = await createEngine(engineConfig);
+await e.connect(engineConfig);
+await e.initSchema();
+await e.executeRaw(
+  \"INSERT INTO sources (id, name, local_path) VALUES ('fm-wallclock', 'Frontmatter wallclock test', \\\$1)\",
+  ['$BRAIN_DIR'],
+);
+await e.disconnect();
+console.log('source registered');
+" 2>&1 | tee -a "$LOG"
 
 # Step 3: run gbrain doctor; capture wall-clock + exit + frontmatter_integrity status.
 echo "[fm_wallclock] running gbrain doctor (budget ${WALLCLOCK_BUDGET_S}s)..." | tee -a "$LOG"

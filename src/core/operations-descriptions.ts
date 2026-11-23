@@ -19,20 +19,10 @@
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const GET_RECENT_SALIENCE_DESCRIPTION =
-  "Returns pages recently touched and ranked by emotional + activity salience " +
-  "(deterministic 0..1 emotional_weight + take density + recency decay). " +
-  "Use this when the user asks what's been going on, what's notable, what's hot, " +
-  "anything crazy happening, or for any open-ended 'current state' question " +
-  "about themselves or their work. Do NOT run a semantic search for these — " +
-  "salience surfaces what's unusual without needing a search term.";
+  "Recently touched pages ranked by salience. Use this when the user asks what's been going on, what's notable, anything crazy happening. Do NOT run a semantic search for these.";
 
 export const FIND_ANOMALIES_DESCRIPTION =
-  "Returns statistical anomalies in recent page activity, grouped by cohort " +
-  "(tag or type). Use this for questions about what stood out, what's unusual, " +
-  "or what changed recently. Returns explanatory cohorts (e.g. '15 pages tagged " +
-  "wedding touched on 2026-04-28, baseline 0.3/day') so you can speak about " +
-  "patterns the user wouldn't have searched for. Cohort kinds: tag, type. " +
-  "Year cohort is deferred to a later release.";
+  "Anomalies in recent page activity, grouped by cohort (tag or type) against a baseline. Use for what stood out, what's unusual or changed. Cohort kinds: tag, type.";
 
 export const FIND_EXPERTS_DESCRIPTION =
   "Answers 'who in my brain knows about <topic>'. Returns ranked person/company " +
@@ -56,50 +46,46 @@ export const GET_RECENT_TRANSCRIPTS_DESCRIPTION =
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const LIST_PAGES_DESCRIPTION =
-  "List pages with optional filters. " +
-  "For 'what's recent / what did I touch this week' questions, use list_pages " +
-  "with sort=updated_desc instead of semantic search.";
+  "List pages by type, slug_prefix, frontmatter where; what did I touch this week: sort=updated_desc. Default 50; truncated: continue with updated_after + updated_after_slug from the last row.";
 
 export const QUERY_DESCRIPTION =
-  "Hybrid search with vector + keyword + multi-query expansion. " +
-  "For personal/emotional questions ('what's going on with me', 'anything notable', " +
-  "'how am I feeling'), prefer get_recent_salience, find_anomalies, or " +
-  "get_recent_transcripts. Semantic search returns polished pages and misses " +
-  "recent activity bursts. Do NOT assume words like 'crazy', 'notable', or 'big' " +
-  "mean impressive — they often mean difficult or emotionally charged.";
+  "Hybrid search for concept/landscape questions and people/companies/projects by topic; adds fact rows. expand: one LLM call (expansion recovers synonyms; rarely helps). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper. Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.";
 
 export const SEARCH_DESCRIPTION =
-  "Keyword search using full-text search. For personal/emotional questions, " +
-  "prefer get_recent_salience or find_anomalies — they surface activity bursts " +
-  "without needing a search term. " +
-  "For code-symbol questions (callers, callees, definitions, blast radius), use " +
-  "code_callers / code_callees / code_def / code_refs instead — those return " +
-  "structural graph data, not text chunks.";
+  "Cheap hybrid search, no LLM expansion, top 20: exact tokens, names, field values. NOT proof of coverage; match: \"keyword\" pages every keyword match and takes OR across quoted names or codes (\"A\" OR \"B\" OR …): one call lists every page matching any. Name lists: entity names. Concepts/landscape or people/companies/projects by topic: `query`; lists: list_pages; personal: get_recent_salience. return_unit: sections or conversations. fields: \"full\" adds diagnostics.";
+
+/** `search`'s `match` param (Cat 40 Hard F2). */
+export const SEARCH_MATCH_DESCRIPTION = 'keyword: every match, paged.';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // v0.32.6 — contradiction probe MCP surface (M3)
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const FIND_CONTRADICTIONS_DESCRIPTION =
-  "v0.32.6 — return suspected-contradiction findings from the most recent " +
+  "Return suspected-contradiction findings from the most recent " +
   "`gbrain eval suspected-contradictions` probe run, optionally filtered by slug " +
   "and/or severity. Use this when the user asks 'what's inconsistent in my " +
   "brain', 'show me contradictions about Acme', 'high-severity issues only', or " +
   "wants to act on the probe's findings without re-running it. Returns " +
   "{contradictions: [{a, b, severity, axis, confidence, resolution_command}]}. " +
-  "Reads the cached run row — does NOT trigger a new probe; users run " +
+  "Remote, source-scoped or min_trust callers get only findings whose two sides they can read now " +
+  "(each side re-read live, with source_id, trust_tier and origin) and total_visible instead of the run total. " +
+  "Reads the stored run without triggering a new probe; users run " +
   "`gbrain eval suspected-contradictions` for that.";
 
 export const FIND_TRAJECTORY_DESCRIPTION =
-  "v0.35.4 — return the chronological claim trajectory for an entity (typed " +
+  "Return the chronological claim trajectory for an entity (typed " +
   "metric values over time, plus auto-detected regressions and narrative drift). " +
   "Use this when the user asks 'how has Acme's MRR trended', 'show me what " +
   "alice-example said about runway over time', 'is this founder consistent', " +
   "'find regressions for fund-a's portfolio', or wants a time-series view of an " +
   "entity's structured claims. Returns " +
   "`{points: [{fact_id, valid_from, metric, value, unit, period, text, source_session, source_markdown_slug}], " +
-  "regressions: [{metric, from_value, from_date, to_value, to_date, delta_pct}], " +
-  "drift_score: number|null, schema_version: 1}`. Drift score 0 = stable narrative, " +
+  "regressions: [{metric, from_value, from_date, to_value, to_date, delta_pct, direction: 'down'|'up'}], " +
+  "drift_score: number|null, schema_version: 1}`. A regression is a 10% drop, or a 10% rise for a " +
+  "lower-is-better metric (burn, churn, cac, cost, expense, loss, latency, payback, debt; not a name that also " +
+  "says savings, recovered, reduction or avoided). " +
+  "Drift score 0 = stable narrative, " +
   "1 = every consecutive claim is unrelated; null when fewer than 3 typed points " +
   "exist. Visibility-filtered for remote callers (world-only); source-scoped by " +
   "the caller's OAuth source binding. Pair with `gbrain founder scorecard <slug>` " +
@@ -120,9 +106,10 @@ export const FIND_TRAJECTORY_DESCRIPTION =
 export const CODE_CALLERS_DESCRIPTION =
   "BEFORE editing any function, run code_callers with the symbol name to find " +
   "every caller (the people who'd be affected by your change). Returns direct " +
-  "callers from the v0.20+ tree-sitter call graph. Use during plan-mode to size " +
+  "callers from the tree-sitter call graph. Use during plan-mode to size " +
   "the change. Defaults to source-scoped; for multi-source brains pass source_id " +
-  "or all_sources=true. " +
+  "or all_sources=true. `resolved:false` marks a call matched by name only: the resolver links calls within one " +
+  "file, so a cross-file call stays unresolved and may name a different symbol with the same name. " +
   "Returns: `{symbol, count, callers: [{from_symbol_qualified, to_symbol_qualified, edge_type, resolved}]}`. " +
   "Example: `{symbol:'parseMarkdown', count:4, callers:[{from_symbol_qualified:'callerInA', " +
   "to_symbol_qualified:'parseMarkdown', edge_type:'calls', resolved:true}]}`.";
@@ -162,28 +149,10 @@ export const CODE_REFS_DESCRIPTION =
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const LIST_SKILLS_DESCRIPTION =
-  "List the skills this agent's brain publishes. A skill is a named prose " +
-  "instruction set (NOT executable code) that teaches you how to do a task " +
-  "using this server's other tools. Returns a flat catalog — each entry has a " +
-  "name, one-line description, triggers (phrasings that should invoke it), and " +
-  "`usable_tools` / `unavailable_tools` (which tools the skill calls that you " +
-  "CAN vs CANNOT call given this server + your access). To actually use a skill, " +
-  "call get_skill with its name, read the returned prose, and follow it — calling " +
-  "the correspondingly-named tools on THIS server. The response also carries an " +
-  "`instructions` envelope explaining this protocol. Reflects the serving repo's " +
-  "skills even when the call targets a mounted brain. Read-scope; published only " +
-  "when the brain owner enabled mcp.publish_skills.";
+  "Skills: prose instruction sets (NOT executable code) for tasks with this server's tools, with triggers, usable_tools and unavailable_tools. Use one via get_skill.";
 
 export const GET_SKILL_DESCRIPTION =
-  "Fetch one skill's full instructions by name. Returns `{name, frontmatter " +
-  "(sanitized), body, usable_tools, unavailable_tools, client_guidance}`. The " +
-  "`body` is prose — read it as your operating instructions for this task, and " +
-  "when it says to search / store / look something up, call the same-named MCP " +
-  "tool on THIS server. There is nothing to 'execute' — the value is the " +
-  "instructions plus your tool calls back to this server. Tools listed in " +
-  "`unavailable_tools` won't work for you (not exposed here, or beyond your " +
-  "access) — adapt accordingly. Size-capped; read-scope; requires the owner to " +
-  "have enabled mcp.publish_skills.";
+  "Fetch a skill's prose and follow it: when it says search or store, call the same-named MCP tool here. There is nothing to execute. unavailable_tools won't work for you.";
 
 /**
  * The load-bearing `instructions` envelope for list_skills. Pinned so the
@@ -203,6 +172,9 @@ export const SKILL_CATALOG_INSTRUCTIONS = {
       "correspondingly-named MCP tool on THIS server (e.g. search, query, put_page).",
     "Only call tools in this skill's `usable_tools`; tools in `unavailable_tools` " +
       "are not callable by you on this server.",
+    "For host-repository skills, declared `tools` narrow the usable tools. Valid " +
+      "frontmatter without `tools` inherits your available brain tools; `tools: []` permits none. " +
+      "Canonical shared skills follow the same rule; their other requirements gate `usable`.",
   ],
 } as const;
 
@@ -218,7 +190,21 @@ export const SKILL_CLIENT_GUIDANCE = {
     "When the prose names a brain operation (search, store, link, look up), call " +
       "the MCP tool of that name on THIS server.",
     "Do not invent tools — only the tools in `usable_tools` are callable by you.",
+    "For host-repository skills, declared `tools` narrow this list. Valid frontmatter " +
+      "without `tools` inherits your available brain tools; `tools: []` permits none. " +
+      "Canonical shared skills follow the same rule; their other requirements gate `usable`.",
     "If `mutating` is true, this skill writes to the brain; confirm before doing so " +
       "if the user hasn't clearly asked for a write.",
   ],
 } as const;
+
+/**
+ * CLI→MCP gap-closure wave — the capture op (D2A). Pinned here because it
+ * rewrites the routing guidance three docs used to carry as the
+ * "unknown tool: capture → use put_page" FAQ: agents must learn the split
+ * (capture = quick notes with auto-slug + dedupe; put_page = full control)
+ * from this description alone. Phrase-pinned by
+ * test/operations-descriptions.test.ts.
+ */
+export const CAPTURE_DESCRIPTION =
+  "Quick note (\"just remember this\"): slugged under inbox/ by date + content hash, so recapturing is idempotent. put_page controls slug or type; remember is for facts about entities.";

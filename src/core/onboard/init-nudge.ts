@@ -10,10 +10,12 @@
 // codex #7 finding's wrong shape. Cancelled queries actually stop on
 // Postgres; PGLite has a documented gap.
 //
-// Bypass: GBRAIN_NO_ONBOARD_NUDGE=1 short-circuits. Non-TTY default
-// also short-circuits (CI/scripted callers see nothing).
+// Bypass: GBRAIN_NO_ONBOARD_NUDGE=1 short-circuits. Non-interactive callers
+// (agents) get the same coaching as an [AGENT] block (agent contract F7).
 
 import type { BrainEngine } from '../engine.ts';
+import { writeCliNotices } from '../interop-notices.ts';
+import { collectOnboardOpportunities, LINK_COVERAGE_MIN, TIMELINE_COVERAGE_MIN } from './mcp-onboarding.ts';
 
 const NUDGE_BUDGET_MS = 3000;
 
@@ -22,113 +24,73 @@ const NUDGE_BUDGET_MS = 3000;
  *
  * Returns silently when:
  *   - GBRAIN_NO_ONBOARD_NUDGE=1
- *   - Non-TTY environment (CI, scripted)
  *   - All 4 onboard checks complete within 3s AND surface 0 recommendations
  *   - ANY error during check execution (logged to stderr, suppressed)
  *
- * Prints a nudge to stderr when:
+ * Emits an `onboard_opportunities` coaching notice (stderr on a terminal,
+ * an [AGENT] block on stdout for a non-interactive caller) when:
  *   - Recommendations exist within budget
  *   - Some checks ran but budget fired (partial-results path)
  */
 export async function runInitNudge(engine: BrainEngine): Promise<void> {
   try {
     if (process.env.GBRAIN_NO_ONBOARD_NUDGE === '1') return;
-    if (!process.stderr.isTTY) return;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), NUDGE_BUDGET_MS);
 
-    let totalStale = 0;
-    let totalEntities = 0;
-    let linkedCount = 0;
-    let timelineCount = 0;
-    let takesCount = 0;
-    let checksRan = 0;
-    let checksAttempted = 0;
-    let partial = false;
-
-    // Run 4 cheap counts in parallel against the 3s budget.
-    const results = await Promise.allSettled([
-      engine.executeRaw<{ count: string | number }>(
-        `SELECT COUNT(*) AS count FROM content_chunks WHERE embedding IS NULL`,
-        [],
-        { signal: controller.signal },
-      ),
-      engine.executeRaw<{ count: string | number }>(
-        `SELECT COUNT(*) AS count FROM pages
-           WHERE type IN ('person', 'company', 'organization', 'entity')
-             AND deleted_at IS NULL`,
-        [],
-        { signal: controller.signal },
-      ),
-      engine.executeRaw<{ count: string | number }>(
-        `SELECT COUNT(*) AS count FROM pages p
-           WHERE p.type IN ('person', 'company', 'organization', 'entity')
-             AND p.deleted_at IS NULL
-             AND EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)`,
-        [],
-        { signal: controller.signal },
-      ),
-      engine.executeRaw<{ count: string | number }>(
-        `SELECT COUNT(*) AS count FROM pages p
-           WHERE p.type IN ('person', 'company', 'organization', 'entity')
-             AND p.deleted_at IS NULL
-             AND EXISTS (SELECT 1 FROM timeline_entries t WHERE t.page_id = p.id)`,
-        [],
-        { signal: controller.signal },
-      ),
-      engine.executeRaw<{ count: string | number }>(
-        `SELECT COUNT(*) AS count FROM takes`,
-        [],
-        { signal: controller.signal },
-      ),
-    ]);
+    const counts = await collectOnboardOpportunities(engine, controller.signal);
     clearTimeout(timer);
 
-    checksAttempted = results.length;
-    for (let i = 0; i < results.length; i++) {
-      const r = results[i];
-      if (r.status === 'rejected') {
-        partial = true;
-        continue;
-      }
-      checksRan++;
-      const n = r.value.length > 0 ? Number(r.value[0].count) : 0;
-      if (i === 0) totalStale = n;
-      else if (i === 1) totalEntities = n;
-      else if (i === 2) linkedCount = n;
-      else if (i === 3) timelineCount = n;
-      else if (i === 4) takesCount = n;
-    }
+    const totalStale = counts.staleChunks ?? 0;
+    const totalEntities = counts.entities ?? 0;
+    const linkedCount = counts.linkedEntities ?? 0;
+    const timelineCount = counts.timelineEntities ?? 0;
+    const takesCount = counts.takes ?? 0;
+    // -1 = the page-count probe failed: fail-open sentinel, treat as non-empty
+    // so current behavior is preserved when the count is unknown.
+    const totalPages = counts.pages ?? -1;
+    const { checksRan, checksAttempted, partial } = counts;
+
+    // A brand-new EMPTY brain has no "opportunities" — telling a fresh user
+    // "0 takes" at the end of their first init is jargon-noise on the
+    // activation surface. Suppress the ENTIRE nudge on empty (including the
+    // partial-checks notice below).
+    const brainEmpty = totalPages === 0;
+    if (brainEmpty) return;
 
     // Aggregate: any non-zero metric triggers the nudge.
     const linkCoverage = totalEntities > 0 ? linkedCount / totalEntities : 1;
     const timelineCoverage = totalEntities > 0 ? timelineCount / totalEntities : 1;
     const hasRecommendations =
       totalStale > 0
-      || (totalEntities > 0 && linkCoverage < 0.7)
-      || (totalEntities > 0 && timelineCoverage < 0.9)
+      || (totalEntities > 0 && linkCoverage < LINK_COVERAGE_MIN)
+      || (totalEntities > 0 && timelineCoverage < TIMELINE_COVERAGE_MIN)
       || takesCount === 0;
-
     if (!hasRecommendations && !partial) return;
 
     // Emit one-line nudge. Be terse — init is the activation surface.
     const parts: string[] = [];
     if (totalStale > 0) parts.push(`${totalStale} stale chunks`);
-    if (totalEntities > 0 && linkCoverage < 0.7) {
+    if (totalEntities > 0 && linkCoverage < LINK_COVERAGE_MIN) {
       parts.push(`link coverage ${Math.round(linkCoverage * 100)}%`);
     }
-    if (totalEntities > 0 && timelineCoverage < 0.9) {
+    if (totalEntities > 0 && timelineCoverage < TIMELINE_COVERAGE_MIN) {
       parts.push(`timeline coverage ${Math.round(timelineCoverage * 100)}%`);
     }
     if (takesCount === 0) parts.push('0 takes');
 
-    process.stderr.write(
-      `\n[onboard] Brain has opportunities: ${parts.join(', ')}.\n` +
-      `[onboard] Run 'gbrain onboard --check' to see the plan.` +
-      (partial ? ` (${checksRan}/${checksAttempted} checks complete; run gbrain onboard --check for full recommendations)` : '') +
-      `\n`,
-    );
+    // Agent contract v1 (F7): a coaching notice on every surface — terminal
+    // lines, an [AGENT] block for a non-interactive caller (no more silence
+    // exactly when an agent runs init).
+    const why = parts.length === 0
+      ? `Init checks incomplete (${checksRan}/${checksAttempted}) — run 'gbrain onboard --check' for full recommendations.`
+      : `Brain has opportunities: ${parts.join(', ')}. Run 'gbrain onboard --check' to see the plan.` +
+        (partial ? ` (${checksRan}/${checksAttempted} checks complete; run gbrain onboard --check for full recommendations)` : '');
+    writeCliNotices([{
+      code: 'onboard_opportunities', kind: 'coaching', why,
+      fix: { argv: ['gbrain', 'onboard', '--check'], consent: [], actor: 'agent', requires_exclusive: false, why: 'Lists each recommendation with its command; read-only.' },
+    }]);
   } catch (err) {
     // A18: NEVER crash init from the nudge. Log and continue.
     process.stderr.write(`[onboard] nudge skipped (${err instanceof Error ? err.message : String(err)})\n`);
@@ -142,10 +104,11 @@ export async function runInitNudge(engine: BrainEngine): Promise<void> {
 export async function runUpgradeBanner(_engine: BrainEngine): Promise<void> {
   try {
     if (process.env.GBRAIN_NO_ONBOARD_NUDGE === '1') return;
-    if (!process.stderr.isTTY) return;
-    process.stderr.write(
-      `\n[onboard] Upgrade complete. Run 'gbrain onboard --check' to see if the new version surfaces any new opportunities.\n`,
-    );
+    writeCliNotices([{
+      code: 'onboard_opportunities', kind: 'coaching',
+      why: "Upgrade complete. Run 'gbrain onboard --check' to see if the new version surfaces any new opportunities.",
+      fix: { argv: ['gbrain', 'onboard', '--check'], consent: [], actor: 'agent', requires_exclusive: false, why: 'Lists each recommendation with its command; read-only.' },
+    }]);
   } catch {
     // A18 posture for symmetry.
   }

@@ -1,0 +1,151 @@
+import type { BrainEngine } from '../engine.ts';
+import type { PageVersion } from '../types.ts';
+import type { PageSnapshot } from './types.ts';
+import { PAGE_INLINE_MAX_BYTES, isLargePageBytes } from '../page-size-policy.ts';
+import { LARGE_PAGE_VERSIONS_KEPT, readPageBodyPolicy } from '../page-body/limits.ts';
+import { opError, type OperationError } from '../ops/contract.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
+
+export { LARGE_PAGE_VERSIONS_KEPT };
+/** GST-2497: the most saved versions of a holding page one save removes, so a page with a long history drains over later saves. */
+export const HOLDING_PAGE_VERSIONS_PRUNED_PER_WRITE = 100;
+
+/**
+ * GBRA-217: what a sync import knows about the write a snapshot records: the reason Git gives for it
+ * (`page_versions.change_reason`), the commit and repository path that reason came from, and whether the import consumed
+ * more than one commit for the page's file, or could not tell (`pages.version_history_gap_at`).
+ */
+export interface VersionHistory { reason?: string | null; reasonSource?: { commit: string; path: string }; historyGap?: boolean }
+
+/**
+ * #8635: a Git reason is read before its publication, so a purge may tombstone its (commit, path) in between. The snapshot
+ * insert reads the tombstone again under the page guard, whose `sources FOR SHARE` waits for a purge holding the source
+ * `FOR UPDATE`: either the purge committed first and this read sees its tombstone, or it waits for this commit and
+ * redacts the stamped reason itself.
+ */
+async function stampableReason(tx: BrainEngine, sourceId: string, history: VersionHistory): Promise<string | null> {
+  if (!history.reason || !history.reasonSource) return history.reason ?? null;
+  const purged = await tx.executeRaw('SELECT 1 FROM reason_purge_tombstones WHERE source_id = $1 AND commit_sha = $2 AND path = $3',
+    [sourceId, history.reasonSource.commit, history.reasonSource.path]);
+  return purged.length ? null : history.reason;
+}
+
+/**
+ * Version the same canonical view an API reader receives, including withdrawals.
+ * `preimage` (#5984) is the caller's own read of the page under its page guard
+ * in this transaction; it is versioned as read, without a second read.
+ */
+export async function createPageVersion(engine: BrainEngine, slug: string, sourceId: string, preimage?: PageSnapshot, history: VersionHistory = {}): Promise<PageVersion> {
+  const insert = async (tx: BrainEngine, snapshot: PageSnapshot) => {
+    const { page, tags, revision } = snapshot;
+    if (history.historyGap) await tx.executeRaw('UPDATE pages SET version_history_gap_at = now() WHERE id = $1', [page.id]);
+    const reason = await stampableReason(tx, sourceId, history);
+    if (isSegmentedPage(page)) return insertSegmentedVersion(tx, snapshot, reason);
+    const rows = await tx.executeRaw<PageVersion>(`INSERT INTO page_versions
+      (page_id,compiled_truth,frontmatter,knowledge_revision,timeline,title,type,tags,is_deleted,source_path,change_reason)
+      VALUES ($1,$2,$3::text::jsonb,$4::uuid,$5,$6,$7,$8::text::jsonb,$9,$10,$11) RETURNING *`,
+    [page.id, page.compiled_truth, JSON.stringify(page.frontmatter), revision, page.timeline, page.title, page.type, JSON.stringify(tags), page.deleted_at != null, page.source_path ?? null, reason]);
+    if (isLargePageBytes(Buffer.byteLength(page.compiled_truth ?? '', 'utf-8') + Buffer.byteLength(page.timeline ?? '', 'utf-8'))) {
+      const pruned = await tx.executeRaw<{ id: number }>(`DELETE FROM page_versions WHERE page_id = $1 AND id IN (SELECT id FROM page_versions WHERE page_id = $1
+        AND octet_length(compiled_truth) + octet_length(COALESCE(timeline, '')) > $2 ORDER BY id DESC OFFSET $3) RETURNING id`,
+      [page.id, PAGE_INLINE_MAX_BYTES, LARGE_PAGE_VERSIONS_KEPT]);
+      await markPrunedHistory(tx, page.id, pruned.map(row => Number(row.id)));
+    }
+    return { ...rows[0], snapshot_at: new Date(rows[0].snapshot_at) };
+  };
+  if (preimage) return insert(engine, preimage);
+  return engine.transaction(async tx => {
+    await tx.lockPageKeys([{ sourceId, slug }]);
+    const snapshot = await tx.readPageSnapshot(slug, { sourceId, includeDeleted: true });
+    if (!snapshot) throw new Error(`createVersion failed: page "${slug}" (source=${sourceId}) not found`);
+    return insert(tx, snapshot);
+  });
+}
+
+/**
+ * Wave B (spec 5): a segmented page's version is a reference, not a copy: the
+ * page's live body generation (its manifest rows stay alive as a GC root),
+ * body_bytes and content_hash; its body columns stay NULL. O(1) at any page size.
+ * It references the generation live when it is inserted, so a caller versions
+ * before its generation flip, as every caller versions before its page write.
+ * Then the page's segmented history is pruned by `pruneSegmentedVersions`.
+ */
+async function insertSegmentedVersion(tx: BrainEngine, snapshot: PageSnapshot, reason: string | null): Promise<PageVersion> {
+  const { page, tags, revision } = snapshot;
+  const [row] = await tx.executeRaw<PageVersion>(`INSERT INTO page_versions
+    (page_id,body_storage,body_generation,body_bytes,content_hash,frontmatter,knowledge_revision,title,type,tags,is_deleted,source_path,change_reason)
+    SELECT p.id,'segmented',p.body_generation,p.body_bytes,p.content_hash,$2::text::jsonb,$3::uuid,$4,$5,$6::text::jsonb,$7,$8,$9
+      FROM pages p WHERE p.id = $1 AND p.body_storage = 'segmented' RETURNING *`,
+  [page.id, JSON.stringify(page.frontmatter), revision, page.title, page.type, JSON.stringify(tags), page.deleted_at != null, page.source_path ?? null, reason]);
+  if (!row) throw new Error(`createVersion failed: page id ${page.id} is no longer segmented`);
+  if ((await pruneSegmentedVersions(tx, page.id)) > 0) await tx.sweepSegments({ pageId: page.id });
+  return { ...row, snapshot_at: new Date(row.snapshot_at) };
+}
+
+/**
+ * Segmented retention (spec 5): keep the newest `versions.segmented_max_per_page`
+ * segmented versions of the page, and prune oldest-first while the bytes they
+ * pin beyond the live generation (manifest rows a kept version's generation
+ * references that are closed, each counted once) exceed
+ * max(`versions.segmented_max_pinned_bytes`, the page's body_bytes). A row's
+ * bytes count from the newest version that references it, so the pinned bytes
+ * of the newest k versions are a running sum and the kept set is a prefix.
+ * Inline snapshots of the page are never touched here. Returns the versions deleted.
+ */
+export async function pruneSegmentedVersions(tx: BrainEngine, pageId: number): Promise<number> {
+  const policy = await readPageBodyPolicy(tx);
+  const deleted = await tx.executeRaw(`WITH v AS (
+      SELECT id, body_generation AS g, row_number() OVER (ORDER BY id DESC) AS rk
+        FROM page_versions WHERE page_id = $1 AND body_storage = 'segmented'),
+    pinned AS (
+      SELECT min(v.rk) AS rk, m.byte_len
+        FROM page_body_manifest m JOIN v ON m.gen_from <= v.g AND v.g < m.gen_to
+       WHERE m.page_id = $1 AND m.gen_to IS NOT NULL AND m.staging_id IS NULL
+       GROUP BY m.occurrence_id, m.gen_from, m.byte_len),
+    per_rank AS (SELECT rk, sum(byte_len) AS bytes FROM pinned GROUP BY rk),
+    kept AS (
+      SELECT v.id, v.rk, sum(COALESCE(per_rank.bytes, 0)) OVER (ORDER BY v.rk) AS bytes
+        FROM v LEFT JOIN per_rank ON per_rank.rk = v.rk),
+    cap AS (SELECT GREATEST($3::bigint, COALESCE(body_bytes, 0)) AS bytes FROM pages WHERE id = $1)
+    DELETE FROM page_versions WHERE id IN (SELECT kept.id FROM kept, cap WHERE kept.rk > $2 OR kept.bytes > cap.bytes)
+    RETURNING id`, [pageId, policy.versionsMaxPerPage, policy.versionsMaxPinnedBytes]);
+  await markPrunedHistory(tx, pageId, deleted.map(row => Number((row as { id: number }).id)));
+  return deleted.length;
+}
+
+/**
+ * GST-2497: a save that adds a fact to a holding page keeps that page's newest LARGE_PAGE_VERSIONS_KEPT inline saved
+ * versions, removing at most HOLDING_PAGE_VERSIONS_PRUNED_PER_WRITE older ones, and records the gap. It runs only from
+ * the fence append, after its version is saved: writes that edit saved versions themselves (a held move, purge) never
+ * prune, so the versions they count are the versions they edit. Segmented versions keep their own retention.
+ */
+export async function pruneHoldingPageVersions(tx: BrainEngine, pageId: number): Promise<void> {
+  const pruned = await tx.executeRaw<{ id: number }>(`DELETE FROM page_versions WHERE id IN (SELECT id FROM (SELECT id FROM page_versions
+    WHERE page_id = $1 AND body_storage IS DISTINCT FROM 'segmented' ORDER BY id DESC OFFSET $2) excess ORDER BY id LIMIT $3) RETURNING id`,
+  [pageId, LARGE_PAGE_VERSIONS_KEPT, HOLDING_PAGE_VERSIONS_PRUNED_PER_WRITE]);
+  await markPrunedHistory(tx, pageId, pruned.map(row => Number(row.id)));
+}
+
+/**
+ * GBRA-217: after a prune, the retained snapshot just before each pruned one has lost its successor (`successor_pruned`,
+ * so a remote reader is never shown its reason: the successor's visibility can no longer be checked), and the page has
+ * lost history (`version_history_gap_at`, read by valid-time answers).
+ */
+async function markPrunedHistory(tx: BrainEngine, pageId: number, pruned: number[]): Promise<void> {
+  if (!pruned.length) return;
+  await tx.executeRaw(`UPDATE page_versions SET successor_pruned = true WHERE page_id = $1 AND id IN (
+      SELECT (SELECT max(k.id) FROM page_versions k WHERE k.page_id = $1 AND k.id < d.id) FROM unnest($2::int[]) AS d(id))`, [pageId, pruned]);
+  await tx.executeRaw('UPDATE pages SET version_history_gap_at = now() WHERE id = $1', [pageId]);
+}
+
+/**
+ * `revert_version` of a segmented page or version is not available until the
+ * segment writer (Wave B PR 3): the version's body lives in segments, and the
+ * revert path rebuilds the page from an inline body. Refused before anything is written.
+ */
+export function segmentedRevertRefusal(slug: string, versionId: unknown): OperationError {
+  return opError('page_body_segmented',
+    `Page ${slug} or its version ${String(versionId)} is stored in segments, so revert_version cannot restore it yet; nothing was changed.`,
+    `Read the version with get_versions (body_bytes, content_hash), then write the content you want with put_page or edit_page.`,
+    { reason: 'segmented_revert' });
+}

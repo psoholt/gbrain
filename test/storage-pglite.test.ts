@@ -10,7 +10,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -98,6 +98,72 @@ describe('Storage tiering on PGLite — full lifecycle (D8 + D4)', () => {
       expect(result.pagesByTier.db_only).toBe(2);
       expect(result.pagesByTier.unspecified).toBe(1);
       expect(result.config!.db_only).toEqual(['media/x/']);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('#8007: getStorageStatus names a db_only declaration that resolved no directory; a one-line flow list resolves', async () => {
+    try {
+      writeFileSync(join(tmp, 'gbrain.yml'), 'storage:\n  db_only: [media/x/,\n    media/y/]\n');
+      const unresolved = await getStorageStatus(engine, tmp);
+      expect(unresolved.warnings.some(w => w.includes('storage.db_only but no directory resolved'))).toBe(true);
+      expect(formatStorageStatusHuman(unresolved)).toContain('db_only: [a/, b/]');
+      writeFileSync(join(tmp, 'gbrain.yml'), 'storage:\n  db_only: [media/x/, "media/y/"]\n');
+      const resolved = await getStorageStatus(engine, tmp);
+      expect(resolved.config!.db_only).toEqual(['media/x/', 'media/y/']);
+      expect(resolved.warnings.some(w => w.includes('no directory resolved'))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('#8015: getStorageStatus names a deprecated supabase_only list canonical keys ignore, only its uncovered dirs', async () => {
+    try {
+      writeFileSync(join(tmp, 'gbrain.yml'), 'storage:\n  db_only: [media/x/]\n  supabase_only:\n    - media/x/\n    - archive/\n');
+      const status = await getStorageStatus(engine, tmp);
+      expect(status.warnings.filter(w => w.includes('deprecated supabase_only'))).toHaveLength(1);
+      expect(status.warnings.find(w => w.includes('deprecated supabase_only'))).toContain('ignores it: archive/.');
+      writeFileSync(join(tmp, 'gbrain.yml'), 'storage:\n  db_only: [media/x/, archive/]\n  supabase_only:\n    - archive/\n');
+      expect((await getStorageStatus(engine, tmp)).warnings.some(w => w.includes('deprecated supabase_only'))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('getStorageStatus scopes page checks to the source that owns the repo path (#4763)', async () => {
+    try {
+      writeGbrainYml();
+      mkdirSync(join(tmp, 'media', 'x'), { recursive: true });
+      writeFileSync(join(tmp, 'media', 'x', 'default-db-only.md'), 'file-backed default page');
+
+      const otherRepo = join(tmp, 'other-repo');
+      mkdirSync(otherRepo, { recursive: true });
+      await engine.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = 'default'`, [tmp]);
+      await engine.executeRaw(
+        `INSERT INTO sources (id, name, local_path, config)
+           VALUES ('media-corpus', 'media-corpus', $1, '{}'::jsonb)
+           ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path`,
+        [otherRepo],
+      );
+
+      await engine.putPage('media/x/default-db-only', {
+        type: 'concept',
+        title: 'Default source page',
+        compiled_truth: '',
+        timeline: '',
+      }, { sourceId: 'default' });
+      await engine.putPage('media/x/foreign-db-only', {
+        type: 'concept',
+        title: 'Foreign source page',
+        compiled_truth: '',
+        timeline: '',
+      }, { sourceId: 'media-corpus' });
+
+      const result = await getStorageStatus(engine, tmp);
+      expect(result.totalPages).toBe(1);
+      expect(result.pagesByTier.db_only).toBe(1);
+      expect(result.missingFiles).toEqual([]);
     } finally {
       cleanup();
     }

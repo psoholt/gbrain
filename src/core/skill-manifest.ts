@@ -26,7 +26,13 @@
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
+import { atomicWriteFileSync } from './atomic-write.ts';
+import { findAllResolverFiles } from './resolver-filenames.ts';
+import { SKILLS_MANIFEST_FILENAME } from './skills-integrity.ts';
+
+/** First line of the block `gbrain skillpack install` writes into a workspace's resolver file. */
+export const SKILLPACK_MANAGED_BEGIN = '<!-- gbrain:skillpack:begin -->';
 
 export interface ManifestEntry {
   name: string;
@@ -143,4 +149,47 @@ export function loadOrDeriveManifest(skillsDir: string): ManifestLoadResult {
   }
 
   return { skills: deriveManifest(skillsDir), derived: true };
+}
+
+/**
+ * Whether gbrain installed or ships this skills folder, read from files only
+ * gbrain writes: its tamper manifest (`skills.lock.json`), a valid
+ * `manifest.json` on disk (a derived one does not count), or the skillpack
+ * managed block in a resolver file (RESOLVER.md / AGENTS.md here or at the
+ * workspace root). A generic RESOLVER.md alone is not a gbrain marker. Doctor
+ * grades an auto-detected skills folder against gbrain's conventions only when
+ * this holds; an agent's own skills folder found by walking up from the cwd is
+ * not gbrain's to grade.
+ */
+export function isGbrainManagedSkillsDir(dir: string): boolean {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- the second segment is a fixed file name; dir is the operator's own skills folder and is only probed for existence, never written.
+  if (existsSync(join(dir, SKILLS_MANIFEST_FILENAME))) return true;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- fixed file name under the operator's own skills folder; existence probe only.
+  if (existsSync(join(dir, 'manifest.json')) && !loadOrDeriveManifest(dir).derived) return true;
+  return [...findAllResolverFiles(dir), ...findAllResolverFiles(dirname(dir))].some((file) => {
+    try { return readFileSync(file, 'utf-8').includes(SKILLPACK_MANAGED_BEGIN); } catch { return false; }
+  });
+}
+
+/**
+ * #4831: register exactly the given just-scaffolded skills in an existing,
+ * valid `skillsDir/manifest.json`. Appends `{name, path}` for each slug not
+ * already listed (by name or path); never removes or reorders entries and
+ * keeps every other key. A missing or malformed manifest is left alone: the
+ * loader derives the skill set from the walk there. Returns the names added.
+ */
+export function registerManifestEntries(skillsDir: string, slugs: readonly string[]): string[] {
+  const unsafe = slugs.find(slug => !slug || slug === '.' || slug.includes('..') || /[\\/]/.test(slug));
+  if (unsafe !== undefined) throw new Error(`refusing to register skill slug ${JSON.stringify(unsafe)}: a slug is one path segment with no separators or '..'`);
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- skillsDir is the operator's workspace skills directory; the file name is a constant.
+  const manifestPath = join(skillsDir, 'manifest.json');
+  if (!slugs.length || !existsSync(manifestPath) || loadOrDeriveManifest(skillsDir).derived) return [];
+  const content = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { skills: ManifestEntry[] };
+  const known = new Set(content.skills.flatMap(entry => [entry.name, entry.path]));
+  const added = slugs.filter(slug => !known.has(slug) && !known.has(`${slug}/SKILL.md`))
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- every slug was checked above to be one segment with no separators or '..'.
+    .map(slug => ({ name: parseSkillName(join(skillsDir, slug, 'SKILL.md')) ?? slug, path: `${slug}/SKILL.md` }));
+  if (!added.length) return [];
+  atomicWriteFileSync(manifestPath, JSON.stringify({ ...content, skills: [...content.skills, ...added] }, null, 2) + '\n');
+  return added.map(entry => entry.name);
 }

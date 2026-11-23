@@ -8,14 +8,14 @@
  *  - Schema seed stores provider:model (Lane A.8 — was prefix-stripped)
  *  - Chunk-row INSERT default writes gateway model (Lane A.7)
  *  - Init precedence chain (Lane B.1 + B.4 + CDX2-7)
- *  - ZE setup hint fires at init when key missing (Lane B.1)
+ *  - Voyage setup hint fires at init when key missing (Lane B.1)
  *  - Init merges existing config across re-init (Lane B.4)
  *  - config set refuses schema-sizing fields with the recipe (Lane C.2)
- *  - ZEROENTROPY_API_KEY env merge into GBrainConfig (Lane C.3)
+ *  - VOYAGE_API_KEY env merge into GBrainConfig (Lane C.3)
  *  - Embed pre-flight catches dim mismatch end-to-end (Lane D.2)
  *  - Sync hint fires at both catch sites (Lane D.3, CDX2-8)
  *  - reinit-pglite end-to-end behavior (deferred-TODO sugar)
- *  - loadRecommendationContext reads gateway + ZE keys (Lane E.4)
+ *  - loadRecommendationContext reads gateway + Voyage keys (Lane E.4)
  *
  * Hermetic — no DATABASE_URL, no real API keys, no real network. Uses
  * PGLite in-memory + transport stubs.
@@ -28,13 +28,18 @@ import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { surfaceSource } from './helpers/source-surface.ts';
 
 // ─────────────────────────────────────────────────────────────────────
-// Lane A.7 — Chunk-row INSERT model default tracks defaults.ts constant
-// (not stale OpenAI literal). Pre-fix `chunk.model || 'text-embedding-3-large'`
-// in both engines; post-fix `chunk.model || DEFAULT_EMBEDDING_MODEL`.
+// Lane A.7 — Chunk-row INSERT model default tracks the gateway-resolved
+// model (not a stale OpenAI literal, not the compile-time constant).
+// Pre-fix `chunk.model || 'text-embedding-3-large'` in both engines;
+// v0.37 fix `chunk.model || DEFAULT_EMBEDDING_MODEL`; #2846 tightened it
+// to the gateway's runtime model so provenance matches the vector's
+// actual producer (falls back to DEFAULT_EMBEDDING_MODEL only when the
+// gateway is unconfigured).
 // ─────────────────────────────────────────────────────────────────────
-describe('Lane A.7 — chunk-row INSERT default tracks ai/defaults.ts constant', () => {
+describe('Lane A.7 — chunk-row INSERT default tracks the gateway-resolved model', () => {
   let engine: PGLiteEngine;
 
   beforeAll(async () => {
@@ -47,8 +52,11 @@ describe('Lane A.7 — chunk-row INSERT default tracks ai/defaults.ts constant',
     await engine.disconnect();
   });
 
-  test('upsertChunks without explicit model: row stores DEFAULT_EMBEDDING_MODEL', async () => {
-    const { DEFAULT_EMBEDDING_MODEL } = await import('../src/core/ai/defaults.ts');
+  test('upsertChunks without explicit model: row stores the gateway-resolved model', async () => {
+    // The test preload (test/helpers/legacy-embedding-preload.ts) pins the
+    // gateway to 'openai:text-embedding-3-large', so that's what the write
+    // site must stamp — NOT the compile-time DEFAULT_EMBEDDING_MODEL (#2846).
+    const { getEmbeddingModel } = await import('../src/core/ai/gateway.ts');
     await engine.putPage('test/a7', { type: 'note', title: 'A.7', compiled_truth: 'hello' });
     await engine.upsertChunks('test/a7', [
       { chunk_index: 0, chunk_text: 'hello', chunk_source: 'compiled_truth' },
@@ -57,9 +65,9 @@ describe('Lane A.7 — chunk-row INSERT default tracks ai/defaults.ts constant',
     const rows = await engine.executeRaw<{ model: string }>(
       `SELECT model FROM content_chunks WHERE chunk_index = 0 LIMIT 1`,
     );
-    expect(rows[0]?.model).toBe(DEFAULT_EMBEDDING_MODEL);
+    expect(rows[0]?.model).toBe(getEmbeddingModel());
     // CDX2-4 regression: would have been 'text-embedding-3-large'
-    // (a literal pre-fix; production write site that was never tested).
+    // (a bare literal pre-fix; provider-prefixed form is required).
     expect(rows[0]?.model).not.toBe('text-embedding-3-large');
   });
 });
@@ -68,11 +76,11 @@ describe('Lane A.7 — chunk-row INSERT default tracks ai/defaults.ts constant',
 // Lane A.8 — Schema seed stores provider:model (was prefix-stripped)
 // ─────────────────────────────────────────────────────────────────────
 describe('Lane A.8 — schema seed stores full provider:model in DB config', () => {
-  test('fresh init with ZE model stores `zeroentropyai:zembed-1`, not `zembed-1`', async () => {
+  test('fresh init with Voyage model stores `voyage:voyage-4`, not `voyage-4`', async () => {
     // Independent engine + gateway so the assertion is unambiguous.
     configureGateway({
-      embedding_model: 'zeroentropyai:zembed-1',
-      embedding_dimensions: 1280,
+      embedding_model: 'voyage:voyage-4',
+      embedding_dimensions: 1024,
       env: { ...process.env },
     });
     const engine = new PGLiteEngine();
@@ -80,9 +88,9 @@ describe('Lane A.8 — schema seed stores full provider:model in DB config', () 
     try {
       await engine.initSchema();
       const stored = await engine.getConfig('embedding_model');
-      expect(stored).toBe('zeroentropyai:zembed-1');
-      // CDX-4 regression: would have been 'zembed-1' under the strip.
-      expect(stored).not.toBe('zembed-1');
+      expect(stored).toBe('voyage:voyage-4');
+      // CDX-4 regression: would have been 'voyage-4' under the strip.
+      expect(stored).not.toBe('voyage-4');
     } finally {
       await engine.disconnect();
       configureGateway({
@@ -166,9 +174,9 @@ describe('Lane B — init precedence chain (CLI > env > existing file > default)
 });
 
 // ─────────────────────────────────────────────────────────────────────
-// Lane C.3 — ZEROENTROPY_API_KEY env merge into GBrainConfig
+// Lane C.3 — OPENAI_API_KEY env merge into GBrainConfig
 // ─────────────────────────────────────────────────────────────────────
-describe('Lane C.3 — env ZEROENTROPY_API_KEY merges into loadConfig', () => {
+describe('Lane C.3 — env OPENAI_API_KEY merges into loadConfig', () => {
   let tmpHome: string;
   let origHome: string | undefined;
 
@@ -191,19 +199,19 @@ describe('Lane C.3 — env ZEROENTROPY_API_KEY merges into loadConfig', () => {
     else process.env.GBRAIN_HOME = origHome;
   });
 
-  test('process.env.ZEROENTROPY_API_KEY → cfg.zeroentropy_api_key', async () => {
-    await withEnv({ ZEROENTROPY_API_KEY: 'ze-from-env-key' }, async () => {
+  test('process.env.OPENAI_API_KEY → cfg.openai_api_key', async () => {
+    await withEnv({ OPENAI_API_KEY: 'openai-from-env-key' }, async () => {
       const { loadConfig } = await import('../src/core/config.ts');
       const cfg = loadConfig();
-      expect(cfg?.zeroentropy_api_key).toBe('ze-from-env-key');
+      expect(cfg?.openai_api_key).toBe('openai-from-env-key');
     });
   });
 
-  test('loadConfigFileOnly does NOT merge the env ZE key', async () => {
-    await withEnv({ ZEROENTROPY_API_KEY: 'ze-from-env-key' }, async () => {
+  test('loadConfigFileOnly does NOT merge the env OpenAI key', async () => {
+    await withEnv({ OPENAI_API_KEY: 'openai-from-env-key' }, async () => {
       const { loadConfigFileOnly } = await import('../src/core/config.ts');
       const cfg = loadConfigFileOnly();
-      expect(cfg?.zeroentropy_api_key).toBeUndefined();
+      expect(cfg?.openai_api_key).toBeUndefined();
     });
   });
 });
@@ -242,13 +250,13 @@ describe('Lane D.2 — embed pre-flight catches dim mismatch before worker pool'
     });
   });
 
-  test('schema=1536 + gateway=ZE/1280 → runEmbedCore throws EmbeddingDimMismatchError before transport fires', async () => {
-    // Reconfigure to mismatched dim. Schema (1536) and gateway (1280)
+  test('schema=1536 + gateway=Voyage/1024 → runEmbedCore throws EmbeddingDimMismatchError before transport fires', async () => {
+    // Reconfigure to mismatched dim. Schema (1536) and gateway (1024)
     // now disagree; pre-flight should throw before the worker pool
     // calls embedMany.
     configureGateway({
-      embedding_model: 'zeroentropyai:zembed-1',
-      embedding_dimensions: 1280,
+      embedding_model: 'voyage:voyage-4',
+      embedding_dimensions: 1024,
       env: { ...process.env },
     });
 
@@ -268,7 +276,7 @@ describe('Lane D.2 — embed pre-flight catches dim mismatch before worker pool'
     expect(caught).toBeInstanceOf(EmbeddingDimMismatchError);
     const err = caught as InstanceType<typeof EmbeddingDimMismatchError>;
     expect(err.recipeMessage).toContain('vector(1536)');
-    expect(err.recipeMessage).toContain('vector(1280)');
+    expect(err.recipeMessage).toContain('vector(1024)');
     // The transport must never have fired — pre-flight's whole point is
     // to kill the N-parallel-API-call-fail-pattern.
     expect(transportCalled).toBe(false);
@@ -283,8 +291,8 @@ describe('Lane D.2 — embed pre-flight catches dim mismatch before worker pool'
 
   test('dryRun skips the pre-flight (no embed risk to gate)', async () => {
     configureGateway({
-      embedding_model: 'zeroentropyai:zembed-1',
-      embedding_dimensions: 1280,
+      embedding_model: 'voyage:voyage-4',
+      embedding_dimensions: 1024,
       env: { ...process.env },
     });
     const { runEmbedCore } = await import('../src/commands/embed.ts');
@@ -306,13 +314,13 @@ describe('Lane D.3 — sync surfaces dim-mismatch recipe at incremental AND firs
     // Structural source-text assertion: pre-fix the incremental catch
     // (line 990) silently swallowed embed errors. Now both catches use
     // an instance check + the same recipe-printing branch.
-    const src = readFileSync(join(__dirname, '..', 'src', 'commands', 'sync.ts'), 'utf-8');
+    const src = surfaceSource('sync');
     const matches = src.match(/e instanceof EmbeddingDimMismatchError/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 
   test('source-text grep: tip mentions --no-embed at the hint site', () => {
-    const src = readFileSync(join(__dirname, '..', 'src', 'commands', 'sync.ts'), 'utf-8');
+    const src = surfaceSource('sync');
     expect(src).toContain('--no-embed');
     expect(src).toContain('Tip:');
   });
@@ -332,7 +340,7 @@ describe('Lane E.4 — loadRecommendationContext is provider-aware', () => {
     // provider for the key. v0.40.x replaced the inline prefix ladder with the
     // shared recipe-aware helper `embeddingProviderConfigured` (so doctor +
     // autopilot can't drift) — assert that shape rather than the old inline
-    // ZE strings.
+    // Voyage strings.
     const fnIdx = src.indexOf('async function loadRecommendationContext');
     expect(fnIdx).toBeGreaterThan(0);
     const slice = src.slice(fnIdx, fnIdx + 3000);
@@ -403,8 +411,8 @@ describe('reinit-pglite — backup + reinit', () => {
     (process as any).exit = ((code?: number) => { exits.push(code ?? 0); throw new Error('exit:' + (code ?? 0)); });
     try {
       await runReinitPglite([
-        '--embedding-model', 'zeroentropyai:zembed-1',
-        '--embedding-dimensions', '1280',
+        '--embedding-model', 'voyage:voyage-4',
+        '--embedding-dimensions', '1024',
         '--yes', '--json',
       ]);
     } catch (e) {
@@ -417,20 +425,180 @@ describe('reinit-pglite — backup + reinit', () => {
     expect(exits).toContain(1);
   });
 
-  test('refuses when missing required --embedding-model / --embedding-dimensions', async () => {
+  // ── Flag defaulting from the config FILE (eng-review 6A + codex 14.10) ──
+  // Omitted --embedding-model / --embedding-dimensions default from
+  // loadConfigFileOnly() (NOT loadConfig(): a transient outage-shell
+  // GBRAIN_EMBEDDING_* export must not silently change the rebuild target).
+  // Precedence: explicit flag > config-file value > missing_model/missing_dims.
+
+  /**
+   * Run runReinitPglite with process.exit stubbed (same throw-on-exit
+   * pattern as the tests above) and console.log/console.error captured,
+   * so the plan output + defaulting notes are assertable.
+   */
+  async function captureRun(args: string[]): Promise<{ exits: number[]; logs: string[]; errs: string[] }> {
     const { runReinitPglite } = await import('../src/commands/reinit-pglite.ts');
     const origExit = process.exit;
+    const origLog = console.log;
+    const origErr = console.error;
     const exits: number[] = [];
+    const logs: string[] = [];
+    const errs: string[] = [];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (process as any).exit = ((code?: number) => { exits.push(code ?? 0); throw new Error('exit:' + (code ?? 0)); });
+    console.log = (...a: unknown[]) => { logs.push(a.map(String).join(' ')); };
+    console.error = (...a: unknown[]) => { errs.push(a.map(String).join(' ')); };
     try {
-      await runReinitPglite(['--json']);
+      await runReinitPglite(args);
     } catch (e) {
       expect((e as Error).message).toMatch(/^exit:/);
     } finally {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (process as any).exit = origExit;
+      console.log = origLog;
+      console.error = origErr;
     }
+    return { exits, logs, errs };
+  }
+
+  test('no flags: defaults BOTH from the config file', async () => {
+    // Sentinel: pre-create the .bak so the run halts at bak_exists AFTER
+    // parseArgs + the plan print — proving the defaulting resolved from
+    // the file without invoking the real (destructive) init+sync path.
+    writeFileSync(join(tmpHome, '.gbrain', 'brain.pglite.bak'), 'sentinel');
+
+    const { exits, logs, errs } = await captureRun(['--yes']);
+
+    // Halted at the sentinel — parseArgs did NOT fail missing_model/missing_dims.
     expect(exits).toContain(1);
+    const err = errs.join('\n');
+    expect(err).toContain('Backup already exists');
+    // The plan shows the config-file values.
+    const out = logs.join('\n');
+    expect(out).toContain('New embedding model: openai:text-embedding-3-large');
+    expect(out).toMatch(/New dimensions:\s+1536/);
+    // One stderr note per defaulted flag.
+    expect(err).toContain('--embedding-model defaulted from config: openai:text-embedding-3-large');
+    expect(err).toContain('--embedding-dimensions defaulted from config: 1536');
+  });
+
+  test('C2: non-interactive without the bound approval exits 3 with the consent payload and leaves the brain in place', async () => {
+    const brain = join(tmpHome, '.gbrain', 'brain.pglite');
+    const outWrites: string[] = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (process.stdout as any).write = (c: string | Uint8Array) => { outWrites.push(String(c)); return true; };
+    const prev = process.env.GBRAIN_NON_INTERACTIVE;
+    process.env.GBRAIN_NON_INTERACTIVE = '1';
+    try {
+      const unauth = await captureRun(['--json']);
+      expect(unauth.exits).toEqual([3]);
+      const payload = JSON.parse(outWrites.join(''));
+      expect(payload).toMatchObject({ code: 'confirmation_required', effects: ['destructive'], actor: 'agent' });
+      expect(payload.risk).toContain(`mv ${brain}.bak ${brain}`);
+      expect(payload.risk).toContain('NOT carried over');
+      expect(payload.fix.argv.slice(-3)).toEqual(['--yes', '--expect', payload.plan_hash]);
+      // A bare --yes retry is not the user's approval of this plan.
+      outWrites.length = 0;
+      const bare = await captureRun(['--yes', '--json']);
+      expect(bare.exits).toEqual([3]);
+      expect(existsSync(join(brain, 'placeholder'))).toBe(true);
+      expect(existsSync(`${brain}.bak`)).toBe(false);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (process.stdout as any).write = origWrite;
+      if (prev === undefined) delete process.env.GBRAIN_NON_INTERACTIVE; else process.env.GBRAIN_NON_INTERACTIVE = prev;
+    }
+  });
+
+  test('no flags + config missing the values: still fails missing_model / missing_dims', async () => {
+    const cfgPath = join(tmpHome, '.gbrain', 'config.json');
+
+    // Neither value in the file → missing_model (checked first).
+    writeFileSync(cfgPath, JSON.stringify({
+      engine: 'pglite',
+      database_path: join(tmpHome, '.gbrain', 'brain.pglite'),
+    }));
+    const noModel = await captureRun(['--json']);
+    expect(noModel.exits).toContain(1);
+    const noModelPayload = JSON.parse(noModel.logs[noModel.logs.length - 1]);
+    expect(noModelPayload.status).toBe('error');
+    expect(noModelPayload.reason).toBe('missing_model');
+
+    // Model present but no dimensions → missing_dims.
+    writeFileSync(cfgPath, JSON.stringify({
+      engine: 'pglite',
+      database_path: join(tmpHome, '.gbrain', 'brain.pglite'),
+      embedding_model: 'openai:text-embedding-3-large',
+    }));
+    const noDims = await captureRun(['--json']);
+    expect(noDims.exits).toContain(1);
+    const noDimsPayload = JSON.parse(noDims.logs[noDims.logs.length - 1]);
+    expect(noDimsPayload.reason).toBe('missing_dims');
+  });
+
+  test('flag present but valueless still fails missing_model (no silent config fallback)', async () => {
+    // A malformed explicit flag is a typo, not an omission — it must not
+    // silently rebuild against whatever the config file happens to hold.
+    const { exits, logs } = await captureRun(['--json', '--embedding-model']);
+    expect(exits).toContain(1);
+    const payload = JSON.parse(logs[logs.length - 1]);
+    expect(payload.reason).toBe('missing_model');
+  });
+
+  test('explicit flags win over config-file values', async () => {
+    writeFileSync(join(tmpHome, '.gbrain', 'brain.pglite.bak'), 'sentinel');
+
+    const { exits, logs, errs } = await captureRun([
+      '--embedding-model', 'voyage:voyage-4',
+      '--embedding-dimensions', '1024',
+      '--yes',
+    ]);
+
+    expect(exits).toContain(1); // bak_exists sentinel
+    const out = logs.join('\n');
+    expect(out).toContain('New embedding model: voyage:voyage-4');
+    expect(out).toMatch(/New dimensions:\s+1024/);
+    expect(out).not.toContain('openai:text-embedding-3-large');
+    // No defaulting note when both values came from flags.
+    expect(errs.join('\n')).not.toContain('defaulted from config');
+  });
+
+  test('env poisoning: GBRAIN_EMBEDDING_* env is ignored — config FILE values win', async () => {
+    writeFileSync(join(tmpHome, '.gbrain', 'brain.pglite.bak'), 'sentinel');
+
+    await withEnv({
+      GBRAIN_EMBEDDING_MODEL: 'voyage:poisoned-model',
+      GBRAIN_EMBEDDING_DIMENSIONS: '9999',
+    }, async () => {
+      const { exits, logs, errs } = await captureRun(['--yes']);
+
+      expect(exits).toContain(1); // bak_exists sentinel
+      const out = logs.join('\n');
+      expect(out).toContain('New embedding model: openai:text-embedding-3-large');
+      expect(out).toMatch(/New dimensions:\s+1536/);
+      expect(out).not.toContain('voyage:poisoned-model');
+      // Scoped to the plan line — the tmpdir's random suffix in the path
+      // lines could otherwise collide with a bare '9999' substring check.
+      expect(out).not.toMatch(/New dimensions:\s+9999/);
+      const err = errs.join('\n');
+      expect(err).toContain('--embedding-model defaulted from config: openai:text-embedding-3-large');
+      expect(err).toContain('--embedding-dimensions defaulted from config: 1536');
+    });
+  });
+
+  test('invalid_dims validation applies to the config-sourced value too', async () => {
+    const cfgPath = join(tmpHome, '.gbrain', 'config.json');
+    writeFileSync(cfgPath, JSON.stringify({
+      engine: 'pglite',
+      database_path: join(tmpHome, '.gbrain', 'brain.pglite'),
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: -5,
+    }));
+
+    const { exits, logs } = await captureRun(['--json']);
+    expect(exits).toContain(1);
+    const payload = JSON.parse(logs[logs.length - 1]);
+    expect(payload.reason).toBe('invalid_dims');
   });
 });

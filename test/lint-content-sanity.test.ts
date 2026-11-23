@@ -28,7 +28,7 @@ describe('lint — huge-page rule', () => {
 
   test('fires with block-threshold language when body exceeds block', () => {
     const content = MINIMAL_FRONTMATTER + 'a'.repeat(600_000);
-    const issues = lintContent(content, 'test.md');
+    const issues = lintContent(content, 'test.md', { contentSanity: { bytes_block: 500_000 } });
     const huge = issues.find((i) => i.rule === 'huge-page');
     expect(huge).toBeDefined();
     expect(huge!.message).toContain('block');
@@ -70,6 +70,24 @@ Body content.`;
     const junk = issues.find((i) => i.rule === 'scraper-junk');
     expect(junk).toBeDefined();
     expect(junk!.message).toContain('cloudflare_attention_required');
+  });
+
+  test('#4702 disabled_patterns turns one pattern off without the kill-switch', () => {
+    const content = MINIMAL_FRONTMATTER + 'Access denied\n\nYou do not have permission.';
+    // Default: fires. With the pattern disabled: silent — matching import's
+    // resolution so lint never reports as junk what import lets through.
+    expect(
+      lintContent(content, 'test.md').find((i) => i.rule === 'scraper-junk'),
+    ).toBeDefined();
+    const issues = lintContent(content, 'test.md', {
+      contentSanity: { disabled_patterns: ['access_denied'] },
+    });
+    expect(issues.find((i) => i.rule === 'scraper-junk')).toBeUndefined();
+    // Not the kill-switch: the size gate stays live under the same opts.
+    const huge = lintContent(MINIMAL_FRONTMATTER + 'a'.repeat(60_000), 'test.md', {
+      contentSanity: { disabled_patterns: ['access_denied'] },
+    });
+    expect(huge.find((i) => i.rule === 'huge-page')).toBeDefined();
   });
 
   test('fires on access_denied body pattern', () => {
