@@ -15,7 +15,7 @@
  * adversarial text could break out of the `<trajectory entity="...">`
  * envelope to inject instructions into the answer-gen prompt.
  *
- * Mirrors test/think-sanitize.test.ts (via test/think-pipeline.serial.test.ts)
+ * Mirrors test/think-sanitize.test.ts (via test/think-pipeline.test.ts)
  * for shape; pinning is at the INJECTION_PATTERNS level (the pattern set
  * is the single source of truth shared by both think/sanitize.ts and
  * eval/longmemeval/sanitize.ts).
@@ -33,6 +33,7 @@ function mkPoint(text: string): TrajectoryPoint {
   return {
     fact_id: 1,
     valid_from: new Date('2026-01-01'),
+    valid_until: null,
     metric: 'mrr',
     value: 50000,
     unit: 'USD',

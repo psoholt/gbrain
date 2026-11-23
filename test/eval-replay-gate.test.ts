@@ -1,3 +1,4 @@
+import { installFixtureChunks } from './helpers/page-projection.ts';
 /**
  * v0.40.1.0 Track D / T5 — Hermetic retrieval qrels gate.
  *
@@ -26,6 +27,7 @@ import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { basisEmbedding } from '../src/eval/deterministic-embed.ts';
 import type { ChunkInput } from '../src/core/types.ts';
 
 // ---------------------------------------------------------------------------
@@ -72,12 +74,9 @@ function loadFixture(): QrelFixture {
   return fix;
 }
 
-/** Basis vector with 1.0 at `idx` and 0.0 elsewhere. Mirrors search-quality.test.ts. */
-function basisEmbedding(idx: number, dim = 1536): Float32Array {
-  const emb = new Float32Array(dim);
-  emb[idx % dim] = 1.0;
-  return emb;
-}
+// basisEmbedding (1.0 at `idx`, 0.0 elsewhere) is imported from
+// src/eval/deterministic-embed.ts — the shared home for hermetic
+// basis-vector embeddings (also used by the retrieval canary).
 
 /**
  * Seed each relevant slug with a chunk whose embedding aligns with the
@@ -116,7 +115,7 @@ async function seedCorpus(fix: QrelFixture): Promise<void> {
         embedding: basisEmbedding(q.embedding_dim),
         token_count: 10,
       };
-      await engine.upsertChunks(slug, [chunk]);
+      await installFixtureChunks(engine, slug, [chunk]);
     }
   }
 }

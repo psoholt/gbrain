@@ -1,20 +1,61 @@
+// Wait discipline: no fixed sleep-waits for async conditions — poll with
+// waitFor/waitForValue (helpers/wait-for.ts) against the condition the wait
+// exists for (job terminal, handler entered, event emitted). Fixed sleeps
+// remain only where the window itself is the contract (negative assertions,
+// timestamp separation) and carry an inline justification. Env mutation goes
+// through withEnv (helpers/with-env.ts) — never bare process.env writes.
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGlite } from '@electric-sql/pglite';
+import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
 import { MinionWorker } from '../src/core/minions/worker.ts';
 import { calculateBackoff } from '../src/core/minions/backoff.ts';
 import { UnrecoverableError } from '../src/core/minions/types.ts';
 import type { MinionJob } from '../src/core/minions/types.ts';
+import { waitFor, waitForValue } from './helpers/wait-for.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 let queue: MinionQueue;
+let workerBackedQueue: MinionQueue;
+
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'dead', 'cancelled']);
+
+/** Poll the shared table until job `id` reaches `status` (or any terminal status). */
+async function waitForJobStatus(
+  id: number,
+  status: string | Set<string> = TERMINAL_STATUSES,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const want = typeof status === 'string' ? new Set([status]) : status;
+  await waitFor(async () => {
+    const j = await queue.getJob(id);
+    return j !== null && want.has(j.status);
+  }, { timeoutMs, label: `job ${id} → ${[...want].join('|')}` });
+}
+
+/** Poll promoteDelayed until it promotes something; returns that batch. */
+async function promoteDelayedEventually(): Promise<MinionJob[]> {
+  return waitForValue(async () => {
+    const promoted = await queue.promoteDelayed();
+    return promoted.length > 0 ? promoted : null;
+  }, { timeoutMs: 5_000, label: 'promoteDelayed picked up the expired delay' });
+}
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({ database_url: '' }); // in-memory
   await engine.initSchema();
   queue = new MinionQueue(engine);
+  const workerBackedEngine = new Proxy(engine, {
+    get(target, prop) {
+      if (prop === 'kind') return 'postgres';
+      const value = Reflect.get(target, prop, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as unknown as BrainEngine;
+  workerBackedQueue = new MinionQueue(workerBackedEngine);
 });
 
 afterAll(async () => {
@@ -139,8 +180,7 @@ describe('MinionQueue: State Machine', () => {
   test('delayed → waiting (promote)', async () => {
     const job = await queue.add('sync', {}, { delay: 1 }); // 1ms delay
     expect(job.status).toBe('delayed');
-    await new Promise(r => setTimeout(r, 10));
-    const promoted = await queue.promoteDelayed();
+    const promoted = await promoteDelayedEventually();
     expect(promoted.length).toBe(1);
     expect(promoted[0].status).toBe('waiting');
     expect(promoted[0].delay_until).toBeNull();
@@ -210,7 +250,7 @@ describe('MinionQueue: Stall Detection', () => {
     await queue.claim('tok1', 30000, 'default', ['sync']);
     // Force lock_until to the past
     await engine.executeRaw(
-      "UPDATE minion_jobs SET lock_until = now() - interval '1 second' WHERE id = $1",
+      "UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1",
       [job.id]
     );
     const { requeued, dead } = await queue.handleStalled();
@@ -227,7 +267,7 @@ describe('MinionQueue: Stall Detection', () => {
     // First stall: counter 0+1=1 < 3, requeued
     await queue.claim('tok1', 30000, 'default', ['sync']);
     await engine.executeRaw(
-      "UPDATE minion_jobs SET lock_until = now() - interval '1 second' WHERE id = $1",
+      "UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1",
       [job.id]
     );
     const r1 = await queue.handleStalled();
@@ -237,7 +277,7 @@ describe('MinionQueue: Stall Detection', () => {
     // Second stall: counter 1+1=2 < 3, requeued
     await queue.claim('tok2', 30000, 'default', ['sync']);
     await engine.executeRaw(
-      "UPDATE minion_jobs SET lock_until = now() - interval '1 second' WHERE id = $1",
+      "UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1",
       [job.id]
     );
     const r2 = await queue.handleStalled();
@@ -246,7 +286,7 @@ describe('MinionQueue: Stall Detection', () => {
     // Third stall: counter 2+1=3 >= 3, dead-lettered
     await queue.claim('tok3', 30000, 'default', ['sync']);
     await engine.executeRaw(
-      "UPDATE minion_jobs SET lock_until = now() - interval '1 second' WHERE id = $1",
+      "UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1",
       [job.id]
     );
     const r3 = await queue.handleStalled();
@@ -260,7 +300,7 @@ describe('MinionQueue: Stall Detection', () => {
     await engine.executeRaw('UPDATE minion_jobs SET max_stalled = 0 WHERE id = $1', [job.id]);
     await queue.claim('tok1', 30000, 'default', ['sync']);
     await engine.executeRaw(
-      "UPDATE minion_jobs SET lock_until = now() - interval '1 second' WHERE id = $1",
+      "UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1",
       [job.id]
     );
     const { requeued, dead } = await queue.handleStalled();
@@ -317,7 +357,7 @@ describe('MinionQueue: #1737 attempt accounting on dead-letter', () => {
     // First stall: requeued, attempts_made stays 0 (lease-loss recovery, not an app attempt).
     await queue.claim('tok1', 30000, 'default', ['sync']);
     await engine.executeRaw(
-      "UPDATE minion_jobs SET lock_until = now() - interval '1 second' WHERE id = $1",
+      "UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1",
       [job.id]
     );
     const r1 = await queue.handleStalled();
@@ -327,7 +367,7 @@ describe('MinionQueue: #1737 attempt accounting on dead-letter', () => {
     // Second stall: dead-lettered, attempts_made now increments.
     await queue.claim('tok2', 30000, 'default', ['sync']);
     await engine.executeRaw(
-      "UPDATE minion_jobs SET lock_until = now() - interval '1 second' WHERE id = $1",
+      "UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1",
       [job.id]
     );
     const r2 = await queue.handleStalled();
@@ -342,7 +382,7 @@ describe('MinionQueue: #1737 attempt accounting on dead-letter', () => {
 
 describe('MinionQueue: #1737 per-handler default timeout', () => {
   test('long handler with no explicit timeout_ms gets the 30-min default stamped', async () => {
-    const job = await queue.add('embed-backfill', { sourceId: 'x' });
+    const job = await workerBackedQueue.add('embed-backfill', { sourceId: 'x' });
     expect(job.timeout_ms).toBe(30 * 60 * 1000);
   });
 
@@ -354,14 +394,90 @@ describe('MinionQueue: #1737 per-handler default timeout', () => {
     expect(sub.timeout_ms).toBe(30 * 60 * 1000);
   });
 
+  // #3207 — facts-absorb is one LLM extraction call per page (same shape as
+  // chronicle_extract) but was missing from HANDLER_DEFAULT_TIMEOUT_MS, so it
+  // inherited the tight null-default wall-clock and was dead-lettered
+  // mid-generation on slow chat providers (facts silently lost).
+  test('facts-absorb gets the 10-min LLM-extraction default (#3207)', async () => {
+    const job = await queue.add('facts-absorb', { slug: 'people/alice-example' });
+    expect(job.timeout_ms).toBe(10 * 60 * 1000);
+  });
+
+  // #5761 — a brain-wide `extract --stale` pass (the remediation plan submits
+  // it without --timeout-ms) was dead-lettered by the null-default wall-clock.
+  test('extract gets its 30-min default from the handler map (#5761)', async () => {
+    const job = await queue.add('extract', { stale: true });
+    expect(job.timeout_ms).toBe(30 * 60 * 1000);
+    await engine.executeRaw(`UPDATE minion_jobs SET timeout_ms = NULL, timeout_at = NULL WHERE id = $1`, [job.id]);
+    const claimed = await queue.claim('tok-extract', 30_000, 'default', ['extract']);
+    expect(claimed!.id).toBe(job.id);
+    expect(claimed!.timeout_ms).toBe(30 * 60 * 1000);
+  });
+
+  test('contextual per-chunk reindex gets the 60-min default', async () => {
+    const job = await queue.add('contextual_reindex_per_chunk', { page_slug: 'large-transcript' }, undefined, {
+      allowProtectedSubmit: true,
+    });
+    expect(job.timeout_ms).toBe(60 * 60 * 1000);
+  });
+
   test('explicit timeout_ms always wins over the default', async () => {
-    const job = await queue.add('embed-backfill', { sourceId: 'x' }, { timeout_ms: 5000 });
+    const job = await workerBackedQueue.add('embed-backfill', { sourceId: 'x' }, { timeout_ms: 5000 });
     expect(job.timeout_ms).toBe(5000);
   });
 
   test('short handler keeps null timeout_ms (tight wall-clock default applies)', async () => {
     const job = await queue.add('sync', {});
     expect(job.timeout_ms).toBeNull();
+  });
+});
+
+// --- Claim-time budget fallback (jobs fix wave, upstream issue #3) ---
+//
+// Rows inserted before submit-time stamping existed (or by writers that
+// bypass add()) carry timeout_ms = NULL and used to fall to the minutes-scale
+// null-default wall-clock sweep. claim() now COALESCEs the budget from
+// HANDLER_DEFAULT_TIMEOUT_MS and derives timeout_at from the coalesced value.
+// Seeding NULL requires a direct UPDATE because add() stamps at submit.
+
+describe('MinionQueue: claim-time timeout fallback', () => {
+  test('legacy NULL-timeout long-handler row gets the map budget stamped at claim', async () => {
+    const job = await queue.add('subagent', {}, undefined, { allowProtectedSubmit: true });
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET timeout_ms = NULL, timeout_at = NULL WHERE id = $1`,
+      [job.id],
+    );
+    const before = Date.now();
+    const claimed = await queue.claim('tok-fallback', 30_000, 'default', ['subagent']);
+    expect(claimed).not.toBeNull();
+    expect(claimed!.id).toBe(job.id);
+    expect(claimed!.timeout_ms).toBe(30 * 60 * 1000);
+    expect(claimed!.timeout_at).toBeInstanceOf(Date);
+    const deadline = claimed!.timeout_at!.getTime();
+    // timeout_at ≈ claim time + 30min (generous 60s slop for slow CI).
+    expect(deadline).toBeGreaterThan(before + 30 * 60 * 1000 - 60_000);
+    expect(deadline).toBeLessThan(before + 30 * 60 * 1000 + 60_000);
+    // Persisted, not just returned — a restarted worker sees the same budget.
+    const rows = await engine.executeRaw<{ timeout_ms: number | null }>(
+      `SELECT timeout_ms FROM minion_jobs WHERE id = $1`, [job.id],
+    );
+    expect(Number(rows[0].timeout_ms)).toBe(30 * 60 * 1000);
+  });
+
+  test('name outside the map keeps NULL budget at claim (fail-open, todays behavior)', async () => {
+    const job = await queue.add('noop', {});
+    expect(job.timeout_ms).toBeNull();
+    const claimed = await queue.claim('tok-nomap', 30_000, 'default', ['noop']);
+    expect(claimed).not.toBeNull();
+    expect(claimed!.timeout_ms).toBeNull();
+    expect(claimed!.timeout_at).toBeNull();
+  });
+
+  test('explicit timeout_ms is never overridden at claim', async () => {
+    await workerBackedQueue.add('embed-backfill', { sourceId: 'x' }, { timeout_ms: 5000 });
+    const claimed = await queue.claim('tok-explicit', 30_000, 'default', ['embed-backfill']);
+    expect(claimed).not.toBeNull();
+    expect(claimed!.timeout_ms).toBe(5000);
   });
 });
 
@@ -379,7 +495,7 @@ describe('MinionQueue: v0.13.1 max_stalled schema default (#219)', () => {
     for (let i = 0; i < 4; i++) {
       await queue.claim(`tok-${i}`, 30000, 'default', ['noop']);
       await engine.executeRaw(
-        "UPDATE minion_jobs SET lock_until = now() - interval '1 second' WHERE id = $1",
+        "UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1",
         [job.id]
       );
       const { requeued, dead } = await queue.handleStalled();
@@ -391,7 +507,7 @@ describe('MinionQueue: v0.13.1 max_stalled schema default (#219)', () => {
     // With stalled_counter now at 4, next stall: 4+1=5 >= 5 = dead.
     await queue.claim('tok-final', 30000, 'default', ['noop']);
     await engine.executeRaw(
-      "UPDATE minion_jobs SET lock_until = now() - interval '1 second' WHERE id = $1",
+      "UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1",
       [job.id]
     );
     const { dead } = await queue.handleStalled();
@@ -560,9 +676,9 @@ describe('MinionWorker', () => {
       return { processed: true };
     });
 
-    // Start worker in background, stop after a short delay
+    // Start worker in background, stop once the job lands terminal
     const workerPromise = worker.start();
-    await new Promise(r => setTimeout(r, 200));
+    await waitForJobStatus(job.id);
     worker.stop();
     await workerPromise;
 
@@ -581,7 +697,7 @@ describe('MinionWorker', () => {
     });
 
     const workerPromise = worker.start();
-    await new Promise(r => setTimeout(r, 200));
+    await waitForJobStatus(job.id);
     worker.stop();
     await workerPromise;
 
@@ -599,7 +715,7 @@ describe('MinionWorker', () => {
     });
 
     const workerPromise = worker.start();
-    await new Promise(r => setTimeout(r, 200));
+    await waitForJobStatus(job.id);
     worker.stop();
     await workerPromise;
 
@@ -613,8 +729,9 @@ describe('MinionWorker', () => {
 
 describe('MinionQueue: Lock Management', () => {
   test('lock renewed during execution', async () => {
-    await queue.add('sync', {});
-    const claimed = await queue.claim('tok1', 30000, 'default', ['sync']);
+    // An unmapped name, so the claim takes the worker's 30s lease.
+    await queue.add('noop', {});
+    const claimed = await queue.claim('tok1', 30000, 'default', ['noop']);
     const originalLockUntil = claimed!.lock_until!.getTime();
 
     const renewed = await queue.renewLock(claimed!.id, 'tok1', 60000);
@@ -683,8 +800,7 @@ describe('MinionQueue: Claim Mechanics', () => {
     await queue.add('past', {}, { delay: 1 }); // 1ms delay, will expire quickly
     await queue.add('future', {}, { delay: 999999 }); // way in the future
 
-    await new Promise(r => setTimeout(r, 10));
-    const promoted = await queue.promoteDelayed();
+    const promoted = await promoteDelayedEventually();
     expect(promoted.length).toBe(1);
     expect(promoted[0].name).toBe('past');
   });
@@ -701,6 +817,26 @@ describe('MinionQueue: Prune', () => {
 
     const count = await queue.prune({ olderThan: new Date(Date.now() + 86400000) }); // future date = prune everything old enough
     expect(count).toBe(1); // only the cancelled one
+  });
+
+  // #2712: --dry-run used to be silently ignored — the destructive default
+  // ran and deleted rows while the operator believed they were previewing.
+  test('dryRun counts prunable jobs without deleting', async () => {
+    const job1 = await queue.add('sync', {});
+    await queue.cancelJob(job1.id); // terminal → prunable
+
+    const wouldPrune = await queue.prune({ olderThan: new Date(Date.now() + 86400000), dryRun: true });
+    expect(wouldPrune).toBe(1);
+
+    // The row must still exist after a dry run.
+    const stillThere = await queue.getJob(job1.id);
+    expect(stillThere).not.toBeNull();
+    expect(stillThere!.status).toBe('cancelled');
+
+    // A real prune afterwards actually deletes it.
+    const pruned = await queue.prune({ olderThan: new Date(Date.now() + 86400000) });
+    expect(pruned).toBe(1);
+    expect(await queue.getJob(job1.id)).toBeNull();
   });
 });
 
@@ -734,6 +870,99 @@ describe('MinionQueue: Cancel & Retry', () => {
     const retried = await queue.retryJob(job.id);
     expect(retried!.status).toBe('waiting');
     expect(retried!.error_text).toBeNull();
+  });
+
+  // #2783: retry must reset started_at/attempts_made/attempts_started/
+  // stalled_counter — an explicit `jobs retry` is an operator asserting
+  // "run this fresh".
+  test('retry resets started_at/attempts_made/attempts_started/stalled_counter', async () => {
+    const job = await queue.add('sync', {}, { max_attempts: 3, max_stalled: 3 });
+    await queue.claim('tok1', 30000, 'default', ['sync']);
+    await queue.failJob(job.id, 'tok1', 'error', 'dead');
+    // Simulate the original claim having stamped started_at long ago,
+    // attempts already elevated, and a near-exhausted stall budget —
+    // matching what a real dead job (killed by wall-clock OR by stall
+    // exhaustion) looks like.
+    await engine.executeRaw(
+      "UPDATE minion_jobs SET started_at = now() - interval '1 hour', stalled_counter = 2 WHERE id = $1",
+      [job.id],
+    );
+    const retried = await queue.retryJob(job.id);
+    expect(retried!.status).toBe('waiting');
+    expect(retried!.started_at).toBeNull();
+    expect(retried!.attempts_made).toBe(0);
+    expect(retried!.attempts_started).toBe(0);
+    expect(retried!.stalled_counter).toBe(0);
+  });
+
+  // #2783 repro: retry issued long after the original claim must NOT be
+  // immediately dead-lettered by the wall-clock sweep on re-claim.
+  test('retry survives handleWallClockTimeouts after re-claim, even long after the original attempt', async () => {
+    const job = await queue.add('sync', {}, { max_attempts: 3 });
+    await engine.executeRaw('UPDATE minion_jobs SET timeout_ms = 1000 WHERE id = $1', [job.id]);
+    await queue.claim('tok1', 30000, 'default', ['sync']);
+    // Original attempt dies from a wall-clock timeout — matches the issue's
+    // repro (an outage that outlasts timeout_ms).
+    await engine.executeRaw(
+      "UPDATE minion_jobs SET started_at = now() - interval '10 seconds' WHERE id = $1",
+      [job.id],
+    );
+    const firstDead = await queue.handleWallClockTimeouts(30000);
+    expect(firstDead.length).toBe(1);
+    expect(firstDead[0].status).toBe('dead');
+
+    // Outage clears; operator retries — LONG after the original claim time
+    // (this is the exact scenario that used to dead-letter in <1s: without
+    // the fix, started_at would still be the original claim's timestamp).
+    await queue.retryJob(job.id);
+    const reclaimed = await queue.claim('tok2', 30000, 'default', ['sync']);
+    expect(reclaimed).not.toBeNull();
+    expect(reclaimed!.attempts_made).toBe(0);
+
+    // The sweep must NOT kill it immediately this time — started_at was
+    // re-stamped fresh on re-claim (claim()'s COALESCE(started_at, now())).
+    const stillAlive = await queue.handleWallClockTimeouts(30000);
+    expect(stillAlive.length).toBe(0);
+    expect((await queue.getJob(job.id))!.status).toBe('active');
+  });
+
+  // #2783 repro (stall side): a job dead-lettered by stall exhaustion must
+  // get a fresh stall budget on retry, not immediately re-die on its first
+  // stall after being re-claimed.
+  test('retry survives one stall after re-claim, even after the original stall budget was exhausted', async () => {
+    const job = await queue.add('sync', {}, { max_attempts: 3, max_stalled: 2 });
+
+    // Exhaust the stall budget the same way the existing stall test does:
+    // one requeue stall, then one dead-lettering stall.
+    await queue.claim('tok1', 30000, 'default', ['sync']);
+    await engine.executeRaw(
+      "UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1",
+      [job.id],
+    );
+    await queue.handleStalled();
+    await queue.claim('tok2', 30000, 'default', ['sync']);
+    await engine.executeRaw(
+      "UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1",
+      [job.id],
+    );
+    const r2 = await queue.handleStalled();
+    expect(r2.dead.length).toBe(1);
+    expect(r2.dead[0].status).toBe('dead');
+    expect(r2.dead[0].stalled_counter).toBe(2); // == max_stalled — exhausted
+
+    // Operator retries. Without the stalled_counter reset, the very next
+    // stall would immediately satisfy `stalled_counter + 1 >= max_stalled`
+    // and dead-letter again despite "run this fresh".
+    const retried = await queue.retryJob(job.id);
+    expect(retried!.stalled_counter).toBe(0);
+    await queue.claim('tok3', 30000, 'default', ['sync']);
+    await engine.executeRaw(
+      "UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1",
+      [job.id],
+    );
+    const r3 = await queue.handleStalled();
+    expect(r3.requeued.length).toBe(1); // fresh budget — requeued, not dead
+    expect(r3.dead.length).toBe(0);
   });
 });
 
@@ -798,8 +1027,8 @@ describe('MinionQueue: Inbox', () => {
     const parent = await queue.add('orchestrate', {});
     // Create child directly with waiting status so it's claimable
     const childRows = await engine.executeRaw<Record<string, unknown>>(
-      `INSERT INTO minion_jobs (name, queue, status, data, parent_job_id)
-       VALUES ('research', 'default', 'waiting', '{}', $1) RETURNING *`,
+      `INSERT INTO minion_jobs (name, queue, status, data, parent_job_id, submission_authority)
+       VALUES ('research', 'default', 'waiting', '{}', $1, '{"version":1,"kind":"application"}'::jsonb) RETURNING *`,
       [parent.id]
     );
     const childId = childRows[0].id as number;
@@ -946,7 +1175,7 @@ describe('MinionWorker: Concurrent', () => {
     });
 
     const p = worker.start();
-    await new Promise(r => setTimeout(r, 500));
+    await waitForJobStatus(job.id);
     worker.stop();
     await p;
 
@@ -965,7 +1194,7 @@ describe('MinionWorker: Concurrent', () => {
     });
 
     const p = worker.start();
-    await new Promise(r => setTimeout(r, 500));
+    await waitForJobStatus(job.id);
     worker.stop();
     await p;
 
@@ -983,7 +1212,7 @@ describe('MinionWorker: Concurrent', () => {
     });
 
     const p = worker.start();
-    await new Promise(r => setTimeout(r, 500));
+    await waitForJobStatus(job.id);
     worker.stop();
     await p;
 
@@ -998,6 +1227,7 @@ describe('MinionWorker: v7 Behavior', () => {
     const job = await queue.add('pause-test', {});
     let signalSeenAborted = false;
     let handlerEntered = false;
+    let handlerExited = false;
 
     const worker = new MinionWorker(engine, {
       concurrency: 1,
@@ -1012,17 +1242,19 @@ describe('MinionWorker: v7 Behavior', () => {
         await new Promise(r => setTimeout(r, 25));
       }
       signalSeenAborted = ctx.signal.aborted;
+      handlerExited = true;
       throw new Error('aborted');
     });
 
     const p = worker.start();
     // Wait for handler to enter
-    await new Promise(r => setTimeout(r, 200));
+    await waitFor(() => handlerEntered, { timeoutMs: 5_000, label: 'pause-test handler entry' });
     expect(handlerEntered).toBe(true);
     // Pause clears the lock token; next renewLock fails → abort fires
     await queue.pauseJob(job.id);
-    // Give renewLock time to fire (lockDuration / 2 = 100ms)
-    await new Promise(r => setTimeout(r, 500));
+    // renewLock cadence is lockDuration / 2 = 100ms; wait for the handler to
+    // observe the abort (or give up at its internal 2s budget) and exit.
+    await waitFor(() => handlerExited, { timeoutMs: 5_000, label: 'pause-test handler exit' });
     worker.stop();
     await p;
 
@@ -1031,6 +1263,8 @@ describe('MinionWorker: v7 Behavior', () => {
 
   test('catch block skips failJob when ctx.signal.aborted', async () => {
     const job = await queue.add('skip-fail', {}, { max_attempts: 5 });
+    let handlerEntered = false;
+    let handlerExited = false;
 
     const worker = new MinionWorker(engine, {
       concurrency: 1,
@@ -1038,18 +1272,22 @@ describe('MinionWorker: v7 Behavior', () => {
       lockDuration: 200,
     });
     worker.register('skip-fail', async (ctx) => {
+      handlerEntered = true;
       // Wait for abort, then throw — failJob should NOT be called
       const start = Date.now();
       while (!ctx.signal.aborted && Date.now() - start < 2000) {
         await new Promise(r => setTimeout(r, 25));
       }
+      handlerExited = true;
       throw new Error('after-abort');
     });
 
     const p = worker.start();
-    await new Promise(r => setTimeout(r, 200));
+    // Pause only after the handler holds the job — pausing a still-waiting
+    // row would skip the catch path entirely.
+    await waitFor(() => handlerEntered, { timeoutMs: 5_000, label: 'skip-fail handler entry' });
     await queue.pauseJob(job.id);
-    await new Promise(r => setTimeout(r, 500));
+    await waitFor(() => handlerExited, { timeoutMs: 5_000, label: 'skip-fail handler exit' });
     worker.stop();
     await p;
 
@@ -1084,10 +1322,7 @@ describe('MinionWorker: v7 Behavior', () => {
 
     const p = worker.start();
     // Wait for all 3 handlers to enter
-    const t0 = Date.now();
-    while (entered < 3 && Date.now() - t0 < 3000) {
-      await new Promise(r => setTimeout(r, 25));
-    }
+    await waitFor(() => entered >= 3, { timeoutMs: 15_000, label: 'barrier handlers entered' });
     expect(entered).toBe(3);
 
     // While blocked, all 3 jobs should be active in DB
@@ -1096,7 +1331,9 @@ describe('MinionWorker: v7 Behavior', () => {
 
     // Release all handlers, let worker complete them
     release();
-    await new Promise(r => setTimeout(r, 300));
+    await waitFor(async () => (await queue.getJobs({ status: 'completed' })).length >= 3, {
+      timeoutMs: 5_000, label: 'barrier jobs completed',
+    });
     worker.stop();
     await p;
 
@@ -1117,13 +1354,15 @@ describe('MinionWorker: v7 Behavior', () => {
     });
 
     const p = worker.start();
-    await new Promise(r => setTimeout(r, 300));
+    await waitForJobStatus(job.id);
     worker.stop();
     await p;
 
     const completed = await queue.getJob(job.id);
     expect(completed!.status).toBe('completed');
-    // Wait beyond the timeout window to confirm the timer was cleared
+    // Wait beyond the timeout window to confirm the timer was cleared.
+    // Genuinely time-based negative check (a leaked timer fires on wall
+    // clock; there is nothing to poll) — the fixed window stays.
     await new Promise(r => setTimeout(r, 200));
     expect(abortFired).toBe(false);
   });
@@ -1142,15 +1381,16 @@ describe('MinionWorker: v7 Behavior', () => {
     });
     worker.register('slow', async (ctx) => {
       ctx.signal.addEventListener('abort', () => { abortFired = true; });
-      // Stall longer than timeout_ms
-      await new Promise(r => setTimeout(r, 800));
+      // Stall past timeout_ms: hold until the safety-net timer aborts us
+      // (deadline-bounded poll instead of a fixed oversleep).
+      await waitFor(() => ctx.signal.aborted, { timeoutMs: 5_000, label: 'safety-net abort' });
       // After abort fires, throwing here goes through the catch — but
       // catch sees signal.aborted and skips failJob.
       throw new Error('should-be-aborted');
     });
 
     const p = worker.start();
-    await new Promise(r => setTimeout(r, 1200));
+    await waitFor(() => abortFired, { timeoutMs: 6_000, label: 'safety-net abort observed' });
     worker.stop();
     await p;
 
@@ -1291,9 +1531,11 @@ describe('MinionQueue: handleTimeouts', () => {
   test('handleTimeouts dead-letters expired active jobs', async () => {
     const job = await queue.add('slow', {}, { timeout_ms: 50 });
     await queue.claim('tok1', 30000, 'default', ['slow']);
-    // Wait past the timeout
-    await new Promise(r => setTimeout(r, 100));
-    const timedOut = await queue.handleTimeouts();
+    // Sweep until the 50ms timeout_at lapses and the eviction lands
+    const timedOut = await waitForValue(async () => {
+      const killed = await queue.handleTimeouts();
+      return killed.length > 0 ? killed : null;
+    }, { timeoutMs: 5_000, label: 'handleTimeouts eviction' });
     expect(timedOut.length).toBe(1);
     expect(timedOut[0].id).toBe(job.id);
 
@@ -1311,8 +1553,12 @@ describe('MinionQueue: handleTimeouts', () => {
   test('handleTimeouts ignores stalled jobs (lock_until > now guard)', async () => {
     // Force a stalled job: timeout_at expired AND lock_until expired
     await queue.add('slow', {}, { timeout_ms: 50 });
-    await queue.claim('tok1', 1, 'default', ['slow']); // 1ms lock duration → expires immediately
-    await new Promise(r => setTimeout(r, 100));
+    const claimed = await queue.claim('tok1', 1, 'default', ['slow']); // 1ms lock duration → expires immediately
+    // Both deadlines must lapse before the negative sweep check is meaningful
+    await waitFor(async () => {
+      const j = await queue.getJob(claimed!.id);
+      return j!.timeout_at!.getTime() <= Date.now() && j!.lock_until!.getTime() <= Date.now();
+    }, { timeoutMs: 5_000, label: 'timeout_at + lock_until lapsed' });
 
     // handleTimeouts should NOT touch it (lock_until < now → stalled, not timed out)
     const timedOut = await queue.handleTimeouts();
@@ -1322,6 +1568,8 @@ describe('MinionQueue: handleTimeouts', () => {
   test('jobs without timeout_ms never timeout', async () => {
     await queue.add('forever', {});
     await queue.claim('tok1', 30000, 'default', ['forever']);
+    // Negative assertion with no expiring deadline to poll — a small fixed
+    // grace window is the whole check.
     await new Promise(r => setTimeout(r, 50));
     const timedOut = await queue.handleTimeouts();
     expect(timedOut.length).toBe(0);
@@ -1489,6 +1737,73 @@ describe('MinionQueue: Idempotency', () => {
     expect(j2.id).toBe(j1.id);
     expect(j2.data).toEqual({ v: 1 }); // first wins
   });
+
+  test('dead job with idempotency_key allows re-submission', async () => {
+    const j1 = await queue.add('test-synth', { prompt: 'synthesize' }, {
+      idempotency_key: 'dream:synth:test:abc123',
+      max_attempts: 1,
+    });
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET status = 'dead', finished_at = now() WHERE id = $1`,
+      [j1.id]
+    );
+    const j2 = await queue.add('test-synth', { prompt: 'synthesize' }, {
+      idempotency_key: 'dream:synth:test:abc123',
+      max_attempts: 8,
+    });
+    expect(j2.id).not.toBe(j1.id);
+    expect(j2.status).toBe('waiting');
+    const oldRow = await engine.executeRaw<{ idempotency_key: string | null }>(
+      `SELECT idempotency_key FROM minion_jobs WHERE id = $1`,
+      [j1.id]
+    );
+    expect(oldRow[0].idempotency_key).toBeNull();
+  });
+
+  test('cancelled job with idempotency_key allows re-submission', async () => {
+    const j1 = await queue.add('test-synth', {}, {
+      idempotency_key: 'dream:synth:test:cancel',
+    });
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET status = 'cancelled', finished_at = now() WHERE id = $1`,
+      [j1.id]
+    );
+    const j2 = await queue.add('test-synth', {}, {
+      idempotency_key: 'dream:synth:test:cancel',
+    });
+    expect(j2.id).not.toBe(j1.id);
+    expect(j2.status).toBe('waiting');
+  });
+
+  test('completed job with idempotency_key still blocks re-submission', async () => {
+    const j1 = await queue.add('sync', {}, {
+      idempotency_key: 'dream:synth:test:completed',
+    });
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET status = 'completed', finished_at = now() WHERE id = $1`,
+      [j1.id]
+    );
+    const j2 = await queue.add('sync', {}, {
+      idempotency_key: 'dream:synth:test:completed',
+    });
+    expect(j2.id).toBe(j1.id);
+    expect(j2.status).toBe('completed');
+  });
+
+  test('active job with idempotency_key still blocks re-submission', async () => {
+    const j1 = await queue.add('sync', {}, {
+      idempotency_key: 'dream:synth:test:active',
+    });
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET status = 'active', claim_generation = claim_generation + 1 WHERE id = $1`,
+      [j1.id]
+    );
+    const j2 = await queue.add('sync', {}, {
+      idempotency_key: 'dream:synth:test:active',
+    });
+    expect(j2.id).toBe(j1.id);
+    expect(j2.status).toBe('active');
+  });
 });
 
 // --- v7 child_done auto-post ---
@@ -1584,7 +1899,9 @@ describe('MinionQueue: child_done', () => {
     await queue.claim('tok-a', 30000, 'default', ['a']);
     await queue.completeJob(c1.id, 'tok-a');
 
-    // Capture a cursor between the two completions
+    // Capture a cursor between the two completions. Genuinely time-based:
+    // the cursor must sit strictly between the two child_done DB timestamps,
+    // so a small separation sleep on each side IS the condition.
     await new Promise(r => setTimeout(r, 50));
     const cursor = new Date();
     await new Promise(r => setTimeout(r, 50));
@@ -1762,7 +2079,7 @@ describe('MinionQueue: v0.19.1 handleWallClockTimeouts (Layer 3 kill shot)', () 
     const job = await queue.add('noop', {}, { timeout_ms: 100 });
     await engine.executeRaw(
       `UPDATE minion_jobs
-         SET status='active',
+         SET status='active', claim_generation = claim_generation + 1,
              lock_token='wc-test',
              lock_until=now() - interval '1 second',
              started_at=now() - interval '1 second',
@@ -1784,7 +2101,7 @@ describe('MinionQueue: v0.19.1 handleWallClockTimeouts (Layer 3 kill shot)', () 
     // Force timeout_ms / timeout_at NULL on-disk (columns might or might not be set by add).
     await engine.executeRaw(
       `UPDATE minion_jobs
-         SET status='active',
+         SET status='active', claim_generation = claim_generation + 1,
              timeout_ms=NULL,
              timeout_at=NULL,
              lock_token='wc-null',
@@ -1806,7 +2123,7 @@ describe('MinionQueue: v0.19.1 handleWallClockTimeouts (Layer 3 kill shot)', () 
     const job = await queue.add('noop', {}, { timeout_ms: 100_000 });
     await engine.executeRaw(
       `UPDATE minion_jobs
-         SET status='active',
+         SET status='active', claim_generation = claim_generation + 1,
              lock_token='wc-inside',
              lock_until=now() + interval '30 seconds',
              started_at=now() - interval '10 seconds',
@@ -1874,11 +2191,186 @@ describe('MinionQueue: v0.19.1 maxWaiting — cap correctness + race (D2/H2)', (
     expect(b.queue).toBe('shell');
   });
 
+  test('cross-source isolation — waiting sync for source A does NOT swallow source B (multi-source regression)', async () => {
+    // Regression: the cap counted all waiting (name, queue) rows regardless
+    // of data.sourceId, so a waiting default-source sync coalesced away every
+    // other source's freshness sync — a secondary source sat 29h stale while
+    // dispatch logs showed its syncs "dispatched".
+    const a = await queue.add('srcsync', { sourceId: 'default' }, { maxWaiting: 1 });
+    const a2 = await queue.add('srcsync', { sourceId: 'default' }, { maxWaiting: 1 });
+    expect(a2.id).toBe(a.id); // same source still coalesces
+    const b = await queue.add('srcsync', { sourceId: 'projects' }, { maxWaiting: 1 });
+    expect(b.id).not.toBe(a.id); // different source MUST get its own row
+    const b2 = await queue.add('srcsync', { sourceId: 'projects' }, { maxWaiting: 1 });
+    expect(b2.id).toBe(b.id); // and its own cap
+  });
+
   test('unset maxWaiting — normal submit path, no coalesce, no cap', async () => {
     const a = await queue.add('uncapped', {});
     const b = await queue.add('uncapped', {});
     const c = await queue.add('uncapped', {});
     expect(new Set([a.id, b.id, c.id]).size).toBe(3);
+  });
+
+  // REGRESSION (jobs fix wave): the backpressure scope now reads BOTH payload
+  // spellings. A snake_case source_id submission previously fell into the
+  // NULL-wildcard arm (counted ALL rows for name+queue); it now scopes
+  // exactly like camelCase sourceId. Pin the new arm for maxWaiting too —
+  // the maxPending tests below cover it for the new option only.
+  test('maxWaiting + snake_case source_id: scoped per source, not wildcard', async () => {
+    const a1 = await queue.add('srcsync2', { source_id: 'src-a' }, { maxWaiting: 1 });
+    // Different source: must NOT be swallowed by src-a's waiting row.
+    const b1 = await queue.add('srcsync2', { source_id: 'src-b' }, { maxWaiting: 1 });
+    expect(b1.id).not.toBe(a1.id);
+    // Same source coalesces.
+    const a2 = await queue.add('srcsync2', { source_id: 'src-a' }, { maxWaiting: 1 });
+    expect(a2.id).toBe(a1.id);
+    expect(a2.coalesced).toBe(true);
+  });
+});
+
+// --- maxPending — single-flight counting waiting + LIVE-LOCK active rows ---
+//
+// Jobs fix wave (upstream issue #2): the autopilot dispatch guards failed once
+// a job sat in 'active' — maxWaiting counts only waiting rows and the slot
+// idempotency key rotates every baseInterval, so a stalled cycle accumulated
+// unbounded byte-identical duplicates. maxPending counts waiting rows PLUS
+// live-lock actives (lock_until > now()); an expired-lock active belongs to a
+// dead/blocked worker and must NOT suppress dispatch — the fresh waiting row
+// keeps feeding the waitingClaimable>0 wedge detectors. Scope is EXACT on
+// COALESCE(data.sourceId, data.source_id): NULL matches only NULL.
+//
+// NOTE: the Promise.all race here runs on single-writer PGLite — a smoke
+// check. The advisory-lock guarantee under real concurrency is pinned by the
+// DATABASE_URL-gated e2e (concurrent same-scope submissions on Postgres).
+
+describe('MinionQueue: maxPending — single-flight (waiting + live-lock active)', () => {
+  async function forceActive(id: number, lockUntilSql: string): Promise<void> {
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET status = 'active', claim_generation = claim_generation + 1, lock_token = 'tok-mp',
+              lock_until = ${lockUntilSql}, started_at = now() - interval '5 minutes'
+        WHERE id = $1`,
+      [id],
+    );
+  }
+
+  test('cap 1: second submission coalesces onto the waiting row (coalesced metadata set)', async () => {
+    const a = await queue.add('single-flight', {}, { maxPending: 1 });
+    expect(a.coalesced).toBeUndefined(); // fresh insert carries no metadata
+    const b = await queue.add('single-flight', {}, { maxPending: 1 });
+    expect(b.id).toBe(a.id);
+    expect(b.coalesced).toBe(true);
+  });
+
+  test('LIVE-LOCK active row suppresses dispatch (the issue-#2 fix)', async () => {
+    const a = await queue.add('single-flight', {}, { maxPending: 1 });
+    await forceActive(a.id, `now() + interval '5 minutes'`);
+    const b = await queue.add('single-flight', {}, { maxPending: 1 });
+    expect(b.id).toBe(a.id); // coalesced onto the in-flight ACTIVE row
+    expect(b.coalesced).toBe(true);
+    expect(b.status).toBe('active');
+  });
+
+  test('EXPIRED-lock active row does NOT suppress — fresh insert (wedge detectors stay fed)', async () => {
+    const a = await queue.add('single-flight', {}, { maxPending: 1 });
+    await forceActive(a.id, `now() - interval '1 second'`);
+    const b = await queue.add('single-flight', {}, { maxPending: 1 });
+    expect(b.id).not.toBe(a.id);
+    expect(b.status).toBe('waiting');
+    expect(b.coalesced).toBeUndefined();
+  });
+
+  test('waiting row preferred over live active on cap-hit', async () => {
+    const active = await queue.add('single-flight', {}, { maxPending: 2 });
+    await forceActive(active.id, `now() + interval '5 minutes'`);
+    const waiting = await queue.add('single-flight', {}, { maxPending: 2 });
+    expect(waiting.status).toBe('waiting');
+    const c = await queue.add('single-flight', {}, { maxPending: 2 });
+    expect(c.id).toBe(waiting.id); // most-recent WAITING wins the coalesce
+    expect(c.coalesced).toBe(true);
+  });
+
+  test('dead row frees the cap', async () => {
+    const a = await queue.add('single-flight', {}, { maxPending: 1 });
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET status = 'dead', finished_at = now() WHERE id = $1`, [a.id],
+    );
+    const b = await queue.add('single-flight', {}, { maxPending: 1 });
+    expect(b.id).not.toBe(a.id);
+    expect(b.status).toBe('waiting');
+  });
+
+  test('EXACT source scope: NULL-source submission never coalesces onto a per-source row (and vice versa)', async () => {
+    const perSource = await queue.add('single-flight', { source_id: 'src-a' }, { maxPending: 1 });
+    // NULL-source submission: per-source row must not count for it.
+    const legacy = await queue.add('single-flight', {}, { maxPending: 1 });
+    expect(legacy.id).not.toBe(perSource.id);
+    // And a second NULL-source submission coalesces onto the legacy row only.
+    const legacy2 = await queue.add('single-flight', {}, { maxPending: 1 });
+    expect(legacy2.id).toBe(legacy.id);
+    // A second per-source submission coalesces onto the per-source row only.
+    const perSource2 = await queue.add('single-flight', { source_id: 'src-a' }, { maxPending: 1 });
+    expect(perSource2.id).toBe(perSource.id);
+  });
+
+  test('snake_case source_id scoping: two sources keep independent caps; same source coalesces', async () => {
+    const a1 = await queue.add('single-flight', { source_id: 'src-a' }, { maxPending: 1 });
+    const b1 = await queue.add('single-flight', { source_id: 'src-b' }, { maxPending: 1 });
+    expect(b1.id).not.toBe(a1.id);
+    const a2 = await queue.add('single-flight', { source_id: 'src-a' }, { maxPending: 1 });
+    expect(a2.id).toBe(a1.id);
+  });
+
+  test('camelCase sourceId scoping parity', async () => {
+    const a1 = await queue.add('single-flight', { sourceId: 'src-a' }, { maxPending: 1 });
+    const b1 = await queue.add('single-flight', { sourceId: 'src-b' }, { maxPending: 1 });
+    expect(b1.id).not.toBe(a1.id);
+    const a2 = await queue.add('single-flight', { sourceId: 'src-a' }, { maxPending: 1 });
+    expect(a2.id).toBe(a1.id);
+  });
+
+  test('clamp: maxPending 0 → 1; floor: 1.7 → 1', async () => {
+    const a = await queue.add('single-flight', {}, { maxPending: 0 });
+    const b = await queue.add('single-flight', {}, { maxPending: 0 });
+    expect(b.id).toBe(a.id); // 0 clamps to 1 → coalesce
+    await engine.executeRaw('DELETE FROM minion_jobs');
+    const c = await queue.add('single-flight', {}, { maxPending: 1.7 });
+    const d = await queue.add('single-flight', {}, { maxPending: 1.7 });
+    expect(d.id).toBe(c.id); // floor(1.7)=1 → coalesce
+  });
+
+  test('race: concurrent submissions hold the cap (PGLite smoke; PG e2e pins the real guarantee)', async () => {
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () => queue.add('single-flight', {}, { maxPending: 1 })),
+    );
+    const ids = new Set(results.map(r => r.id));
+    expect(ids.size).toBe(1);
+  });
+
+  test('both guards supplied: maxPending checked first, both enforced', async () => {
+    // One waiting row. maxPending: 2 passes (1 pending < 2) but
+    // maxWaiting: 1 must still coalesce — both guards apply.
+    const a = await queue.add('single-flight', {}, { maxPending: 2, maxWaiting: 1 });
+    const b = await queue.add('single-flight', {}, { maxPending: 2, maxWaiting: 1 });
+    expect(b.id).toBe(a.id);
+    expect(b.coalesced).toBe(true);
+    // Now force it ACTIVE (live lock): maxWaiting alone would let a new row
+    // in (waiting=0), but maxPending: 1 fires FIRST and coalesces onto the
+    // in-flight row.
+    await forceActive(a.id, `now() + interval '5 minutes'`);
+    const c = await queue.add('single-flight', {}, { maxPending: 1, maxWaiting: 1 });
+    expect(c.id).toBe(a.id);
+    expect(c.coalesced).toBe(true);
+  });
+
+  test('ON CONFLICT idempotency race fallback also carries coalesced metadata', async () => {
+    // Same idempotency_key twice: the fast-path SELECT returns the existing
+    // row with coalesced: true (first coalesce path).
+    const a = await queue.add('single-flight', {}, { idempotency_key: 'sf-key-1' });
+    expect(a.coalesced).toBeUndefined();
+    const b = await queue.add('single-flight', {}, { idempotency_key: 'sf-key-1' });
+    expect(b.id).toBe(a.id);
+    expect(b.coalesced).toBe(true);
   });
 });
 
@@ -1948,27 +2440,25 @@ describe('backpressure-audit (v0.19.1 Q1): JSONL on coalesce', () => {
     const os = await import('node:os');
 
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-audit-'));
-    const prev = process.env.GBRAIN_AUDIT_DIR;
-    process.env.GBRAIN_AUDIT_DIR = tmp;
     try {
-      expect(resolveAuditDir()).toBe(tmp);
-      logBackpressureCoalesce({
-        queue: 'default',
-        name: 'poll',
-        waiting_count: 2,
-        max_waiting: 2,
-        returned_job_id: 42,
+      await withEnv({ GBRAIN_AUDIT_DIR: tmp }, async () => {
+        expect(resolveAuditDir()).toBe(tmp);
+        logBackpressureCoalesce({
+          queue: 'default',
+          name: 'poll',
+          waiting_count: 2,
+          max_waiting: 2,
+          returned_job_id: 42,
+        });
+        const file = path.join(tmp, computeAuditFilename());
+        const text = fs.readFileSync(file, 'utf8');
+        const line = JSON.parse(text.trim());
+        expect(line.decision).toBe('coalesced');
+        expect(line.name).toBe('poll');
+        expect(line.returned_job_id).toBe(42);
+        expect(typeof line.ts).toBe('string');
       });
-      const file = path.join(tmp, computeAuditFilename());
-      const text = fs.readFileSync(file, 'utf8');
-      const line = JSON.parse(text.trim());
-      expect(line.decision).toBe('coalesced');
-      expect(line.name).toBe('poll');
-      expect(line.returned_job_id).toBe(42);
-      expect(typeof line.ts).toBe('string');
     } finally {
-      if (prev === undefined) delete process.env.GBRAIN_AUDIT_DIR;
-      else process.env.GBRAIN_AUDIT_DIR = prev;
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
@@ -1981,7 +2471,7 @@ describe('MinionQueue: v0.19.1 wall-clock + handleTimeouts non-interference (T1)
     const job = await queue.add('noop', {}, { timeout_ms: 100_000 });
     await engine.executeRaw(
       `UPDATE minion_jobs
-         SET status='active',
+         SET status='active', claim_generation = claim_generation + 1,
              lock_token='t1',
              lock_until=now() + interval '30 seconds',
              started_at=now() - interval '2 seconds',
@@ -2135,9 +2625,11 @@ describe('MinionWorker: --max-rss watchdog', () => {
     await queue.add('noop', {});
     await queue.add('noop', {});
 
-    // Run for a moment, then stop manually
+    // Run until all 3 jobs drain (and each post-job RSS check ran), then stop
     const startPromise = worker.start();
-    await new Promise(r => setTimeout(r, 500));
+    await waitFor(async () =>
+      postJobCount >= 3 && (await queue.getJobs({ status: 'completed' })).length >= 3,
+    { timeoutMs: 5_000, label: '3 noop jobs completed + RSS checks' });
     worker.stop();
     await startPromise;
 
@@ -2159,10 +2651,10 @@ describe('MinionWorker: --max-rss watchdog', () => {
     });
 
     worker.register('noop', async () => {});
-    await queue.add('noop', {});
+    const job = await queue.add('noop', {});
 
     const startPromise = worker.start();
-    await new Promise(r => setTimeout(r, 500));
+    await waitForJobStatus(job.id);
     worker.stop();
     await startPromise;
 
@@ -2274,8 +2766,8 @@ describe('MinionWorker: abort signal propagation (v0.20.5)', () => {
     });
 
     const workerPromise = worker.start();
-    // Wait for timeout (150ms) + handler to notice + margin
-    await new Promise(r => setTimeout(r, 500));
+    // Wait for timeout (150ms) + handler to notice + dead-letter to land
+    await waitForJobStatus(job.id);
     worker.stop();
     await workerPromise;
 
@@ -2300,7 +2792,8 @@ describe('MinionWorker: abort signal propagation (v0.20.5)', () => {
     const worker = new MinionWorker(engine, { pollInterval: 50 });
     worker.register('abort-ignorer', async (ctx) => {
       handlerStarted = true;
-      // Wait a bit, then check if signal was aborted
+      // Deliberately ignore the signal past timeout_ms (100), then check —
+      // the fixed sleep IS the "handler that doesn't poll its signal".
       await new Promise(r => setTimeout(r, 200));
       signalWasAborted = ctx.signal.aborted;
       // Now exit (a well-behaved handler would do this)
@@ -2311,7 +2804,7 @@ describe('MinionWorker: abort signal propagation (v0.20.5)', () => {
     });
 
     const workerPromise = worker.start();
-    await new Promise(r => setTimeout(r, 500));
+    await waitForJobStatus(job.id);
 
     expect(handlerStarted).toBe(true);
     expect(signalWasAborted).toBe(true);
@@ -2348,11 +2841,15 @@ describe('MinionWorker: abort signal propagation (v0.20.5)', () => {
     const workerPromise = worker.start();
 
     // Wait for slow job to start and timeout
-    await new Promise(r => setTimeout(r, 300));
+    await waitFor(() => slowAborted, { timeoutMs: 5_000, label: 'slow-timeout abort observed' });
 
     // Now submit the fast job — it should get claimed
     const fastJob = await queue.add('fast-after', {});
-    await new Promise(r => setTimeout(r, 300));
+    await waitFor(async () => {
+      const fast = await queue.getJob(fastJob.id);
+      const slow = await queue.getJob(slowJob.id);
+      return fast?.status === 'completed' && slow?.status === 'dead';
+    }, { timeoutMs: 5_000, label: 'fast completed + slow dead' });
 
     worker.stop();
     await workerPromise;
@@ -2412,11 +2909,7 @@ describe('checkAborted (v0.20.5 cycle signal)', () => {
 
 describe('MinionWorker: self-health-check', () => {
   test('health check is active when GBRAIN_SUPERVISED is not set', async () => {
-    // Save and clear the env var
-    const saved = process.env.GBRAIN_SUPERVISED;
-    delete process.env.GBRAIN_SUPERVISED;
-
-    try {
+    await withEnv({ GBRAIN_SUPERVISED: undefined }, async () => {
       const worker = new MinionWorker(engine, {
         queue: 'default',
         concurrency: 1,
@@ -2427,28 +2920,25 @@ describe('MinionWorker: self-health-check', () => {
       });
 
       worker.register('noop', async () => {});
-      await queue.add('noop', {});
+      const job = await queue.add('noop', {});
 
       const startPromise = worker.start();
-      // Let the health check fire at least once (100ms interval)
-      await new Promise(r => setTimeout(r, 300));
+      // Let the health check fire at least once (100ms interval) — the
+      // premise under test is that a live tick coexists with processing,
+      // so this floor is genuinely time-based; then poll for the drain.
+      await new Promise(r => setTimeout(r, 150));
+      await waitForJobStatus(job.id);
       worker.stop();
       await startPromise;
 
       // Worker should have processed the job despite health check running
       const completed = await queue.getJobs({ status: 'completed' });
       expect(completed.length).toBeGreaterThanOrEqual(1);
-    } finally {
-      if (saved !== undefined) process.env.GBRAIN_SUPERVISED = saved;
-      else delete process.env.GBRAIN_SUPERVISED;
-    }
+    });
   }, 10_000);
 
   test('health check is skipped when GBRAIN_SUPERVISED=1', async () => {
-    const saved = process.env.GBRAIN_SUPERVISED;
-    process.env.GBRAIN_SUPERVISED = '1';
-
-    try {
+    await withEnv({ GBRAIN_SUPERVISED: '1' }, async () => {
       const worker = new MinionWorker(engine, {
         queue: 'default',
         concurrency: 1,
@@ -2459,44 +2949,41 @@ describe('MinionWorker: self-health-check', () => {
       });
 
       worker.register('noop', async () => {});
-      await queue.add('noop', {});
+      const job = await queue.add('noop', {});
 
       const startPromise = worker.start();
-      await new Promise(r => setTimeout(r, 300));
+      await waitForJobStatus(job.id);
       worker.stop();
       await startPromise;
 
       // Worker should still process jobs fine
       const completed = await queue.getJobs({ status: 'completed' });
       expect(completed.length).toBeGreaterThanOrEqual(1);
-    } finally {
-      if (saved !== undefined) process.env.GBRAIN_SUPERVISED = saved;
-      else delete process.env.GBRAIN_SUPERVISED;
-    }
+    });
   }, 10_000);
 
   test('healthCheckInterval=0 disables health check', async () => {
-    delete process.env.GBRAIN_SUPERVISED;
+    await withEnv({ GBRAIN_SUPERVISED: undefined }, async () => {
+      const worker = new MinionWorker(engine, {
+        queue: 'default',
+        concurrency: 1,
+        healthCheckInterval: 0,
+        pollInterval: 50,
+        stalledInterval: 10_000,
+        maxRssMb: 0,
+      });
 
-    const worker = new MinionWorker(engine, {
-      queue: 'default',
-      concurrency: 1,
-      healthCheckInterval: 0,
-      pollInterval: 50,
-      stalledInterval: 10_000,
-      maxRssMb: 0,
+      worker.register('noop', async () => {});
+      const job = await queue.add('noop', {});
+
+      const startPromise = worker.start();
+      await waitForJobStatus(job.id);
+      worker.stop();
+      await startPromise;
+
+      const completed = await queue.getJobs({ status: 'completed' });
+      expect(completed.length).toBeGreaterThanOrEqual(1);
     });
-
-    worker.register('noop', async () => {});
-    await queue.add('noop', {});
-
-    const startPromise = worker.start();
-    await new Promise(r => setTimeout(r, 300));
-    worker.stop();
-    await startPromise;
-
-    const completed = await queue.getJobs({ status: 'completed' });
-    expect(completed.length).toBeGreaterThanOrEqual(1);
   }, 10_000);
 });
 
@@ -2543,224 +3030,237 @@ function makeProbeEngine(overrides: ProbeOverrides) {
 
 describe('MinionWorker: self-health-check behavior (v0.22.14)', () => {
   test('emits unhealthy{db_dead} after dbFailExitAfter consecutive DB probe failures', async () => {
-    delete process.env.GBRAIN_SUPERVISED;
+    await withEnv({ GBRAIN_SUPERVISED: undefined }, async () => {
+      let probeCount = 0;
+      const probeEngine = makeProbeEngine({
+        selectOne: async () => {
+          probeCount++;
+          throw new Error('connection terminated unexpectedly');
+        },
+      });
 
-    let probeCount = 0;
-    const probeEngine = makeProbeEngine({
-      selectOne: async () => {
-        probeCount++;
-        throw new Error('connection terminated unexpectedly');
-      },
+      const worker = new MinionWorker(probeEngine, {
+        queue: 'default',
+        concurrency: 1,
+        healthCheckInterval: 30,
+        dbFailExitAfter: 3,
+        pollInterval: 50,
+        stalledInterval: 10_000,
+        maxRssMb: 0,
+      });
+
+      worker.register('noop', async () => {});
+
+      const events: Array<{ reason: string }> = [];
+      worker.on('unhealthy', (info) => { events.push(info); });
+
+      const startPromise = worker.start();
+      // 3 ticks at 30ms trip the counter; poll for the event itself.
+      await waitFor(() => probeCount >= 3 && events.length >= 1, {
+        timeoutMs: 5_000, label: 'db_dead unhealthy event',
+      });
+      worker.stop();
+      await startPromise;
+
+      expect(probeCount).toBeGreaterThanOrEqual(3);
+      expect(events.length).toBeGreaterThanOrEqual(1);
+      expect(events[0].reason).toBe('db_dead');
     });
-
-    const worker = new MinionWorker(probeEngine, {
-      queue: 'default',
-      concurrency: 1,
-      healthCheckInterval: 30,
-      dbFailExitAfter: 3,
-      pollInterval: 50,
-      stalledInterval: 10_000,
-      maxRssMb: 0,
-    });
-
-    worker.register('noop', async () => {});
-
-    const events: Array<{ reason: string }> = [];
-    worker.on('unhealthy', (info) => { events.push(info); });
-
-    const startPromise = worker.start();
-    // 3 ticks at 30ms = 90ms; give extra slack.
-    await new Promise(r => setTimeout(r, 250));
-    worker.stop();
-    await startPromise;
-
-    expect(probeCount).toBeGreaterThanOrEqual(3);
-    expect(events.length).toBeGreaterThanOrEqual(1);
-    expect(events[0].reason).toBe('db_dead');
   }, 10_000);
 
   test('DB recovery resets the failure counter (no exit after intermittent failures)', async () => {
-    delete process.env.GBRAIN_SUPERVISED;
+    await withEnv({ GBRAIN_SUPERVISED: undefined }, async () => {
+      let probeCount = 0;
+      // Pattern: fail, fail, succeed (resets), fail, fail, then permanently succeed.
+      // No 3 consecutive failures, so dbFailExitAfter=3 must NOT trip.
+      const probeEngine = makeProbeEngine({
+        selectOne: async () => {
+          const idx = probeCount++;
+          if (idx === 0 || idx === 1 || idx === 3 || idx === 4) {
+            throw new Error('transient blip');
+          }
+          return [{ ok: 1 }];
+        },
+      });
 
-    let probeCount = 0;
-    // Pattern: fail, fail, succeed (resets), fail, fail, then permanently succeed.
-    // No 3 consecutive failures, so dbFailExitAfter=3 must NOT trip.
-    const probeEngine = makeProbeEngine({
-      selectOne: async () => {
-        const idx = probeCount++;
-        if (idx === 0 || idx === 1 || idx === 3 || idx === 4) {
-          throw new Error('transient blip');
-        }
-        return [{ ok: 1 }];
-      },
+      const worker = new MinionWorker(probeEngine, {
+        queue: 'default',
+        concurrency: 1,
+        healthCheckInterval: 30,
+        dbFailExitAfter: 3,
+        pollInterval: 50,
+        stalledInterval: 10_000,
+        maxRssMb: 0,
+      });
+
+      worker.register('noop', async () => {});
+
+      const events: Array<{ reason: string }> = [];
+      worker.on('unhealthy', (info) => { events.push(info); });
+
+      const startPromise = worker.start();
+      // Run until the fail/ok/fail pattern is fully exercised (6 probes).
+      await waitFor(() => probeCount >= 6, { timeoutMs: 5_000, label: 'probe pattern exercised' });
+      worker.stop();
+      await startPromise;
+
+      // Counter should never have hit 3 consecutive — success at index 2 resets it.
+      const dbDeadEvents = events.filter(e => e.reason === 'db_dead');
+      expect(dbDeadEvents.length).toBe(0);
     });
-
-    const worker = new MinionWorker(probeEngine, {
-      queue: 'default',
-      concurrency: 1,
-      healthCheckInterval: 30,
-      dbFailExitAfter: 3,
-      pollInterval: 50,
-      stalledInterval: 10_000,
-      maxRssMb: 0,
-    });
-
-    worker.register('noop', async () => {});
-
-    const events: Array<{ reason: string }> = [];
-    worker.on('unhealthy', (info) => { events.push(info); });
-
-    const startPromise = worker.start();
-    await new Promise(r => setTimeout(r, 250));
-    worker.stop();
-    await startPromise;
-
-    // Counter should never have hit 3 consecutive — success at index 2 resets it.
-    const dbDeadEvents = events.filter(e => e.reason === 'db_dead');
-    expect(dbDeadEvents.length).toBe(0);
   }, 10_000);
 
   test('emits unhealthy{stalled} after stallExitAfterMs of continuous idle with waiting jobs', async () => {
-    delete process.env.GBRAIN_SUPERVISED;
+    await withEnv({ GBRAIN_SUPERVISED: undefined }, async () => {
+      const probeEngine = makeProbeEngine({
+        selectOne: async () => [{ ok: 1 }],
+        countWaiting: () => 5, // pretend 5 jobs are waiting for our handler names
+      });
 
-    const probeEngine = makeProbeEngine({
-      selectOne: async () => [{ ok: 1 }],
-      countWaiting: () => 5, // pretend 5 jobs are waiting for our handler names
+      const worker = new MinionWorker(probeEngine, {
+        queue: 'default',
+        concurrency: 1,
+        healthCheckInterval: 30,
+        stallWarnAfterMs: 50,
+        stallExitAfterMs: 100,
+        pollInterval: 50,
+        stalledInterval: 10_000,
+        maxRssMb: 0,
+      });
+
+      worker.register('noop', async () => {});
+      // Don't queue any real jobs — claim returns null, inFlight stays 0,
+      // jobsCompleted stays 0, idle clock advances.
+
+      const events: Array<{ reason: string; waitingCount?: number }> = [];
+      worker.on('unhealthy', (info) => { events.push(info); });
+
+      const startPromise = worker.start();
+      // Both thresholds measured from lastCompletionTime (corrected per codex r2):
+      //   - tick @ +30ms: idle=30ms, < stallWarnAfterMs(50), no warn
+      //   - tick @ +60ms: idle=60ms, > 50, warn fires (stallWarningSince set)
+      //   - tick @ +90ms: idle=90ms, < stallExitAfterMs(100), no exit yet
+      //   - tick @ +120ms: idle=120ms, > 100 → exit fires (unhealthy event)
+      // Poll for the event instead of guessing setTimeout drift.
+      await waitFor(() => events.some(e => e.reason === 'stalled'), {
+        timeoutMs: 5_000, label: 'stalled unhealthy event',
+      });
+      worker.stop();
+      await startPromise;
+
+      const stalledEvents = events.filter(e => e.reason === 'stalled');
+      expect(stalledEvents.length).toBeGreaterThanOrEqual(1);
+      expect(stalledEvents[0].waitingCount).toBe(5);
+      // The idleMinutes payload should reflect total idle, not warn-since.
+      // With idle ~120ms at exit time, idleMinutes rounds to 0 — that's
+      // expected; the value is informative, not load-bearing.
     });
-
-    const worker = new MinionWorker(probeEngine, {
-      queue: 'default',
-      concurrency: 1,
-      healthCheckInterval: 30,
-      stallWarnAfterMs: 50,
-      stallExitAfterMs: 100,
-      pollInterval: 50,
-      stalledInterval: 10_000,
-      maxRssMb: 0,
-    });
-
-    worker.register('noop', async () => {});
-    // Don't queue any real jobs — claim returns null, inFlight stays 0,
-    // jobsCompleted stays 0, idle clock advances.
-
-    const events: Array<{ reason: string; waitingCount?: number }> = [];
-    worker.on('unhealthy', (info) => { events.push(info); });
-
-    const startPromise = worker.start();
-    // Both thresholds measured from lastCompletionTime (corrected per codex r2):
-    //   - tick @ +30ms: idle=30ms, < stallWarnAfterMs(50), no warn
-    //   - tick @ +60ms: idle=60ms, > 50, warn fires (stallWarningSince set)
-    //   - tick @ +90ms: idle=90ms, < stallExitAfterMs(100), no exit yet
-    //   - tick @ +120ms: idle=120ms, > 100 → exit fires (unhealthy event)
-    // Wait 350ms which leaves comfortable slack for setTimeout drift.
-    await new Promise(r => setTimeout(r, 350));
-    worker.stop();
-    await startPromise;
-
-    const stalledEvents = events.filter(e => e.reason === 'stalled');
-    expect(stalledEvents.length).toBeGreaterThanOrEqual(1);
-    expect(stalledEvents[0].waitingCount).toBe(5);
-    // The idleMinutes payload should reflect total idle, not warn-since.
-    // With idle ~120ms at exit time, idleMinutes rounds to 0 — that's
-    // expected; the value is informative, not load-bearing.
   }, 10_000);
 
   test('inFlight > 0 blocks stall detection (long-running legitimate job)', async () => {
-    delete process.env.GBRAIN_SUPERVISED;
+    await withEnv({ GBRAIN_SUPERVISED: undefined }, async () => {
+      const probeEngine = makeProbeEngine({
+        selectOne: async () => [{ ok: 1 }],
+        countWaiting: () => 5,
+      });
 
-    const probeEngine = makeProbeEngine({
-      selectOne: async () => [{ ok: 1 }],
-      countWaiting: () => 5,
+      const worker = new MinionWorker(probeEngine, {
+        queue: 'default',
+        concurrency: 1,
+        healthCheckInterval: 30,
+        stallWarnAfterMs: 50,
+        stallExitAfterMs: 100,
+        pollInterval: 50,
+        stalledInterval: 10_000,
+        maxRssMb: 0,
+      });
+
+      worker.register('noop', async () => {});
+
+      const events: Array<{ reason: string }> = [];
+      worker.on('unhealthy', (info) => { events.push(info); });
+
+      // Inject a fake in-flight entry directly. This bypasses the claim path
+      // (which goes through the proxy and complicates the cleanup race) and
+      // tests exactly what we want: the stall check's `inFlight.size === 0`
+      // gate when there's legitimate ongoing work.
+      const fakeInFlight = (worker as unknown as {
+        inFlight: Map<number, { lockTimer: NodeJS.Timeout; abort: AbortController; promise: Promise<void> }>
+      }).inFlight;
+      const fakeAbort = new AbortController();
+      const fakePromise = new Promise<void>(() => { /* never resolves */ });
+      const fakeTimer = setInterval(() => {}, 60_000); // dummy lock timer
+      fakeInFlight.set(99999, { lockTimer: fakeTimer, abort: fakeAbort, promise: fakePromise });
+
+      const startPromise = worker.start();
+      // Negative-assertion window: must comfortably exceed stallExitAfterMs
+      // (100ms) plus several 30ms health ticks; there is no positive event to
+      // poll (the point is that none fires), so the fixed window stays.
+      await new Promise(r => setTimeout(r, 350));
+      // Remove our fake entry before stop so the worker doesn't wait 30s for it.
+      clearInterval(fakeTimer);
+      fakeInFlight.delete(99999);
+      worker.stop();
+      await startPromise;
+
+      // No stall event should fire — inFlight.size > 0 gates the stall check.
+      const stalledEvents = events.filter(e => e.reason === 'stalled');
+      expect(stalledEvents.length).toBe(0);
     });
-
-    const worker = new MinionWorker(probeEngine, {
-      queue: 'default',
-      concurrency: 1,
-      healthCheckInterval: 30,
-      stallWarnAfterMs: 50,
-      stallExitAfterMs: 100,
-      pollInterval: 50,
-      stalledInterval: 10_000,
-      maxRssMb: 0,
-    });
-
-    worker.register('noop', async () => {});
-
-    const events: Array<{ reason: string }> = [];
-    worker.on('unhealthy', (info) => { events.push(info); });
-
-    // Inject a fake in-flight entry directly. This bypasses the claim path
-    // (which goes through the proxy and complicates the cleanup race) and
-    // tests exactly what we want: the stall check's `inFlight.size === 0`
-    // gate when there's legitimate ongoing work.
-    const fakeInFlight = (worker as unknown as {
-      inFlight: Map<number, { lockTimer: NodeJS.Timeout; abort: AbortController; promise: Promise<void> }>
-    }).inFlight;
-    const fakeAbort = new AbortController();
-    const fakePromise = new Promise<void>(() => { /* never resolves */ });
-    const fakeTimer = setInterval(() => {}, 60_000); // dummy lock timer
-    fakeInFlight.set(99999, { lockTimer: fakeTimer, abort: fakeAbort, promise: fakePromise });
-
-    const startPromise = worker.start();
-    await new Promise(r => setTimeout(r, 350));
-    // Remove our fake entry before stop so the worker doesn't wait 30s for it.
-    clearInterval(fakeTimer);
-    fakeInFlight.delete(99999);
-    worker.stop();
-    await startPromise;
-
-    // No stall event should fire — inFlight.size > 0 gates the stall check.
-    const stalledEvents = events.filter(e => e.reason === 'stalled');
-    expect(stalledEvents.length).toBe(0);
   }, 10_000);
 
   test('regression (D1): waiting jobs of unregistered handler names do NOT trigger stall exit', async () => {
-    delete process.env.GBRAIN_SUPERVISED;
+    await withEnv({ GBRAIN_SUPERVISED: undefined }, async () => {
+      // The count(*) query is filtered by registered handler names. If handlers=['noop']
+      // and the queue has 5 'widget-fn' jobs, the SQL `name = ANY($2)` filter returns 0.
+      // The probe engine simulates this by checking handlers before returning a count;
+      // we ALSO capture the SQL to assert the predicate text is actually present (so a
+      // future refactor that silently drops `AND name = ANY(...)` is caught).
+      const capturedStallSql = { sql: null as string | null };
+      const probeEngine = makeProbeEngine({
+        selectOne: async () => [{ ok: 1 }],
+        countWaiting: (handlers) => handlers.includes('widget-fn') ? 5 : 0,
+        capturedStallSql,
+      });
 
-    // The count(*) query is filtered by registered handler names. If handlers=['noop']
-    // and the queue has 5 'widget-fn' jobs, the SQL `name = ANY($2)` filter returns 0.
-    // The probe engine simulates this by checking handlers before returning a count;
-    // we ALSO capture the SQL to assert the predicate text is actually present (so a
-    // future refactor that silently drops `AND name = ANY(...)` is caught).
-    const capturedStallSql = { sql: null as string | null };
-    const probeEngine = makeProbeEngine({
-      selectOne: async () => [{ ok: 1 }],
-      countWaiting: (handlers) => handlers.includes('widget-fn') ? 5 : 0,
-      capturedStallSql,
+      const worker = new MinionWorker(probeEngine, {
+        queue: 'default',
+        concurrency: 1,
+        healthCheckInterval: 50,
+        stallWarnAfterMs: 100,
+        stallExitAfterMs: 200,
+        pollInterval: 50,
+        stalledInterval: 10_000,
+        maxRssMb: 0,
+      });
+
+      // Register 'noop' but pretend the queue is full of 'widget-fn' (unhandled).
+      worker.register('noop', async () => {});
+
+      const events: Array<{ reason: string }> = [];
+      worker.on('unhealthy', (info) => { events.push(info); });
+
+      const startPromise = worker.start();
+      // Anchor on the first stall-count probe, then hold a negative window
+      // past stallExitAfterMs (200ms); if the D1 fix regressed, stall fires
+      // inside it. No positive event exists to poll — the window stays.
+      await waitFor(() => capturedStallSql.sql !== null, {
+        timeoutMs: 5_000, label: 'stall-count probe ran',
+      });
+      await new Promise(r => setTimeout(r, 300));
+      worker.stop();
+      await startPromise;
+
+      // No stall event — the count for 'noop' handlers is 0, so worker is correctly idle.
+      const stalledEvents = events.filter(e => e.reason === 'stalled');
+      expect(stalledEvents.length).toBe(0);
+      // SQL shape assertion: the production query MUST filter by handler names.
+      // Without this assertion, a future change that drops the predicate would
+      // pass the no-event check above (the handler array would be irrelevant
+      // to the underlying DB but our probe just needs to return 0).
+      expect(capturedStallSql.sql).not.toBeNull();
+      expect(capturedStallSql.sql).toMatch(/name\s*=\s*ANY/i);
     });
-
-    const worker = new MinionWorker(probeEngine, {
-      queue: 'default',
-      concurrency: 1,
-      healthCheckInterval: 50,
-      stallWarnAfterMs: 100,
-      stallExitAfterMs: 200,
-      pollInterval: 50,
-      stalledInterval: 10_000,
-      maxRssMb: 0,
-    });
-
-    // Register 'noop' but pretend the queue is full of 'widget-fn' (unhandled).
-    worker.register('noop', async () => {});
-
-    const events: Array<{ reason: string }> = [];
-    worker.on('unhealthy', (info) => { events.push(info); });
-
-    const startPromise = worker.start();
-    // Window > stallExitAfterMs; if D1 fix wasn't applied, stall would fire.
-    await new Promise(r => setTimeout(r, 500));
-    worker.stop();
-    await startPromise;
-
-    // No stall event — the count for 'noop' handlers is 0, so worker is correctly idle.
-    const stalledEvents = events.filter(e => e.reason === 'stalled');
-    expect(stalledEvents.length).toBe(0);
-    // SQL shape assertion: the production query MUST filter by handler names.
-    // Without this assertion, a future change that drops the predicate would
-    // pass the no-event check above (the handler array would be irrelevant
-    // to the underlying DB but our probe just needs to return 0).
-    expect(capturedStallSql.sql).not.toBeNull();
-    expect(capturedStallSql.sql).toMatch(/name\s*=\s*ANY/i);
   }, 10_000);
 
   test('regression (R3): constructor throws when stallExitAfterMs <= stallWarnAfterMs', () => {
@@ -2781,5 +3281,323 @@ describe('MinionWorker: self-health-check behavior (v0.22.14)', () => {
 
     // Sanity: defaults (5min warn / 10min exit) construct without throwing.
     expect(() => new MinionWorker(engine, {})).not.toThrow();
+  });
+});
+
+// --- v0.46 (#4145 R2-1): inFlight generation-safety ---
+
+describe('MinionWorker: inFlight generation-safety (#4145 R2-1)', () => {
+  test('a stale execution\'s finally does not delete the reclaimed execution\'s entry', async () => {
+    const worker = new MinionWorker(engine, { concurrency: 2, pollInterval: 50, lockDuration: 60000 });
+    // Two gated executions of the SAME job id: A (stale, will be superseded)
+    // and B (the same-worker re-claim). Each handler invocation blocks on
+    // its own gate so the test controls the interleave deterministically.
+    const gates: Array<() => void> = [];
+    const gatePromises = [
+      new Promise<void>(r => gates.push(r)),
+      new Promise<void>(r => gates.push(r)),
+    ];
+    let invocation = 0;
+    worker.register('gensafe', async () => {
+      const idx = invocation++;
+      await gatePromises[idx];
+      return { ok: true };
+    });
+
+    const row = await queue.add('gensafe', {});
+
+    // Execution A claims + launches.
+    const claimedA = await queue.claim('tok-A', 60000, 'default', ['gensafe']);
+    expect(claimedA?.id).toBe(row.id);
+    (worker as unknown as { launchJob(j: MinionJob, t: string): void }).launchJob(claimedA!, 'tok-A');
+
+    // Simulate the post-force-evict requeue (what handleStalled does) and a
+    // SAME-WORKER re-claim as execution B while A's handler is still alive.
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET status='waiting', lock_token=NULL, lock_until=NULL, started_at=NULL WHERE id = $1`,
+      [row.id]
+    );
+    const claimedB = await queue.claim('tok-B', 60000, 'default', ['gensafe']);
+    expect(claimedB?.id).toBe(row.id);
+    (worker as unknown as { launchJob(j: MinionJob, t: string): void }).launchJob(claimedB!, 'tok-B');
+
+    const inFlight = (worker as unknown as { inFlight: Map<number, { lockToken: string }> }).inFlight;
+    expect(inFlight.get(row.id)?.lockToken).toBe('tok-B');
+
+    // Release stale execution A: its completeJob is fenced-false ("completion
+    // dropped") and its finally fires. Pre-fix, that finally deleted B's
+    // entry by bare job.id — the R2-1 generation race. A's pipeline has no
+    // external observable when the fix holds (a negative assertion), so a
+    // fixed grace window is the check.
+    gates[0]();
+    await new Promise(r => setTimeout(r, 150));
+    expect(inFlight.get(row.id)?.lockToken).toBe('tok-B'); // B survived A's finally
+
+    // Release B: its OWN finally removes its own entry and completes the row.
+    gates[1]();
+    await waitFor(() => !inFlight.has(row.id), { timeoutMs: 5_000, label: 'execution B drained' });
+    expect(inFlight.has(row.id)).toBe(false);
+    const final = await queue.getJob(row.id);
+    expect(final!.status).toBe('completed');
+  });
+});
+
+// --- v0.46 (#4145 CDX-7): stall-sweep reclaim grace ---
+
+describe('MinionQueue: stall-sweep reclaim grace (#4145)', () => {
+  async function activeJobWithLockLapsedMs(msAgo: number): Promise<MinionJob> {
+    await queue.add('grace-test', {});
+    const claimed = await queue.claim('tok-grace', 60000, 'default', ['grace-test']);
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET lock_until = now() - ($1::double precision * interval '1 millisecond') WHERE id = $2`,
+      [msAgo, claimed!.id]
+    );
+    return claimed!;
+  }
+
+  test('a lock that lapsed WITHIN the grace window is NOT reclaimed (starved-owner head start)', async () => {
+    const job = await activeJobWithLockLapsedMs(5_000); // grace default = 15_000
+    const { requeued, dead } = await queue.handleStalled();
+    expect(requeued).toHaveLength(0);
+    expect(dead).toHaveLength(0);
+    const still = await queue.getJob(job.id);
+    expect(still!.status).toBe('active');
+    expect(still!.lock_token).toBe('tok-grace');
+  });
+
+  test('a lock that lapsed BEYOND the grace window IS reclaimed', async () => {
+    const job = await activeJobWithLockLapsedMs(20_000);
+    const { requeued, dead } = await queue.handleStalled();
+    expect(requeued).toHaveLength(1);
+    expect(dead).toHaveLength(0);
+    const requeuedJob = await queue.getJob(job.id);
+    expect(requeuedJob!.status).toBe('waiting');
+    expect(requeuedJob!.lock_token).toBeNull();
+  });
+
+  test('grace=0 restores the exact legacy predicate (lock_until < now())', async () => {
+    const job = await activeJobWithLockLapsedMs(100);
+    const { requeued } = await queue.handleStalled(0);
+    expect(requeued).toHaveLength(1);
+    const requeuedJob = await queue.getJob(job.id);
+    expect(requeuedJob!.status).toBe('waiting');
+  });
+
+  test('env knob GBRAIN_MINION_STALL_RECLAIM_GRACE_MS resolves; bad value warns + falls back', async () => {
+    const { resolveStallReclaimGraceMs, DEFAULT_STALL_RECLAIM_GRACE_MS, _resetStallGraceWarningsForTests } =
+      await import('../src/core/minions/queue.ts');
+    _resetStallGraceWarningsForTests();
+    expect(resolveStallReclaimGraceMs({})).toBe(DEFAULT_STALL_RECLAIM_GRACE_MS);
+    expect(resolveStallReclaimGraceMs({ GBRAIN_MINION_STALL_RECLAIM_GRACE_MS: '0' })).toBe(0);
+    expect(resolveStallReclaimGraceMs({ GBRAIN_MINION_STALL_RECLAIM_GRACE_MS: '25000' })).toBe(25_000);
+    expect(resolveStallReclaimGraceMs({ GBRAIN_MINION_STALL_RECLAIM_GRACE_MS: '-5' })).toBe(DEFAULT_STALL_RECLAIM_GRACE_MS);
+    expect(resolveStallReclaimGraceMs({ GBRAIN_MINION_STALL_RECLAIM_GRACE_MS: 'abc' })).toBe(DEFAULT_STALL_RECLAIM_GRACE_MS);
+    // Cap: an absurd digit string must not become Infinity and push the
+    // sweep cutoff to -infinity (which would disable stalled-job recovery).
+    expect(resolveStallReclaimGraceMs({ GBRAIN_MINION_STALL_RECLAIM_GRACE_MS: '9'.repeat(40) })).toBe(600_000);
+  });
+
+  test('grace env warn fires once per bad value, not per call (warn-once dedupe)', async () => {
+    const { resolveStallReclaimGraceMs, _resetStallGraceWarningsForTests } =
+      await import('../src/core/minions/queue.ts');
+    _resetStallGraceWarningsForTests();
+    const captured: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: (chunk: string | Uint8Array) => boolean }).write = (chunk) => {
+      captured.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      return true;
+    };
+    try {
+      resolveStallReclaimGraceMs({ GBRAIN_MINION_STALL_RECLAIM_GRACE_MS: 'bogus' });
+      resolveStallReclaimGraceMs({ GBRAIN_MINION_STALL_RECLAIM_GRACE_MS: 'bogus' });
+    } finally {
+      process.stderr.write = origWrite;
+    }
+    expect(captured.filter(c => c.includes('GBRAIN_MINION_STALL_RECLAIM_GRACE_MS')).length).toBe(1);
+  });
+});
+
+// --- v0.46 (#4145): per-job lock_duration_ms — three-layer lease resolution ---
+
+describe('MinionQueue: per-job lock lease (#4145)', () => {
+  test('claim stamps the handler-map default (300s) for subagent and derives lock_until from it', async () => {
+    await queue.add('subagent', {}, undefined, { allowProtectedSubmit: true });
+    const before = Date.now();
+    const claimed = await queue.claim('tok-lease', 30_000, 'default', ['subagent']);
+    expect(claimed).not.toBeNull();
+    expect(claimed!.lock_duration_ms).toBe(300_000); // stamped from the map
+    const horizon = claimed!.lock_until!.getTime() - before;
+    // lock_until derives from the 300s lease, NOT the worker's 30s default.
+    expect(horizon).toBeGreaterThan(250_000);
+    expect(horizon).toBeLessThan(360_000);
+  });
+
+  test('a sync job gets the 5-minute default lease while an unmapped job claimed the same way keeps 30s', async () => {
+    await queue.add('sync', { sourceId: 'default' });
+    await queue.add('lease-control', {});
+    const syncJob = await queue.claim('tok-sync', 30_000, 'default', ['sync']);
+    const control = await queue.claim('tok-control', 30_000, 'default', ['lease-control']);
+    expect(syncJob!.lock_duration_ms).toBe(5 * 60_000);
+    expect(control!.lock_duration_ms).toBeNull();
+    const syncHorizon = syncJob!.lock_until!.getTime() - syncJob!.started_at!.getTime();
+    const controlHorizon = control!.lock_until!.getTime() - control!.started_at!.getTime();
+    expect(syncHorizon).toBeGreaterThan(4 * 60_000);
+    expect(controlHorizon).toBeLessThan(60_000);
+  });
+
+  test('an unmapped handler keeps NULL lease → worker default horizon (legacy behavior)', async () => {
+    await queue.add('shortling', {});
+    const before = Date.now();
+    const claimed = await queue.claim('tok-short', 30_000, 'default', ['shortling']);
+    expect(claimed!.lock_duration_ms).toBeNull();
+    const horizon = claimed!.lock_until!.getTime() - before;
+    expect(horizon).toBeGreaterThan(20_000);
+    expect(horizon).toBeLessThan(40_000);
+  });
+
+  test('explicit submit value wins over the map and is clamped to [5s, 1h]', async () => {
+    const explicit = await queue.add('subagent', {}, { lock_duration_ms: 120_000 }, { allowProtectedSubmit: true });
+    expect(explicit.lock_duration_ms).toBe(120_000);
+
+    const floored = await queue.add('floorling', {}, { lock_duration_ms: 1 });
+    expect(floored.lock_duration_ms).toBe(5_000);
+
+    const ceiled = await queue.add('ceiling', {}, { lock_duration_ms: 99_999_999 });
+    expect(ceiled.lock_duration_ms).toBe(3_600_000);
+  });
+
+  test('claim precedence: an explicit row lease beats the handler map at the claim UPDATE', async () => {
+    // The claim COALESCE is (row, map, worker default) in that order — if it
+    // were ever flipped (map before row) the explicit lease would be silently
+    // overwritten at claim while the add()-time tests stayed green.
+    await queue.add('subagent', {}, { lock_duration_ms: 120_000 }, { allowProtectedSubmit: true });
+    const before = Date.now();
+    const claimed = await queue.claim('tok-precedence', 30_000, 'default', ['subagent']);
+    expect(claimed!.lock_duration_ms).toBe(120_000); // row wins, not the 300s map
+    const horizon = claimed!.lock_until!.getTime() - before;
+    expect(horizon).toBeGreaterThan(90_000);
+    expect(horizon).toBeLessThan(150_000);
+  });
+
+  test('worker renews with the per-job lease, not the worker default (launchJob wiring)', async () => {
+    // GAP-1 pin: effectiveLockMs = row lease drives BOTH the renewal call's
+    // duration arg and the cadence. A 5s lease (clamp floor) under a worker
+    // configured at 60s yields a 2.5s cadence — observable within test time.
+    const worker = new MinionWorker(engine, { concurrency: 1, pollInterval: 50, lockDuration: 60_000 });
+    let release: () => void = () => {};
+    const gate = new Promise<void>(r => { release = r; });
+    worker.register('leased-renewal', async () => { await gate; return { ok: true }; });
+
+    await queue.add('leased-renewal', {}, { lock_duration_ms: 5_000 });
+    const claimed = await queue.claim('tok-lease-renew', 5_000, 'default', ['leased-renewal']);
+    expect(claimed!.lock_duration_ms).toBe(5_000);
+
+    const durs: number[] = [];
+    const q = (worker as unknown as { queue: MinionQueue }).queue;
+    const orig = q.renewLock.bind(q);
+    q.renewLock = ((id: number, tok: string, dur: number, opts?: { signal?: AbortSignal }) => {
+      durs.push(dur);
+      return orig(id, tok, dur, opts);
+    }) as typeof q.renewLock;
+
+    (worker as unknown as { launchJob(j: MinionJob, t: string): void }).launchJob(claimed!, 'tok-lease-renew');
+    // Cadence = min(5000/2, 60000) = 2500ms; wait for at least one tick.
+    // release() runs in finally so a timeout can't leak the gated handler.
+    try {
+      await waitFor(() => durs.length > 0, { timeoutMs: 8_000, label: 'per-job lease renewal tick' });
+    } finally {
+      release();
+    }
+    await waitForJobStatus(claimed!.id, 'completed');
+    expect(durs.length).toBeGreaterThanOrEqual(1);
+    // Every renewal used the per-job 5s lease — NOT the worker's 60s default.
+    expect(new Set(durs)).toEqual(new Set([5_000]));
+  });
+
+  test('MCP submit_job threads lock_duration_ms through the shared clamp (round-trip)', async () => {
+    const { operationsByName } = await import('../src/core/operations.ts');
+    const op = operationsByName['submit_job'];
+    const ctx = { engine, remote: false, dryRun: false } as never;
+
+    const clamped = await op.handler(ctx, { name: 'lease-op-test', lock_duration_ms: 99_999_999 }) as { id: number };
+    expect((await queue.getJob(clamped.id))!.lock_duration_ms).toBe(3_600_000); // ceiling
+
+    const exact = await op.handler(ctx, { name: 'lease-op-test', lock_duration_ms: 60_000 }) as { id: number };
+    expect((await queue.getJob(exact.id))!.lock_duration_ms).toBe(60_000);
+
+    // Boundary pin: 0 is falsy through the op's `|| undefined` coercion and
+    // falls to the handler-map/worker default (NULL for an unmapped name) —
+    // the documented remote semantics, distinct from the CLI's exit-1 reject.
+    const zero = await op.handler(ctx, { name: 'lease-op-test', lock_duration_ms: 0 }) as { id: number };
+    expect((await queue.getJob(zero.id))!.lock_duration_ms).toBeNull();
+  });
+
+  test('idempotent re-submit never mutates the first submitter\'s lease (INSERT-only)', async () => {
+    const first = await queue.add('lease-idem', {}, { lock_duration_ms: 60_000, idempotency_key: 'lease-key-1' });
+    expect(first.lock_duration_ms).toBe(60_000);
+    const second = await queue.add('lease-idem', {}, { lock_duration_ms: 600_000, idempotency_key: 'lease-key-1' });
+    expect(second.id).toBe(first.id);
+    expect(second.lock_duration_ms).toBe(60_000); // unchanged
+  });
+
+  test('REGRESSION pin: NULL-lease rows keep the exact legacy wall-clock null-fallback', async () => {
+    // handleWallClockTimeouts' null-timeout branch is COALESCE(lock_duration_ms, $1)
+    // — rows WITHOUT a lease must behave exactly as before (worker default drives
+    // the 2x * max_stalled bound), and rows WITH a lease use their own.
+    const legacy = await queue.add('wallclock-legacy', {}, { max_stalled: 1 });
+    await queue.claim('tok-wc-legacy', 1_000, 'default', ['wallclock-legacy']);
+    // started 10s ago; NULL lease → threshold = 2 * 1000ms (worker default $1) * 1 = 2s → dead.
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET started_at = now() - interval '10 seconds', timeout_ms = NULL, timeout_at = NULL WHERE id = $1`,
+      [legacy.id]
+    );
+    const killedLegacy = await queue.handleWallClockTimeouts(1_000);
+    expect(killedLegacy.map(j => j.id)).toContain(legacy.id);
+
+    // Same shape WITH a 60s lease: threshold = 2 * 60000 * 1 = 120s → survives 10s.
+    const leased = await queue.add('wallclock-leased', {}, { max_stalled: 1, lock_duration_ms: 60_000 });
+    await queue.claim('tok-wc-leased', 1_000, 'default', ['wallclock-leased']);
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET started_at = now() - interval '10 seconds', timeout_ms = NULL, timeout_at = NULL WHERE id = $1`,
+      [leased.id]
+    );
+    const killedLeased = await queue.handleWallClockTimeouts(1_000);
+    expect(killedLeased.map(j => j.id)).not.toContain(leased.id);
+    const survivor = await queue.getJob(leased.id);
+    expect(survivor!.status).toBe('active');
+  });
+
+  test('repeated infrastructure evictions eventually dead-letter via max_stalled (lifetime accumulation pin)', async () => {
+    // The "no attempt burned" contract survives only max_stalled - 1
+    // requeues: stalled_counter accumulates across the job's lifetime and
+    // the final stall burns one attempt and dead-letters. Known coverage
+    // gap flagged in the #4145 review — pinned here.
+    const job = await queue.add('evict-accumulate', {}, { max_stalled: 3 });
+    for (let round = 1; round <= 2; round++) {
+      const claimed = await queue.claim(`tok-ev-${round}`, 30_000, 'default', ['evict-accumulate']);
+      expect(claimed!.id).toBe(job.id);
+      await engine.executeRaw(
+        `UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1`,
+        [job.id]
+      );
+      const { requeued, dead } = await queue.handleStalled();
+      expect(requeued.map(j => j.id)).toContain(job.id);
+      expect(dead).toHaveLength(0);
+      const after = await queue.getJob(job.id);
+      expect(after!.stalled_counter).toBe(round);
+      expect(after!.attempts_made).toBe(0); // no attempt burned on requeue
+    }
+    // Third stall: stalled_counter + 1 >= max_stalled → dead + attempt burned.
+    await queue.claim('tok-ev-3', 30_000, 'default', ['evict-accumulate']);
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET lock_until = now() - interval '30 seconds' WHERE id = $1`,
+      [job.id]
+    );
+    const finalSweep = await queue.handleStalled();
+    expect(finalSweep.dead.map(j => j.id)).toContain(job.id);
+    const final = await queue.getJob(job.id);
+    expect(final!.status).toBe('dead');
+    expect(final!.attempts_made).toBe(1);
+    expect(final!.error_text).toBe('max stalled count exceeded');
   });
 });

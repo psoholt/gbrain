@@ -1,7 +1,33 @@
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, afterEach } from 'bun:test';
 import { EventEmitter } from 'events';
-import { runServe, type ServeOptions } from '../src/commands/serve';
+import { spawnSync } from 'node:child_process';
+import { PassThrough } from 'node:stream';
+import {
+  runServe,
+  isPidAlive,
+  readLiveParentPid,
+  probeWatchdogAvailable,
+  type ServeOptions,
+} from '../src/commands/serve';
 import type { BrainEngine } from '../src/core/engine';
+import { _resetStdoutRedirectForTests } from '../src/core/console-prefix';
+
+// runServe's stdio path calls redirectStdoutLoggingToStderr(), which
+// rebinds the process-global console.log/info/debug. Restore the real
+// bindings after every test so files sharing this shard process (e.g.
+// test/console-prefix.test.ts, which asserts bare console.log semantics)
+// don't inherit the redirect.
+/* eslint-disable no-console */
+const __realConsoleLog = console.log;
+const __realConsoleInfo = console.info;
+const __realConsoleDebug = console.debug;
+afterEach(() => {
+  console.log = __realConsoleLog;
+  console.info = __realConsoleInfo;
+  console.debug = __realConsoleDebug;
+  _resetStdoutRedirectForTests();
+});
+/* eslint-enable no-console */
 
 // These tests cover the stdio lifecycle hooks added to runServe so that the
 // PGLite write lock is released when the parent disconnects. We don't spawn
@@ -66,6 +92,29 @@ function makeTimerStub(): TimerStub {
   };
 }
 
+/** A manual clock for the boot deadline: timers fire only inside advance(), in due order. */
+function makeBootClock() {
+  let t = 0;
+  let next = 1;
+  const timers = new Map<number, { at: number; fn: () => void }>();
+  return {
+    now: () => t,
+    setTimeout: (fn: () => void, ms: number) => { const id = next++; timers.set(id, { at: t + ms, fn }); return id; },
+    clearTimeout: (h: unknown) => { timers.delete(h as number); },
+    advance(ms: number) {
+      const end = t + ms;
+      for (;;) {
+        const due = [...timers.entries()].filter(([, v]) => v.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!due) break;
+        timers.delete(due[0]);
+        t = due[1].at;
+        due[1].fn();
+      }
+      t = end;
+    },
+  };
+}
+
 interface Harness {
   engine: StubEngine;
   stdin: EventEmitter & { isTTY?: boolean; on: any; once: any };
@@ -122,6 +171,12 @@ function makeHarness(opts: {
     clearInterval: timers.clearInterval,
     probeWatchdog: () => probeWatchdogResult,
     mcpStdio: opts.mcpStdio,
+    // [ENG-5] The idle maintenance sweep registers its own (default-on)
+    // interval through the same deps.setInterval seam, which would inflate
+    // this harness's timers.active() watchdog assertions. This file tests
+    // the stdio lifecycle, not the sweep — test/sweep.test.ts owns the
+    // sweep-timer wiring coverage — so opt out here.
+    sweepEnabled: false,
   };
 
   return {
@@ -297,7 +352,7 @@ describe('runServe stdio lifecycle', () => {
 
     // Watchdog NOT installed — message matches behavior.
     expect(h.timers.active()).toBe(0);
-    expect(h.logs.some(l => l.includes('[gbrain serve] watchdog disabled: ps unavailable'))).toBe(true);
+    expect(h.logs.some(l => l.includes('[gbrain serve] watchdog disabled: no parent-liveness mechanism'))).toBe(true);
 
     // Sanity: the other lifecycle paths still work — the shutdown still
     // funnels through stdin EOF / signals, just not via the watchdog.
@@ -377,6 +432,37 @@ describe('runServe stdio lifecycle', () => {
     h.signals.emit('SIGTERM');
     await h.exited;
     expect(h.engine.disconnectCalls).toBe(1);
+  });
+
+  test('--stdio-idle-timeout leaves stdin paused until the MCP transport listener is attached', async () => {
+    const h = makeHarness();
+    const stdin = new PassThrough();
+    h.opts.stdin = stdin;
+    const initializeFrame = '{"jsonrpc":"2.0","id":1,"method":"initialize"}\n';
+    let sdkReceived = '';
+
+    h.opts.startMcpServer = async () => {
+      // Model a fast MCP client: it writes initialize while startMcpServer is
+      // still booting, immediately before StdioServerTransport adds its data
+      // listener. A paused Readable buffers this frame for the SDK. Any earlier
+      // lifecycle data listener flips the stream to flowing mode and consumes
+      // the frame before the SDK can observe it.
+      stdin.write(initializeFrame);
+      stdin.on('data', (chunk: Buffer) => { sdkReceived += chunk.toString('utf8'); });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    };
+
+    await runServe(
+      h.engine as unknown as BrainEngine,
+      ['--stdio-idle-timeout', '60'],
+      h.opts,
+    );
+
+    expect(sdkReceived).toBe(initializeFrame);
+
+    h.signals.emit('SIGTERM');
+    await h.exited;
+    stdin.destroy();
   });
 
   test('idle timer is reset on every stdin data chunk', async () => {
@@ -499,5 +585,215 @@ describe('runServe stdio lifecycle', () => {
       expect(h.engine.disconnectCalls).toBe(1);
       expect(h.logs.some(l => l.includes('graceful exit (stdin-end)'))).toBe(true);
     });
+  });
+});
+
+// Default watchdog implementations — the platform split that decides
+// whether the watchdog can run at all. The injected-seam tests above
+// never touch these; before this suite existed, the Windows branch had
+// zero coverage and the ps-only default silently disabled the watchdog
+// on every Windows host (orphaned serve → PGLite write lock held until
+// reboot). Signal-0 works on every platform Node/Bun support, so the
+// win32 branch is exercised on POSIX CI via the platform test seam.
+describe('watchdog platform defaults', () => {
+  test('isPidAlive: our own PID is alive', () => {
+    expect(isPidAlive(process.pid)).toBe(true);
+  });
+
+  test('isPidAlive: rejects non-PIDs without probing', () => {
+    expect(isPidAlive(0)).toBe(false);
+    expect(isPidAlive(-1)).toBe(false);
+    expect(isPidAlive(1.5)).toBe(false);
+    expect(isPidAlive(NaN)).toBe(false);
+  });
+
+  test('isPidAlive: an exited child is dead', () => {
+    // Spawn a trivial child and let it exit; its PID must then probe
+    // dead. PID reuse between exit and probe is theoretically possible
+    // but the window is microseconds — acceptable for a unit test of
+    // the same mechanism the production watchdog relies on.
+    const r = spawnSync(process.execPath, ['-e', ''], { timeout: 10_000 });
+    expect(r.pid).toBeGreaterThan(0);
+    expect(isPidAlive(r.pid as number)).toBe(false);
+  });
+
+  test('readLiveParentPid(win32): reports cached ppid while parent is alive', () => {
+    // The test runner's parent (bun's spawner / the shell) is alive, so
+    // the Windows reader must report the cached ppid unchanged — a
+    // healthy tick that must NOT fire the watchdog.
+    expect(readLiveParentPid('win32')).toBe(process.ppid);
+  });
+
+  test('probeWatchdogAvailable(win32): signal-0 mechanism is always available', () => {
+    // No external binary involved — the probe verifies signal-0 against
+    // our own (always-alive) PID. This is the line that un-disables the
+    // watchdog on Windows hosts.
+    expect(probeWatchdogAvailable('win32')).toBe(true);
+  });
+
+  test('readLiveParentPid(default platform): returns a usable integer PID', () => {
+    // POSIX: live kernel PPID via ps (or the cached-ppid fallback).
+    // Windows: liveness-checked cached ppid. Either way the watchdog
+    // install site needs an integer >= 0.
+    const n = readLiveParentPid();
+    expect(Number.isInteger(n)).toBe(true);
+    expect(n).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('boot-readiness deadline (#3273)', () => {
+  test('a boot that never completes releases the engine and exits non-zero', async () => {
+    const h = makeHarness();
+    // Never-resolving boot = serve wedged mid-boot while holding the
+    // PGLite write lock (the reported symptom: every CLI consumer times
+    // out on the lock until the serve PID is manually killed).
+    h.opts.startMcpServer = () => new Promise<void>(() => {});
+    h.opts.bootTimeoutMs = 20;
+    void runServe(h.engine as unknown as BrainEngine, [], h.opts);
+
+    const code = await h.exited;
+    expect(code).toBe(1);
+    expect(h.engine.disconnectCalls).toBe(1);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(true);
+  });
+
+  test('a completed boot clears the deadline (no spurious exit)', async () => {
+    const h = makeHarness();
+    h.opts.bootTimeoutMs = 20;
+    await runServe(h.engine as unknown as BrainEngine, [], h.opts);
+
+    // Give the (cleared) deadline window time to fire if the clear failed.
+    await new Promise(r => setTimeout(r, 50));
+    expect(h.engine.disconnectCalls).toBe(0);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
+  });
+
+  // #5205: the deadline line used to blame provider endpoints even when the
+  // boot was starved by a pool below what a resident serve needs.
+  test('names the stuck boot phase and a pool below the resident floor', async () => {
+    const h = makeHarness();
+    Object.assign(h.engine, { getPoolDiagnostics: () => ({ tracked: { raw: 0, direct: 0, reserved: 1, tx: 1 }, poolMax: 2, poisonedDiscards: 0 }) });
+    h.opts.startMcpServer = (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('persistence_consumer');
+      return new Promise<void>(() => {});
+    };
+    h.opts.bootTimeoutMs = 20;
+    void runServe(h.engine as unknown as BrainEngine, [], h.opts);
+
+    expect(await h.exited).toBe(1);
+    const line = h.logs.find(l => l.includes('boot did not complete'))!;
+    expect(line).toContain('code=serve_boot_timeout phase=persistence_consumer pool=2/2 tracked checkouts (below the resident floor of 6)');
+    expect(line).toContain('fix: export GBRAIN_POOL_SIZE=6');
+    expect(line).toContain('docs: docs/ENGINES.md#serve-boot-timeout');
+    expect(line).not.toContain('provider endpoints');
+  });
+
+  test('a stall with pool headroom points at the phase, not the pool', async () => {
+    const h = makeHarness();
+    Object.assign(h.engine, { getPoolDiagnostics: () => ({ tracked: { raw: 0, direct: 0, reserved: 0, tx: 0 }, poolMax: 10, poisonedDiscards: 0 }) });
+    h.opts.startMcpServer = (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('startup_sweep');
+      return new Promise<void>(() => {});
+    };
+    h.opts.bootTimeoutMs = 20;
+    void runServe(h.engine as unknown as BrainEngine, [], h.opts);
+
+    expect(await h.exited).toBe(1);
+    const line = h.logs.find(l => l.includes('boot did not complete'))!;
+    expect(line).toContain('phase=startup_sweep pool=0/10 tracked checkouts;');
+    expect(line).toContain('cause: boot stalled in startup_sweep');
+    expect(line).toContain('GBRAIN_SERVE_BOOT_TIMEOUT_SECONDS');
+  });
+
+  // Large-brain ceiling (F4d): a 52k-document brain took ~80 s to boot,
+  // past the 60 s deadline, and serve exited mid-session. The deadline now
+  // measures time without boot progress; a boot that keeps advancing is
+  // never killed, however long it takes in total.
+  test('a slow boot that keeps advancing phases outlives several windows', async () => {
+    const h = makeHarness();
+    const clock = makeBootClock();
+    h.opts.bootClock = clock;
+    h.opts.startMcpServer = async (_engine, startOpts) => {
+      for (const phase of ['source_preflight', 'writeback_config', 'mcp_connect', 'source_scope', 'persistence_consumer', 'resolve_ipc_bind', 'startup_sweep']) {
+        startOpts?.onBootPhase?.(phase);
+        clock.advance(25);
+      }
+    };
+    h.opts.bootTimeoutMs = 60;
+    await runServe(h.engine as unknown as BrainEngine, [], h.opts);
+    clock.advance(100);
+    expect(clock.now()).toBe(275);
+    expect(h.engine.disconnectCalls).toBe(0);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
+  });
+
+  test('forward-progress notes inside one long phase keep the boot alive', async () => {
+    const { noteForwardProgress } = await import('../src/core/forward-progress.ts');
+    const h = makeHarness();
+    const clock = makeBootClock();
+    h.opts.bootClock = clock;
+    h.opts.startMcpServer = async (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('persistence_consumer');
+      for (let i = 0; i < 12; i++) { noteForwardProgress(); clock.advance(20); }
+    };
+    h.opts.bootTimeoutMs = 60;
+    await runServe(h.engine as unknown as BrainEngine, [], h.opts);
+    clock.advance(100);
+    expect(h.engine.disconnectCalls).toBe(0);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
+  });
+
+  // The 52k-document serve kept answering tool calls while its boot waited on
+  // the engine behind them; completed requests are progress too. The window is
+  // 10x one request so scheduling stalls on a loaded runner never open a real
+  // no-progress gap as long as the window (#8446), and the boot still runs
+  // about four windows, which only per-request progress keeps alive.
+  test('a boot phase waiting behind answered tool calls is not killed', async () => {
+    const { trackStdioRpc } = await import('../src/mcp/server.ts');
+    const h = makeHarness();
+    h.opts.startMcpServer = async (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('mcp_connect');
+      startOpts?.onBootPhase?.('persistence_consumer');
+      for (let i = 0; i < 40; i++) await trackStdioRpc(() => new Promise(r => setTimeout(r, 20)));
+    };
+    h.opts.bootTimeoutMs = 200;
+    await runServe(h.engine as unknown as BrainEngine, [], h.opts);
+    await new Promise(r => setTimeout(r, 100));
+    expect(h.engine.disconnectCalls).toBe(0);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
+  });
+
+  test('a boot that stops advancing still exits one window after its last progress, naming the phase', async () => {
+    const h = makeHarness();
+    const clock = makeBootClock();
+    h.opts.bootClock = clock;
+    h.opts.startMcpServer = async (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('source_scope');
+      clock.advance(30);
+      startOpts?.onBootPhase?.('persistence_consumer');
+      clock.advance(49);
+      expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
+      clock.advance(1);
+      return new Promise<void>(() => {});
+    };
+    h.opts.bootTimeoutMs = 50;
+    void runServe(h.engine as unknown as BrainEngine, [], h.opts);
+    expect(await h.exited).toBe(1);
+    const line = h.logs.find(l => l.includes('boot did not complete'))!;
+    expect(line).toContain('no boot progress for 50ms');
+    expect(line).toContain('code=serve_boot_timeout phase=persistence_consumer');
+  });
+
+  test('bootTimeoutMs = 0 disables the deadline', async () => {
+    const h = makeHarness();
+    let resolveBoot!: () => void;
+    h.opts.startMcpServer = () => new Promise<void>(r => { resolveBoot = r; });
+    h.opts.bootTimeoutMs = 0;
+    const running = runServe(h.engine as unknown as BrainEngine, [], h.opts);
+
+    await new Promise(r => setTimeout(r, 30));
+    expect(h.engine.disconnectCalls).toBe(0);
+    resolveBoot();
+    await running;
   });
 });

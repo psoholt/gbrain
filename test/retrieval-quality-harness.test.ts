@@ -37,6 +37,17 @@ describe('scoreQuestion', () => {
     expect(scoreQuestion(q, ['a', 'b', 'c']).negative_clean).toBe(true);
     expect(scoreQuestion(q, ['a', 'bad', 'c']).negative_clean).toBe(false);
   });
+  test('deduplicates pages before hit, reciprocal-rank, recall, and hard-negative cutoffs', () => {
+    const positive: NamedThingQuestion = { family: 'title-substring', query: 'x', relevant: ['a'] };
+    const scored = scoreQuestion(positive, ['x', 'x', 'a', 'a']);
+    expect(scored.hit_at_3).toBe(true);
+    expect(scored.reciprocal_rank).toBe(0.5);
+    expect(scored.recall_at_k).toBe(1);
+    expect(scored.recall_at_10).toBe(1);
+
+    const negative: NamedThingQuestion = { family: 'hard-negative', query: 'x', forbidden: ['bad'] };
+    expect(scoreQuestion(negative, ['x', 'x', 'y', 'bad']).negative_clean).toBe(false);
+  });
 });
 
 describe('evaluateGate', () => {
@@ -110,5 +121,39 @@ describe('parseQuestionsJsonl', () => {
 `);
     expect(qs).toHaveLength(2);
     expect(qs[1].forbidden).toEqual(['b']);
+  });
+});
+
+describe('search errors count as errors (read-path audit #10)', () => {
+  const qs: NamedThingQuestion[] = [
+    { family: 'hard-negative', query: 'boom', forbidden: ['bad'] },
+    { family: 'title-substring', query: 'ok', relevant: ['a'] },
+  ];
+  const searchFn = async (query: string) => {
+    if (query === 'boom') throw new Error('search down');
+    return ['a'];
+  };
+
+  test('a thrown search is a miss, never a clean hard-negative', async () => {
+    const report = await runRetrievalQuality(qs, searchFn);
+    const boom = report.questions.find(q => q.query === 'boom')!;
+    expect(boom.errored).toBe(true);
+    expect(boom.hit_at_1).toBe(false);
+    expect(boom.hit_at_3).toBe(false);
+    expect(boom.reciprocal_rank).toBe(0);
+    expect(boom.negative_clean).toBe(false);
+    expect(report.errored).toBe(1);
+    expect(report.families.find(f => f.family === 'hard-negative')!.errored).toBe(1);
+    expect(report.families.find(f => f.family === 'hard-negative')!.hit_at_1).toBe(0);
+    expect(report.questions.find(q => q.query === 'ok')!.errored).toBeUndefined();
+  });
+
+  test('any errored question fails the gate', async () => {
+    const gate = evaluateGate(await runRetrievalQuality(qs, searchFn));
+    expect(gate.errored).toBe(1);
+    expect(gate.pass).toBe(false);
+    const clean = evaluateGate(await runRetrievalQuality(qs.slice(1), searchFn));
+    expect(clean.errored).toBe(0);
+    expect(clean.pass).toBe(true);
   });
 });

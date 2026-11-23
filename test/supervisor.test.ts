@@ -1,10 +1,15 @@
-import { describe, it, expect, afterEach } from 'bun:test';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, spyOn } from 'bun:test';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, chmodSync, mkdirSync, rmSync } from 'fs';
 import { spawn } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { readSupervisorEvents, computeSupervisorAuditFilename } from '../src/core/minions/handlers/supervisor-audit.ts';
-import { calculateBackoffMs, resolveHardStopMaxCrashes } from '../src/core/minions/supervisor.ts';
+import { calculateBackoffMs, resolveHardStopMaxCrashes, MinionSupervisor, type SupervisorEmission } from '../src/core/minions/supervisor.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { MinionQueue } from '../src/core/minions/queue.ts';
+import type { BrainEngine } from '../src/core/engine.ts';
+import { maybeRunWorkerStartupRecovery } from '../src/commands/jobs.ts';
+import { surfaceFileSource } from './helpers/source-surface.ts';
 
 const TEST_PID_FILE = '/tmp/gbrain-supervisor-test.pid';
 
@@ -508,6 +513,107 @@ describe('MinionSupervisor', () => {
         h.cleanup();
       }
     }, 15_000);
+  });
+
+  // Private-queue startup recovery hook (beforeSpawn seam into
+  // ChildWorkerSupervisor). Constructed in-process with a real/throwing engine
+  // — the hook never spawns anything, so no supervisor-runner fixture needed.
+  describe('supervised recovery after worker readiness', () => {
+    let engine: PGLiteEngine;
+    let queue: MinionQueue;
+    let queueSeq = 0;
+
+    beforeAll(async () => {
+      engine = new PGLiteEngine();
+      await engine.connect({ database_url: '' }); // in-memory
+      await engine.initSchema();
+      queue = new MinionQueue(engine);
+    }, 120_000);
+
+    afterAll(async () => {
+      await engine.disconnect();
+    });
+
+    beforeEach(async () => {
+      // Targeted DELETE preserves the `config.version` key MinionQueue's
+      // ensureSchema requires (full resetPgliteState wipes it).
+      await engine.executeRaw('DELETE FROM minion_jobs');
+    });
+
+    /** Orphan fixture: waiting 'subagent' child, terminal owner, aged updated_at. */
+    async function seedOrphanQueue(): Promise<number> {
+      const queueName = `dream-inline-sup-recovery-${++queueSeq}`;
+      const owner = await queue.add('autopilot-cycle', {});
+      await engine.executeRaw(
+        `UPDATE minion_jobs SET status = 'completed', finished_at = now() WHERE id = $1`,
+        [owner.id],
+      );
+      const child = await queue.add(
+        'subagent',
+        { prompt: 'orphan fixture' },
+        {
+          queue: queueName,
+          private_queue_owner_job_id: owner.id,
+          private_queue_owner_token: 'sup-recovery-token',
+          private_queue_lease_ms: 600_000,
+        },
+        { allowProtectedSubmit: true },
+      );
+      await engine.executeRaw(
+        `UPDATE minion_jobs SET updated_at = now() - interval '5 minutes' WHERE id = $1`,
+        [child.id],
+      );
+      return child.id;
+    }
+
+    it('cancels an orphaned queue after supervised readiness and reports the recovered counts', async () => {
+      const childId = await seedOrphanQueue();
+      const diagnostic = spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await maybeRunWorkerStartupRecovery(queue, { GBRAIN_SUPERVISED: '1' }, true);
+
+        const rows = await engine.executeRaw<{ status: string; error_text: string | null }>(
+          `SELECT status, error_text FROM minion_jobs WHERE id = $1`,
+          [childId],
+        );
+        expect(rows[0]!.status).toBe('cancelled');
+        expect(rows[0]!.error_text).toContain('worker startup recovery');
+        expect(diagnostic).toHaveBeenCalledWith('[gbrain jobs] private-queue startup recovery: cancelled 1 job(s) across 1 orphaned queue(s)');
+      } finally { diagnostic.mockRestore(); }
+    });
+
+    it('resolves and reports startup recovery failure when the engine throws', async () => {
+      const throwingEngine = {
+        executeRaw: async () => {
+          throw new Error('injected executeRaw failure');
+        },
+      } as unknown as BrainEngine;
+      const diagnostic = spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await expect(
+          maybeRunWorkerStartupRecovery(new MinionQueue(throwingEngine), { GBRAIN_SUPERVISED: '1' }, true),
+        ).resolves.toBeUndefined();
+        expect(diagnostic).toHaveBeenCalledWith('[gbrain jobs] private-queue startup recovery failed: injected executeRaw failure');
+      } finally { diagnostic.mockRestore(); }
+    });
+
+  });
+
+  // Structural (separate suite so the behavioral recovery tests above stay
+  // classified behavioral; binding name is deliberately non-generic so the
+  // classifier's reference heuristic can't leak onto sibling suites).
+  describe('recovery hook timeout bound (structural)', () => {
+    it('the hook bounds recovery in a Promise.race with a 30_000ms timeout', () => {
+      // W4 jobs: the hook moved with its only caller into src/commands/jobs/work.ts.
+      const supervisorSource = surfaceFileSource('jobs', 'src/commands/jobs/work.ts');
+      const hookStart = supervisorSource.indexOf('export async function maybeRunWorkerStartupRecovery');
+      expect(hookStart).toBeGreaterThan(-1);
+      const hookEnd = supervisorSource.indexOf('export async function runJobsWork(');
+      expect(hookEnd).toBeGreaterThan(hookStart);
+      const body = supervisorSource.slice(hookStart, hookEnd);
+      expect(body).toContain('Promise.race');
+      expect(body).toContain('30_000');
+    });
   });
 
   describe('integration: audit file rotation + helper', () => {

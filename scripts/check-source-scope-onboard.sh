@@ -16,6 +16,9 @@
 
 set -e
 
+# Seam: GBRAIN_GUARD_ROOT (fixture tree root); default is the repo root.
+cd "${GBRAIN_GUARD_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+
 FILES_TO_CHECK=(
   "src/core/onboard/checks.ts"
   "src/core/onboard/impact-capture.ts"

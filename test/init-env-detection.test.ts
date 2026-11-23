@@ -4,7 +4,9 @@
  * These tests exercise the exported pure helpers (groupReadyByProvider,
  * findEnvKeyTypos) with hermetic env injections. The resolveAIOptions
  * orchestration itself is exercised end-to-end via T12's
- * test/e2e/init-fresh-pglite.test.ts (PTY-based, real CLI).
+ * test/init-fresh-pglite.slow.test.ts (piped-stdin, real CLI — non-TTY
+ * branches) and test/init-picker-pty.test.ts (real PTY — the
+ * interactive picker branches).
  *
  * Per CLAUDE.md test isolation rules: env mutations would normally need
  * `withEnv`, but these helpers accept env as an argument — purer DI, no
@@ -12,7 +14,8 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { groupReadyByProvider, findEnvKeyTypos } from '../src/commands/init.ts';
+import { groupReadyByProvider, findEnvKeyTypos, seedAIOptionsFromConfig } from '../src/commands/init.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 describe('groupReadyByProvider — embedding touchpoint', () => {
   test('OPENAI_API_KEY alone → openai is ready', async () => {
@@ -25,9 +28,20 @@ describe('groupReadyByProvider — embedding touchpoint', () => {
     expect(got.map(p => p.recipeId)).toContain('voyage');
   });
 
-  test('ZEROENTROPY_API_KEY alone → zeroentropyai is ready', async () => {
-    const got = await groupReadyByProvider('embedding', { ZEROENTROPY_API_KEY: 'ze-test' });
-    expect(got.map(p => p.recipeId)).toContain('zeroentropyai');
+  test('v0.46.3: file-plane voyage_api_key folds into readiness (buildGatewayConfig env)', async () => {
+    // init's resolveEmbeddingByEnv builds its effective env via
+    // buildGatewayConfig(fileCfg).env so keys placed in ~/.gbrain/config.json
+    // (the documented alternative to shell env) select a provider too. This
+    // pins the mechanism end-to-end: file key → gateway env fold → ready.
+    // buildEnv reads the REAL process.env (env wins over file), so scrub the
+    // ambient key for the duration — dev machines may have a live one set.
+    await withEnv({ VOYAGE_API_KEY: undefined }, async () => {
+      const { buildGatewayConfig } = await import('../src/core/ai/build-gateway-config.ts');
+      const folded = buildGatewayConfig({ voyage_api_key: 'pa-file-plane' } as never).env;
+      expect(folded.VOYAGE_API_KEY).toBe('pa-file-plane');
+      const got = await groupReadyByProvider('embedding', folded as NodeJS.ProcessEnv);
+      expect(got.map(p => p.recipeId)).toContain('voyage');
+    });
   });
 
   test('OPENAI_API_KEY + VOYAGE_API_KEY → both providers in ready list', async () => {
@@ -44,7 +58,6 @@ describe('groupReadyByProvider — embedding touchpoint', () => {
     const got = await groupReadyByProvider('embedding', {
       OPENAI_API_KEY: 'sk-test',
       VOYAGE_API_KEY: 'pa-test',
-      ZEROENTROPY_API_KEY: 'ze-test',
     });
     const ids = got.map(p => p.recipeId);
     const dupes = ids.filter((id, i) => ids.indexOf(id) !== i);
@@ -61,11 +74,11 @@ describe('groupReadyByProvider — embedding touchpoint', () => {
     expect(got.map(p => p.recipeId)).not.toContain('anthropic');
   });
 
-  test('regression: bug reporter scenario — only OPENAI_API_KEY set → openai picked, ZE not present', async () => {
+  test('regression: bug reporter scenario — only OPENAI_API_KEY set → openai picked, Voyage not present', async () => {
     const got = await groupReadyByProvider('embedding', { OPENAI_API_KEY: 'sk-test' });
     const ids = got.map(p => p.recipeId);
     expect(ids).toContain('openai');
-    expect(ids).not.toContain('zeroentropyai');
+    expect(ids).not.toContain('voyage');
   });
 });
 
@@ -75,9 +88,9 @@ describe('groupReadyByProvider — chat touchpoint', () => {
     expect(got.map(p => p.recipeId)).toContain('openai');
   });
 
-  test('ZEROENTROPY_API_KEY alone → no chat ready (ZE has no chat touchpoint)', async () => {
-    const got = await groupReadyByProvider('chat', { ZEROENTROPY_API_KEY: 'ze-test' });
-    expect(got.map(p => p.recipeId)).not.toContain('zeroentropyai');
+  test('VOYAGE_API_KEY alone → no chat ready (Voyage has no chat touchpoint)', async () => {
+    const got = await groupReadyByProvider('chat', { VOYAGE_API_KEY: 'voyage-test' });
+    expect(got.map(p => p.recipeId)).not.toContain('voyage');
   });
 
   test('ANTHROPIC_API_KEY → anthropic chat ready', async () => {
@@ -147,5 +160,49 @@ describe('findEnvKeyTypos', () => {
     const got = await findEnvKeyTypos({ COMPLETELY_UNRELATED_KEY: 'foo' });
     // Should not match any canonical via Levenshtein ≤ 3.
     expect(got.find(t => t.userSet === 'COMPLETELY_UNRELATED_KEY')).toBeUndefined();
+  });
+});
+
+describe('seedAIOptionsFromConfig — #1058 cold-install env fallback', () => {
+  test('null config (no config.json, no DATABASE_URL) falls back to GBRAIN_* env vars', () => {
+    const got = seedAIOptionsFromConfig(null, {
+      GBRAIN_EMBEDDING_MODEL: 'voyage:voyage-3-large',
+      GBRAIN_EMBEDDING_DIMENSIONS: '1024',
+      GBRAIN_EXPANSION_MODEL: 'openai:gpt-5-mini',
+      GBRAIN_CHAT_MODEL: 'anthropic:claude-sonnet-4-6',
+    });
+    expect(got.embedding_model).toBe('voyage:voyage-3-large');
+    expect(got.embedding_dimensions).toBe(1024);
+    expect(got.expansion_model).toBe('openai:gpt-5-mini');
+    expect(got.chat_model).toBe('anthropic:claude-sonnet-4-6');
+  });
+
+  test('null config + no env vars → empty seed (Tier-3 detection takes over)', () => {
+    const got = seedAIOptionsFromConfig(null, {});
+    expect(got).toEqual({});
+  });
+
+  test('persisted config wins (loadConfig already merged env when non-null)', () => {
+    const got = seedAIOptionsFromConfig(
+      { engine: 'pglite', embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536 } as any,
+      { GBRAIN_EMBEDDING_MODEL: 'voyage:voyage-3-large' },
+    );
+    expect(got.embedding_model).toBe('openai:text-embedding-3-small');
+    expect(got.embedding_dimensions).toBe(1536);
+  });
+
+  test('embedding_disabled sentinel honored on re-init', () => {
+    const got = seedAIOptionsFromConfig({ engine: 'pglite', embedding_disabled: true } as any, {});
+    expect(got.noEmbedding).toBe(true);
+    expect(got.embedding_model).toBeUndefined();
+  });
+
+  test('non-numeric GBRAIN_EMBEDDING_DIMENSIONS ignored, model still seeds', () => {
+    const got = seedAIOptionsFromConfig(null, {
+      GBRAIN_EMBEDDING_MODEL: 'voyage:voyage-3-large',
+      GBRAIN_EMBEDDING_DIMENSIONS: 'not-a-number',
+    });
+    expect(got.embedding_model).toBe('voyage:voyage-3-large');
+    expect(got.embedding_dimensions).toBeUndefined();
   });
 });

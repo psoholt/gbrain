@@ -159,13 +159,19 @@ Before spending anything, see what the run will cost:
 gbrain skillopt meeting-prep --split 1:1:1 --dry-run
 ```
 
-This makes **zero LLM calls** — it just prints the plan and the cost estimate.
-A ~15-task benchmark with defaults runs around $0.70–$1.00. The preflight refuses
-to start a real run whose estimate exceeds `--max-cost-usd` (default $5.00), so
-you can't get surprise-billed mid-run.
+This makes **zero LLM calls**. It prints the models banner, the strict-mode
+verdict and the cost estimate. The banner lists every model the run can call
+(optimizer, target, judge, plus engine-internal query expansion, chat and
+embedding), each with the flag or config key that chose it. A row marked `*`
+came from `models.default` or a built-in default rather than configuration
+you set for that touchpoint. A ~15-task benchmark with defaults runs around
+$0.70–$1.00. The preflight refuses to start a real run whose estimate exceeds
+`--max-cost-usd` (default $5.00), so you can't get surprise-billed mid-run.
 
-> `--dry-run` exits with code **2** ("aborted"). That's the convention for "did
-> not run the optimization," not a failure. The cost line is what you came for.
+> `--dry-run` exits **0**. It exits 1 only when strict mode is on
+> (`--models-strict` / `skillopt.models_strict`) and some model was not
+> explicitly configured. The abort lists a `gbrain config set` line for each
+> offending touchpoint.
 
 ## Step 3: Run it for real
 
@@ -173,10 +179,13 @@ you can't get surprise-billed mid-run.
 gbrain skillopt meeting-prep --split 1:1:1
 ```
 
-You'll watch it work: a baseline eval to set the bar, then per-step forward passes
-(run the skill), backward passes (propose edits), and a validation gate that
-runs each sel task's judge 3 times and takes the median — accepting only if the
-median beats the current best by more than 0.05.
+You'll watch it work: a baseline eval to set the bar, one forward pass over a
+batch of train tasks (run the skill), one rewrite of the skill body from those
+rollouts, and a validation gate that runs each sel task's judge 3 times and
+takes the median — accepting only if the median beats the baseline by more than
+0.05. (`--loop` runs the older iterative edit loop instead. It is deprecated
+and removed on or after 2026-12-03; see the
+[reference guide](../guides/skillopt.md#one-shot-rewrite-the-default).)
 
 When it finishes, the last lines tell you everything:
 
@@ -193,7 +202,11 @@ When it finishes, the last lines tell you everything:
 |---|---|---|---|
 | `accepted` | 0 | A candidate beat the baseline. SKILL.md was rewritten (or a proposed file written — see Step 5). | Review the diff, keep it. |
 | `no_improvement` | 1 | Nothing cleared the gate. Your skill is already good, or the benchmark can't tell good from bad. | Strengthen the benchmark (Step 6) or stop. |
-| `aborted` | 2 | A gate stopped it: dirty working tree, over budget, `D_sel < 5`, or `--dry-run`. | Read the message — it names the gate. |
+| `aborted` | 2 | A gate stopped it: dirty working tree, over budget, `D_sel < 5`. | Read the message — it names the gate. |
+| `errored` | 2 | Something broke, for example the optimizer never produced a usable reply (`optimizer_output_unusable`). It usually ran out of output tokens or ignored the edits JSON format. | Follow the printed `Fix (<code>)` line, then run the printed `Resume:` command. |
+
+The summary also prints a "Models called" table showing every model the run
+actually used, engine-internal calls included, with calls, tokens and cost.
 
 `no_improvement` is not a failure. It's the gate doing its job: it would rather
 keep your known-good skill than accept a change it can't prove is better.
@@ -233,20 +246,21 @@ keep it or `git checkout` to throw it away. Nothing is committed for you.
 
 **For a skill that ships with gbrain** (anything under the gbrain repo's own
 `skills/`): SkillOpt refuses to overwrite it by default and writes the winner to
-`skills/<name>/skillopt/best.md` instead, so an optimization pass can never
-silently mutate a skill other people depend on. Two ways to handle that:
+`skills/<name>/skillopt/proposed.md` instead (while keeping `best.md` as the
+optimizer's current-best pointer), so an optimization pass can never silently
+mutate a skill other people depend on. Two ways to handle that:
 
 ```bash
 # See the proposed improvement without touching SKILL.md (works for ANY skill):
 gbrain skillopt meeting-prep --split 1:1:1 --no-mutate
-# → writes skills/meeting-prep/skillopt/best.md (the proposed rewrite), prints its path. Copy what you want.
+# → writes skills/meeting-prep/skillopt/proposed.md, updates best.md, and prints the proposal path.
 
 # Actually rewrite a bundled skill (explicit opt-in + an independent held-out set):
 gbrain skillopt brain-ops --split 1:1:1 --allow-mutate-bundled \
   --held-out skills/brain-ops/held-out.jsonl
 ```
 
-Rewriting a bundled skill in place now requires BOTH `--allow-mutate-bundled` AND
+Rewriting a bundled skill in place requires BOTH `--allow-mutate-bundled` AND
 `--held-out <path>` (a JSONL with the same shape as your benchmark, but at least 5
 tasks whose IDs don't appear in the benchmark). The held-out set is how the run
 proves the edit didn't just learn the benchmark: a candidate that climbs the

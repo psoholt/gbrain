@@ -1,0 +1,100 @@
+/**
+ * `gbrain sources refresh <source-id>` (F0): fast-forward a managed source's
+ * checkout to its upstream through the drained, worktree-wide refresh in
+ * `src/core/persistence/worktree-refresh.ts`, then run the managed `--no-pull`
+ * sync for every source bound to that worktree. Trusted local CLI on the
+ * registered owner host only; not an MCP operation.
+ *
+ * Every outcome, refusals included, is printed on stdout (one JSON object with
+ * --json) with the next command filled in; exit 1 means it did not finish.
+ */
+import type { BrainEngine } from '../core/engine.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
+import { OperationError } from '../core/ops/contract.ts';
+import { cliRenderContext, toAgentError } from '../core/agent-output.ts';
+import { refreshWorktree, type RefreshOptions, type WorktreeRefreshResult } from '../core/persistence/worktree-refresh.ts';
+
+const USAGE = 'Usage: gbrain sources refresh <source-id> [--dry-run] [--wait-drain <seconds>] [--fetch-timeout-ms <ms>] [--resume | --abandon] [--json]';
+
+function numberFlag(args: string[], flag: string): number | undefined {
+  const index = args.indexOf(flag);
+  if (index < 0) return undefined;
+  const raw = args[index + 1];
+  const value = Number(raw);
+  if (raw === undefined || raw.startsWith('--') || !Number.isFinite(value) || value < 0) {
+    throw new OperationError('invalid_params', `${flag} needs a non-negative number; got ${raw ?? 'nothing'}.`, USAGE);
+  }
+  return value;
+}
+
+export function parseRefreshArgs(args: string[]): { sourceId: string; json: boolean; options: RefreshOptions } {
+  const valued = new Set(['--wait-drain', '--fetch-timeout-ms']);
+  const known = new Set(['--dry-run', '--resume', '--abandon', '--json', ...valued]);
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (valued.has(arg)) { i++; continue; }
+    if (arg.startsWith('-')) {
+      if (!known.has(arg)) throw new OperationError('invalid_params', `Unknown sources refresh flag: ${arg}.`, USAGE);
+      continue;
+    }
+    positional.push(arg);
+  }
+  if (positional.length !== 1) throw new OperationError('invalid_params', 'sources refresh needs exactly one source id.', USAGE);
+  if (args.includes('--resume') && args.includes('--abandon')) throw new OperationError('invalid_params', '--resume and --abandon are exclusive.', USAGE);
+  const waitDrain = numberFlag(args, '--wait-drain');
+  return { sourceId: positional[0], json: args.includes('--json'), options: {
+    dryRun: args.includes('--dry-run'), resume: args.includes('--resume'), abandon: args.includes('--abandon'),
+    ...(waitDrain !== undefined ? { waitDrainMs: Math.round(waitDrain * 1000) } : {}),
+    ...(args.includes('--fetch-timeout-ms') ? { fetchTimeoutMs: numberFlag(args, '--fetch-timeout-ms') } : {}),
+  } };
+}
+
+function describe(result: WorktreeRefreshResult): string {
+  const head = (value: string | null) => value ? value.slice(0, 12) : '-';
+  const lines = [`Refresh ${result.status}: sources ${result.source_ids.join(', ')}; ${head(result.old_head)} -> ${head(result.target_head)}${result.upstream_ref ? ` (${result.upstream_ref})` : ''}.`];
+  if (result.recovered) lines.push(`Recovered orphaned refresh ${result.recovered.refresh_id} (${result.recovered.status}; previous holder: ${result.recovered.previous_holder ? `pid ${result.recovered.previous_holder.pid} on ${result.recovered.previous_holder.hostname}` : 'not recorded'}).`);
+  if (result.published) lines.push(`Published ${result.published.local_commits} local commit(s) merged with ${result.published.integrated} upstream commit(s) as ${head(result.published.sha)} before the fast-forward (sources.refresh_publish_diverged).`);
+  if (result.published?.quarantined) lines.push(`The remote also changed ${result.published.quarantined.paths.join(', ')}: its version was published and this machine's version is kept under ${result.published.quarantined.ref}; gbrain doctor lists it (quarantined_changes).`);
+  if (result.published?.superseded_remote_paths) lines.push(`Kept this machine's version of ${result.published.superseded_remote_paths.join(', ')}: the remote held a version this checkout had already replaced (docs/guides/shared-checkout-git.md#conflicts).`);
+  if (result.incoming_files !== undefined) lines.push(`Incoming files: ${result.incoming_files}.`);
+  for (const member of result.synced) lines.push(`  ${member.source_id}: sync ${member.status}, last_commit ${head(member.last_commit)}`);
+  if (result.preserved_uncommitted.length) lines.push(`Preserved uncommitted paths (outside the incoming diff): ${result.preserved_uncommitted.slice(0, 20).join(', ')}${result.preserved_uncommitted.length > 20 ? ' ...' : ''}`);
+  for (const backlog of result.link_backlog ?? []) lines.push(backlog.outcome === 'drained' ? `  ${backlog.source_id}: derived links for ${backlog.pages} stale page(s) after the refresh` + (backlog.remaining ? `; ${backlog.remaining} remain` : '')
+    : backlog.outcome === 'skipped' ? `  ${backlog.source_id}: stale-link backlog skipped (another drain of this source is running)` : `  ${backlog.source_id}: stale-link backlog drain failed: ${backlog.message}`);
+  for (const blocked of result.sync_blocked ?? []) lines.push(`  ${blocked.source_id} blocked (${blocked.code}): ${blocked.message} Resume: ${blocked.resume}`);
+  if (result.next) lines.push(`Next: ${result.next}`);
+  return lines.join('\n');
+}
+
+/** Print a refresh result, or a refusal with its filled fix; both go to stdout (one JSON object with --json). */
+export function printRefreshOutcome(outcome: { result: WorktreeRefreshResult } | { error: OperationError }, json: boolean): void {
+  if ('result' in outcome) {
+    const { phase_ms, lock_held_ms } = outcome.result;
+    if (process.env.GBRAIN_DEBUG === '1' && phase_ms) process.stderr.write(`[gbrain] sources refresh phase_ms ${JSON.stringify(phase_ms)}${lock_held_ms !== undefined ? ` lock_held_ms ${lock_held_ms}` : ''}\n`);
+    console.log(json ? JSON.stringify(outcome.result) : describe(outcome.result));
+    if (['sync_blocked', 'sync_deferred', 'syncing'].includes(outcome.result.status)) setCliExitVerdict(1);
+    return;
+  }
+  const error = outcome.error;
+  // F0's legacy refusal keys stay (its `fix` is the stored command string); the v1 envelope keys ride beside them (D1).
+  // #7685: a refusal that carries a structured fix (argv, actor, ask_user) emits it as the v1 `fix`; the prose stays in `suggestion`.
+  const env = toAgentError(error, { transport: 'cli', command: 'sources refresh', render: cliRenderContext() });
+  const refusal = { status: 'refused', code: error.code, cause: error.message, fix: error.fix && env.fix ? env.fix : error.suggestion ?? null, docs: error.docs ?? null,
+    ...(error.detail ? { detail: error.detail } : {}), ...(error.why ? { why: error.why } : {}), ...(error.reason ? { reason: error.reason } : {}),
+    error: env.error, message: env.message, suggestion: env.suggestion, docs_cmd: env.docs_cmd, class: env.class, retryable: env.retryable,
+    contract_version: env.contract_version };
+  console.log(json ? JSON.stringify(refusal) : `Refresh refused (${error.code}): ${error.message}\nFix: ${error.suggestion ?? USAGE}${error.docs ? `\nDocs: ${error.docs}` : ''}${error.why ? `\nWhy: ${error.why}` : ''}`);
+  setCliExitVerdict(1);
+}
+
+export async function runSourcesRefresh(engine: BrainEngine, args: string[]): Promise<void> {
+  const json = args.includes('--json');
+  try {
+    const parsed = parseRefreshArgs(args);
+    printRefreshOutcome({ result: await refreshWorktree(engine, parsed.sourceId, parsed.options) }, json);
+  } catch (error) {
+    if (!(error instanceof OperationError)) throw error;
+    printRefreshOutcome({ error }, json);
+  }
+}

@@ -46,6 +46,14 @@ export {
 } from './closure.ts';
 
 export {
+  type BorrowedTypes,
+  mergeByKey,
+  mergeUnion,
+  mergePageTypes,
+  mergeInheritedManifest,
+} from './merge.ts';
+
+export {
   type SourceClosureBinding,
   buildPerSourceBindings,
   buildSourceClosureCte,
@@ -90,6 +98,8 @@ export {
 
 export {
   loadActivePack,
+  loadResolvedPackByName,
+  resolveLoadedPack,
   resolveActivePackNameOnly,
   __setPackLocatorForTests,
   _resetPackLocatorForTests,
@@ -102,6 +112,16 @@ export {
   validateSchemaPackTrustGate,
   loadActivePackForOp,
 } from './op-trust-gate.ts';
+
+export {
+  loadActivePackForEngine,
+  engineSchemaInput,
+  approvedSchemaIdentity,
+  checkApprovedSchemaForEngine,
+  SchemaApprovalError,
+  type ApprovedSchemaIdentity,
+  type ApprovedSchemaCheck,
+} from './engine-resolution.ts';
 
 export {
   inferLinkTypeFromPack,
@@ -178,6 +198,9 @@ export {
   removeLinkTypeFromPack,
   setExtractableOnType,
   setExpertRoutingOnType,
+  type BatchMutationRequest,
+  type BatchMutationResult,
+  applyMutationsAtomic,
 } from './mutate.ts';
 
 export { invalidateQueryCache } from './query-cache-invalidator.ts';

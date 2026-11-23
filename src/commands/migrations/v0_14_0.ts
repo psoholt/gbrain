@@ -3,7 +3,8 @@
  *
  * Ships two phases:
  *
- *   A. Schema: `ALTER TABLE minion_jobs ALTER COLUMN max_stalled SET DEFAULT 3`.
+ *   A. Schema: `ALTER TABLE minion_jobs ALTER COLUMN max_stalled SET DEFAULT 3`
+ *      when the current default is below 3 (never lowers schema v15's 5).
  *      New installs already get the bumped default from schema-embedded.ts +
  *      pglite-schema.ts. This ALTER is for existing brains where the table
  *      was created under v0.13.x (default 1). Idempotent — running twice is
@@ -25,9 +26,8 @@ import { existsSync, readFileSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
 
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
-import { loadConfig, toEngineConfig, gbrainPath } from '../../core/config.ts';
-import { createEngine } from '../../core/engine-factory.ts';
-import type { BrainEngine } from '../../core/engine.ts';
+import { loadConfig, gbrainPath } from '../../core/config.ts';
+import { connectMigrationEngine, type MigrationEngine } from './run-engine.ts';
 
 // gbrainPath() honors GBRAIN_HOME at call time (not module-load) and routes
 // through the centralized config dir, so the prior resolveHome()/HOME-env
@@ -39,7 +39,7 @@ function pendingHostWorkPath(): string { return join(pendingHostWorkDir(), 'pend
 // Phase A — schema: bump minion_jobs.max_stalled default 1 → 3
 // ---------------------------------------------------------------------------
 
-async function phaseASchema(opts: OrchestratorOpts): Promise<{ result: OrchestratorPhaseResult; engine: BrainEngine | null }> {
+async function phaseASchema(opts: OrchestratorOpts): Promise<{ result: OrchestratorPhaseResult; engine: MigrationEngine | null }> {
   if (opts.dryRun) {
     return { result: { name: 'schema', status: 'skipped', detail: 'dry-run' }, engine: null };
   }
@@ -51,26 +51,22 @@ async function phaseASchema(opts: OrchestratorOpts): Promise<{ result: Orchestra
         engine: null,
       };
     }
-    const engine = await createEngine(toEngineConfig(config));
-    await engine.connect(toEngineConfig(config));
-    try {
-      // Both Postgres and PGLite accept this ALTER. Idempotent at the
-      // table level — setting the default to 3 twice is fine.
-      await engine.executeRaw('ALTER TABLE minion_jobs ALTER COLUMN max_stalled SET DEFAULT 3');
-    } catch (e) {
-      // If minion_jobs doesn't exist yet (brand new install), the schema
-      // file already has the new default, so this is moot. Skip instead of
-      // fail.
-      const msg = e instanceof Error ? e.message : String(e);
-      if (/does not exist|no such table|relation .* does not exist/i.test(msg)) {
-        return {
-          result: { name: 'schema', status: 'skipped', detail: 'minion_jobs not yet created (fresh install)' },
-          engine,
-        };
-      }
-      throw e;
+    const opened = await connectMigrationEngine(config);
+    const { engine } = opened;
+    // Only a default below 3 is raised: schema migration v15 later set 5,
+    // which a fresh brain already has, and lowering it would undo that fix.
+    const [column] = await engine.executeRaw<{ column_default: string | null }>(
+      `SELECT column_default FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'minion_jobs' AND column_name = 'max_stalled'`);
+    if (!column) {
+      return { result: { name: 'schema', status: 'skipped', detail: 'minion_jobs not yet created (fresh install)' }, engine: opened };
     }
-    return { result: { name: 'schema', status: 'complete' }, engine };
+    const current = parseInt(column.column_default ?? '', 10);
+    if (current >= 3) {
+      return { result: { name: 'schema', status: 'skipped', detail: `max_stalled default already ${current}` }, engine: opened };
+    }
+    await engine.executeRaw('ALTER TABLE minion_jobs ALTER COLUMN max_stalled SET DEFAULT 3');
+    return { result: { name: 'schema', status: 'complete' }, engine: opened };
   } catch (e) {
     return {
       result: { name: 'schema', status: 'failed', detail: e instanceof Error ? e.message : String(e) },
@@ -144,7 +140,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
     phases.push(hostRes);
   } finally {
     if (engine) {
-      try { await engine.disconnect(); } catch { /* best-effort */ }
+      try { await engine.close(); } catch { /* best-effort */ }
     }
   }
 
@@ -175,4 +171,5 @@ export const v0_14_0: Migration = {
       'Host-specific skill doc: skills/migrations/v0.14.0.md.',
   },
   orchestrator,
+  sharesRunEngine: true,
 };

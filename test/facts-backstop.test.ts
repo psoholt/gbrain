@@ -15,10 +15,15 @@ import { runFactsBackstop } from '../src/core/facts/backstop.ts';
 import type { FactsBackstopCtx } from '../src/core/facts/backstop.ts';
 import {
   __setChatTransportForTests,
+  __setEmbedTransportForTests,
+  configureGateway,
   resetGateway,
   type ChatResult,
 } from '../src/core/ai/gateway.ts';
 import { __resetFactsQueueForTests } from '../src/core/facts/queue.ts';
+import { MinionWorker } from '../src/core/minions/worker.ts';
+import type { MinionJobContext } from '../src/core/minions/types.ts';
+import { registerBuiltinHandlers } from '../src/commands/jobs.ts';
 
 let engine: PGLiteEngine;
 
@@ -40,7 +45,7 @@ afterEach(() => {
 
 const LONG_BODY = 'this is a real meeting note longer than 80 chars '.repeat(3);
 
-function chatStub(facts: Array<{ fact: string; kind: string; notability: 'high' | 'medium' | 'low'; entity?: string | null }>) {
+function chatStub(facts: Array<{ fact: string; kind: string; notability?: string; entity?: string | null }>) {
   __setChatTransportForTests(async (): Promise<ChatResult> => ({
     text: JSON.stringify({
       facts: facts.map(f => ({
@@ -75,6 +80,16 @@ const meetingPage = (slug = 'meetings/test-' + Math.random().toString(36).slice(
   compiled_truth: LONG_BODY,
   frontmatter: {} as Record<string, unknown>,
 });
+
+async function factsForIds(ids: number[]): Promise<Array<{ fact: string }>> {
+  return Promise.all(ids.map(async (id) => {
+    // PGLite's test engine deliberately exposes its raw query client for
+    // storage assertions where the public API only offers scoped listings.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query('SELECT fact FROM facts WHERE id = $1', [id]);
+    return rows.rows[0];
+  }));
+}
 
 describe('runFactsBackstop — eligibility + kill-switch gates', () => {
   test('skips with extraction_disabled when kill-switch off', async () => {
@@ -120,12 +135,24 @@ describe('runFactsBackstop — mode: inline', () => {
     }
   });
 
-  test('notabilityFilter=high-only drops MEDIUM + LOW from the insert path', async () => {
+  test('notabilityFilter=high-only embeds and persists only HIGH facts', async () => {
+    const embeddedTexts: string[] = [];
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-small',
+      embedding_dimensions: 1536,
+      env: { OPENAI_API_KEY: 'test' },
+    });
     chatStub([
       { fact: 'high-only-1', kind: 'event', notability: 'high', entity: 'people/bob-test' },
-      { fact: 'high-only-2-skip', kind: 'event', notability: 'medium', entity: 'people/bob-test' },
-      { fact: 'high-only-3-skip', kind: 'event', notability: 'low', entity: 'people/bob-test' },
+      { fact: 'high-only-medium-skip', kind: 'event', notability: 'medium', entity: 'people/bob-test' },
+      { fact: 'high-only-low-skip', kind: 'event', notability: 'low', entity: 'people/bob-test' },
+      { fact: 'high-only-absent-skip', kind: 'event', entity: 'people/bob-test' },
+      { fact: 'high-only-unknown-skip', kind: 'event', notability: 'unknown', entity: 'people/bob-test' },
     ]);
+    __setEmbedTransportForTests((async ({ values }: { values: string[] }) => {
+      embeddedTexts.push(...values);
+      return { embeddings: values.map(() => Array.from({ length: 1536 }, () => 0.1)) };
+    }) as never);
     const r = await runFactsBackstop(
       meetingPage(),
       makeCtx({ mode: 'inline', notabilityFilter: 'high-only' }),
@@ -134,6 +161,35 @@ describe('runFactsBackstop — mode: inline', () => {
     if (r.mode === 'inline') {
       expect(r.inserted).toBe(1);
       expect(r.fact_ids.length).toBe(1);
+      const rows = await factsForIds(r.fact_ids);
+      expect(embeddedTexts).toEqual(['high-only-1']);
+      expect(rows.map(f => f.fact)).toEqual(['high-only-1']);
+    }
+  });
+
+  test('notabilityFilter=all embeds and persists every tier', async () => {
+    const embeddedTexts: string[] = [];
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-small',
+      embedding_dimensions: 1536,
+      env: { OPENAI_API_KEY: 'test' },
+    });
+    chatStub([
+      { fact: 'all-high', kind: 'event', notability: 'high', entity: 'people/all-test' },
+      { fact: 'all-medium', kind: 'event', notability: 'medium', entity: 'people/all-test' },
+      { fact: 'all-low', kind: 'event', notability: 'low', entity: 'people/all-test' },
+      { fact: 'all-absent', kind: 'event', entity: 'people/all-test' },
+    ]);
+    __setEmbedTransportForTests((async ({ values }: { values: string[] }) => {
+      embeddedTexts.push(...values);
+      return { embeddings: values.map(() => Array.from({ length: 1536 }, () => 0.1)) };
+    }) as never);
+    const r = await runFactsBackstop(meetingPage(), makeCtx({ mode: 'inline', notabilityFilter: 'all' }));
+    expect(r.mode).toBe('inline');
+    if (r.mode === 'inline') {
+      const rows = await factsForIds(r.fact_ids);
+      expect(embeddedTexts).toEqual(['all-high', 'all-medium', 'all-low', 'all-absent']);
+      expect(rows.map(f => f.fact)).toEqual(['all-high', 'all-medium', 'all-low', 'all-absent']);
     }
   });
 
@@ -239,11 +295,65 @@ describe('runFactsBackstop — dedup fast-path', () => {
   });
 });
 
+describe('runFactsBackstop — exact duplicates without a resolved entity (#5275)', () => {
+  // The legacy DB-only path used to skip the exact-fingerprint check when the
+  // entity was null or fell back to slugification, so every re-extraction
+  // inserted an identical active row outside the fence-key unique index.
+  const census = async (text: string) => (await engine.executeRaw<{ entity_slug: string | null; n: number }>(
+    `SELECT entity_slug, count(*)::int AS n FROM facts WHERE fact = $1 AND expired_at IS NULL GROUP BY entity_slug ORDER BY entity_slug`, [text]));
+
+  test('a NULL-entity fact re-extracted twice lands once and the repeat reports duplicate with the same id', async () => {
+    chatStub([{ fact: 'unparented-claim-A', kind: 'event', notability: 'high', entity: null }]);
+    const r1 = await runFactsBackstop(meetingPage(), makeCtx({ mode: 'inline', source: 'sync:import' }));
+    expect(r1.mode).toBe('inline');
+    if (r1.mode !== 'inline') return;
+    expect(r1.inserted).toBe(1);
+
+    chatStub([{ fact: 'unparented-claim-A', kind: 'event', notability: 'high', entity: null }]);
+    const r2 = await runFactsBackstop(meetingPage(), makeCtx({ mode: 'inline', source: 'sync:import' }));
+    if (r2.mode !== 'inline') return;
+    expect({ inserted: r2.inserted, duplicate: r2.duplicate, ids: r2.fact_ids }).toEqual({ inserted: 0, duplicate: 1, ids: r1.fact_ids });
+    expect(await census('unparented-claim-A')).toEqual([{ entity_slug: null, n: 1 }]);
+  });
+
+  test('a bare-name entity that falls back to slugification dedups the same way; a fingerprint variant too', async () => {
+    chatStub([{ fact: 'Said hello, twice', kind: 'event', notability: 'high', entity: 'nobodyresolvable' }]);
+    const r1 = await runFactsBackstop(meetingPage(), makeCtx({ mode: 'inline', source: 'sync:import' }));
+    if (r1.mode !== 'inline') return;
+    expect(r1.inserted).toBe(1);
+    // Same fingerprint (whitespace and case differences collapse), different bytes.
+    chatStub([{ fact: 'said  hello, twice', kind: 'event', notability: 'high', entity: 'nobodyresolvable' }]);
+    const r2 = await runFactsBackstop(meetingPage(), makeCtx({ mode: 'inline', source: 'sync:import' }));
+    if (r2.mode !== 'inline') return;
+    expect({ inserted: r2.inserted, duplicate: r2.duplicate }).toEqual({ inserted: 0, duplicate: 1 });
+    expect(await census('Said hello, twice')).toEqual([{ entity_slug: null, n: 1 }]);
+  });
+
+  test('visibility and attribution still separate rows; different text inserts', async () => {
+    chatStub([{ fact: 'unparented-claim-B', kind: 'event', notability: 'high', entity: null }]);
+    const a = await runFactsBackstop(meetingPage(), makeCtx({ mode: 'inline', source: 'sync:import' }));
+    if (a.mode !== 'inline') return;
+    expect(a.inserted).toBe(1);
+    chatStub([{ fact: 'unparented-claim-B', kind: 'event', notability: 'high', entity: null }]);
+    const b = await runFactsBackstop(meetingPage(), makeCtx({ mode: 'inline', source: 'sync:import', visibility: 'world' }));
+    if (b.mode !== 'inline') return;
+    expect(b.inserted).toBe(1);
+    chatStub([{ fact: 'unparented-claim-C', kind: 'event', notability: 'high', entity: null }]);
+    const c = await runFactsBackstop(meetingPage(), makeCtx({ mode: 'inline', source: 'sync:import' }));
+    if (c.mode !== 'inline') return;
+    expect(c.inserted).toBe(1);
+    const rows = await engine.executeRaw<{ fact: string; visibility: string }>(
+      `SELECT fact, visibility FROM facts WHERE fact LIKE 'unparented-claim-%' AND fact <> 'unparented-claim-A' ORDER BY id`);
+    expect(rows).toEqual([
+      { fact: 'unparented-claim-B', visibility: 'private' },
+      { fact: 'unparented-claim-B', visibility: 'world' },
+      { fact: 'unparented-claim-C', visibility: 'private' },
+    ]);
+  });
+});
+
 describe('runFactsBackstop — stub guard routing (v0.34.5)', () => {
   test('bare-name entity routes to legacy DB-only path (no phantom page)', async () => {
-    // Set up: configure default source with a real local_path so the
-    // backstop reaches Phase 5 (fence write) instead of Phase 4 (legacy).
-    // This is the scenario where the stub guard actually fires.
     const { mkdtempSync, rmSync, existsSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
@@ -263,9 +373,6 @@ describe('runFactsBackstop — stub guard routing (v0.34.5)', () => {
       //   2. fuzzy match → miss (no title contains noresolvable)
       //   3. prefix expansion → miss (no people/noresolvable-* rows)
       //   4. slugify fallback → 'noresolvable' (bare)
-      // The bare slug then trips the stub guard in writeFactsToFence,
-      // which returns stubGuardBlocked: true, and backstop routes the
-      // fact to engine.insertFact (DB-only).
       chatStub([
         { fact: 'said hello at the meeting', kind: 'event', notability: 'high', entity: 'noresolvable' },
       ]);
@@ -281,14 +388,12 @@ describe('runFactsBackstop — stub guard routing (v0.34.5)', () => {
         // No phantom file at the brain root (this is the whole point of the guard).
         expect(existsSync(join(brainDir, 'noresolvable.md'))).toBe(false);
 
-        // The fact is in the DB with the bare entity_slug. Query directly to
-        // confirm — the routing is the contract under test.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const rows = await (engine as any).db.query(
           `SELECT entity_slug, fact, source_markdown_slug FROM facts WHERE id = $1`,
           [r.fact_ids[0]],
         );
-        expect(rows.rows[0].entity_slug).toBe('noresolvable');
+        expect(rows.rows[0].entity_slug).toBeNull();
         expect(rows.rows[0].fact).toBe('said hello at the meeting');
         // source_markdown_slug is the fence-tracking column; under DB-only
         // fallback it stays null (no .md file backs the row).
@@ -299,5 +404,111 @@ describe('runFactsBackstop — stub guard routing (v0.34.5)', () => {
       await (engine as any).db.query(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
       rmSync(brainDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('runFactsBackstop — sync.write_through opt-out', () => {
+  test('flag disabled routes fence-eligible facts to DB-only (no fence file, fact still lands)', async () => {
+    const { mkdtempSync, rmSync, existsSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { _resetWriteThroughCacheForTest } = await import('../src/core/write-through.ts');
+
+    const brainDir = mkdtempSync(join(tmpdir(), 'backstop-write-through-flag-'));
+    try {
+      await engine.putPage('people/flag-test', {
+        type: 'person', title: 'Flag Test', compiled_truth: '# Existing entity', frontmatter: {},
+      }, { sourceId: 'default' });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (engine as any).db.query(
+        `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+        [brainDir],
+      );
+      await engine.setConfig('sync.write_through', 'false');
+      _resetWriteThroughCacheForTest();
+
+      chatStub([
+        { fact: 'joined widget-co as cto', kind: 'event', notability: 'high', entity: 'people/flag-test' },
+      ]);
+
+      const r = await runFactsBackstop(meetingPage(), makeCtx({ mode: 'inline' }));
+
+      expect(r.mode).toBe('inline');
+      if (r.mode === 'inline') {
+        // The fact MUST persist via the DB-only route, not get dropped.
+        expect(r.inserted).toBe(1);
+        expect(r.fact_ids.length).toBe(1);
+
+        // No fence file, no stub page, not even the directory.
+        expect(existsSync(join(brainDir, 'people/flag-test.md'))).toBe(false);
+        expect(existsSync(join(brainDir, 'people'))).toBe(false);
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const rows = await (engine as any).db.query(
+          `SELECT entity_slug, source_markdown_slug FROM facts WHERE id = $1`,
+          [r.fact_ids[0]],
+        );
+        expect(rows.rows[0].entity_slug).toBe('people/flag-test');
+        // DB-only rows have no .md of record.
+        expect(rows.rows[0].source_markdown_slug).toBeNull();
+      }
+    } finally {
+      await engine.unsetConfig('sync.write_through');
+      _resetWriteThroughCacheForTest();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (engine as any).db.query(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+      rmSync(brainDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// #4870: the durable facts-absorb payload carries the writer's notabilityFilter
+// verbatim (backstop.ts), but the minion handler (commands/jobs.ts) is the only
+// reader of that value — it must honor every value the ctx union permits, not
+// collapse everything but 'high-only' to 'all'. Drive the registered handler
+// directly with a queued 'medium-and-up' payload (reachable at stock master via
+// `gbrain jobs submit facts-absorb --params ...`).
+describe('facts-absorb minion handler honors the queued notabilityFilter (#4870)', () => {
+  test("a queued 'medium-and-up' payload persists high+medium and drops low", async () => {
+    const worker = new MinionWorker(engine, { queue: 'test' });
+    await registerBuiltinHandlers(worker, engine, { quiet: true });
+    const handler = worker.getHandler('facts-absorb');
+    expect(handler).toBeDefined();
+
+    const page = meetingPage();
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth) VALUES ($1, 'default', 'meeting', $1, $2)`,
+      [page.slug, LONG_BODY],
+    );
+    chatStub([
+      { fact: 'queued-medium-up-high', kind: 'event', notability: 'high', entity: 'people/queue-test' },
+      { fact: 'queued-medium-up-medium', kind: 'event', notability: 'medium', entity: 'people/queue-test' },
+      { fact: 'queued-medium-up-low', kind: 'event', notability: 'low', entity: 'people/queue-test' },
+    ]);
+    const job: MinionJobContext = {
+      id: 1,
+      name: 'facts-absorb',
+      data: { slug: page.slug, sourceId: 'default', source: 'mcp:put_page', notabilityFilter: 'medium-and-up' },
+      attempts_made: 0,
+      idempotency_key: null,
+      signal: new AbortController().signal,
+      deadlineAtMs: null,
+      shutdownSignal: new AbortController().signal,
+      updateProgress: async () => {},
+      updateTokens: async () => {},
+      log: async () => {},
+      isActive: async () => true,
+      readInbox: async () => [],
+    };
+    await handler!(job);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      `SELECT fact FROM facts WHERE fact LIKE 'queued-medium-up-%' ORDER BY fact`,
+    );
+    expect(rows.rows.map((r: { fact: string }) => r.fact)).toEqual([
+      'queued-medium-up-high',
+      'queued-medium-up-medium',
+    ]);
   });
 });

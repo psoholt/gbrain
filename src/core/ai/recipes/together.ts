@@ -10,12 +10,26 @@ export const together: Recipe = {
   name: 'Together AI',
   tier: 'openai-compat',
   implementation: 'openai-compatible',
+  // No shipped rate for these yet: they warn and run under a default cap; a
+  // user cap refuses them until `gbrain pricing set` registers one (X1 guard).
+  unpriced_models: [
+    'Qwen/Qwen2.5-72B-Instruct-Turbo',
+    'deepseek-ai/DeepSeek-V3',
+    'mistralai/Mixtral-8x22B-Instruct-v0.1',
+  ],
   base_url_default: 'https://api.together.xyz/v1',
   auth_env: {
     required: ['TOGETHER_API_KEY'],
     setup_url: 'https://api.together.ai/settings/api-keys',
   },
   touchpoints: {
+    // Same OpenAI-compatible endpoint as chat; declared so an explicit
+    // `expansion_model: together:...` resolves instead of silently dropping
+    // expansion (#1135).
+    expansion: {
+      models: ['meta-llama/Llama-3.3-70B-Instruct-Turbo', 'Qwen/Qwen2.5-72B-Instruct-Turbo'],
+      price_last_verified: '2026-04-20',
+    },
     chat: {
       models: [
         'Qwen/Qwen2.5-72B-Instruct-Turbo',

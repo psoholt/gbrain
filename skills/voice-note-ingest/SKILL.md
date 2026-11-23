@@ -36,15 +36,16 @@ up. The vivid, unpolished, stream-of-consciousness phrasing captures
 something that cleaned-up prose does not. Preserve it in block quotes.
 The Analysis section can interpret; the transcript section is sacred.
 
-- ✅ `"The ambition-to-lifespan ratio has never been more fucked"`
+- ✅ `"The ambition-to-lifespan ratio has never been more lopsided"`
 - ❌ `User noted the tension between ambition and mortality`
 
 ## When to invoke
 
-The user sends an audio or voice message via any channel (Telegram, voice
-memo upload, openclaw audio attachment). The host agent typically provides
-the transcript text. If not, transcribe via `gbrain transcription` (Groq
-Whisper by default; OpenAI fallback for audio > 25MB segmented via ffmpeg).
+The user sends an audio or voice message via any channel (a chat app, a
+voice memo upload, an agent host's audio attachment). The host agent typically provides
+the transcript text. If not, transcribe it with your host's transcription
+tool (Groq Whisper is fast and cheap; OpenAI Whisper works too — segment
+audio > 25MB via ffmpeg first).
 
 ## The pipeline
 
@@ -52,8 +53,9 @@ Whisper by default; OpenAI fallback for audio > 25MB segmented via ffmpeg).
 1. STORE       → Upload original audio to gbrain storage backend
                  (S3 / Supabase Storage / local — pluggable per
                  src/core/storage.ts).
-2. TRANSCRIBE  → Use the agent-provided transcript verbatim, OR call
-                 gbrain transcription if no transcript was supplied.
+2. TRANSCRIBE  → Use the agent-provided transcript verbatim, OR
+                 transcribe the audio yourself (see "When to invoke")
+                 if no transcript was supplied.
 3. ROUTE       → Apply the decision tree (below) to find the right
                  destination directory.
 4. WRITE       → Create / update the destination brain page; preserve the
@@ -158,13 +160,20 @@ Include timestamps when available:
 ## Naming convention
 
 - Audio files: `YYYY-MM-DD-<brief-slug>.<ext>` (e.g.,
-  `2026-04-13-rick-rubin-creative-philosophy.ogg`)
+  `2026-04-13-alice-example-creative-process.ogg`)
 - Brain pages: match the slug of the destination directory.
 
 ## Bulk vs. single
 
 This skill handles ONE voice note at a time. Each is its own ingest cycle.
 No batching.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- Transcription is unavailable or the storage backend refuses the audio (`gbrain storage` shows no backend): file the note text you have and tell the user the audio was not stored.
+- The routed page write returns `revision_conflict` or `write_pending`: re-read and merge, or poll `gbrain write-request <request_id>`; never paraphrase to resolve a conflict.
 
 ## Anti-Patterns
 
@@ -191,10 +200,10 @@ This skill guarantees:
 - Routing matches the canonical triggers in the frontmatter.
 - Output written under the directories listed in `writes_to:` (when applicable).
 - Conventions referenced (`quality.md`, `brain-first.md`, `_brain-filing-rules.md`) are followed.
-- Privacy contract preserved: no real names, no fork-specific filesystem path literals, no upstream-fork references.
+- Examples use placeholder names and paths.
 
-The full behavior contract is documented in the body sections above; this section exists for the conformance test.
+The full behavior contract is documented in the body sections above.
 
 ## Output Format
 
-The skill's output shape is documented inline in the body sections above (see "Output", "Brain page format", or equivalent). The literal section header here exists for the conformance test (`test/skills-conformance.test.ts`).
+The skill's output shape is documented inline in the body sections above (see "Output", "Brain page format", or equivalent).

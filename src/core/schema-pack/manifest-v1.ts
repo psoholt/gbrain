@@ -16,6 +16,7 @@
 //   `<pack-name>@<version>+<manifest-sha8>` (E10).
 
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 
 export const SCHEMA_PACK_API_VERSION = 'gbrain-schema-pack-v1' as const;
 
@@ -34,12 +35,23 @@ const LinkInferenceSchema = z.object({
   regex: z.string().optional(),
   page_type: z.string().optional(),
   target_type: z.string().optional(),
+  /** The regex labels body mentions found by NER only; markdown links fall through to the in-code matchers (#5882). */
+  ner_only: z.boolean().optional(),
 }).strict();
 
 const LinkTypeSchema = z.object({
   name: z.string().min(1),
   inverse: z.string().optional(),
   inference: LinkInferenceSchema.optional(),
+  /**
+   * Temporal typed edges: `state` relations can end (works_at, reports_to) and
+   * graph reads return the ones true today; `event` relations happened on a
+   * date and stay true. Omitted: the built-in table decides, else a plain
+   * reference. See docs/guides/temporal-edges.md.
+   */
+  temporal: z.enum(['state', 'event']).optional(),
+  /** `one_per_from`: a page holds at most one live relationship of this type; a newer dated start closes the older one (docs/guides/temporal-edges.md). */
+  cardinality: z.enum(['many', 'one_per_from']).optional(),
 }).strict();
 
 /**
@@ -141,6 +153,8 @@ const PageTypeSchema = z.object({
    * declare it stay valid. Consumers MUST handle undefined via `?? []`.
    */
   subtypes: z.array(SubtypeMatchSchema).optional(),
+  /** Frontmatter fields that hold one identity per entity (an account or registry id); the duplicate finder treats a shared value as a key and a different value as a veto (core/entities/duplicates.ts). */
+  identity_keys: z.array(z.string().min(1)).optional(),
 }).strict();
 
 const FrontmatterLinkSchema = z.object({
@@ -258,6 +272,7 @@ const RetypeMappingRuleSchema = z.object({
   subtype: z.string().optional(),
   subtype_field: z.enum(ALLOWED_SUBTYPE_FIELDS).default('subtype'),
   path_filter: z.string().optional(),
+  slug_filter: z.string().optional(),
 }).strict();
 
 const ResolverSchema = z.union([
@@ -448,11 +463,7 @@ export function parseSchemaPackManifest(
 export async function computeManifestSha8(manifest: SchemaPackManifest): Promise<string> {
   // Canonical JSON: sorted keys for determinism (E10 + codex F6 hash-determinism).
   const canonical = canonicalJSONStringify(manifest);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
-  return Array.from(new Uint8Array(hashBuffer))
-    .slice(0, 4)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 8);
 }
 
 function canonicalJSONStringify(value: unknown): string {

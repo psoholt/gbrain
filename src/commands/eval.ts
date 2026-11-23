@@ -52,6 +52,15 @@ export async function runEvalCommand(engine: BrainEngine, args: string[]): Promi
     const { runEvalCrossModal } = await import('./eval-cross-modal.ts');
     process.exit(await runEvalCrossModal(args.slice(1)));
   }
+  if (sub === 'brainbench') {
+    // No-DB sub-subcommand: brainbench brings its own hermetic PGLite. The
+    // cli.ts dispatcher routes the user-facing path before connectEngine;
+    // this branch only fires on re-entry. Engine intentionally unused. The
+    // command owns its exit codes (0 pass / 1 regression / 2 error).
+    const { runEvalBrainBench } = await import('./eval-brainbench.ts');
+    await runEvalBrainBench(args.slice(1));
+    return; // unreachable — runEvalBrainBench always exits — but keeps control flow explicit
+  }
   if (sub === 'code-retrieval') {
     // v0.33.3 pre-w0 — code-retrieval baseline / gate harness. Needs a brain
     // for the baseline (BaselineStrategy calls hybridSearch); --compare
@@ -105,11 +114,24 @@ export async function runEvalCommand(engine: BrainEngine, args: string[]): Promi
   // v0.32.3 search-lite — per-mode orchestrator + comparison report.
   if (sub === 'run-all') {
     const { runEvalRunAll } = await import('./eval-run-all.ts');
-    return runEvalRunAll(engine, args.slice(1));
+    const { setCliExitVerdict } = await import('../core/cli-force-exit.ts');
+    setCliExitVerdict(await runEvalRunAll(engine, args.slice(1)));
+    return;
   }
   if (sub === 'compare') {
     const { runEvalCompare } = await import('./eval-compare.ts');
     return runEvalCompare(args.slice(1));
+  }
+  if (sub === 'synthesize-concepts') {
+    // #4198: honest not-implemented scaffold. The user-facing path routes
+    // through the cli.ts pre-engine branch; this re-entry branch exists so
+    // the generic qrels flow below can never recapture the subcommand.
+    const { runEvalSynthesizeConceptsCli } = await import('./eval-synthesize-concepts.ts');
+    const { setCliExitVerdict } = await import('../core/cli-force-exit.ts');
+    // Exit-verdict ownership: never assign process.exitCode raw — PGLite
+    // teardown can scribble over it; the owned verdict survives (cli-force-exit).
+    setCliExitVerdict(await runEvalSynthesizeConceptsCli(args.slice(1)));
+    return;
   }
 
   const opts = parseArgs(args);
@@ -395,6 +417,26 @@ gbrain eval — measure and compare retrieval quality
 USAGE
   gbrain eval --qrels <path>
   gbrain eval --qrels <path> --config-a <path> --config-b <path>
+  gbrain eval <subcommand> [flags]     (run \`gbrain eval <subcommand> --help\` where available)
+
+SUBCOMMANDS (#3686 — each has its own flag surface)
+  replay                     Re-run captured production queries against the current config
+  retrieval-quality          Retrieval-quality suite over the calibration corpus
+  gate                       CI pass/fail gate over a saved baseline
+  compare                    Compare two saved eval runs
+  run-all                    Run the wired suites (brainbench); names the per-suite commands for the rest
+  brainbench                 Cross-harness memory conformance suite (hermetic)
+  longmemeval                LongMemEval benchmark (brings its own in-memory brain)
+  cross-modal                Cross-modal quality gate (pure API calls, no DB)
+  code-retrieval             Code-retrieval benchmark
+  brainstorm                 Brainstorm-quality eval
+  whoknows                   whoknows ranking eval
+  suspected-contradictions   Contradiction-probe eval
+  trajectory                 Chronological claim trajectory for an entity
+  conversation-parser        Fixture-corpus CI gate for the parser registry
+  chronicle                  Chronicle suite
+  takes-quality              {run,trend,regress,replay} takes-quality harness
+  export / prune             Export or prune recorded eval results
 
 OPTIONS
   --qrels <path|json>         Path to qrels JSON file (required)
@@ -422,6 +464,13 @@ QRELS FORMAT
     ]
   }
   "grades" is optional — enables graded nDCG. Without it, binary relevance is used.
+  A bare array of entries (no wrapper) is also accepted, as are the
+  \`gbrain eval gate\` per-entry keys ("relevant_slugs" / "first_relevant_slug",
+  in a {"schema_version": 1, "queries": [...]} wrapper) — they map onto
+  "relevant". The gate's federated shape ("relevant" as {source_id, slug}
+  objects) is gate-only: this command compares unqualified slugs and rejects
+  it with a pointer to \`gbrain eval gate\`. Every entry is validated BEFORE
+  any search is billed.
 
 CONFIG FORMAT
   { "name": "rrf-k-30", "strategy": "hybrid", "rrf_k": 30, "expand": false }

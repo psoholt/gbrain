@@ -1,3 +1,5 @@
+import { assertUnmanagedCanonicalWriter } from './persistence/maintenance.ts';
+import { managedPersistenceEnabled } from './persistence/ownership.ts';
 /**
  * Destructive operation guard — v0.26.5
  *
@@ -14,6 +16,17 @@
  */
 
 import type { BrainEngine } from './engine.ts';
+import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
+import { rmSync, lstatSync, realpathSync } from 'node:fs';
+import { resolve as resolvePath } from 'node:path';
+import { isPathContained } from './path-confine.ts';
+import { defaultCloneDir } from './sources-ops.ts';
+import { gbrainPath } from './config.ts';
+import { isMissingSchemaObject } from './utils.ts';
+import { deleteSourceRow, EXPIRED_ARCHIVE_SQL, UNVERIFIED_ARCHIVE_SQL, unverifiedArchiveReason } from './source-delete.ts';
+import { ItemRun } from './item-failure.ts';
+import { OperationError } from './ops/contract.ts';
+import { cliRenderContext, renderAction, type RenderedAction } from './agent-output.ts';
 
 // ── Types ───────────────────────────────────────────────────
 
@@ -24,8 +37,34 @@ export interface DestructiveImpact {
   chunkCount: number;
   embeddingCount: number;
   fileCount: number;
+  /**
+   * PR6 D5b: count of ALL OAuth clients (live AND soft-deleted — the FK is
+   * physical, ON DELETE RESTRICT ignores deleted_at) whose source_id
+   * references this source. A hard delete with referents raises a raw FK
+   * violation — the preview surfaces the block before the trigger is pulled.
+   * Optional so hand-built impact literals (tests, older callers) stay valid.
+   */
+  oauthClientCount?: number;
+  /**
+   * cathedral-6: count of hot-memory facts in the source. Facts are the
+   * primary agent write lane — a revoked agent's workspace can hold facts
+   * with ZERO pages, so a pages-only preview would say "safe to remove"
+   * while the delete cascades the agent's memory away. Optional so
+   * hand-built impact literals (tests, older callers) stay valid; consumers
+   * read it as `?? 0`.
+   */
+  factCount?: number;
   /** Human-readable summary line */
   summary: string;
+}
+
+/** An OAuth client row that references a source via oauth_clients.source_id.
+ * `deleted` marks soft-deleted (revoked-but-retained) rows — the FK is
+ * PHYSICAL (ON DELETE RESTRICT ignores deleted_at), so they block too. */
+export interface SourceClientReferent {
+  clientId: string;
+  clientName: string;
+  deleted: boolean;
 }
 
 export interface SoftDeletedSource {
@@ -43,6 +82,93 @@ export const SOFT_DELETE_TTL_HOURS = 72;
 
 /** Threshold: operations affecting this many pages or more require confirmation. */
 export const CONFIRM_THRESHOLD_PAGES = 1;
+
+// ── FK-RESTRICT lifecycle (PR6 D5b) ─────────────────────────
+
+/**
+ * ALL OAuth clients referencing a source via oauth_clients.source_id
+ * (ON DELETE RESTRICT — these rows BLOCK a hard delete of the source).
+ * PHYSICAL semantics: soft-deleted rows (admin revoke does UPDATE SET
+ * deleted_at) still hold the FK, so they are returned too, tagged
+ * `deleted: true`, and the guidance splits per row. Pre-migration brains
+ * without the deleted_at column fall back to all referents (same
+ * 42703-retry idiom as oauth-provider.ts) tagged live; brains without
+ * the oauth_clients table — or without the source_id column (no column
+ * ⇒ no FK ⇒ no referents) — have no referents by construction.
+ */
+export async function clientsReferencingSource(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<SourceClientReferent[]> {
+  try {
+    const rows = await engine.executeRaw<{ client_id: string; client_name: string; deleted: boolean }>(
+      `SELECT client_id, client_name, (deleted_at IS NOT NULL) AS deleted
+       FROM oauth_clients
+       WHERE source_id = $1
+       ORDER BY client_id`,
+      [sourceId],
+    );
+    return rows.map((r) => ({ clientId: r.client_id, clientName: r.client_name, deleted: r.deleted === true }));
+  } catch (e) {
+    if (isMissingSchemaObject(e, 'table', 'oauth_clients')) return [];
+    // The primary query references BOTH optional columns; the strict
+    // predicate tells them apart by the column the error names.
+    if (isMissingSchemaObject(e, 'column', 'source_id')) return [];
+    if (!isMissingSchemaObject(e, 'column', 'deleted_at')) throw e;
+    try {
+      const rows = await engine.executeRaw<{ client_id: string; client_name: string }>(
+        `SELECT client_id, client_name FROM oauth_clients
+         WHERE source_id = $1
+         ORDER BY client_id`,
+        [sourceId],
+      );
+      return rows.map((r) => ({ clientId: r.client_id, clientName: r.client_name, deleted: false }));
+    } catch (e2) {
+      // The fallback's only optional column is source_id — no column ⇒ no FK.
+      if (isMissingSchemaObject(e2, 'column', 'source_id')) return [];
+      throw e2;
+    }
+  }
+}
+
+/**
+ * Refusal message for `sources remove` / `sources purge <id>` when live OAuth
+ * clients still reference the source. Built here (not in sources.ts — that
+ * file is module-size-ratcheted) so both arms print identical guidance
+ * instead of letting the raw FK violation surface.
+ */
+export function formatClientReferentsBlock(
+  sourceId: string,
+  referents: SourceClientReferent[],
+): string {
+  const live = referents.filter((r) => !r.deleted);
+  const dead = referents.filter((r) => r.deleted);
+  const lines: string[] = [
+    ``,
+    `Cannot delete source "${sourceId}": ${referents.length} OAuth client(s) reference this source`,
+    `(oauth_clients.source_id is ON DELETE RESTRICT — the delete would fail at the database).`,
+    ``,
+  ];
+  for (const r of referents) {
+    lines.push(`  - ${r.clientName} (${r.clientId})${r.deleted ? '  [revoked, retained]' : ''}`);
+  }
+  if (live.length > 0) {
+    lines.push(``);
+    lines.push(`Revoke each live client first (hard delete), then retry:`);
+    for (const r of live) {
+      lines.push(`  gbrain auth revoke-client "${r.clientId}"`);
+    }
+  }
+  if (dead.length > 0) {
+    lines.push(``);
+    lines.push(`Revoked-but-retained rows still block the FK — \`gbrain auth revoke-client "<id>"\` hard-deletes them:`);
+    for (const r of dead) {
+      lines.push(`  gbrain auth revoke-client "${r.clientId}"`);
+    }
+  }
+  lines.push(``);
+  return lines.join('\n');
+}
 
 // ── Impact Assessment ───────────────────────────────────────
 
@@ -105,11 +231,31 @@ export async function assessDestructiveImpact(
     fileCount = fileRows[0]?.n ?? 0;
   }
 
+  // cathedral-6: count hot-memory facts. A revoked agent's workspace can
+  // hold facts with zero pages — those are data at risk, not "no data".
+  // Tolerant of a pre-v0.31 brain without the facts table (same degrade
+  // posture as clientsReferencingSource).
+  let factCount = 0;
+  try {
+    const factRows = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM facts WHERE source_id = $1`,
+      [sourceId],
+    );
+    factCount = factRows[0]?.n ?? 0;
+  } catch (e) {
+    if (!isMissingSchemaObject(e, 'table', 'facts')) throw e;
+  }
+
+  // PR6 D5b: fold the FK-RESTRICT referent count into the preview so the
+  // operator sees the block BEFORE pulling the trigger.
+  const oauthClientCount = (await clientsReferencingSource(engine, sourceId)).length;
+
   const parts: string[] = [];
   if (pageCount > 0) parts.push(`${pageCount.toLocaleString()} pages`);
   if (chunkCount > 0) parts.push(`${chunkCount.toLocaleString()} chunks`);
   if (embeddingCount > 0) parts.push(`${embeddingCount.toLocaleString()} embeddings`);
   if (fileCount > 0) parts.push(`${fileCount.toLocaleString()} files`);
+  if (factCount > 0) parts.push(`${factCount.toLocaleString()} facts`);
 
   const summary = parts.length > 0
     ? `⚠️  This will permanently delete: ${parts.join(', ')}`
@@ -122,6 +268,8 @@ export async function assessDestructiveImpact(
     chunkCount,
     embeddingCount,
     fileCount,
+    factCount,
+    oauthClientCount,
     summary,
   };
 }
@@ -143,8 +291,10 @@ export function checkDestructiveConfirmation(
   // Dry run always passes (no side effects)
   if (opts.dryRun) return null;
 
-  // No data = no risk
-  if (impact.pageCount === 0 && impact.chunkCount === 0 && impact.fileCount === 0) {
+  // No data = no risk. Facts gate exactly like pages (cathedral-6): a
+  // fact-only source (revoked agent workspace) is data at stake, not empty.
+  if (impact.pageCount === 0 && impact.chunkCount === 0 && impact.fileCount === 0
+    && (impact.factCount ?? 0) === 0) {
     return null;
   }
 
@@ -153,8 +303,9 @@ export function checkDestructiveConfirmation(
 
   // --yes alone is NOT sufficient for destructive operations with data.
   // This is the key behavior change: --yes used to be enough, now you
-  // need --confirm-destructive when there's actual data at stake.
-  if (opts.yes && impact.pageCount === 0) return null;
+  // need --confirm-destructive when there's actual data at stake. Facts
+  // mirror pages here too — --yes never bypasses a fact-holding source.
+  if (opts.yes && impact.pageCount === 0 && (impact.factCount ?? 0) === 0) return null;
 
   return (
     `\n${impact.summary}\n\n` +
@@ -181,6 +332,15 @@ export async function softDeleteSource(
   engine: BrainEngine,
   sourceId: string,
 ): Promise<SoftDeletedSource | null> {
+  if(await managedPersistenceEnabled(engine)){
+    const {runManagedSourceLifecycle}=await import('./persistence/source-lifecycle.ts');
+    const result=await runManagedSourceLifecycle(engine,{operation:'archive',sourceId});
+    if(result.noop)return null;
+    const [row]=await engine.executeRaw<{name:string;archived_at:string;archive_expires_at:string;n:number}>(`SELECT name,archived_at,archive_expires_at,
+      (SELECT count(*)::integer FROM pages WHERE source_id=$1) AS n FROM sources WHERE id=$1`,[sourceId]);
+    return row?{id:sourceId,name:row.name,deletedAt:new Date(row.archived_at),expiresAt:new Date(row.archive_expires_at),pageCount:row.n}:null;
+  }
+  await assertUnmanagedCanonicalWriter(engine, 'sources archive');
   // Atomic: only flip rows that are currently active. Returns the metadata
   // we need without a follow-up SELECT. RETURNING projects the columns the
   // caller cares about; pageCount is a separate count.
@@ -190,7 +350,7 @@ export async function softDeleteSource(
      SET archived = true,
          archived_at = now(),
          archive_expires_at = ${expiresClause},
-         config = COALESCE(config, '{}'::jsonb) || '{"federated": false}'::jsonb
+         config = ${SOURCE_CONFIG_OBJECT_SQL} || '{"federated": false}'::jsonb
      WHERE id = $1 AND archived = false
      RETURNING id, name, archived_at, archive_expires_at`,
     [sourceId],
@@ -226,13 +386,20 @@ export async function restoreSource(
   sourceId: string,
   refederate: boolean = true,
 ): Promise<boolean> {
-  const federatedPatch = refederate ? '{"federated": true}' : '{"federated": false}';
+  if(await managedPersistenceEnabled(engine)){
+    const {runManagedSourceLifecycle}=await import('./persistence/source-lifecycle.ts');
+    const result=await runManagedSourceLifecycle(engine,{operation:'restore',sourceId,refederate});return !result.noop;
+  }
+  await assertUnmanagedCanonicalWriter(engine, 'sources restore');
+  // GST-1113: a scope source is never federated, so restore leaves it unfederated.
+  const federate = refederate && !(await (await import('./access/attest-sources.ts')).markedScopeSources(engine, [sourceId])).size;
+  const federatedPatch = federate ? '{"federated": true}' : '{"federated": false}';
   const rows = await engine.executeRaw<{ id: string }>(
     `UPDATE sources
      SET archived = false,
          archived_at = NULL,
          archive_expires_at = NULL,
-         config = COALESCE(config, '{}'::jsonb) || $1::jsonb
+         config = ${SOURCE_CONFIG_OBJECT_SQL} || $1::text::jsonb
      WHERE id = $2 AND archived = true
      RETURNING id`,
     [federatedPatch, sourceId],
@@ -274,25 +441,139 @@ export async function listArchivedSources(
   }));
 }
 
+/** Result of a purge sweep: what deleted, and what an FK deliberately held. */
+export interface PurgeExpiredResult {
+  /** Source ids permanently deleted this sweep. */
+  purged: string[];
+  /**
+   * Sources past TTL that could NOT be deleted because a RESTRICT FK still
+   * references them — today that is migration v64's oauth_clients.source_id
+   * ON DELETE RESTRICT, which intentionally refuses source deletion until
+   * every client is revoked-and-purged or re-scoped. Blocked is a policy
+   * outcome, not an error: the sweep reports it and moves on.
+   */
+  blocked: Array<{
+    id: string;
+    reason: string;
+    /** GBRA-130 A-50 (unmanaged): the classified code of a delete that failed for this source alone (statement_timeout, lock_timeout, ...). */
+    code?: string;
+    /** With `code`: the manual purge of this source, for the user to run (`next: tell_user_to_run`). */
+    fix?: RenderedAction;
+  }>;
+}
+
 /**
  * Permanently purge sources whose 72h TTL has expired. Cascades to pages
- * (and content_chunks via existing FKs). Returns the ids of purged sources.
+ * (and content_chunks via existing FKs).
  *
- * v0.26.5: moved from JSONB-driven iteration to a single set-based DELETE
- * with `archived = true AND archive_expires_at <= now()`. Server-side
- * filter; one round-trip; cascade-friendly.
+ * v0.26.5 used a single set-based DELETE; gbrain#4115 showed one FK-blocked
+ * source (a revoked-but-retained oauth_client under v64's ON DELETE RESTRICT)
+ * aborted the whole statement, wedging the nightly purge forever. The sweep is
+ * now per-source: each DELETE re-checks the expiry predicate (no
+ * select-then-delete race with a concurrent restore), ONLY the FK-restriction
+ * error class (SQLSTATE 23503) is treated as blocked-and-reported.
+ * GBRA-130 A-50: any other failure of one source's delete is classified
+ * (classifyItemFailure via ItemRun): an item-scoped one (a statement timeout on
+ * a large source's cascade, a lock timeout) is reported in `blocked` with its
+ * code and the manual purge as its fix, and the sweep continues; a run-scoped
+ * one, or a sweep where most sources fail, re-raises. (Supersedes #4238's set-based NOT-EXISTS variant at
+ * merge: the 23503 catch covers ANY current or future RESTRICT FK — including
+ * soft-deleted oauth_clients, since the FK is physical — not just the one
+ * table an EXISTS prefilter names, and the structured {purged, blocked}
+ * return is what every caller + test in this tree consumes.)
  */
+async function unverifiedArchives(engine: BrainEngine): Promise<PurgeExpiredResult['blocked']> {
+  const rows = await engine.executeRaw<{ id: string }>(`SELECT id FROM sources WHERE ${UNVERIFIED_ARCHIVE_SQL} ORDER BY id`);
+  return rows.map(({ id }) => ({ id, reason: unverifiedArchiveReason(id) }));
+}
+
 export async function purgeExpiredSources(
   engine: BrainEngine,
-): Promise<string[]> {
-  const rows = await engine.executeRaw<{ id: string }>(
-    `DELETE FROM sources
-     WHERE archived = true
-       AND archive_expires_at IS NOT NULL
-       AND archive_expires_at <= now()
-     RETURNING id`,
+): Promise<PurgeExpiredResult> {
+  if(await managedPersistenceEnabled(engine)){
+    const {runManagedSourceLifecycle}=await import('./persistence/source-lifecycle.ts');
+    const candidates=await engine.executeRaw<{id:string;incarnation:string}>(`SELECT id,incarnation FROM sources WHERE ${EXPIRED_ARCHIVE_SQL} ORDER BY id`);
+    const result:PurgeExpiredResult={purged:[],blocked:await unverifiedArchives(engine)};
+    for(const source of candidates){
+      try{const receipt=await runManagedSourceLifecycle(engine,{operation:'purge',sourceId:source.id,expectedIncarnation:source.incarnation,confirmDestructive:true,expiredOnly:true});if(!receipt.noop)result.purged.push(source.id);}
+      catch(error){
+        const code=error instanceof OperationError&&error.code==='source_pages_remain'?error.code:undefined;
+        result.blocked.push({id:source.id,reason:error instanceof Error?error.message:'Source lifecycle could not finish.',...(code?{code,fix:renderAction((error as OperationError).fix!,cliRenderContext())}:{})});
+      }
+    }
+    return result;
+  }
+  await assertUnmanagedCanonicalWriter(engine, 'sources purge');
+  const candidates = await engine.executeRaw<{ id: string; config: unknown; local_path: string | null }>(
+    `SELECT id, config, local_path FROM sources WHERE ${EXPIRED_ARCHIVE_SQL} ORDER BY id`,
   );
-  return rows.map((r) => r.id);
+  const purged: string[] = [];
+  const blocked: PurgeExpiredResult['blocked'] = await unverifiedArchives(engine);
+  const cloneRoot = gbrainPath('clones');
+  const items = new ItemRun('retention.expired_sources');
+  for (const candidate of candidates) {
+    const { id } = candidate;
+    try {
+      if (await (await import('./owned-folder/remove.ts')).removeOwnedFolderThen(engine, id, {}, () => deleteSourceRow(engine, id, { expiredArchiveOnly: true }))) {
+        purged.push(id);
+        // github-kind mirrors are gbrain-owned only when created at the
+        // default clone location. Never recursively delete an altered or
+        // symlinked path outside the managed clone root.
+        try {
+          const cfg = (typeof candidate.config === 'string'
+            ? JSON.parse(candidate.config)
+            : (candidate.config ?? {})) as Record<string, unknown>;
+          if (cfg.kind === 'github' && cfg.gh_managed === true && candidate.local_path) {
+            // STRICT containment: isPathContained accepts child === parent, so
+            // a corrupt row whose local_path IS the clone root would rm -rf
+            // every mirror. Require a real subtree AND pin the gh_managed
+            // creation shape — addSource only sets the marker when the dir is
+            // exactly defaultCloneDir('<id>-github').
+            const strictSubtree =
+              isPathContained(candidate.local_path, cloneRoot) &&
+              realpathSync(candidate.local_path) !== realpathSync(cloneRoot);
+            const expectedShape =
+              resolvePath(candidate.local_path) === resolvePath(defaultCloneDir(`${id}-github`));
+            if (strictSubtree && expectedShape) {
+              const lst = lstatSync(candidate.local_path);
+              if (!lst.isSymbolicLink()) {
+                rmSync(candidate.local_path, { recursive: true, force: true });
+              }
+            }
+          }
+        } catch {
+          // Best-effort cleanup; source deletion already completed.
+        }
+      }
+      // 0 rows = restored/already gone between SELECT and DELETE; neither
+      // purged nor blocked.
+      items.succeed();
+    } catch (err) {
+      // SQLSTATE 23503 foreign_key_violation — same detection idiom as
+      // oauth-provider.ts's delete path for this exact FK.
+      if (err instanceof OperationError && err.code === 'source_pages_remain') {
+        blocked.push({ id, code: err.code, reason: `${err.message} ${err.suggestion}`, fix: renderAction(err.fix!, cliRenderContext()) });
+        continue;
+      }
+      if ((err as { code?: string })?.code === '23503') {
+        blocked.push({
+          id,
+          reason:
+            'still referenced by a RESTRICT foreign key (revoked oauth_client not yet purged? the FK is physical, so soft-deleted clients also block) — ' +
+            'review with `gbrain auth clients`, revoke with `gbrain auth revoke-client "<client-id>"`, then retry',
+        });
+        continue;
+      }
+      const failure = items.fail(id, err);
+      blocked.push({
+        id, code: failure.code,
+        reason: `its delete failed (${failure.message}); the next retention sweep retries it`,
+        fix: renderAction({ argv: ['gbrain', 'sources', 'purge', id, '--confirm-destructive'], consent: ['destructive'], actor: 'user', requires_exclusive: false,
+          why: 'Purges this expired archived source by hand, outside the nightly sweep.' }, cliRenderContext()),
+      });
+    }
+  }
+  return { purged, blocked };
 }
 
 // ── Display Helpers ─────────────────────────────────────────
@@ -313,11 +594,19 @@ export function formatImpact(impact: DestructiveImpact): string {
     `║  Chunks:     ${String(impact.chunkCount.toLocaleString()).padEnd(42)}║`,
     `║  Embeddings: ${String(impact.embeddingCount.toLocaleString()).padEnd(42)}║`,
     `║  Files:      ${String(impact.fileCount.toLocaleString()).padEnd(42)}║`,
+    `║  Facts:      ${String((impact.factCount ?? 0).toLocaleString()).padEnd(42)}║`,
     `╠══════════════════════════════════════════════════════════╣`,
     `║  ${impact.summary.padEnd(56)}║`,
     `╚══════════════════════════════════════════════════════════╝`,
     ``,
   ];
+  // PR6 D5b: surface the FK-RESTRICT block in the preview. Rendered outside
+  // the box (variable-width padding inside would misalign the frame).
+  if ((impact.oauthClientCount ?? 0) > 0) {
+    lines.push(`⚠️  ${impact.oauthClientCount} OAuth client(s) reference this source — a hard delete is`);
+    lines.push(`   blocked (FK RESTRICT) until they are revoked: gbrain auth revoke-client "<client-id>"`);
+    lines.push(``);
+  }
   return lines.join('\n');
 }
 

@@ -60,16 +60,22 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       cache_similarity_threshold: 0.92,
       cache_ttl_seconds: 3600,
       intentWeighting: true,
+      keywordOrFallback: true,
       tokenBudget: 4000,
       expansion: false,
+      // ranker wave — null = legacy weighting (byte-identical to pre-knob fusion).
+      expansion_variant_budget: null,
       searchLimit: 10,
       reranker_enabled: false,
-      reranker_model: 'zeroentropyai:zerank-2',
+      reranker_model: 'voyage:rerank-3-lite',
       reranker_top_n_in: 30,
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       title_boost: 1.25,
+      evidence_cosine_floor: 0.8,
+      reranker_gate: 'off',
+      reranker_gate_min_gap: 0.05,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: false,
       ...CR_DISABLED_DEFAULT,
@@ -77,9 +83,26 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       // v0.42.3.0 — autocut OFF for conservative (no reranker).
       autocut: false,
       autocut_jump: 0.2,
+      autocut_min_top: 0.35,
+      autocut_min_keep: 1,
       // v0.43 — relational recall OFF for conservative.
       relationalRetrieval: false,
       relational_retrieval_depth: 2,
+      // ranker wave (R1) — relational rerank pin, 3 in every bundle (0 = off).
+      relational_rerank_pin: 3,
+      relational_planner: false,
+      relational_orient_onehop: false,
+      relational_chain_slots: 10,
+      diverse_pool_depth: 0,
+      collapse: true,
+      rank_priors: true,
+      keyword_phrase: false,
+      qualified_aliases: false,
+      title_qualified: false,
+      // ranker wave (Phase E2) — keyword-arm confidence floor OFF in every bundle until the Cat 13 receipt.
+      keyword_arm_confidence_floor: null,
+      // ranker wave (Phase E3) — metadata boost gate `lexical` in every bundle since the Cat 13 held-out receipt (`always` = pre-wave pipeline).
+      metadata_boost_gate: 'lexical',
     });
   });
 
@@ -91,27 +114,49 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       cache_similarity_threshold: 0.92,
       cache_ttl_seconds: 3600,
       intentWeighting: true,
+      keywordOrFallback: true,
       tokenBudget: 12000,
       expansion: false,
+      expansion_variant_budget: null,
       searchLimit: 25,
       reranker_enabled: true,
-      reranker_model: 'zeroentropyai:zerank-2',
+      reranker_model: 'voyage:rerank-3-lite',
       // v0.42.3.0 D4: topNIn = searchLimit (25), was 30.
       reranker_top_n_in: 25,
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       title_boost: 1.25,
+      evidence_cosine_floor: 0.8,
+      reranker_gate: 'off',
+      reranker_gate_min_gap: 0.05,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: true,
       ...CR_DISABLED_DEFAULT,
       contextual_retrieval: 'title',
-      // v0.42.3.0 — autocut ON.
-      autocut: true,
+      // autocut OFF since the ranker wave (rule R2 receipt).
+      autocut: false,
       autocut_jump: 0.2,
+      autocut_min_top: 0.35,
+      autocut_min_keep: 1,
       // v0.43 — relational recall ON for balanced.
       relationalRetrieval: true,
       relational_retrieval_depth: 2,
+      // ranker wave (R1) — relational rerank pin, 3 in every bundle (0 = off).
+      relational_rerank_pin: 3,
+      relational_planner: true,
+      relational_orient_onehop: false,
+      relational_chain_slots: 10,
+      diverse_pool_depth: 0,
+      collapse: true,
+      rank_priors: true,
+      keyword_phrase: false,
+      qualified_aliases: false,
+      title_qualified: false,
+      // ranker wave (Phase E2) — keyword-arm confidence floor OFF in every bundle until the Cat 13 receipt.
+      keyword_arm_confidence_floor: null,
+      // ranker wave (Phase E3) — metadata boost gate `lexical` in every bundle since the Cat 13 held-out receipt (`always` = pre-wave pipeline).
+      metadata_boost_gate: 'lexical',
     });
   });
 
@@ -121,27 +166,50 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       cache_similarity_threshold: 0.92,
       cache_ttl_seconds: 3600,
       intentWeighting: true,
+      keywordOrFallback: true,
       tokenBudget: undefined,
-      expansion: true,
+      // GBRA-94 (2026-10-14): off, like the other two bundles.
+      expansion: false,
+      expansion_variant_budget: null,
       searchLimit: 50,
       reranker_enabled: true,
-      reranker_model: 'zeroentropyai:zerank-2',
+      reranker_model: 'voyage:rerank-3-lite',
       // v0.42.3.0 D4: topNIn = searchLimit (50), was 30.
       reranker_top_n_in: 50,
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       title_boost: 1.25,
+      evidence_cosine_floor: 0.8,
+      reranker_gate: 'off',
+      reranker_gate_min_gap: 0.05,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: true,
       ...CR_DISABLED_DEFAULT,
       contextual_retrieval: 'per_chunk_synopsis',
-      // v0.42.3.0 — autocut ON.
-      autocut: true,
+      // autocut OFF since the ranker wave (rule R2 receipt).
+      autocut: false,
       autocut_jump: 0.2,
+      autocut_min_top: 0.35,
+      autocut_min_keep: 1,
       // v0.43 — relational recall ON for tokenmax.
       relationalRetrieval: true,
       relational_retrieval_depth: 2,
+      // ranker wave (R1) — relational rerank pin, 3 in every bundle (0 = off).
+      relational_rerank_pin: 3,
+      relational_planner: true,
+      relational_orient_onehop: false,
+      relational_chain_slots: 10,
+      diverse_pool_depth: 0,
+      collapse: true,
+      rank_priors: true,
+      keyword_phrase: false,
+      qualified_aliases: false,
+      title_qualified: false,
+      // ranker wave (Phase E2) — keyword-arm confidence floor OFF in every bundle until the Cat 13 receipt.
+      keyword_arm_confidence_floor: null,
+      // ranker wave (Phase E3) — metadata boost gate `lexical` in every bundle since the Cat 13 held-out receipt (`always` = pre-wave pipeline).
+      metadata_boost_gate: 'lexical',
     });
   });
 
@@ -240,19 +308,19 @@ describe('resolveSearchMode resolution chain', () => {
   test('per-call false-y values (false / 0) still beat fallback', () => {
     const r = resolveSearchMode({
       mode: 'tokenmax',
-      perCall: { expansion: false, cache_enabled: false },
+      perCall: { reranker_enabled: false, cache_enabled: false },
     });
-    expect(r.expansion).toBe(false); // beat tokenmax's true
+    expect(r.reranker_enabled).toBe(false); // beat tokenmax's true
     expect(r.cache_enabled).toBe(false); // beat tokenmax's true
   });
 
   test('undefined fields in perCall fall through (not coerced to false)', () => {
     const r = resolveSearchMode({
       mode: 'tokenmax',
-      perCall: { tokenBudget: undefined, expansion: undefined },
+      perCall: { tokenBudget: undefined, reranker_enabled: undefined },
     });
     expect(r.tokenBudget).toBeUndefined(); // from tokenmax bundle
-    expect(r.expansion).toBe(true); // from tokenmax bundle, NOT overridden
+    expect(r.reranker_enabled).toBe(true); // from tokenmax bundle, NOT overridden
   });
 });
 
@@ -295,12 +363,12 @@ describe('v0.40.6.1 — reranker_timeout_ms threads recipe default through resol
     expect(r.reranker_timeout_ms).toBe(100);
   });
 
-  test('ZE (no recipe default) regression: still gets bundle default of 5000ms', () => {
-    // ZeroEntropy's recipe does not declare default_timeout_ms — its hosted
+  test('Voyage (no recipe default) regression: still gets bundle default of 5000ms', () => {
+    // Voyage's recipe does not declare default_timeout_ms — its hosted
     // path is fast enough that the bundle default suffices.
     const r = resolveSearchMode({
       mode: 'balanced',
-      overrides: { reranker_model: 'zeroentropyai:zerank-2' },
+      overrides: { reranker_model: 'voyage:rerank-2.5' },
     });
     expect(r.reranker_timeout_ms).toBe(5000);
   });
@@ -323,12 +391,20 @@ describe('attributeKnob source attribution', () => {
     expect(a.value).toBe(999);
   });
 
-  test('override source labels the config key path', () => {
-    const input = { mode: 'conservative', overrides: { cache_enabled: false } };
+  test('override source labels the REAL config key path, not the knob name (#4605)', () => {
+    // `gbrain search modes` prints source_detail verbatim as a copy-pasteable
+    // `gbrain config set` target, so it must be the key mode.ts reads.
+    const input = {
+      mode: 'conservative',
+      overrides: { cache_enabled: false, reranker_top_n_in: 5, relationalRetrieval: false },
+    };
     const resolved = resolveSearchMode(input);
     const a = attributeKnob('cache_enabled', input, resolved);
     expect(a.source).toBe('override');
-    expect(a.source_detail).toContain('search.cache_enabled');
+    expect(a.source_detail).toContain('search.cache.enabled');
+    expect(a.source_detail).not.toContain('search.cache_enabled');
+    expect(attributeKnob('reranker_top_n_in', input, resolved).source_detail).toBe('config: search.reranker.top_n_in');
+    expect(attributeKnob('relationalRetrieval', input, resolved).source_detail).toBe('config: search.relational_retrieval');
   });
 
   test('mode source labels the mode name', () => {
@@ -404,10 +480,146 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // v0.43: bumped 9→10 for the relational recall arm (rel=/reld=) — a
     // relational-on write must not be served to a relational-off lookup.
     // #1400: bumped 10→11 for the asymmetric input_type fix — embedQuery()
-    // now produces query-side vectors for asymmetric providers (zembed-1,
+    // now produces query-side vectors for asymmetric providers (voyage-4,
     // Voyage v3+), so rows keyed on pre-fix document-side query vectors
     // must not be served to post-fix lookups.
-    expect(KNOBS_HASH_VERSION).toBe(11);
+    // #2825: bumped 11→12 to fold the resolved hard-exclude prefix list
+    // (hx=) — cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across
+    // processes.
+    // #3390/#3391: bumped 12→13 for the embedding-provider migration wave —
+    // legacy callers hash prov=default before AND after a provider swap, so
+    // pre-migration cache rows must become unreachable on upgrade.
+    // v0.42.67.x bumped 13→14: the compiled_truth boost no longer applies at
+    // detail=medium (#3430). Cached rows were ranked under the old semantics,
+    // so they must become unreachable rather than be served under the new ones.
+    // Bumped 14→15 to fold the resolved FTS configuration name (fts=) —
+    // GBRAIN_FTS_LANGUAGE retokenizes both the trigger-built search_vector and
+    // the query-side tsquery, so rows written under the previous language must
+    // not survive a `reindex-search-vector` switch.
+    // #3515: bumped 15→16 to fold the effective detail level (det=) — a
+    // detail=low write must not be served to a detail=medium lookup.
+    // v0.46.15 (#1863): bumped 17→18 to fold the autocut weak-top floor (acm=).
+    // #3621: bumped 18→19 to fold the autocut minKeep floor (ack=).
+    // #895: bumped 19→21 — recency DEFAULT_FALLBACK 0.5→0.3 reorders cached
+    // rows (19→20 pool floor #3002, 20→21 recency fallback #895, same release).
+    // mw2: 21→22 — #1663 exact-lookup injection + #3995 relational slot +
+    // #3783/#4220 stamps alter stored rows for identical knobs.
+    // #4352 follow-up: bumped 22→23 to fold the private-visibility posture
+    // (xp=) — replaces the wholesale skipCache bypass that disabled the
+    // semantic cache for every remote MCP caller (excludePrivate=true is
+    // their default). A private-included write must not serve a
+    // private-excluding lookup and vice versa.
+    // #4358 residual: bumped 23→24 — negative-offset requests could
+    // read/write the same cache row an offset=0 request shares
+    // (pagedRequest previously skipped only offset>0).
+    // 24→25: kof= (keyword AND→OR fallback knob) joins the key.
+    // 25→26: sal=/rec=/ipat= — salience/recency + intent_patterns fold (#4415).
+    // 26→27: ar=/arem=/arom=/armk=/ari= — adaptive-return gate params +
+    // resolved intent class fold (2026-08 fix wave E5b + outside-voice F11);
+    // adaptive-on calls now cache instead of skipping.
+    // 27→28: compiledTruthBoost suppresses the 2x boost for synthetic
+    // chunkless title rows (#4256, fixes #3695's fusion path) — reorders
+    // fused rows for identical knobs; version-only invalidation.
+    // 28→29: evb= expansion variant budget fold (ranker wave) — budget-weighted
+    // variant fusion reorders rows for identical knobs; null hashes as legacy.
+    // v=29 ALSO carries rrp= (relational rerank pin, ranker wave R1) — same
+    // epoch, no extra bump: neither part had shipped in a release yet.
+    // v=29 ALSO carries kacf= (keyword-arm confidence floor, ranker wave
+    // Phase E2 / Cat 13) — same unshipped epoch; null hashes as off.
+    // v=29 ALSO carries mbg= (metadata boost gate, ranker wave Phase E3 /
+    // Cat 13) — same unshipped epoch; a partial literal hashes as always.
+    // 29→30 (#5889): exact-title-first title-arm order + weight-A remote
+    // title predicate reorder rows for identical knobs; version-only.
+    expect(KNOBS_HASH_VERSION).toBe(31);
+  });
+
+  test('#3515: detail set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
+    const knobs = resolveSearchMode({ mode: 'balanced' });
+    const low = knobsHash(knobs, { detail: 'low' });
+    const medium = knobsHash(knobs, { detail: 'medium' });
+    const high = knobsHash(knobs, { detail: 'high' });
+    const unset = knobsHash(knobs);
+    expect(low).not.toBe(medium);
+    expect(medium).not.toBe(high);
+    expect(low).not.toBe(high);
+    // Undefined falls back to 'medium' — the documented default — so legacy
+    // callers that don't thread detail share the default-detail rows.
+    expect(unset).toBe(medium);
+    // WP2/T3: bumped 16→17 for the degradation-stamp epoch — cache rows now
+    // carry degraded[]/retrieved_count; pre-stamp rows must not claim clean.
+    // v0.46.15 (#1863): 17→18 — autocut weak-top floor folds in (acm=).
+    // #3621: 18→19 — autocut minKeep floor folds in (ack=).
+    // 19→20 pool floor (#3002); 20→21 recency fallback re-key (#895).
+    // mw2: 21→22 result-stamp/injection epoch (#1663 #3995 #3783 #4220).
+    // #4352 follow-up: 22→23 private-visibility posture fold (xp=).
+    // #4358 residual: 23→24 negative-offset cache-skip gap.
+    // 24→25: kof= (keyword AND→OR fallback knob) joins the key.
+    // 25→26: sal=/rec=/ipat= — salience/recency + intent_patterns fold (#4415).
+    // 26→27: ar=/arem=/arom=/armk=/ari= — adaptive-return gate params +
+    // resolved intent class fold (2026-08 fix wave E5b + outside-voice F11);
+    // adaptive-on calls now cache instead of skipping.
+    // 27→28: compiledTruthBoost synthetic-row suppression (#4256/#3695) —
+    // version-only invalidation.
+    // 28→29: evb= expansion variant budget fold (ranker wave) — budget-weighted
+    // variant fusion reorders rows for identical knobs; null hashes as legacy.
+    // v=29 ALSO carries rrp= (relational rerank pin, ranker wave R1) — same
+    // epoch, no extra bump: neither part had shipped in a release yet.
+    // v=29 ALSO carries kacf= (keyword-arm confidence floor, ranker wave
+    // Phase E2 / Cat 13) — same unshipped epoch; null hashes as off.
+    // v=29 ALSO carries mbg= (metadata boost gate, ranker wave Phase E3 /
+    // Cat 13) — same unshipped epoch; a partial literal hashes as always.
+    expect(KNOBS_HASH_VERSION).toBe(31);
+  });
+
+  test('#4352 follow-up: excludePrivate true vs false produces DIFFERENT hashes (cache contamination prevention)', () => {
+    // The private-visibility posture folds into the key (xp=) instead of
+    // wholesale-skipping the cache: excludePrivate=true is the DEFAULT for
+    // every remote MCP caller, so the skip disabled the semantic cache for
+    // exactly the highest-volume beneficiaries. A private-included (trusted)
+    // write must never serve a private-excluding lookup and vice versa.
+    const knobs = resolveSearchMode({ mode: 'balanced' });
+    const excluding = knobsHash(knobs, { excludePrivate: true });
+    const including = knobsHash(knobs, { excludePrivate: false });
+    const unset = knobsHash(knobs);
+    expect(excluding).not.toBe(including);
+    // Undefined hashes like false (private included) — mirrors enforcement's
+    // strict `=== true` predicate, so legacy callers that don't thread the
+    // posture share the trusted (private-included) rows.
+    expect(unset).toBe(including);
+  });
+
+  test('#4415 (wave-g): salience/recency modes produce DIFFERENT hashes (cache contamination prevention)', () => {
+    // A salience:'strong' write (post-fusion reordered result set) must
+    // never serve a salience:'off' lookup of the same query, and vice
+    // versa — same contamination class as det= (v=16). #4415 extended the
+    // per-call overrides to the default MCP `search` surface.
+    const knobs = resolveSearchMode({ mode: 'balanced' });
+    const off = knobsHash(knobs, { salience: 'off', recency: 'off' });
+    const on = knobsHash(knobs, { salience: 'on', recency: 'off' });
+    const strong = knobsHash(knobs, { salience: 'strong', recency: 'off' });
+    const recOn = knobsHash(knobs, { salience: 'off', recency: 'on' });
+    const recStrong = knobsHash(knobs, { salience: 'off', recency: 'strong' });
+    const unset = knobsHash(knobs);
+    expect(new Set([off, on, strong, recOn, recStrong]).size).toBe(5);
+    // Undefined falls back to 'off' (the classifier default for unmatched
+    // queries) so legacy callers that don't thread the modes hash stably.
+    expect(unset).toBe(off);
+  });
+
+  test('#4415 (wave-g): intent-pattern config fingerprint produces DIFFERENT hashes (config-edit invalidation)', () => {
+    // search.intent_patterns changes classification (intent weights + auto
+    // salience/recency/detail) and thus results; folding the fingerprint
+    // makes a config edit invalidate immediately instead of serving
+    // old-classification rows for the rest of the cache TTL.
+    const knobs = resolveSearchMode({ mode: 'balanced' });
+    const none = knobsHash(knobs, { intentPatterns: 'none' });
+    const cfgA = knobsHash(knobs, { intentPatterns: 'aaaaaaaaaaaa' });
+    const cfgB = knobsHash(knobs, { intentPatterns: 'bbbbbbbbbbbb' });
+    const unset = knobsHash(knobs);
+    expect(none).not.toBe(cfgA);
+    expect(cfgA).not.toBe(cfgB);
+    // Undefined falls back to 'none' so pattern-less brains hash stably.
+    expect(unset).toBe(none);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -572,14 +784,22 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 11 (10→11 asymmetric input_type fix, #1400)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(11);
+  test('KNOBS_HASH_VERSION is 31 (…; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256; 28→29 evb= expansion variant budget fold; 30→31 rrg=/rrgg=/ecf= rerank gate fold W3)', () => {
+    // 28→29: evb= expansion variant budget fold (ranker wave) — budget-weighted
+    // variant fusion reorders rows for identical knobs; null hashes as legacy.
+    // v=29 ALSO carries rrp= (relational rerank pin, ranker wave R1) — same
+    // epoch, no extra bump: neither part had shipped in a release yet.
+    // v=29 ALSO carries kacf= (keyword-arm confidence floor, ranker wave
+    // Phase E2 / Cat 13) — same unshipped epoch; null hashes as off.
+    // v=29 ALSO carries mbg= (metadata boost gate, ranker wave Phase E3 /
+    // Cat 13) — same unshipped epoch; a partial literal hashes as always.
+    expect(KNOBS_HASH_VERSION).toBe(31);
   });
 
-  test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {
+  test('bundle defaults: autocut off in every bundle (ranker wave rule R2), jump 0.20 kept for operators who re-enable it', () => {
     expect(MODE_BUNDLES.conservative.autocut).toBe(false);
-    expect(MODE_BUNDLES.balanced.autocut).toBe(true);
-    expect(MODE_BUNDLES.tokenmax.autocut).toBe(true);
+    expect(MODE_BUNDLES.balanced.autocut).toBe(false);
+    expect(MODE_BUNDLES.tokenmax.autocut).toBe(false);
     for (const m of ['conservative', 'balanced', 'tokenmax'] as const) {
       expect(MODE_BUNDLES[m].autocut_jump).toBe(0.2);
     }
@@ -617,9 +837,10 @@ describe('v0.42.3.0 — autocut knobs', () => {
   });
 
   test('knobsHash includes ac= / acj= — autocut-on vs off differ', () => {
-    const on = knobsHash(resolveSearchMode({ mode: 'balanced' })); // autocut true
-    const off = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { autocut: false } }));
+    const off = knobsHash(resolveSearchMode({ mode: 'balanced' })); // autocut false (bundle default)
+    const on = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { autocut: true } }));
     expect(on).not.toBe(off);
+    expect(knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { autocut: false } }))).toBe(off);
   });
 
   test('knobsHash differs on jump sensitivity', () => {
@@ -634,6 +855,57 @@ describe('v0.42.3.0 — autocut knobs', () => {
     const attr = attributeKnob('autocut', input, resolved);
     expect(attr.source).toBe('per-call');
     expect(attr.value).toBe(false);
+  });
+
+  test('bundle default: autocut_min_keep is 1 in every bundle (the previous hardcoded failsafe)', () => {
+    for (const m of ['conservative', 'balanced', 'tokenmax'] as const) {
+      expect(MODE_BUNDLES[m].autocut_min_keep).toBe(1);
+    }
+  });
+
+  test('resolveSearchMode threads autocut_min_keep: per-call > config > bundle', () => {
+    // bundle default
+    expect(resolveSearchMode({ mode: 'balanced' }).autocut_min_keep).toBe(1);
+    // config override wins over bundle
+    expect(
+      resolveSearchMode({ mode: 'balanced', overrides: { autocut_min_keep: 6 } }).autocut_min_keep,
+    ).toBe(6);
+    // per-call beats config
+    expect(
+      resolveSearchMode({
+        mode: 'balanced',
+        overrides: { autocut_min_keep: 6 },
+        perCall: { autocut_min_keep: 3 },
+      }).autocut_min_keep,
+    ).toBe(3);
+  });
+
+  test('loadOverridesFromConfig reads search.autocut_min_keep (integer ≥ 1; junk falls through)', () => {
+    expect(loadOverridesFromConfig({ 'search.autocut_min_keep': '6' }).autocut_min_keep).toBe(6);
+    expect(loadOverridesFromConfig({ 'search.autocut_min_keep': '1' }).autocut_min_keep).toBe(1);
+    // Out-of-range / non-numeric values are IGNORED (fall through to bundle),
+    // mirroring the acj clamp — a fat-fingered config must not zero the floor.
+    expect(loadOverridesFromConfig({ 'search.autocut_min_keep': '0' }).autocut_min_keep).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.autocut_min_keep': '-3' }).autocut_min_keep).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.autocut_min_keep': 'lots' }).autocut_min_keep).toBeUndefined();
+  });
+
+  test('SEARCH_MODE_CONFIG_KEYS includes search.autocut_min_keep', () => {
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.autocut_min_keep');
+  });
+
+  test('knobsHash includes acm= — floors 1 vs 6 differ (cache contamination prevention)', () => {
+    const floor1 = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const floor6 = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { autocut_min_keep: 6 } }));
+    expect(floor1).not.toBe(floor6);
+  });
+
+  test('attributeKnob reports autocut_min_keep config source', () => {
+    const input = { mode: 'balanced', overrides: { autocut_min_keep: 6 } };
+    const resolved = resolveSearchMode(input);
+    const attr = attributeKnob('autocut_min_keep', input, resolved);
+    expect(attr.source).toBe('override');
+    expect(attr.value).toBe(6);
   });
 });
 
@@ -675,5 +947,245 @@ describe('v0.43 — relational recall knobs', () => {
     const on = knobsHash(resolveSearchMode({ mode: 'balanced' })); // relational true
     const off = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { relationalRetrieval: false } }));
     expect(on).not.toBe(off);
+  });
+});
+
+describe('v0.46.15 — retrieval-wave knobs (evidence_cosine_floor + autocut_min_top)', () => {
+  test('loadOverridesFromConfig parses both new keys with [0,1] range guards', () => {
+    expect(loadOverridesFromConfig({ 'search.evidence_cosine_floor': '0.75' }).evidence_cosine_floor).toBe(0.75);
+    expect(loadOverridesFromConfig({ 'search.evidence_cosine_floor': '1.5' }).evidence_cosine_floor).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.evidence_cosine_floor': '-0.1' }).evidence_cosine_floor).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.evidence_cosine_floor': 'cheese' }).evidence_cosine_floor).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.autocut_min_top': '0.5' }).autocut_min_top).toBe(0.5);
+    expect(loadOverridesFromConfig({ 'search.autocut_min_top': '0' }).autocut_min_top).toBe(0);
+    expect(loadOverridesFromConfig({ 'search.autocut_min_top': '2' }).autocut_min_top).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.autocut_min_top': '-1' }).autocut_min_top).toBeUndefined();
+  });
+
+  test('SEARCH_MODE_CONFIG_KEYS includes both new keys', () => {
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.evidence_cosine_floor');
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.autocut_min_top');
+  });
+
+  test('autocut_min_top participates in knobsHash (acm=) — cache key bifurcates', () => {
+    const base = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const tuned = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { autocut_min_top: 0.5 } }));
+    expect(base).not.toBe(tuned);
+  });
+
+  test('evidence_cosine_floor folds into knobsHash (ecf=, v=31): it decides the rerank gate grade', () => {
+    // Label-only until W3: the floor now decides whether a high_vector_match
+    // rank-1 is gate-strong, so a row written under one floor must not serve
+    // a lookup under another. An explicit bundle-default floor hashes as the default.
+    const base = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const relabeled = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { evidence_cosine_floor: 0.5 } }));
+    const same = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { evidence_cosine_floor: 0.8 } }));
+    expect(relabeled).not.toBe(base);
+    expect(same).toBe(base);
+  });
+});
+
+describe('keywordOrFallback knob (v=25)', () => {
+  test('config override turns the fallback off; bundle default stays on', () => {
+    expect(resolveSearchMode({ mode: 'balanced' }).keywordOrFallback).toBe(true);
+    const off = resolveSearchMode({ mode: 'balanced', overrides: { keywordOrFallback: false } });
+    expect(off.keywordOrFallback).toBe(false);
+  });
+
+  test('loadOverridesFromConfig parses search.keywordOrFallback', () => {
+    expect(loadOverridesFromConfig({ 'search.keywordOrFallback': 'false' }).keywordOrFallback).toBe(false);
+    expect(loadOverridesFromConfig({ 'search.keywordOrFallback': '0' }).keywordOrFallback).toBe(false);
+    expect(loadOverridesFromConfig({ 'search.keywordOrFallback': '1' }).keywordOrFallback).toBe(true);
+    expect(loadOverridesFromConfig({ 'search.keywordOrFallback': 'true' }).keywordOrFallback).toBe(true);
+    expect(loadOverridesFromConfig({}).keywordOrFallback).toBeUndefined();
+  });
+
+  test('kof participates in knobsHash — a fallback-on row cannot serve a fallback-off lookup', () => {
+    const on = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const off = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { keywordOrFallback: false } }));
+    expect(on).not.toBe(off);
+  });
+});
+
+describe('adaptive-return knobs hash fold (v=27, 2026-08 fix wave E5b)', () => {
+  const knobs = resolveSearchMode({ mode: 'balanced' });
+  const ar = (over: Partial<{ enabled: boolean; entityMax: number; otherMax: number; minKeep: number; intent: string }>) =>
+    knobsHash(knobs, {
+      adaptiveReturn: { enabled: true, entityMax: 2, otherMax: 6, minKeep: 1, intent: 'general', ...over },
+    });
+
+  test('gate-off and absent-ctx hash identically (legacy rows stay reachable)', () => {
+    expect(knobsHash(knobs, { adaptiveReturn: { enabled: false, entityMax: 2, otherMax: 6, minKeep: 1, intent: 'entity' } }))
+      .toBe(knobsHash(knobs));
+  });
+
+  test('gate-on diverges from gate-off', () => {
+    expect(ar({})).not.toBe(knobsHash(knobs));
+  });
+
+  test('differing caps diverge (an e1/o1 row cannot serve an e1/o2 lookup)', () => {
+    expect(ar({ otherMax: 1 })).not.toBe(ar({ otherMax: 2 }));
+    expect(ar({ entityMax: 1 })).not.toBe(ar({ entityMax: 2 }));
+    expect(ar({ minKeep: 2 })).not.toBe(ar({ minKeep: 1 }));
+  });
+
+  test('differing resolved intent class diverges (outside-voice F11: an entity-capped row cannot serve a concept lookup via semantic similarity)', () => {
+    expect(ar({ intent: 'entity' })).not.toBe(ar({ intent: 'concept' }));
+  });
+});
+
+describe('ranker wave — expansion_variant_budget knob (null = legacy weighting)', () => {
+  test('every bundle lands at null (behavior-preserving; weighting flips only on receipt)', () => {
+    for (const m of SEARCH_MODES) {
+      expect(MODE_BUNDLES[m].expansion_variant_budget).toBeNull();
+    }
+  });
+
+  test('loadOverridesFromConfig parses a number in (0, 4] and the legacy literal', () => {
+    expect(loadOverridesFromConfig({ 'search.expansion_variant_budget': '0.5' }).expansion_variant_budget).toBe(0.5);
+    expect(loadOverridesFromConfig({ 'search.expansion_variant_budget': '4' }).expansion_variant_budget).toBe(4);
+    expect(loadOverridesFromConfig({ 'search.expansion_variant_budget': 'legacy' }).expansion_variant_budget).toBeNull();
+    expect(loadOverridesFromConfig({ 'search.expansion_variant_budget': 'null' }).expansion_variant_budget).toBeNull();
+    expect(loadOverridesFromConfig({ 'search.expansion_variant_budget': 'LEGACY' }).expansion_variant_budget).toBeNull();
+  });
+
+  test('out-of-range / non-numeric values are ignored (fall through to the bundle)', () => {
+    expect(loadOverridesFromConfig({ 'search.expansion_variant_budget': '0' }).expansion_variant_budget).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.expansion_variant_budget': '5' }).expansion_variant_budget).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.expansion_variant_budget': '-1' }).expansion_variant_budget).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.expansion_variant_budget': 'x' }).expansion_variant_budget).toBeUndefined();
+    expect(loadOverridesFromConfig({})).not.toHaveProperty('expansion_variant_budget');
+    // Unset key → bundle value (null) resolves through the pick chain.
+    expect(resolveSearchMode({ mode: 'tokenmax', overrides: loadOverridesFromConfig({ 'search.expansion_variant_budget': '5' }) }).expansion_variant_budget).toBeNull();
+  });
+
+  test('resolution chain: per-call > config override > bundle (null override is honored, not skipped)', () => {
+    expect(resolveSearchMode({ mode: 'tokenmax', overrides: { expansion_variant_budget: 0.5 } }).expansion_variant_budget).toBe(0.5);
+    expect(resolveSearchMode({ mode: 'tokenmax', overrides: { expansion_variant_budget: 0.5 }, perCall: { expansion_variant_budget: 2 } }).expansion_variant_budget).toBe(2);
+    // An explicit `legacy` (null) override must win over a hypothetical non-null bundle — pick() keys on !== undefined.
+    expect(resolveSearchMode({ mode: 'tokenmax', overrides: { expansion_variant_budget: null }, perCall: {} }).expansion_variant_budget).toBeNull();
+    expect(attributeKnob('expansion_variant_budget', { mode: 'tokenmax', overrides: { expansion_variant_budget: null } }, resolveSearchMode({ mode: 'tokenmax', overrides: { expansion_variant_budget: null } })).source).toBe('override');
+  });
+
+  test('SEARCH_MODE_CONFIG_KEYS carries the key (modes --reset clears it)', () => {
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.expansion_variant_budget');
+  });
+
+  test('knobsHash folds the budget: legacy vs 0.5 vs 1.0 all differ; legacy is stable', () => {
+    const legacy = knobsHash(resolveSearchMode({ mode: 'tokenmax' }));
+    const legacyExplicit = knobsHash(resolveSearchMode({ mode: 'tokenmax', overrides: { expansion_variant_budget: null } }));
+    const half = knobsHash(resolveSearchMode({ mode: 'tokenmax', overrides: { expansion_variant_budget: 0.5 } }));
+    const one = knobsHash(resolveSearchMode({ mode: 'tokenmax', overrides: { expansion_variant_budget: 1.0 } }));
+    expect(legacy).toBe(legacyExplicit);
+    expect(half).not.toBe(legacy);
+    expect(one).not.toBe(legacy);
+    expect(one).not.toBe(half);
+  });
+});
+
+describe('ranker wave (R1) — relational_rerank_pin knob (relational rows bypass reranker demotion)', () => {
+  test('every bundle pins 3 (the R1 receipt fix rides the default path — conservative has no reranker, so it is a no-op there)', () => {
+    for (const m of SEARCH_MODES) {
+      expect(MODE_BUNDLES[m].relational_rerank_pin).toBe(3);
+    }
+  });
+
+  test('loadOverridesFromConfig parses a non-negative integer <= 10 and the off literal', () => {
+    expect(loadOverridesFromConfig({ 'search.relational_rerank_pin': '0' }).relational_rerank_pin).toBe(0);
+    expect(loadOverridesFromConfig({ 'search.relational_rerank_pin': '5' }).relational_rerank_pin).toBe(5);
+    expect(loadOverridesFromConfig({ 'search.relational_rerank_pin': '10' }).relational_rerank_pin).toBe(10);
+    expect(loadOverridesFromConfig({ 'search.relational_rerank_pin': 'off' }).relational_rerank_pin).toBe(0);
+    expect(loadOverridesFromConfig({ 'search.relational_rerank_pin': 'OFF' }).relational_rerank_pin).toBe(0);
+    expect(loadOverridesFromConfig({ 'search.relational_rerank_pin': 'false' }).relational_rerank_pin).toBe(0);
+  });
+
+  test('out-of-range / non-integer / garbage values are ignored (fall through to the bundle)', () => {
+    for (const bad of ['11', '-1', '2.5', 'x', '', 'true']) {
+      expect(loadOverridesFromConfig({ 'search.relational_rerank_pin': bad })).not.toHaveProperty('relational_rerank_pin');
+    }
+    expect(loadOverridesFromConfig({})).not.toHaveProperty('relational_rerank_pin');
+    expect(resolveSearchMode({ mode: 'balanced', overrides: loadOverridesFromConfig({ 'search.relational_rerank_pin': '11' }) }).relational_rerank_pin).toBe(3);
+  });
+
+  test('resolution chain: per-call > config override > bundle (an explicit 0 override is honored, not skipped)', () => {
+    expect(resolveSearchMode({ mode: 'balanced', overrides: { relational_rerank_pin: 0 } }).relational_rerank_pin).toBe(0);
+    expect(resolveSearchMode({ mode: 'balanced', overrides: { relational_rerank_pin: 0 }, perCall: { relational_rerank_pin: 5 } }).relational_rerank_pin).toBe(5);
+    expect(resolveSearchMode({ mode: 'balanced', overrides: { relational_rerank_pin: 1 }, perCall: {} }).relational_rerank_pin).toBe(1);
+    expect(attributeKnob('relational_rerank_pin', { mode: 'balanced', overrides: { relational_rerank_pin: 0 } }, resolveSearchMode({ mode: 'balanced', overrides: { relational_rerank_pin: 0 } })).source).toBe('override');
+    expect(attributeKnob('relational_rerank_pin', { mode: 'balanced' }, resolveSearchMode({ mode: 'balanced' })).source).toBe('mode');
+  });
+
+  test('SEARCH_MODE_CONFIG_KEYS carries the key (modes --reset clears it)', () => {
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.relational_rerank_pin');
+  });
+
+  test('knobsHash folds the pin (rrp=): 3 vs 0 vs 1 all differ; explicit 3 equals the bundle default', () => {
+    const dflt = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const three = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { relational_rerank_pin: 3 } }));
+    const off = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { relational_rerank_pin: 0 } }));
+    const one = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { relational_rerank_pin: 1 } }));
+    expect(three).toBe(dflt);
+    expect(off).not.toBe(dflt);
+    expect(one).not.toBe(dflt);
+    expect(one).not.toBe(off);
+    // The pin rides KNOBS_HASH_VERSION 29 together with evb= — no separate bump.
+    expect(KNOBS_HASH_VERSION).toBe(31);
+  });
+});
+
+describe('multi-hop planner knobs (relational_planner, relational_orient_onehop)', () => {
+  test('balanced and tokenmax ship the planner on (held-out verdict); conservative off; one-hop orientation opt-in everywhere', () => {
+    expect(MODE_BUNDLES.conservative.relational_planner).toBe(false);
+    for (const m of ['balanced', 'tokenmax'] as const) expect(MODE_BUNDLES[m].relational_planner).toBe(true);
+    for (const m of ['conservative', 'balanced', 'tokenmax'] as const) expect(MODE_BUNDLES[m].relational_orient_onehop).toBe(false);
+  });
+
+  test('config booleans parse; garbage falls through', () => {
+    expect(loadOverridesFromConfig({ 'search.relational_planner': 'true' }).relational_planner).toBe(true);
+    expect(loadOverridesFromConfig({ 'search.relational_planner': 'off' }).relational_planner).toBe(false);
+    expect(loadOverridesFromConfig({ 'search.relational_planner': 'maybe' }).relational_planner).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.relational_orient_onehop': '0' }).relational_orient_onehop).toBe(false);
+    expect(loadOverridesFromConfig({ 'search.relational_chain_slots': '3' }).relational_chain_slots).toBe(3);
+    expect(loadOverridesFromConfig({ 'search.relational_chain_slots': '11' }).relational_chain_slots).toBeUndefined();
+  });
+
+  test('knobsHash: planner off ignores chain slots; on folds slots and orientation in', () => {
+    const dflt = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const explicitOn = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { relational_planner: true, relational_orient_onehop: false } }));
+    const off = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { relational_planner: false } }));
+    const offSlots = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { relational_planner: false, relational_chain_slots: 3 } }));
+    const onSlots = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { relational_chain_slots: 0 } }));
+    const orient = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { relational_orient_onehop: true } }));
+    expect(explicitOn).toBe(dflt);
+    expect(offSlots).toBe(off);
+    expect(new Set([dflt, off, onSlots, orient]).size).toBe(4);
+  });
+});
+
+describe('qualified_aliases / title_qualified mode knobs', () => {
+  test('off in every bundle', () => {
+    for (const m of ['conservative', 'balanced', 'tokenmax'] as const) {
+      expect(MODE_BUNDLES[m].qualified_aliases).toBe(false);
+      expect(MODE_BUNDLES[m].title_qualified).toBe(false);
+    }
+  });
+
+  test('config parses into the overrides; a bad value is ignored', () => {
+    expect(loadOverridesFromConfig({ 'search.qualified_aliases': 'true' }).qualified_aliases).toBe(true);
+    expect(loadOverridesFromConfig({ 'search.title_qualified': 'on' }).title_qualified).toBe(true);
+    expect(loadOverridesFromConfig({ 'search.qualified_aliases': 'false' }).qualified_aliases).toBe(false);
+    expect(loadOverridesFromConfig({ 'search.qualified_aliases': 'maybe' }).qualified_aliases).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.title_qualified': 'yes please' }).title_qualified).toBeUndefined();
+    expect(resolveSearchMode({ mode: 'balanced', overrides: { qualified_aliases: true } }).qualified_aliases).toBe(true);
+  });
+
+  test('knobsHash: off keeps every existing key; each knob on segregates the cache on its own', () => {
+    const dflt = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const explicitOff = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { qualified_aliases: false, title_qualified: false } }));
+    const qa = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { qualified_aliases: true } }));
+    const tq = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { title_qualified: true } }));
+    const both = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { qualified_aliases: true, title_qualified: true } }));
+    expect(explicitOff).toBe(dflt);
+    expect(new Set([dflt, qa, tq, both]).size).toBe(4);
   });
 });

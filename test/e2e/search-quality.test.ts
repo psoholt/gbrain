@@ -9,6 +9,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { installFixtureChunks } from '../helpers/page-projection.ts';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import type { ChunkInput, SearchResult } from '../../src/core/types.ts';
 
@@ -51,7 +52,7 @@ beforeAll(async () => {
       token_count: 18,
     },
   ];
-  await engine.upsertChunks('people/pedro', pedroChunks);
+  await installFixtureChunks(engine, 'people/pedro', pedroChunks);
 
   await engine.putPage('companies/variant', {
     type: 'company',
@@ -76,7 +77,7 @@ beforeAll(async () => {
       token_count: 12,
     },
   ];
-  await engine.upsertChunks('companies/variant', variantChunks);
+  await installFixtureChunks(engine, 'companies/variant', variantChunks);
 
   await engine.putPage('concepts/ai-philosophy', {
     type: 'concept',
@@ -101,7 +102,7 @@ beforeAll(async () => {
       token_count: 15,
     },
   ];
-  await engine.upsertChunks('concepts/ai-philosophy', aiChunks);
+  await installFixtureChunks(engine, 'concepts/ai-philosophy', aiChunks);
 }, 60_000);
 
 afterAll(async () => {
@@ -128,6 +129,17 @@ describe('SearchResult fields', () => {
     expect(r.chunk_index).toBeDefined();
     expect(typeof r.chunk_index).toBe('number');
   });
+
+  test('empty keyword query returns a defined array without throwing', async () => {
+    const results = await engine.searchKeyword('');
+    expect(Array.isArray(results)).toBe(true);
+  });
+
+  test('zero vector search returns a defined array without throwing', async () => {
+    const zeroVector = new Float32Array(1536);
+    const results = await engine.searchVector(zeroVector);
+    expect(Array.isArray(results)).toBe(true);
+  });
 });
 
 describe('detail parameter', () => {
@@ -145,9 +157,11 @@ describe('detail parameter', () => {
   });
 
   test('detail=low on vector search filters to compiled_truth', async () => {
-    // Use a timeline-direction embedding — with detail=low, should get no results
-    // or only compiled_truth results
+    // Use a timeline-direction embedding — detail=low filters to compiled_truth.
+    // Vector search returns every chunk with an embedding (ordered by distance),
+    // so the seeded compiled_truth chunks are non-empty and ALL compiled_truth.
     const results = await engine.searchVector(basisEmbedding(1), { detail: 'low' });
+    expect(results.length).toBeGreaterThan(0);
     for (const r of results) {
       expect(r.chunk_source).toBe('compiled_truth');
     }

@@ -1,6 +1,6 @@
 ---
 name: data-research
-version: 1.0.0
+version: 1.1.0
 description: |
   Structured data research: search sources, extract structured data,
   archive raw sources, maintain canonical tracker pages, deduplicate.
@@ -49,13 +49,16 @@ All three use the same 7-phase pipeline with parameterized recipes.
 
 ### Phase 1: Define Research Recipe
 
-Ask the user what they want to track. Either:
+Infer the research target from conversation context, recent brain activity, active
+tasks (`ops/tasks.md`), and memory files. If the request is ambiguous, present the
+most likely interpretation based on what the user has been working on. Only ask for
+clarification if context is genuinely insufficient. Options:
 - Pick a built-in recipe: investor-updates, expense-tracker, company-updates
 - Define a custom recipe with: source queries, classification rules, extraction schema,
   tracker page path, tracker format
 
-Recipes are YAML files at `~/.gbrain/recipes/{name}.yaml`. Use `gbrain research init`
-to scaffold a new one.
+Recipes are YAML files at `~/.gbrain/recipes/{name}.yaml`. Scaffold a new one by
+copying a built-in recipe file and editing its fields.
 
 ### Phase 2: Search Sources
 
@@ -111,6 +114,14 @@ Three example recipes ship with GBrain (see `~/.gbrain/recipes/`):
 1. **investor-updates** — extract MRR, ARR, growth, burn, runway, headcount from investor update emails
 2. **expense-tracker** — extract amounts, recipients, platforms from receipt emails (subscriptions, services, recurring charges)
 3. **company-updates** — extract revenue, users, key metrics from portfolio company update emails
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `file_upload` is refused for a path outside the allowed root (remote callers are confined): ask the user to upload from the brain host or pass the content inline.
+- `put_page` / `add_timeline_entry` returns `revision_conflict` or `write_pending`: re-read and merge for the first; poll `gbrain write-request <request_id>` for the second.
+- An extraction source rate-limits (`rate_limited`): back off for the stated delay and keep the cursor; log the gap instead of guessing the missing rows.
 
 ## Anti-Patterns
 

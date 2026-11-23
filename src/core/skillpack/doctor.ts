@@ -20,6 +20,7 @@
  * output or stable JSON for agent consumption.
  */
 
+import { assertLegacySkillFilesystemWrite } from './writer-guard.ts';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'fs';
 import { join, dirname } from 'path';
 
@@ -273,7 +274,9 @@ async function applyAutoFixes(
             '# Bootstrap',
             '',
             '1. show user: "<pack-name> is installed. Try one of the trigger phrases listed in skills/."',
-            '2. (edit me) agent: gbrain put_page wiki/_bootstrap-stub --frontmatter type=stub',
+            // #3697: `gbrain put_page ... --frontmatter` never resolved (CLI name
+            // is `put`, content arrives on stdin, and no --frontmatter flag exists).
+            "2. (edit me) agent: printf -- '---\\ntype: stub\\n---\\n\\nstub body\\n' | gbrain put wiki/_bootstrap-stub",
             '',
             '<!-- v0.36 contract: gbrain displays this post-scaffold but DOES NOT auto-execute. -->',
             '',
@@ -304,7 +307,9 @@ async function applyAutoFixes(
     return [];
   }
 
+  for (const p of plan) assertLegacySkillFilesystemWrite(p.path);
   for (const p of plan) {
+    assertLegacySkillFilesystemWrite(p.path);
     mkdirSync(dirname(p.path), { recursive: true });
     writeFileSync(p.path, p.content);
     fixes.push(`${p.name}: created ${p.path}`);

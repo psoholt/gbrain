@@ -40,7 +40,12 @@ function parseFlags(args: string[]): BackfillOpts {
     } else if (a === '--all-sources') {
       opts.allSources = true;
     } else if (a === '--max-chunks') {
-      opts.maxChunks = parseInt(args[++i] ?? '', 10);
+      const raw = args[++i];
+      const n = Number(raw);
+      if (!raw || !/^\d+$/.test(raw.trim()) || !Number.isSafeInteger(n) || n < 1) {
+        throw new Error('--max-chunks must be a positive safe integer');
+      }
+      opts.maxChunks = n;
     } else if (a === '--json') {
       opts.json = true;
     } else if (a === '--workers' || a === '--concurrency') {

@@ -13,7 +13,7 @@
  * - MCP dispatch with per-token allow-list (defense-in-depth Codex P0 #3)
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { setupDB, teardownDB, hasDatabase, getEngine } from './helpers.ts';
+import { setupLegacyEmbeddingDB, teardownDB, hasDatabase, getEngine } from './helpers.ts';
 import { extractTakesFromDb } from '../../src/core/cycle/extract-takes.ts';
 import { dispatchToolCall } from '../../src/mcp/dispatch.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../../src/core/takes-fence.ts';
@@ -26,7 +26,7 @@ let acmePageId: number;
 
 beforeAll(async () => {
   if (!RUN) return;
-  const engine = await setupDB();
+  const engine = await setupLegacyEmbeddingDB();
   const alice = await engine.putPage('people/alice-example', {
     title: 'Alice', type: 'person', compiled_truth: '## Takes\n',
   });
@@ -87,8 +87,33 @@ d('v0.28 takes engine — Postgres', () => {
     expect(hits.length).toBeGreaterThan(0);
     expect(hits[0].claim.toLowerCase()).toContain('technical');
 
+    // #2450: int8 columns (take_id/page_id) arrive as native BigInt from the
+    // pg driver; the raw-row cast crashed JSON.stringify at the MCP boundary
+    // the moment a query matched. Only this suite runs the real driver that
+    // produces BigInt, so only these assertions fail if the takeHitRowToHit
+    // call sites regress.
+    expect(typeof hits[0].take_id).toBe('number');
+    expect(typeof hits[0].page_id).toBe('number');
+    expect(() => JSON.stringify(hits)).not.toThrow();
+
     const worldHits = await engine.searchTakes('founder', { takesHoldersAllowList: ['world'] });
     expect(worldHits.every(h => h.holder === 'world')).toBe(true);
+  });
+
+  test('searchTakesVector returns coerced, JSON-serializable hits (#2450)', async () => {
+    const engine = getEngine();
+    // Fixture takes carry no embeddings; give one a vector directly so the
+    // vector path (embedding IS NOT NULL) returns a real row.
+    const vec = `[${new Array(1536).fill(0.001).join(',')}]`;
+    await engine.executeRaw(
+      `UPDATE takes SET embedding = $1::vector WHERE page_id = $2 AND row_num = 1`,
+      [vec, alicePageId],
+    );
+    const hits = await engine.searchTakesVector(new Float32Array(1536).fill(0.001));
+    expect(hits.length).toBeGreaterThan(0);
+    expect(typeof hits[0].take_id).toBe('number');
+    expect(typeof hits[0].page_id).toBe('number');
+    expect(() => JSON.stringify(hits)).not.toThrow();
   });
 
   test('supersedeTake is transactional on real Postgres', async () => {
@@ -154,6 +179,9 @@ d('v0.28 takes engine — Postgres', () => {
     const stale = await engine.listStaleTakes();
     expect(stale.length).toBe(count);
     expect(stale[0]).toHaveProperty('take_id');
+    expect(typeof stale[0]!.take_id).toBe('number');
+    expect(typeof stale[0]!.row_num).toBe('number');
+    expect(() => JSON.stringify(stale)).not.toThrow();
   });
 });
 
@@ -188,8 +216,7 @@ d('v0.28 MCP allow-list — Postgres dispatch', () => {
   test('takes_list returns only world holders when allow-list = ["world"]', async () => {
     const engine = getEngine();
     const result = await dispatchToolCall(engine, 'takes_list', { page_slug: 'people/alice-example' }, {
-      remote: true,
-      takesHoldersAllowList: ['world'],
+      remote: true, sourceId: 'default',      takesHoldersAllowList: ['world'],
     });
     expect(result.isError).toBeFalsy();
     const takes = JSON.parse(result.content[0].text);
@@ -211,8 +238,7 @@ d('v0.28 MCP allow-list — Postgres dispatch', () => {
   test('takes_search honors allow-list', async () => {
     const engine = getEngine();
     const result = await dispatchToolCall(engine, 'takes_search', { query: 'technical' }, {
-      remote: true,
-      takesHoldersAllowList: ['world'],
+      remote: true, sourceId: 'default',      takesHoldersAllowList: ['world'],
     });
     const hits = JSON.parse(result.content[0].text) as Array<{ holder: string }>;
     expect(hits.every(h => h.holder === 'world')).toBe(true);
@@ -221,8 +247,7 @@ d('v0.28 MCP allow-list — Postgres dispatch', () => {
   test('think op rejects save/take from remote callers', async () => {
     const engine = getEngine();
     const result = await dispatchToolCall(engine, 'think', { question: 'q', save: true, take: true }, {
-      remote: true,
-    });
+      remote: true, sourceId: 'default',    });
     const env = JSON.parse(result.content[0].text);
     // Remote with save/take → safe path forces them off, runs gather-only
     expect(env.remote_persisted_blocked).toBe(true);
@@ -359,8 +384,7 @@ d('v0.30.0 MCP dispatch — Postgres', () => {
   test('takes_scorecard via MCP returns correct counts with allow-list', async () => {
     const engine = getEngine();
     const result = await dispatchToolCall(engine, 'takes_scorecard', { holder: 'garry' }, {
-      remote: true,
-      takesHoldersAllowList: ['garry'],
+      remote: true, sourceId: 'default',      takesHoldersAllowList: ['garry'],
     });
     expect(result.isError).toBeFalsy();
     const card = JSON.parse(result.content[0].text);
@@ -374,8 +398,7 @@ d('v0.30.0 MCP dispatch — Postgres', () => {
   test('takes_calibration via MCP returns bucket array with allow-list', async () => {
     const engine = getEngine();
     const result = await dispatchToolCall(engine, 'takes_calibration', { holder: 'garry', bucket_size: 0.1 }, {
-      remote: true,
-      takesHoldersAllowList: ['garry'],
+      remote: true, sourceId: 'default',      takesHoldersAllowList: ['garry'],
     });
     expect(result.isError).toBeFalsy();
     const buckets = JSON.parse(result.content[0].text);
@@ -394,8 +417,7 @@ d('v0.30.0 MCP dispatch — Postgres', () => {
     // 'world' has only fact-kind takes in the seed; bets are garry-only.
     // Scorecard scoped to world should report zero resolved.
     const result = await dispatchToolCall(engine, 'takes_scorecard', {}, {
-      remote: true,
-      takesHoldersAllowList: ['world'],
+      remote: true, sourceId: 'default',      takesHoldersAllowList: ['world'],
     });
     const card = JSON.parse(result.content[0].text);
     // No resolved bets exist with holder='world' in our seed.

@@ -22,7 +22,8 @@ import { tmpdir } from 'os';
 import { createHash } from 'crypto';
 
 import { gbrainPath, loadConfig } from '../core/config.ts';
-import { configureGateway, isAvailable } from '../core/ai/gateway.ts';
+import { configureGateway, getChatModel, isAvailable } from '../core/ai/gateway.ts';
+import { buildGatewayConfig } from '../core/ai/build-gateway-config.ts';
 import { runWithLimit } from '../core/worker-pool.ts';
 import { resolveCycleDefault, cycleDefaultSuffix } from '../core/eval/cycle-default.ts';
 import {
@@ -36,6 +37,8 @@ import type {
   RunEvalResult,
   SlotConfig,
 } from '../core/cross-modal-eval/runner.ts';
+import type { ParsedModelResult } from '../core/cross-modal-eval/json-repair.ts';
+import { splitProviderModelId } from '../core/model-id.ts';
 
 const HELP = `gbrain eval cross-modal — multi-model quality gate
 
@@ -76,9 +79,9 @@ FLAGS:
                            dimensions (goal, depth, sourcing, specificity, useful).
   --cycles N               1-3. Default: 3 in TTY, 1 in non-TTY (T11). Each
                            cycle is 3 model calls; verdict aggregates over them.
-  --slot-a-model <id>      Override default 'openai:gpt-4o'.
+  --slot-a-model <id>      Override default 'openai:gpt-5.2'.
   --slot-b-model <id>      Override default 'anthropic:claude-opus-4-7'.
-  --slot-c-model <id>      Override default 'google:gemini-1.5-pro'.
+  --slot-c-model <id>      Override default 'deepseek:deepseek-v4-pro'.
   --receipt-dir <path>     Default: gbrainPath('eval-receipts').
   --max-tokens N           Output token budget per call. Default: 4000.
   --json                   Emit final aggregate as JSON to stdout (progress to stderr).
@@ -275,20 +278,54 @@ function configureGatewayForCli(): boolean {
       chat_model: undefined,
       chat_fallback_chain: undefined,
       base_urls: undefined,
+      provider_chat_options: undefined,
       env: { ...process.env },
     });
     return true;
   }
-  configureGateway({
-    embedding_model: config.embedding_model,
-    embedding_dimensions: config.embedding_dimensions,
-    expansion_model: config.expansion_model,
-    chat_model: config.chat_model,
-    chat_fallback_chain: config.chat_fallback_chain,
-    base_urls: config.provider_base_urls,
-    env: { ...process.env },
-  });
+  configureGateway(buildGatewayConfig(config));
   return true;
+}
+
+/**
+ * #4636: the default slots are three DISTINCT frontier providers, which a
+ * single-provider install can never serve — the 3-slot panel misses its
+ * 2-model quorum and every nightly quality-probe run lands as a false
+ * ERROR/INCONCLUSIVE. For each slot the caller did NOT explicitly override,
+ * substitute the gateway's configured chat model when the slot default's
+ * provider is unusable (missing key / unknown recipe) AND the configured
+ * model itself is usable. Explicit `--slot-*-model` flags always win, an
+ * install with all three default providers keyed is untouched, and when no
+ * configured model is usable either the defaults stay (the run surfaces the
+ * existing no-provider error). Call only once the gateway is configured
+ * (configureGatewayForCli(), or the caller's own under useConfiguredGateway).
+ * `log` receives the one line per substituted slot (default: stderr).
+ *
+ * Exported for the hermetic unit test (the batch DI seam skips gateway
+ * configuration entirely, so the policy is pinned at this boundary) and for
+ * `gbrain models`, which reports the nightly probe's panel with a silent log.
+ */
+export function substituteUnavailableDefaultSlots(
+  slots: SlotConfig[],
+  explicit: Record<string, string | undefined>,
+  log: (line: string) => void = line => { process.stderr.write(line); },
+): SlotConfig[] {
+  let fallback: string | null = null;
+  try {
+    const configured = getChatModel();
+    if (isAvailable('chat', configured)) fallback = configured;
+  } catch {
+    /* gateway unconfigured — leave the defaults in place */
+  }
+  if (!fallback) return slots;
+  return slots.map(s => {
+    if (explicit[s.id] || isAvailable('chat', s.model)) return s;
+    log(
+      `[eval cross-modal] slot ${s.id} default ${s.model} has no usable provider here; ` +
+      `using the configured chat model ${fallback} instead (#4636).\n`,
+    );
+    return { ...s, model: fallback as string };
+  });
 }
 
 /**
@@ -299,6 +336,45 @@ function configureGatewayForCli(): boolean {
  */
 export interface RunCrossModalOpts {
   runEval?: typeof runEval;
+  /**
+   * #5872: the caller already configured the gateway from its brain (the
+   * nightly probe inside the autopilot daemon). Skip configureGatewayForCli(),
+   * which would rebuild the process-global gateway from the file plane and
+   * drop the brain-resolved chat model; the chat-provider gate and the #4636
+   * substitution still run, in batch mode even with an injected `runEval`.
+   */
+  useConfiguredGateway?: boolean;
+  /**
+   * #6486: the brain's `models.eval.cross_modal.slot_{a,b,c}` pins, read
+   * only when some slot has no `--slot-*-model` flag. `src/cli/main.ts`
+   * passes a fail-open probe-only read of the configured brain; a reader
+   * that throws (no brain, brain busy) leaves the defaults in place.
+   */
+  slotConfig?: () => Promise<Partial<Record<'A' | 'B' | 'C', string>>>;
+}
+
+type SlotFlags = Pick<ParsedArgs, 'slotAModel' | 'slotBModel' | 'slotCModel'>;
+type SlotPins = Partial<Record<'A' | 'B' | 'C', string>>;
+
+/** Per slot: `--slot-<x>-model` flag → brain pin → DEFAULT_SLOTS (#6486). */
+export function resolveSlotModels(flags: SlotFlags, pins: SlotPins): SlotConfig[] {
+  const pin = (id: 'A' | 'B' | 'C') => pins[id]?.trim() || undefined;
+  return [
+    { id: 'A', model: flags.slotAModel ?? pin('A') ?? DEFAULT_SLOTS[0]!.model },
+    { id: 'B', model: flags.slotBModel ?? pin('B') ?? DEFAULT_SLOTS[1]!.model },
+    { id: 'C', model: flags.slotCModel ?? pin('C') ?? DEFAULT_SLOTS[2]!.model },
+  ];
+}
+
+/** The pins to consult: none when every slot is flagged, and a throwing reader counts as no pins. */
+async function readSlotPins(flags: SlotFlags, read: RunCrossModalOpts['slotConfig']): Promise<SlotPins> {
+  if (!read || (flags.slotAModel && flags.slotBModel && flags.slotCModel)) return {};
+  try {
+    return await read();
+  } catch (err) {
+    process.stderr.write(`[eval cross-modal] could not read models.eval.cross_modal.slot_* from the brain (${err instanceof Error ? err.message : String(err)}); using the default slots.\n`);
+    return {};
+  }
 }
 
 export async function runEvalCrossModal(args: string[], opts: RunCrossModalOpts = {}): Promise<number> {
@@ -351,16 +427,13 @@ export async function runEvalCrossModal(args: string[], opts: RunCrossModalOpts 
   const receiptDir = parsed.receiptDir ?? gbrainPath('eval-receipts');
   const maxTokens = parsed.maxTokens ?? 4000;
 
-  const slots: SlotConfig[] = [
-    { id: 'A', model: parsed.slotAModel ?? DEFAULT_SLOTS[0]!.model },
-    { id: 'B', model: parsed.slotBModel ?? DEFAULT_SLOTS[1]!.model },
-    { id: 'C', model: parsed.slotCModel ?? DEFAULT_SLOTS[2]!.model },
-  ];
+  const pins = await readSlotPins(parsed, opts.slotConfig);
+  let slots: SlotConfig[] = resolveSlotModels(parsed, pins);
 
   // Configure the AI gateway. Without this, every chat() call throws
   // "AI gateway is not configured" because the cli.ts no-DB branch skips
   // connectEngine (T3=A).
-  configureGatewayForCli();
+  if (!opts.useConfiguredGateway) configureGatewayForCli();
 
   // Probe whether the gateway can serve `chat`. If not, we can't run.
   if (!isAvailable('chat')) {
@@ -371,6 +444,11 @@ export async function runEvalCrossModal(args: string[], opts: RunCrossModalOpts 
     );
     return 1;
   }
+  // #4636: swap unusable frontier defaults for the configured chat model
+  // (before the cost estimate so the banner prices what actually runs).
+  slots = substituteUnavailableDefaultSlots(slots, {
+    A: parsed.slotAModel ?? pins.A, B: parsed.slotBModel ?? pins.B, C: parsed.slotCModel ?? pins.C,
+  });
 
   // Cost estimate (T11=B).
   const cost = estimateCost(slots, cycles, maxTokens);
@@ -466,6 +544,14 @@ interface BatchRow {
   question_id: string;
   question: string;
   hypothesis: string;
+  /**
+   * Gold answer from the benchmark dataset, when the upstream eval emits
+   * it (eval-longmemeval does). Folded into the judge task so CORRECTNESS
+   * is verifiable — without it a judge panel that sees only
+   * {question, hypothesis} cannot validate a terse factual answer against
+   * a haystack it never saw.
+   */
+  answer?: string;
 }
 
 /**
@@ -514,6 +600,12 @@ export interface BatchSummary {
   verdict: 'pass' | 'fail' | 'inconclusive' | 'error';
   est_cost_usd: number;
   slots: SlotConfig[];
+  /**
+   * The judges that scored (#5506): distinct models and providers among
+   * the slots that scored at least one question, and per slot in slot
+   * order the questions whose last cycle it scored.
+   */
+  panel: { distinct_models: number; distinct_providers: number; slot_scored_questions: number[] };
   cycles_per_question: number;
   concurrent: number;
   per_question: Array<{
@@ -521,7 +613,67 @@ export interface BatchSummary {
     verdict: 'pass' | 'fail' | 'inconclusive' | 'error' | 'upstream_error';
     error?: string;
     final_aggregate?: unknown;
+    /** Per dimension, one score per slot in slot order (null: that slot gave none). */
+    slot_scores?: Record<string, Array<number | null>>;
   }>;
+}
+
+/**
+ * The judge panel that scored: distinct models and distinct providers (the
+ * `splitProviderModelId` provider) among the slots that scored at least one
+ * question, each such model holding two or more of those slots (its votes
+ * then count more than once in the aggregate), and the silent slots, which
+ * scored none (for example an explicit slot key whose provider is not
+ * usable here).
+ */
+function describeJudgePanel(slots: SlotConfig[], scoredQuestions: number[]): {
+  panel: BatchSummary['panel'];
+  shared: Array<{ model: string; slotIds: string[] }>;
+  silent: SlotConfig[];
+} {
+  const judged = slots.filter((_, i) => (scoredQuestions[i] ?? 0) > 0);
+  const slotIdsByModel = new Map<string, string[]>();
+  for (const s of judged) slotIdsByModel.set(s.model, [...(slotIdsByModel.get(s.model) ?? []), s.id]);
+  const providers = new Set(judged.map(s => splitProviderModelId(s.model).provider ?? ''));
+  return {
+    panel: {
+      distinct_models: slotIdsByModel.size,
+      distinct_providers: providers.size,
+      slot_scored_questions: scoredQuestions,
+    },
+    shared: [...slotIdsByModel].filter(([, ids]) => ids.length > 1).map(([model, slotIds]) => ({ model, slotIds })),
+    silent: slots.filter((_, i) => (scoredQuestions[i] ?? 0) === 0),
+  };
+}
+
+/** Per position in the last cycle's slot list, whether that judge returned a finite score. */
+function lastCycleScoredSlots(result: RunEvalResult): boolean[] {
+  const last = result.cycles[result.cycles.length - 1];
+  return (last?.slots ?? []).map(slot => {
+    const scores = slot.ok ? (slot.parsed as ParsedModelResult | undefined)?.scores : undefined;
+    return Object.values(scores ?? {}).some(e => typeof e?.score === 'number' && Number.isFinite(e.score));
+  });
+}
+
+/**
+ * Each dimension's scores by position in the last cycle's slot list, null
+ * for a slot that errored or gave no score for it. The aggregate keeps only
+ * the scores that arrived, so its `scores` shift onto the wrong judge as
+ * soon as one slot misses. Dimension names match the aggregate's
+ * (trimmed, lowercased). Undefined when no cycle receipt came back.
+ */
+function lastCycleSlotScores(result: RunEvalResult): Record<string, Array<number | null>> | undefined {
+  const last = result.cycles[result.cycles.length - 1];
+  if (!last) return undefined;
+  const out: Record<string, Array<number | null>> = {};
+  for (const dim of Object.keys(result.finalAggregate.dimensions)) {
+    out[dim] = last.slots.map(slot => {
+      const scores = slot.ok ? (slot.parsed as ParsedModelResult | undefined)?.scores : undefined;
+      const entry = Object.entries(scores ?? {}).find(([name]) => name.trim().toLowerCase() === dim)?.[1];
+      return typeof entry?.score === 'number' && Number.isFinite(entry.score) ? entry.score : null;
+    });
+  }
+  return out;
 }
 
 function readBatchRows(path: string): BatchReadResult {
@@ -579,6 +731,7 @@ function readBatchRows(path: string): BatchReadResult {
       question_id: typeof obj.question_id === 'string' ? obj.question_id : `line-${lineNo}`,
       question: obj.question,
       hypothesis: obj.hypothesis,
+      ...(typeof obj.answer === 'string' && obj.answer.length > 0 ? { answer: obj.answer } : {}),
     });
   }
   if (summarySkipped > 0) {
@@ -613,11 +766,8 @@ async function runBatchMode(parsed: ParsedArgs, opts: RunCrossModalOpts): Promis
   const maxTokens = parsed.maxTokens ?? 4000;
   const maxUsd = parsed.maxUsd ?? 5.0;
 
-  const slots: SlotConfig[] = [
-    { id: 'A', model: parsed.slotAModel ?? DEFAULT_SLOTS[0]!.model },
-    { id: 'B', model: parsed.slotBModel ?? DEFAULT_SLOTS[1]!.model },
-    { id: 'C', model: parsed.slotCModel ?? DEFAULT_SLOTS[2]!.model },
-  ];
+  const pins = await readSlotPins(parsed, opts.slotConfig);
+  let slots: SlotConfig[] = resolveSlotModels(parsed, pins);
 
   // v0.40.1.0 Track D (codex CDX-2): --limit must be >= 1. Passing
   // --limit 0 would let an empty result fall through to PASS with
@@ -652,6 +802,28 @@ async function runBatchMode(parsed: ParsedArgs, opts: RunCrossModalOpts): Promis
   }
   if (limit < rows.length) rows = rows.slice(0, limit);
 
+  // Configure gateway (same path as single-task mode). When runEval is
+  // injected (test mode), skip the gateway availability gate — the injected
+  // function handles its own backend, so requiring an API key here would
+  // make hermetic unit tests impossible — unless the caller configured the
+  // gateway itself (useConfiguredGateway), whose gate and substitution
+  // still run. Runs BEFORE the cost estimate so the #4636 slot
+  // substitution below prices what actually runs.
+  if (!opts.runEval || opts.useConfiguredGateway) {
+    if (!opts.useConfiguredGateway) configureGatewayForCli();
+    if (!isAvailable('chat')) {
+      process.stderr.write(
+        'Error: AI gateway has no usable chat provider. ' +
+        'Configure one of OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY.\n',
+      );
+      return 1;
+    }
+    // #4636: swap unusable frontier defaults for the configured chat model.
+    slots = substituteUnavailableDefaultSlots(slots, {
+      A: parsed.slotAModel ?? pins.A, B: parsed.slotBModel ?? pins.B, C: parsed.slotCModel ?? pins.C,
+    });
+  }
+
   // Pre-flight cost estimate. Refuse if over --max-usd without --yes.
   const perQuestion = estimateCost(slots, cycles, maxTokens);
   const estTotal = perQuestion.perRunMaxUSD * rows.length;
@@ -660,27 +832,15 @@ async function runBatchMode(parsed: ParsedArgs, opts: RunCrossModalOpts): Promis
     `for ${rows.length} questions x ${cycles} cycle(s) x 3 slots ` +
     `(per-question ~$${perQuestion.perRunMaxUSD.toFixed(2)}, concurrent=${concurrent})\n`,
   );
+  for (const note of perQuestion.notes) {
+    process.stderr.write(`[eval cross-modal batch] note: ${note}\n`);
+  }
   if (estTotal > maxUsd && !parsed.yes) {
     process.stderr.write(
       `Error: estimated cost $${estTotal.toFixed(2)} exceeds --max-usd $${maxUsd.toFixed(2)}; ` +
       `pass --yes to proceed or lower --limit / --cycles.\n`,
     );
     return 1;
-  }
-
-  // Configure gateway (same path as single-task mode). When runEval is
-  // injected (test mode), skip the gateway availability gate — the injected
-  // function handles its own backend, so requiring an API key here would
-  // make hermetic unit tests impossible.
-  if (!opts.runEval) {
-    configureGatewayForCli();
-    if (!isAvailable('chat')) {
-      process.stderr.write(
-        'Error: AI gateway has no usable chat provider. ' +
-        'Configure one of OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY.\n',
-      );
-      return 1;
-    }
   }
 
   // Per-question receipts land in a tempdir; we delete the tempdir at the
@@ -695,7 +855,11 @@ async function runBatchMode(parsed: ParsedArgs, opts: RunCrossModalOpts): Promis
       fn: async (row, idx) => {
         process.stderr.write(`[eval cross-modal batch] ${idx + 1}/${rows.length} ${row.question_id} starting...\n`);
         return await runEvalFn({
-          task: row.question,
+          // With a gold answer the judges can actually verify correctness;
+          // without one they see only {question, hypothesis} and cannot.
+          task: row.answer
+            ? `${row.question}\n\nExpected answer (gold label from the benchmark dataset): ${row.answer}`
+            : row.question,
           output: row.hypothesis,
           slug: row.question_id,
           dimensions,
@@ -710,6 +874,7 @@ async function runBatchMode(parsed: ParsedArgs, opts: RunCrossModalOpts): Promis
     // Aggregate verdicts.
     let pass = 0, fail = 0, inconclusive = 0, errored = 0;
     const perQuestionResults: BatchSummary['per_question'] = [];
+    const slotScoredQuestions = slots.map(() => 0);
     for (let i = 0; i < results.length; i++) {
       const r = results[i]!;
       const qid = rows[i]!.question_id;
@@ -725,10 +890,15 @@ async function runBatchMode(parsed: ParsedArgs, opts: RunCrossModalOpts): Promis
       if (v === 'pass') pass++;
       else if (v === 'fail') fail++;
       else inconclusive++;
+      lastCycleScoredSlots(r.value).forEach((scored, idx) => {
+        if (scored && idx < slotScoredQuestions.length) slotScoredQuestions[idx]!++;
+      });
+      const slotScores = lastCycleSlotScores(r.value);
       perQuestionResults.push({
         question_id: qid,
         verdict: v,
         final_aggregate: r.value.finalAggregate,
+        ...(slotScores ? { slot_scores: slotScores } : {}),
       });
     }
 
@@ -765,6 +935,7 @@ async function runBatchMode(parsed: ParsedArgs, opts: RunCrossModalOpts): Promis
     else if (inconclusive > 0) { batchVerdict = 'inconclusive'; exitCode = 2; }
     else { batchVerdict = 'pass'; exitCode = 0; }
 
+    const judgePanel = describeJudgePanel(slots, slotScoredQuestions);
     const summary: BatchSummary = {
       schema_version: 1,
       kind: 'cross_modal_batch_summary',
@@ -779,6 +950,7 @@ async function runBatchMode(parsed: ParsedArgs, opts: RunCrossModalOpts): Promis
       verdict: batchVerdict,
       est_cost_usd: estTotal,
       slots,
+      panel: judgePanel.panel,
       cycles_per_question: cycles,
       concurrent,
       per_question: perQuestionResults,
@@ -801,8 +973,25 @@ async function runBatchMode(parsed: ParsedArgs, opts: RunCrossModalOpts): Promis
       `\n[eval cross-modal batch] verdict=${batchVerdict} ` +
       `pass=${pass} fail=${fail} inconclusive=${inconclusive} ` +
       `error=${errored} upstream_error=${upstreamErrorCount} malformed=${malformedCount} ` +
-      `(total ${totalDenom})\n`,
+      `(total ${totalDenom}) distinct_judge_models=${judgePanel.panel.distinct_models} ` +
+      `distinct_judge_providers=${judgePanel.panel.distinct_providers}\n`,
     );
+    for (const { model, slotIds } of judgePanel.shared) {
+      process.stderr.write(
+        `[eval cross-modal batch] judge ${model} holds slots ${slotIds.join(', ')}, ` +
+        `so its votes count more than once.\n`,
+      );
+    }
+    for (const { model, id } of judgePanel.silent) {
+      process.stderr.write(
+        `[eval cross-modal batch] judge ${model} in slot ${id} scored no question, so it did not judge.\n`,
+      );
+    }
+    if (judgePanel.panel.distinct_providers < 3) {
+      process.stderr.write(
+        `[eval cross-modal batch] fewer than 3 providers judged, so this panel is not cross-modal.\n`,
+      );
+    }
     process.stderr.write(`[eval cross-modal batch] summary receipt: ${summaryPath}\n`);
 
     if (parsed.json) {

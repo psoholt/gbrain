@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { formatRecipeTable, envReady } from '../src/commands/providers.ts';
+import { formatRecipeTable, formatEnvOutput, envReady } from '../src/commands/providers.ts';
 import { listRecipes, getRecipe } from '../src/core/ai/recipes/index.ts';
 import type { Recipe } from '../src/core/ai/types.ts';
 
@@ -62,6 +62,22 @@ describe('formatRecipeTable', () => {
     expect(openaiLine).toContain('✗ missing OPENAI_API_KEY');
   });
 
+  test('shows keyless Ollama chat as available', () => {
+    const out = formatRecipeTable(listRecipes(), {});
+    const ollamaLine = out.split('\n').find(line => line.startsWith('ollama'));
+    expect(ollamaLine).toBeDefined();
+    // Master-skew fixup: on this branch ollama also carries an expansion
+    // touchpoint (#4073), so the EXPAND column reads `yes`, not `—`.
+    // System One: RERANK and DECIDE columns follow CHAT (ollama declares neither).
+    expect(ollamaLine).toMatch(/ollama\s+openai-compat\s+yes\s+yes\s+yes\s+—\s+—\s+✓ ready/);
+  });
+
+  test('TypeSafe shows the rerank and decide capabilities and accepts either key name', () => {
+    const line = (env: Record<string, string>) => formatRecipeTable(listRecipes(), env).split('\n').find(l => l.startsWith('typesafe '));
+    expect(line({})).toMatch(/typesafe\s+openai-compat\s+—\s+—\s+—\s+yes\s+yes\s+✗ missing TYPESAFE_API_KEY/);
+    expect(line({ JEV_TYPESAFE_API_KEY: 'k' })).toContain('✓ ready');
+  });
+
   test('each recipe appears at most once', () => {
     const out = formatRecipeTable(listRecipes(), {});
     const recipes = listRecipes();
@@ -71,26 +87,61 @@ describe('formatRecipeTable', () => {
     }
   });
 
-  test('embedding-only recipe (zeroentropyai) shows yes/—/— for tiers', () => {
+  test('embedding-only recipe (voyage) shows yes/—/— for tiers', () => {
     const out = formatRecipeTable(listRecipes(), {});
-    const zeLine = out.split('\n').find(line => line.startsWith('zeroentropyai'));
-    expect(zeLine).toBeDefined();
-    // ZE has embedding but no expansion or chat
-    expect(zeLine).toContain('yes');
-    expect(zeLine).toContain('—');
+    const voyageLine = out.split('\n').find(line => line.startsWith('voyage'));
+    expect(voyageLine).toBeDefined();
+    // Voyage has embedding but no expansion or chat
+    expect(voyageLine).toContain('yes');
+    expect(voyageLine).toContain('—');
   });
 
   test('isolated subset renders correctly (picker reuses this)', () => {
     const openai = getRecipe('openai');
-    const ze = getRecipe('zeroentropyai');
-    expect(openai && ze).toBeTruthy();
-    const out = formatRecipeTable([openai!, ze!], { OPENAI_API_KEY: 'sk-test' });
+    const voyage = getRecipe('voyage');
+    expect(openai && voyage).toBeTruthy();
+    const out = formatRecipeTable([openai!, voyage!], { OPENAI_API_KEY: 'sk-test' });
     const lines = out.split('\n');
     // header + separator + 2 recipe rows
     expect(lines.length).toBe(4);
     expect(lines[2]).toContain('openai');
     expect(lines[2]).toContain('✓ ready');
-    expect(lines[3]).toContain('zeroentropyai');
-    expect(lines[3]).toContain('✗ missing ZEROENTROPY_API_KEY');
+    expect(lines[3]).toContain('voyage');
+    expect(lines[3]).toContain('✗ missing VOYAGE_API_KEY');
+  });
+});
+
+describe('formatEnvOutput (providers env <id>)', () => {
+
+  test('living provider control: setup funnel intact', () => {
+    const voyage = getRecipe('voyage')!;
+    const out = formatEnvOutput(voyage, {});
+    expect(out).not.toContain('DEPRECATED');
+    expect(out).toContain('Setup:');
+  });
+
+  test('keyless recipe (ollama): Required: (none) arm renders', () => {
+    const ollama = getRecipe('ollama')!;
+    const out = formatEnvOutput(ollama, {});
+    expect(out).toContain('Required: (none)');
+    expect(out).not.toContain('DEPRECATED');
+  });
+
+  test('optional-env arm renders when a recipe declares optional vars', () => {
+    const fake = {
+      id: 'fake-optional',
+      name: 'Fake Optional',
+      tier: 'native',
+      touchpoints: {},
+      auth_env: { required: ['FAKE_KEY'], optional: ['FAKE_ORG'], setup_url: 'https://example.com' },
+      setup_hint: 'Get a key at example.com.',
+    } as unknown as Recipe;
+    const out = formatEnvOutput(fake, { FAKE_ORG: 'org-1' });
+    expect(out).toContain('Optional:');
+    expect(out).toContain('FAKE_ORG');
+    expect(out).toContain('✓ set');
+    // Living provider keeps its funnel:
+    expect(out).toContain('Setup: https://example.com');
+    expect(out).toContain('Get a key at example.com.');
   });
 });

@@ -18,7 +18,7 @@
  * `ANTHROPIC_API_KEY`); this test is the structural regression guard that
  * runs in every parallel-test shard.
  */
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { afterAll, describe, test, expect, beforeEach } from 'bun:test';
 import {
   configureGateway,
   isAvailable,
@@ -31,6 +31,25 @@ import { extractFactsFromTurn } from '../src/core/facts/extract.ts';
 beforeEach(() => {
   resetGateway();
   __setChatTransportForTests(null);
+});
+
+// Shard hygiene: this file's tests each configureGateway WITHOUT
+// embedding_dimensions, and the file used to END in that state. The
+// legacy-embedding-preload only re-pins 1536 when the gateway is RESET
+// (it checks by calling getEmbeddingDimensions, which doesn't throw on a
+// configured-but-dimensionless gateway), and the NEXT file's beforeAll
+// (often engine.initSchema, which sizes vector columns from ambient
+// gateway state) runs before any beforeEach — so this file poisoned every
+// later fresh-schema file in its shard down to 1280-d columns under
+// 1536-d fixtures (bit engine-find-trajectory in CI shard 5). Restore the
+// legacy pin on exit.
+afterAll(() => {
+  __setChatTransportForTests(null);
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: 1536,
+    env: { ...process.env },
+  });
 });
 
 describe('facts extract — silent-no-op regression (v0.31.6 bug class)', () => {
@@ -91,7 +110,7 @@ describe('facts extract — silent-no-op regression (v0.31.6 bug class)', () => 
     });
     expect(isAvailable('chat')).toBe(false);
     const facts = await extractFactsFromTurn({
-      turnText: 'Garry founded Initialized in 2010 with Alexis.',
+      turnText: 'alice-example founded acme-example in 2010 with charlie-example.',
       source: 'test:no-op-regression',
     });
     expect(facts).toEqual([]);
@@ -122,9 +141,43 @@ describe('facts extract — silent-no-op regression (v0.31.6 bug class)', () => 
       };
     });
     await extractFactsFromTurn({
-      turnText: 'Garry founded Initialized in 2010 with Alexis.',
+      turnText: 'alice-example founded acme-example in 2010 with charlie-example.',
       source: 'test:smoking-gun',
     });
     expect(chatCalled).toBe(true);  // ← THE bug-class assertion
+  });
+});
+
+describe('gate-vs-model split (the wrong-model gate bug class)', () => {
+  test('global chat unservable but extraction override servable → override gate passes', () => {
+    // Global chat_model is Anthropic with no Anthropic key; the only live key
+    // is OpenAI. The bare probe must say NO while the model-override probe
+    // says YES — extraction gates on the model it will actually call.
+    configureGateway({
+      chat_model: 'anthropic:claude-sonnet-4-6',
+      env: { OPENAI_API_KEY: 'sk-test' },
+    });
+    expect(isAvailable('chat')).toBe(false);
+    expect(isAvailable('chat', 'openai:gpt-4o-mini')).toBe(true);
+  });
+
+  test('reverse split: global servable but extraction model unservable → chat_unavailable carries the model', async () => {
+    configureGateway({
+      chat_model: 'anthropic:claude-sonnet-4-6',
+      env: { ANTHROPIC_API_KEY: 'sk-ant-test' },
+    });
+    expect(isAvailable('chat')).toBe(true);
+    expect(isAvailable('chat', 'openai:gpt-4o-mini')).toBe(false);
+    const { extractFactsFromTurnWithOutcome } = await import('../src/core/facts/extract.ts');
+    const outcome = await extractFactsFromTurnWithOutcome({
+      turnText: 'Some turn text worth extracting.',
+      source: 'test:gate-split',
+      model: 'openai:gpt-4o-mini',
+    });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe('chat_unavailable');
+      expect(outcome.model).toBe('openai:gpt-4o-mini'); // outcome names the ACTUAL model
+    }
   });
 });

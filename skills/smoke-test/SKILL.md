@@ -1,9 +1,11 @@
 ---
 name: smoke-test
 description: |
-  Post-restart smoke tests + auto-fix for gbrain and OpenClaw environments.
-  Tests critical services, auto-fixes known issues, extensible via user-defined
-  test scripts in ~/.gbrain/smoke-tests.d/*.sh.
+  Health smoke tests + auto-fix for gbrain installs (and OpenClaw services
+  when present). Run after machine/container restarts or whenever something
+  seems broken. Tests critical services, auto-fixes bounded local issues,
+  and reports worker topology without starting daemons. Extensible via
+  user-defined test scripts in ~/.gbrain/smoke-tests.d/*.sh.
 triggers:
   - "smoke test"
   - "run smoke tests"
@@ -19,13 +21,16 @@ mutating: true
 
 # Smoke Test Skillpack
 
-> Run `gbrain smoke-test` or `bash scripts/smoke-test.sh` after any container restart.
+> Run `gbrain smoke-test` after any machine or container restart, or whenever
+> something seems broken.
 
 ## Contract
 
 This skill guarantees:
-- 8 core tests verify gbrain + OpenClaw health after restart
-- Known failures are auto-fixed before reporting
+- 8 core tests verify gbrain health after restart (plus OpenClaw services when
+  present; skipped otherwise)
+- Bounded local failures are auto-fixed before reporting; worker repair is
+  explicit because process topology and shell-job policy are operator choices
 - User-extensible via `~/.gbrain/smoke-tests.d/*.sh` drop-in scripts
 - Results logged to `/tmp/gbrain-smoke-test.log`
 - Exit code = number of unfixed failures (0 = all pass)
@@ -36,10 +41,10 @@ This skill guarantees:
 |---|------|----------|
 | 1 | Bun runtime | Install from bun.sh |
 | 2 | GBrain CLI loads | Reinstall deps |
-| 3 | GBrain database (doctor) | — |
-| 4 | GBrain worker process | Start worker |
-| 5 | OpenClaw Codex plugin (Zod CJS) | `npm install zod@4 --force` |
-| 6 | OpenClaw gateway | — (may not be started yet) |
+| 3 | GBrain database (engine identity via `gbrain engine status --json`, then `doctor --json`'s `connection` check) | `gbrain db-repair --yes`, re-test |
+| 4 | GBrain worker process | — (native supervisor status + duplicate detection) |
+| 5 | OpenClaw Codex plugin (Zod CJS); skips if OpenClaw absent | `npm install zod@4 --force` |
+| 6 | OpenClaw gateway; skips if OpenClaw absent | — (may not be started yet) |
 | 7 | Embedding API key | — (check .env) |
 | 8 | Brain repo exists | — |
 
@@ -50,12 +55,15 @@ This skill guarantees:
 gbrain smoke-test
 ```
 
-### Direct
+This is the invocation for all installs; it resolves the test script from the
+installed package.
+
+### From any startup script or login hook
 ```bash
-bash scripts/smoke-test.sh
+gbrain smoke-test >> /tmp/bootstrap.log 2>&1
 ```
 
-### From OpenClaw bootstrap
+### From OpenClaw bootstrap (OpenClaw deployments only)
 Add to your `ensure-services.sh` or equivalent:
 ```bash
 bash /path/to/gbrain/scripts/smoke-test.sh >> /tmp/bootstrap.log 2>&1
@@ -63,8 +71,11 @@ bash /path/to/gbrain/scripts/smoke-test.sh >> /tmp/bootstrap.log 2>&1
 
 ### From an agent
 ```
-exec: bash /data/gbrain/scripts/smoke-test.sh
+exec: gbrain smoke-test
 ```
+
+Contributor note: inside a gbrain repo checkout you can also run the script
+directly with `bash scripts/smoke-test.sh`.
 
 ## Adding Custom Tests
 
@@ -82,7 +93,11 @@ Rules:
 - Keep tests fast (< 10s each)
 - Tests run in alphabetical order
 
-## Adding Built-in Tests
+## Adding Built-in Tests (gbrain contributors)
+
+This section is for contributors working in the gbrain source repo. Plugin
+installs ship the script read-only and upgrades overwrite it; if you just want
+extra checks, use the `~/.gbrain/smoke-tests.d/` drop-in scripts above.
 
 Edit `scripts/smoke-test.sh`. Follow this pattern:
 
@@ -116,13 +131,17 @@ fi
 |-----|---------|-------------|
 | `GBRAIN_SMOKE_LOG` | `/tmp/gbrain-smoke-test.log` | Log file path |
 | `GBRAIN_DIR_OVERRIDE` | (auto-detect) | Force gbrain install path |
+| `GBRAIN_BUN_PATH` | (auto-detect) | Force Bun binary path |
 | `GBRAIN_DATABASE_URL` | (from .env) | Database connection URL |
+| `GBRAIN_SMOKE_WORKER_PID_FILE` | `/tmp/gbrain-worker.pid` | Legacy bare-worker PID path |
 | `OPENCLAW_GATEWAY_PORT` | `18789` | Gateway port to test |
-| `GBRAIN_BRAIN_PATH` | `/data/brain` | Brain repo path |
+| `GBRAIN_BRAIN_PATH` | (deployment-specific) | Brain repo path. Container deployments default to `/data/brain`; set it to your brain repo path otherwise. Test 8 skips (not fails) when unset. |
 
 ## Known Issues & Their Auto-Fixes
 
 ### Codex Zod core.cjs Missing (discovered 2026-04-23)
+(OpenClaw gateway deployments only: this concerns OpenClaw's Codex ACP plugin,
+not the OpenAI Codex CLI.)
 - **Symptom:** `Cannot find module './core.cjs'` → all Codex ACP sessions fail
 - **Cause:** Zod v4 npm package ships without `core.cjs` in some installs
 - **Auto-fix:** `npm install zod@4 --force` in the codex extension's zod dir
@@ -133,6 +152,14 @@ fi
 - **Symptom:** Worker can't connect to DB
 - **Cause:** `GBRAIN_DATABASE_URL` not propagated to worker subprocess
 - **Auto-fix:** Script explicitly passes both `DATABASE_URL` and `GBRAIN_DATABASE_URL`
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- Exit code = number of unfixed failures: report each by name and the attempted fix; never report all-green when a test was skipped.
+- The database test fails with a `GBRAIN_DB_ACCESS` marker: run `gbrain db-repair` and re-test; the rewrite tier needs the user's agreement.
+- The embedding API key check fails: there is no auto-fix. Tell the user which key is missing and that search runs keyword-only until it is set.
 
 ## Anti-Patterns
 

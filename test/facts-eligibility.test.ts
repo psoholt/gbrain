@@ -122,7 +122,7 @@ describe('isFactsBackstopEligible — eligible-types coverage', () => {
     });
   }
 
-  for (const t of ['person', 'company', 'deal', 'concept', 'project', 'image', 'code'] as PageType[]) {
+  for (const t of ['person', 'company', 'deal', 'concept', 'atom', 'project', 'image', 'code'] as PageType[]) {
     test(`type=${t} on non-rescued slug → rejected with kind:${t}`, () => {
       const f = fixture({ slug: 'wiki/whatever/x', type: t });
       const r = isFactsBackstopEligible(f.slug, f.parsed);
@@ -130,4 +130,56 @@ describe('isFactsBackstopEligible — eligible-types coverage', () => {
       if (!r.ok) expect(r.reason).toBe(`kind:${t}`);
     });
   }
+});
+
+describe('#6232 facts_backstop opt-out', () => {
+  test.each([false, 'false', 'no', 'off', 0, '0', 'OFF', ' No '])('facts_backstop: %p opts the page out', (value) => {
+    const { slug, parsed } = fixture({ frontmatter: { facts_backstop: value } });
+    expect(isFactsBackstopEligible(slug, parsed)).toEqual({ ok: false, reason: 'opted_out' });
+  });
+
+  test.each([true, 'true', 'yes', undefined, null, 'maybe'])('facts_backstop: %p leaves an eligible page eligible', (value) => {
+    const { slug, parsed } = fixture({ frontmatter: { facts_backstop: value } });
+    expect(isFactsBackstopEligible(slug, parsed)).toEqual({ ok: true });
+  });
+
+  test('the meeting-ingestion skill writes opt-outs the predicate honors', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { parseMarkdown } = await import('../src/core/markdown.ts');
+    const skill = readFileSync(new URL('../skills/meeting-ingestion/SKILL.md', import.meta.url), 'utf8');
+    expect(skill).toContain('`facts_backstop: false` in the sidecar\'s frontmatter');
+    const template = skill.match(/```markdown\n(---\ntype: meeting\n[\s\S]*?\n---\n)/)?.[1];
+    expect(template).toBeDefined();
+    const meeting = parseMarkdown(`${template}\n# Kickoff\n\n${LONG_BODY}\n`, 'meetings/2026-05-09-kickoff');
+    expect(isFactsBackstopEligible('meetings/2026-05-09-kickoff', meeting)).toEqual({ ok: false, reason: 'opted_out' });
+  });
+});
+
+// #6259 (quarantine leaks, item 2): a page the content-quality gate hid as junk is never offered to the backstop.
+describe('isFactsBackstopEligible — quarantined pages', () => {
+  test('a quarantine marker makes an otherwise eligible page ineligible with reason quarantined', () => {
+    const { slug, parsed } = fixture({ frontmatter: { quarantine: { reason: 'junk_pattern', detail: 'cloudflare_ray_id', assessed_at: '2026-10-07T00:00:00.000Z' } } });
+    expect(isFactsBackstopEligible(slug, parsed)).toEqual({ ok: false, reason: 'quarantined' });
+  });
+  test('a content_flag (searchable, warned) leaves the page eligible', () => {
+    const { slug, parsed } = fixture({ frontmatter: { content_flag: { reason: 'markup_heavy', detail: 'x', assessed_at: '2026-10-07T00:00:00.000Z' } } });
+    expect(isFactsBackstopEligible(slug, parsed)).toEqual({ ok: true });
+  });
+});
+
+// #6557: conversation-shaped pages belong to the opt-in conversation facts pipeline; the skip says so.
+describe('isFactsBackstopEligible — conversation pipeline types', () => {
+  test.each(['conversation', 'imessage', 'imessage-daily', 'slack-thread', 'slack-dm-day', 'email-digest'])(
+    '%s skips with reason conversation_pipeline', (type) => {
+      const { parsed } = fixture({ type: type as PageType });
+      expect(isFactsBackstopEligible('conversations/2026-10-01-thread', parsed)).toEqual({ ok: false, reason: 'conversation_pipeline' });
+    });
+  test('a non-conversation ineligible type keeps its kind reason', () => {
+    const { parsed } = fixture({ type: 'person' as PageType });
+    expect(isFactsBackstopEligible('people/alice-example', parsed)).toEqual({ ok: false, reason: 'kind:person' });
+  });
+  test('a conversation page under a rescue prefix stays eligible', () => {
+    const { parsed } = fixture({ type: 'conversation' as PageType });
+    expect(isFactsBackstopEligible('meetings/2026-10-01-call', parsed)).toEqual({ ok: true });
+  });
 });

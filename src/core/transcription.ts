@@ -6,8 +6,9 @@
  * For files >25MB: ffmpeg segmentation into <25MB chunks, transcribe each, concatenate.
  */
 
-import { statSync, readFileSync } from 'fs';
-import { basename, extname } from 'path';
+import { statSync, readFileSync, rmSync } from 'fs';
+import { basename, extname, join } from 'path';
+import { invokeAI } from './ai/invocation-guard.ts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -124,11 +125,12 @@ async function transcribeFile(
   formData.append('response_format', 'verbose_json');
   if (config.language) formData.append('language', config.language);
 
-  const response = await fetch(`${baseUrl}/audio/transcriptions`, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${apiKey}` },
-    body: formData,
-  });
+  const response = await invokeAI({ operation: 'transcription', kind: 'transcription', model: `${provider}:${model}` },
+    () => fetch(`${baseUrl}/audio/transcriptions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+      body: formData,
+    }), () => null);
 
   if (!response.ok) {
     const errorText = await response.text();
@@ -169,14 +171,22 @@ async function transcribeLargeFile(
     );
   }
 
-  // Segment into ~20MB chunks (with some overlap for better joining)
-  const { execSync } = await import('child_process');
-  const tmpDir = execSync('mktemp -d').toString().trim();
+  // Segment into ~20MB chunks (with some overlap for better joining).
+  //
+  // SECURITY (#245): use execFileSync with argument arrays — never a shell
+  // command string. audioPath is interpolated here, and a path containing
+  // shell metacharacters (`;`, `$()`, backticks, quotes) would be a command
+  // injection if passed through a shell. Argument arrays bypass the shell
+  // entirely, so audioPath is always a single literal argv element.
+  const { execFileSync } = await import('./spawn.ts');
+  const tmpDir = execFileSync('mktemp', ['-d']).toString().trim();
 
   try {
     // Get audio duration
-    const durationStr = execSync(
-      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`,
+    const durationStr = execFileSync(
+      'ffprobe',
+      ['-v', 'error', '-show_entries', 'format=duration',
+       '-of', 'default=noprint_wrappers=1:nokey=1', audioPath],
       { encoding: 'utf-8' }
     ).trim();
     const totalDuration = parseFloat(durationStr) || 0;
@@ -188,8 +198,10 @@ async function transcribeLargeFile(
 
     // Split audio
     const ext = extname(audioPath);
-    execSync(
-      `ffmpeg -i "${audioPath}" -f segment -segment_time ${segmentSeconds} -c copy "${tmpDir}/segment_%03d${ext}"`,
+    execFileSync(
+      'ffmpeg',
+      ['-i', audioPath, '-f', 'segment', '-segment_time', String(segmentSeconds),
+       '-c', 'copy', join(tmpDir, `segment_%03d${ext}`)],
       { stdio: 'pipe' }
     );
 
@@ -200,7 +212,7 @@ async function transcribeLargeFile(
     let timeOffset = 0;
 
     for (const seg of segments) {
-      const segPath = `${tmpDir}/${seg}`;
+      const segPath = join(tmpDir, seg);
       const result = await transcribeFile(segPath, provider, apiKey, config);
       // Offset timestamps
       result.segments = result.segments.map(s => ({
@@ -221,15 +233,15 @@ async function transcribeLargeFile(
       provider,
     };
   } finally {
-    // Cleanup temp directory
-    try { execSync(`rm -rf "${tmpDir}"`); } catch {}
+    // Cleanup temp directory via fs.rmSync — never a shell remove command (#245).
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 }
 
 async function checkFfmpeg(): Promise<boolean> {
   try {
-    const { execSync } = await import('child_process');
-    execSync('ffmpeg -version', { stdio: 'pipe' });
+    const { execFileSync } = await import('./spawn.ts');
+    execFileSync('ffmpeg', ['-version'], { stdio: 'pipe' });
     return true;
   } catch {
     return false;

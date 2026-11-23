@@ -28,6 +28,8 @@ import {
   computeDoctorReport,
   type Check,
 } from '../src/commands/doctor.ts';
+import { buildEmbedSkipMarker } from '../src/core/embed-skip.ts';
+import { PAGE_MAX_BYTES } from '../src/core/page-size-policy.ts';
 
 let engine: PGLiteEngine;
 
@@ -206,6 +208,125 @@ describe('buildChecks — orchestrator against PGLite', () => {
     const connection = checks.find(c => c.name === 'connection');
     expect(connection).toBeDefined();
     expect(connection!.status).toBe('warn');
+  });
+
+  test('content-sanity checks run on PGLite — oversized page warns, none die on the dead postgres singleton (#1871)', async () => {
+    // Pre-fix these three checks reached the DB via db.getConnection() —
+    // the postgres.js singleton, which is never connected on the default
+    // PGLite engine — so every run reported
+    // "Skipped (No database connection: connect() has not been called)".
+    const big = 'oversized page body prose for the block threshold probe. '.repeat(Math.ceil((PAGE_MAX_BYTES + 1) / 57)); // over the 24 MiB default block
+    await engine.putPage('wiki/oversized-probe-1871', {
+      type: 'note',
+      title: 'Oversized Probe 1871',
+      compiled_truth: big,
+      timeline: '',
+      frontmatter: {},
+    });
+
+    const checks = await buildChecks(engine, []);
+
+    const oversized = checks.find(c => c.name === 'oversized_pages');
+    expect(oversized).toBeDefined();
+    expect(oversized!.status).toBe('warn');
+    expect(oversized!.message).toContain('oversized-probe-1871');
+
+    // The sibling checks now execute for real on PGLite too.
+    const junk = checks.find(c => c.name === 'scraper_junk_pages');
+    expect(junk).toBeDefined();
+    expect(junk!.message).not.toContain('Skipped');
+    const mbc = checks.find(c => c.name === 'markdown_body_completeness');
+    expect(mbc).toBeDefined();
+
+    // No check on a healthy PGLite brain reports the dead-singleton error.
+    for (const c of checks) {
+      expect(c.message).not.toContain('connect() has not been called');
+    }
+  });
+
+  test('oversized_pages excludes pages that already took the embed_skip remediation (gbrain dogfooding find)', async () => {
+    // The warn message for this check says "existing oversized pages can be
+    // ... accepted as non-embeddable" (i.e. frontmatter.embed_skip set).
+    // Before this fix the underlying query never excluded those pages, so a
+    // page an operator had already remediated the documented way kept
+    // re-appearing in this check's output on every run with no way to clear
+    // it short of deleting the page. Uses the real production marker shape
+    // (an object from buildEmbedSkipMarker, not a bare boolean) — the
+    // canonical writer (src/core/content-sanity.ts) never writes a boolean,
+    // and the exclusion must match what actually lands in frontmatter.
+    const big = 'oversized page body prose for the embed_skip exclusion probe. '.repeat(Math.ceil((PAGE_MAX_BYTES + 1) / 62));
+    await engine.putPage('wiki/oversized-embed-skip-probe', {
+      type: 'note',
+      title: 'Oversized Embed-Skip Probe',
+      compiled_truth: big,
+      timeline: '',
+      frontmatter: { embed_skip: buildEmbedSkipMarker(big.length) },
+    });
+
+    const checks = await buildChecks(engine, []);
+    const oversized = checks.find(c => c.name === 'oversized_pages');
+    expect(oversized).toBeDefined();
+    // Positive control above (line ~227) proves the same byte count without
+    // embed_skip DOES warn and names the page — this proves the ONLY
+    // difference (embed_skip set) is what excludes it.
+    expect(oversized!.status).toBe('ok');
+    expect(oversized!.message).not.toContain('oversized-embed-skip-probe');
+  });
+
+  test('oversized_pages still warns when embed_skip is absent (does not exclude every page)', async () => {
+    // Sibling positive control to the exclusion test above: a page with no
+    // embed_skip key at all must still warn, proving the exclusion is
+    // scoped to the marker's presence and isn't a query regression that
+    // silently stops counting oversized pages altogether.
+    //
+    // Note: per the canonical contract in src/core/embed-skip.ts
+    // (isEmbedSkipped: "any non-null value" is skip, by design — the
+    // predicate is key-EXISTENCE, not a boolean value check), an explicit
+    // `embed_skip: false` is ALSO treated as skip, matching every other
+    // embed-skip consumer in the codebase (embed.ts, postgres-engine.ts,
+    // pglite-engine.ts). This check must stay consistent with that shared
+    // contract rather than inventing its own true/false semantics.
+    const big = 'oversized page body prose for the embed_skip-absent probe. '.repeat(Math.ceil((PAGE_MAX_BYTES + 1) / 59));
+    await engine.putPage('wiki/oversized-embed-skip-absent-probe', {
+      type: 'note',
+      title: 'Oversized Embed-Skip-Absent Probe',
+      compiled_truth: big,
+      timeline: '',
+    });
+
+    const checks = await buildChecks(engine, []);
+    const oversized = checks.find(c => c.name === 'oversized_pages');
+    expect(oversized).toBeDefined();
+    expect(oversized!.status).toBe('warn');
+    expect(oversized!.message).toContain('oversized-embed-skip-absent-probe');
+  });
+
+  test('#6526: oversized_pages honors a DB-plane content_sanity.bytes_block override', async () => {
+    // The check read bytes_block from the file and env planes only (loadConfig), so a
+    // `gbrain config set content_sanity.bytes_block N` that the write gate honors never
+    // reached it. It now uses the gate's resolution (import-screen.ts effectiveBytesBlock).
+    // The page sits between the operator's 500_000 and the 24 MiB default, with no
+    // embed_skip marker, so the DB-plane value alone decides the warn.
+    const lowered = 500_000;
+    await engine.setConfig('content_sanity.bytes_block', String(lowered));
+    try {
+      const big = 'oversized page body prose for the db-plane override probe. '.repeat(11_000); // ~650KB
+      await engine.putPage('wiki/oversized-db-plane-probe', {
+        type: 'note',
+        title: 'Oversized DB-Plane Probe',
+        compiled_truth: big,
+        timeline: '',
+      });
+
+      const checks = await buildChecks(engine, []);
+      const oversized = checks.find(c => c.name === 'oversized_pages');
+      expect(oversized).toBeDefined();
+      expect(oversized!.status).toBe('warn');
+      expect(oversized!.message).toContain('oversized-db-plane-probe');
+      expect(oversized!.message).toContain(`${lowered}`);
+    } finally {
+      await engine.unsetConfig('content_sanity.bytes_block');
+    }
   });
 
   test('mixed-outcome render path: synthesized checks aggregate as expected', () => {

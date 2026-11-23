@@ -5,20 +5,30 @@
 #
 # Sibling to scripts/check-progress-to-stdout.sh and
 # scripts/check-jsonb-pattern.sh per CLAUDE.md's CI guard pattern.
-# Wired into `bun run test` via package.json's `test` script.
+# Wired into `bun run verify` (check:newlines).
+#
+# Guard fixtures under test/fixtures/guards/ are skipped: their known-bad
+# trees deliberately lack the newline. Seam: GBRAIN_GUARD_ROOT scans a fixture
+# tree with find instead of git ls-files.
 
 set -euo pipefail
+
+cd "${GBRAIN_GUARD_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 
 # Files to check: anything tracked under src/ + test/ that's a code/text file.
 # Also the top-level *.yml + *.md the repo controls. Portable to bash 3.2
 # (macOS default) — no mapfile, no associative arrays.
-files=$(
-  git ls-files \
-    'src/**/*.ts' 'src/**/*.js' 'src/**/*.json' 'src/**/*.sql' 'src/**/*.md' \
-    'test/**/*.ts' 'test/**/*.js' 'test/**/*.json' 'test/**/*.md' \
-    'gbrain.yml' '*.md' \
-  2>/dev/null | sort -u
-)
+if [ -n "${GBRAIN_GUARD_ROOT:-}" ]; then
+  files=$(find . -type f \( -name '*.ts' -o -name '*.js' -o -name '*.json' -o -name '*.sql' -o -name '*.md' -o -name 'gbrain.yml' \) | sed 's#^\./##' | sort -u)
+else
+  files=$(
+    git ls-files \
+      'src/**/*.ts' 'src/**/*.js' 'src/**/*.json' 'src/**/*.sql' 'src/**/*.md' \
+      'test/**/*.ts' 'test/**/*.js' 'test/**/*.json' 'test/**/*.md' \
+      'gbrain.yml' '*.md' \
+    2>/dev/null | grep -v '^test/fixtures/guards/' | sort -u
+  )
+fi
 
 missing=""
 total=0

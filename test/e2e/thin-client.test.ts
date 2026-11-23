@@ -10,6 +10,11 @@
  *   - `gbrain doctor` reports `mode: thin-client` with all checks green
  *   - `gbrain sync` is refused with the canonical thin-client error
  *   - re-running `gbrain init` refuses without --force
+ *   - daily-driver verbs: `search` / `query` / `recall --json` from the
+ *     thin-client HOME return host-seeded rows with the same top-level JSON
+ *     shape as a local-engine run (key sets pinned)
+ *   - invalid/revoked credentials and a stopped host both surface the
+ *     canonical RemoteMcpError rendering with a non-zero exit, fail-fast
  *
  * Tier B flows (`gbrain remote ping` / `remote doctor`) are stubbed for now
  * and will be exercised when the Tier B commands ship.
@@ -22,6 +27,10 @@ import { describe, test as testRaw, expect, beforeAll, afterAll } from 'bun:test
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { keylessBrainEnv } from '../helpers/provider-env.ts';
+import { startServeHttp, type ServeHttp } from '../helpers/serve-http.ts';
+import { cliDiagnostic, fixtureDiagnostic } from '../helpers/fixture-diagnostics.ts';
+import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
 
 function test(name: string, fn: () => void | Promise<unknown>): void {
   testRaw(name, fn, 120000);
@@ -29,22 +38,16 @@ function test(name: string, fn: () => void | Promise<unknown>): void {
 
 const CLI = join(__dirname, '..', '..', 'src', 'cli.ts');
 const DATABASE_URL = process.env.DATABASE_URL;
+let hostDatabaseUrl = DATABASE_URL;
 
 interface RunResult { exitCode: number; stdout: string; stderr: string; }
 
 async function spawn(args: string[], home: string, extraEnv: Record<string, string | undefined> = {}): Promise<RunResult> {
-  const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined) env[k] = v;
-  }
-  env.GBRAIN_HOME = home;
-  delete env.GBRAIN_REMOTE_CLIENT_SECRET;
-  for (const [k, v] of Object.entries(extraEnv)) {
-    if (v === undefined) delete env[k];
-    else env[k] = v;
-  }
+  const env = keylessBrainEnv(process.env, home, {
+    GBRAIN_REMOTE_CLIENT_SECRET: undefined, GBRAIN_DATABASE_URL: undefined, DATABASE_URL: hostDatabaseUrl, ...extraEnv,
+  });
   const proc = Bun.spawn({
-    cmd: ['bun', 'run', CLI, ...args],
+    cmd: ['bun', '--no-env-file', 'run', CLI, ...args],
     env,
     stdin: 'ignore',
     stdout: 'pipe',
@@ -65,50 +68,39 @@ const describeWhen = DATABASE_URL ? describe : describe.skip;
 describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
   let hostHome: string;          // GBRAIN_HOME for the host (with local engine)
   let clientHome: string;        // GBRAIN_HOME for the thin client (no engine)
-  let serverProc: ReturnType<typeof Bun.spawn> | null = null;
+  let server: ServeHttp | null = null;
   let serverPort: number;
   let clientId: string;
   let clientSecret: string;
+  let database: Awaited<ReturnType<typeof isolatedPersistencePostgres>> | undefined;
 
   beforeAll(async () => {
     hostHome = mkdtempSync(join(tmpdir(), 'gbrain-thin-host-'));
     clientHome = mkdtempSync(join(tmpdir(), 'gbrain-thin-client-'));
 
+    // Host health and permanent receipt IDs must not inherit another file's
+    // pages, grants or config. Never truncate the shared shard database.
+    database = await isolatedPersistencePostgres(DATABASE_URL!);
+    const [{ name }] = await database.engine.executeRaw<{ name: string }>('SELECT current_database() AS name');
+    const url = new URL(DATABASE_URL!); url.pathname = `/${name}`;
+    hostDatabaseUrl = url.toString();
+
     // 1. Init host with a real Postgres. `--no-embedding` defers embedding
     //    setup (v0.37.10.0+ requires an explicit embedding provider OR the
     //    deferral flag); thin-client tests exercise the routing surface, not
     //    embedding, so no provider is needed.
-    const init = await spawn(['init', '--non-interactive', '--no-embedding', '--url', DATABASE_URL!], hostHome);
-    if (init.exitCode !== 0) throw new Error(`host init failed: ${init.stderr || init.stdout}`);
+    const init = await spawn(['init', '--non-interactive', '--no-embedding', '--url', hostDatabaseUrl], hostHome);
+    if (init.exitCode !== 0) throw new Error(cliDiagnostic(`host init failed`, init));
 
-    // 2. Pick a random free port for serve --http.
-    serverPort = 30000 + Math.floor(Math.random() * 30000);
-
-    // 3. Spawn serve --http (background, async).
-    const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) {
-      if (v !== undefined) env[k] = v;
-    }
-    env.GBRAIN_HOME = hostHome;
-    serverProc = Bun.spawn({
-      cmd: ['bun', 'run', CLI, 'serve', '--http', '--port', String(serverPort)],
-      env,
-      stdin: 'ignore',
-      stdout: 'pipe',
-      stderr: 'pipe',
+    // 2-3. serve --http on a port the kernel reports free, healthy before the suite continues.
+    server = await startServeHttp({
+      cwd: process.cwd(),
+      env: keylessBrainEnv(process.env, hostHome, {
+        GBRAIN_REMOTE_CLIENT_SECRET: undefined, GBRAIN_DATABASE_URL: undefined, DATABASE_URL: hostDatabaseUrl,
+      }),
+      timeoutMs: 20_000,
     });
-
-    // Wait for the server to be ready (poll the discovery endpoint).
-    const deadline = Date.now() + 20_000;
-    while (Date.now() < deadline) {
-      try {
-        const res = await fetch(`http://127.0.0.1:${serverPort}/.well-known/oauth-authorization-server`, {
-          signal: AbortSignal.timeout(500),
-        });
-        if (res.ok) break;
-      } catch { /* retry */ }
-      await new Promise(r => setTimeout(r, 250));
-    }
+    serverPort = server.port;
 
     // 4. Register a client with read,write,admin scope.
     const reg = await spawn([
@@ -116,12 +108,12 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
       '--grant-types', 'client_credentials',
       '--scopes', 'read write admin',
     ], hostHome);
-    if (reg.exitCode !== 0) throw new Error(`register-client failed: ${reg.stderr || reg.stdout}`);
+    if (reg.exitCode !== 0) throw new Error(cliDiagnostic(`register-client failed`, reg));
     const parsed = parseRegisterClientOutput(reg.stdout);
     clientId = parsed.clientId;
     clientSecret = parsed.clientSecret;
     if (!clientId || !clientSecret) {
-      throw new Error(`register-client returned unexpected output: ${reg.stdout}`);
+      throw new Error(fixtureDiagnostic("register-client", "missing client ID or secret"));
     }
   });
 
@@ -138,12 +130,11 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
   }
 
   afterAll(async () => {
-    if (serverProc) {
-      try { serverProc.kill(); } catch { /* best-effort */ }
-      try { await serverProc.exited; } catch { /* ignore */ }
-    }
+    await server?.stop();
     try { rmSync(hostHome, { recursive: true, force: true }); } catch { /* best-effort */ }
     try { rmSync(clientHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+    await database?.close();
+    hostDatabaseUrl = DATABASE_URL;
   });
 
   test('init --mcp-only succeeds against the live host', async () => {
@@ -154,7 +145,7 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
       '--oauth-client-id', clientId,
       '--oauth-client-secret', clientSecret,
     ], clientHome);
-    expect(r.exitCode).toBe(0);
+    expect(r.exitCode, cliDiagnostic("thin-client CLI", r)).toBe(0);
     const cfgPath = join(clientHome, '.gbrain', 'config.json');
     expect(existsSync(cfgPath)).toBe(true);
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf-8'));
@@ -165,8 +156,9 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
 
   test('doctor reports mode: thin-client with all checks green', async () => {
     const r = await spawn(['doctor', '--json'], clientHome);
-    expect(r.exitCode).toBe(0);
     const report = JSON.parse(r.stdout.trim());
+    const failedChecks = report.checks.filter((check: { status: string }) => check.status !== 'ok');
+    expect(r.exitCode, fixtureDiagnostic('thin-client doctor checks', JSON.stringify(failedChecks), [clientId, clientSecret])).toBe(0);
     expect(report.mode).toBe('thin-client');
     expect(report.status).toBe('ok');
     const checkNames = report.checks.map((c: { name: string }) => c.name);
@@ -179,7 +171,7 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
 
   test('sync is refused with canonical thin-client error', async () => {
     const r = await spawn(['sync'], clientHome);
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode, cliDiagnostic("thin-client CLI", r)).toBe(1);
     // refuseThinClient() emits "(thin-client of <mcp_url>)" with the hyphenated
     // form. Allow either spelling so a future format tweak doesn't false-fail.
     expect(r.stderr).toMatch(/thin[- ]client/);
@@ -188,7 +180,7 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
 
   test('re-running init refuses without --force', async () => {
     const r = await spawn(['init', '--non-interactive', '--pglite', '--json'], clientHome);
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode, cliDiagnostic("thin-client CLI", r)).toBe(1);
     const parsed = JSON.parse(r.stdout.trim().split('\n').pop()!);
     expect(parsed.reason).toBe('thin_client_config_present');
   });
@@ -262,7 +254,7 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
       '--grant-types', 'client_credentials',
       '--scopes', 'read write',
     ], hostHome);
-    if (reg.exitCode !== 0) throw new Error(`register-client failed: ${reg.stderr || reg.stdout}`);
+    if (reg.exitCode !== 0) throw new Error(cliDiagnostic(`register-client failed`, reg));
     const parsed = parseRegisterClientOutput(reg.stdout);
     const lowScopeId = parsed.clientId;
     const lowScopeSecret = parsed.clientSecret;
@@ -278,12 +270,12 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
         '--oauth-client-secret', lowScopeSecret,
       ], lowScopeHome);
       if (init.exitCode !== 0) {
-        throw new Error(`low-scope init exit=${init.exitCode}\nstdout:${init.stdout}\nstderr:${init.stderr}`);
+        throw new Error(cliDiagnostic("low-scope init", init));
       }
-      expect(init.exitCode).toBe(0);
+      expect(init.exitCode, cliDiagnostic("thin-client CLI", init)).toBe(0);
 
       const r = await spawn(['remote', 'doctor', '--json'], lowScopeHome);
-      expect(r.exitCode).toBe(1);
+      expect(r.exitCode, cliDiagnostic("thin-client CLI", r)).toBe(1);
       const err = JSON.parse(r.stdout.trim());
       expect(err.status).toBe('error');
       // Either the SDK 401 path or our auth_after_refresh wrap is fine —
@@ -292,5 +284,185 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
     } finally {
       rmSync(lowScopeHome, { recursive: true, force: true });
     }
+  });
+
+  // ─── G3: the daily-driver verbs over the live host serve ───
+  //
+  // ORDERING NOTE: bun runs tests in declaration order within a file. The
+  // 'stopped host' test below KILLS the shared serve process, so it must stay
+  // the LAST test in this file — add new live-serve tests ABOVE it.
+
+  const G3_MARKER = 'peridot-gyroscope-mangrove-e2e';
+  const G3_SLUG = 'thin-client-daily-driver-marker';
+
+  /**
+   * Seed the HOST brain through its own local-engine CLI: one page (found by
+   * the search/query keyword arm — the host was inited --no-embedding, so the
+   * vector arm degrades and keyword carries the match) and one
+   * world-visibility fact (the recall arm; remote callers see world-only).
+   * The owned database starts empty; seed once so a failed write or read
+   * remains visible instead of being hidden by a retry.
+   */
+  async function seedHostMarker(): Promise<void> {
+    const content = [
+      '---',
+      'title: Daily Driver Marker Page',
+      'type: note',
+      '---',
+      '',
+      `The secret phrase is ${G3_MARKER} and it lives only in the host brain.`,
+      '',
+    ].join('\n');
+    const put = await spawn(['put', G3_SLUG, '--content', content], hostHome);
+    if (put.exitCode !== 0) throw new Error(cliDiagnostic(`seed put failed`, put));
+    const rem = await spawn(
+      ['remember', `The rendezvous codeword is ${G3_MARKER}`, '--provenance', 'thin-client e2e seed'],
+      hostHome,
+    );
+    if (rem.exitCode !== 0) throw new Error(cliDiagnostic(`seed remember failed`, rem));
+  }
+
+  interface VerbRuns {
+    hostSearch: RunResult;
+    clientSearch: RunResult;
+    hostQuery: RunResult;
+    clientQuery: RunResult;
+    hostRecall: RunResult;
+    clientRecall: RunResult;
+  }
+
+  test('daily-driver verbs (search/query/recall) return host-brain rows with local-parity --json envelopes', async () => {
+    await seedHostMarker();
+    // Local and routed reads of the same owned host brain run concurrently.
+    const [hostSearch, clientSearch, hostQuery, clientQuery, hostRecall, clientRecall] = await Promise.all([
+      spawn(['search', G3_MARKER, '--json'], hostHome),
+      spawn(['search', G3_MARKER, '--json'], clientHome),
+      spawn(['query', G3_MARKER, '--json'], hostHome),
+      spawn(['query', G3_MARKER, '--json'], clientHome),
+      spawn(['recall', '--grep', G3_MARKER, '--json'], hostHome),
+      spawn(['recall', '--grep', G3_MARKER, '--json'], clientHome),
+    ]);
+    const runs: VerbRuns = { hostSearch, clientSearch, hostQuery, clientQuery, hostRecall, clientRecall };
+    for (const [verb, result] of Object.entries(runs)) {
+      expect(result.exitCode, cliDiagnostic(verb, result, [clientId, clientSecret])).toBe(0);
+    }
+
+    // search + query --json: top-level shape is an ARRAY of result rows
+    // (formatResult's search/query case prints JSON.stringify(results)).
+    // The routed envelope must carry the SAME per-row key set as the
+    // local-engine run — cli.ts normalizes the local path via
+    // normalizeLocalResult (ENG-2: renderer parity by data shape) exactly so
+    // these two match.
+    const pinRowParity = (local: RunResult, routed: RunResult, verb: string) => {
+      const localRows = JSON.parse(local.stdout.trim()) as Array<Record<string, unknown>>;
+      const routedRows = JSON.parse(routed.stdout.trim()) as Array<Record<string, unknown>>;
+      expect(Array.isArray(localRows)).toBe(true);
+      expect(Array.isArray(routedRows)).toBe(true);
+      const localRow = localRows.find(r => r.slug === G3_SLUG);
+      const routedRow = routedRows.find(r => r.slug === G3_SLUG);
+      if (!localRow || !routedRow) throw new Error(`${verb}: marker row missing after complete-run gate`);
+      // Rows come from the HOST brain: the host-seeded marker string rides
+      // the routed row's chunk text.
+      expect(String(routedRow.chunk_text)).toContain(G3_MARKER);
+      // Daily-driver core keys, pinned by name — agents branch on these.
+      for (const key of ['slug', 'page_id', 'title', 'type', 'chunk_text', 'chunk_source', 'score', 'evidence', 'source_id', 'stale']) {
+        expect(Object.keys(routedRow)).toContain(key);
+      }
+      // Full key-set parity local ↔ routed. The CLI put stamps the page agent-written, so the routed (remote)
+      // read alone returns it quoted and adds `quoted` (GST-687); the local read returns it as stored.
+      expect(routedRow.quoted).toBe('transcript');
+      expect(localRow.quoted).toBeUndefined();
+      expect(Object.keys(routedRow).filter(k => k !== 'quoted').sort()).toEqual(Object.keys(localRow).sort());
+    };
+    pinRowParity(runs.hostSearch, runs.clientSearch, 'search');
+    pinRowParity(runs.hostQuery, runs.clientQuery, 'query');
+
+    // recall --json: top-level shape is the {facts, total} envelope on BOTH
+    // paths (runRecallOnce renders factRowToJson locally and re-renders the
+    // remote op's rows through the same serializer on the routed path).
+    const localEnv = JSON.parse(runs.hostRecall.stdout.trim()) as { facts: Array<Record<string, unknown>>; total: number };
+    const routedEnv = JSON.parse(runs.clientRecall.stdout.trim()) as { facts: Array<Record<string, unknown>>; total: number };
+    expect(Object.keys(localEnv).sort()).toEqual(['facts', 'total']);
+    expect(Object.keys(routedEnv).sort()).toEqual(['facts', 'total']);
+    const localFact = localEnv.facts.find(f => String(f.fact).includes(G3_MARKER));
+    const routedFact = routedEnv.facts.find(f => String(f.fact).includes(G3_MARKER));
+    if (!localFact || !routedFact) throw new Error('recall: marker fact missing after complete-run gate');
+    for (const key of ['id', 'fact', 'kind', 'entity_slug', 'visibility', 'confidence', 'effective_confidence', 'created_at']) {
+      expect(Object.keys(routedFact)).toContain(key);
+    }
+    expect(Object.keys(routedFact).sort()).toEqual(Object.keys(localFact).sort());
+    // Same host row over the wire, not a lookalike.
+    expect(routedFact.id).toBe(localFact.id);
+  });
+
+  test('invalid/revoked client credentials fail with the canonical remote error and non-zero exit', async () => {
+    // GBRAIN_REMOTE_CLIENT_SECRET overrides the config-file secret
+    // (mcp-client resolveSecret), so this exercises the exact wire path a
+    // revoked/rotated credential takes: the host's /token endpoint answers
+    // 401 invalid_client (RFC 6749 §5.2) for bad AND revoked clients alike.
+    const r = await spawn(['search', G3_MARKER, '--json'], clientHome, {
+      GBRAIN_REMOTE_CLIENT_SECRET: 'gbrain_cs_definitely_not_the_real_secret',
+    });
+    expect(r.exitCode, cliDiagnostic("thin-client CLI", r)).toBe(1);
+    // No fabricated results: under --json stdout carries only the v1 error envelope (agent contract D1).
+    expect(JSON.parse(r.stdout)).toMatchObject({ code: expect.any(String), suggestion: expect.any(String), contract_version: 1 });
+    // Canonical RemoteMcpError surface: reason 'auth' ("OAuth auth failed.");
+    // any other /token status renders as reason 'token' ("OAuth /token
+    // failed: ..."), never as a discovery failure.
+    expect(r.stderr).toMatch(/OAuth (auth|\/token) failed/);
+  });
+
+  test('a client bound to a disabled member is told so by the real host, not that its credentials were revoked', async () => {
+    const host = async (args: string[]) => {
+      const r = await spawn(args, hostHome);
+      expect(r.exitCode, cliDiagnostic(`host ${args.join(' ')}`, r)).toBe(0);
+    };
+    await host(['access', 'member', 'add', 'alice-example']);
+    await host(['auth', 'rescope', '--client', clientId, '--member', 'alice-example']);
+    await host(['access', 'member', 'disable', 'alice-example']);
+    try {
+      const r = await spawn(['search', G3_MARKER, '--json'], clientHome);
+      expect(r.exitCode, cliDiagnostic('thin-client CLI', r)).toBe(1);
+      expect(r.stderr).toContain('bound to a member who is disabled, removed or missing (access_member_disabled)');
+      expect(r.stderr).not.toContain('Credentials may have been revoked');
+      expect(r.stderr).not.toContain('gbrain remote doctor');
+    } finally {
+      await host(['auth', 'rescope', '--client', clientId, '--member', 'none']);
+      await host(['access', 'member', 'enable', 'alice-example']);
+      // The refused call dropped the cached token; the stopped-host test below needs one again.
+      const warm = await spawn(['search', G3_MARKER, '--json'], clientHome);
+      expect(warm.exitCode, cliDiagnostic('thin-client CLI', warm)).toBe(0);
+    }
+  });
+
+  test('stopped host: routed verbs fail fast with the canonical unreachable error, not a hang', async () => {
+    // Kill the live serve. This test is LAST in the file by design (see the
+    // ordering note above); afterAll's kill is a no-op afterwards.
+    await server?.stop();
+    const t0 = Date.now();
+    // Routed-op lane (runThinClientRouted): connection refused surfaces the
+    // RemoteMcpError network/unreachable rendering with the mcp_url named.
+    const search = await spawn(['search', G3_MARKER, '--json'], clientHome);
+    // CLI_ONLY lane (runRecall's thin-client branch) with the access token the
+    // earlier calls cached (#7360): no discovery runs, and the MCP connection
+    // itself is refused.
+    const recallCached = await spawn(['recall', '--grep', G3_MARKER, '--json'], clientHome);
+    // With no cached token the same RemoteMcpError class propagates with its
+    // raw discovery-failure message.
+    rmSync(join(clientHome, '.gbrain', 'remote-tokens'), { recursive: true, force: true });
+    const recall = await spawn(['recall', '--grep', G3_MARKER, '--json'], clientHome);
+    // Fail-fast bound: connection-refused returns in milliseconds; even the
+    // routed default timeout is 30s. Anything near the 120s test timeout is
+    // the hang this test exists to forbid.
+    expect(Date.now() - t0).toBeLessThan(60_000);
+    expect(search.exitCode, cliDiagnostic("thin-client CLI", search)).toBe(1);
+    expect(JSON.parse(search.stdout)).toMatchObject({ code: expect.any(String), contract_version: 1 }); // D1: the error envelope, no results
+    expect(search.stderr).toContain(`Cannot reach http://127.0.0.1:${serverPort}/mcp`);
+    expect(recallCached.exitCode, cliDiagnostic("thin-client CLI", recallCached)).toBe(1);
+    expect(JSON.parse(recallCached.stdout)).toMatchObject({ code: expect.any(String), contract_version: 1 });
+    expect(recallCached.stderr).toContain(`http://127.0.0.1:${serverPort}/mcp`);
+    expect(recall.exitCode, cliDiagnostic("thin-client CLI", recall)).toBe(1);
+    expect(JSON.parse(recall.stdout)).toMatchObject({ code: expect.any(String), contract_version: 1 }); // D1: the error envelope, no results
+    expect(recall.stderr).toMatch(/OAuth discovery failed/);
   });
 });

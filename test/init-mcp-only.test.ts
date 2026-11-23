@@ -17,7 +17,7 @@ import { describe, test as testRaw, expect, beforeAll, afterAll, beforeEach, aft
 function test(name: string, fn: () => void | Promise<unknown>): void {
   testRaw(name, fn, 30000);
 }
-import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createServer, Server } from 'http';
@@ -44,6 +44,7 @@ beforeAll(async () => {
     if (req.url === '/token') {
       res.statusCode = tokenStatus;
       res.setHeader('Content-Type', 'application/json');
+      if (tokenStatus === 429) res.setHeader('Retry-After', '900');
       res.end(JSON.stringify({
         access_token: 'token-' + Date.now(),
         token_type: 'bearer',
@@ -184,50 +185,50 @@ describe('gbrain init --mcp-only — happy path', () => {
 });
 
 describe('gbrain init --mcp-only — required-flag errors', () => {
-  test('missing --issuer-url exits 1 with clear error', async () => {
+  test('missing --issuer-url exits 2 (usage) with clear error', async () => {
     const r = await run([
       'init', '--mcp-only', '--json',
       '--mcp-url', `http://127.0.0.1:${port}/mcp`,
       '--oauth-client-id', 'cid',
       '--oauth-client-secret', 'csecret',
     ]);
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2); // usage error (agent contract v1 A3)
     const parsed = JSON.parse(r.stdout.trim().split('\n').pop()!);
     expect(parsed.reason).toBe('missing_issuer_url');
   });
 
-  test('missing --mcp-url exits 1', async () => {
+  test('missing --mcp-url exits 2 (usage)', async () => {
     const r = await run([
       'init', '--mcp-only', '--json',
       '--issuer-url', `http://127.0.0.1:${port}`,
       '--oauth-client-id', 'cid',
       '--oauth-client-secret', 'csecret',
     ]);
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2); // usage error (agent contract v1 A3)
     const parsed = JSON.parse(r.stdout.trim().split('\n').pop()!);
     expect(parsed.reason).toBe('missing_mcp_url');
   });
 
-  test('missing --oauth-client-id exits 1', async () => {
+  test('missing --oauth-client-id exits 2 (usage)', async () => {
     const r = await run([
       'init', '--mcp-only', '--json',
       '--issuer-url', `http://127.0.0.1:${port}`,
       '--mcp-url', `http://127.0.0.1:${port}/mcp`,
       '--oauth-client-secret', 'csecret',
     ]);
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2); // usage error (agent contract v1 A3)
     const parsed = JSON.parse(r.stdout.trim().split('\n').pop()!);
     expect(parsed.reason).toBe('missing_client_id');
   });
 
-  test('missing --oauth-client-secret exits 1', async () => {
+  test('missing --oauth-client-secret exits 2 (usage)', async () => {
     const r = await run([
       'init', '--mcp-only', '--json',
       '--issuer-url', `http://127.0.0.1:${port}`,
       '--mcp-url', `http://127.0.0.1:${port}/mcp`,
       '--oauth-client-id', 'cid',
     ]);
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2); // usage error (agent contract v1 A3)
     const parsed = JSON.parse(r.stdout.trim().split('\n').pop()!);
     expect(parsed.reason).toBe('missing_client_secret');
   });
@@ -264,6 +265,23 @@ describe('gbrain init --mcp-only — pre-flight smoke failures', () => {
     expect(parsed.reason).toBe('token_auth');
   });
 
+  test('token 429 → exits 1 with token_rate_limited, the wait, and a rate-limit hint', async () => {
+    tokenStatus = 429;
+    const r = await run([
+      'init', '--mcp-only', '--json',
+      '--issuer-url', `http://127.0.0.1:${port}`,
+      '--mcp-url', `http://127.0.0.1:${port}/mcp`,
+      '--oauth-client-id', 'cid',
+      '--oauth-client-secret', 'csecret',
+    ]);
+    expect(r.exitCode).toBe(1);
+    expect(existsSync(configPath())).toBe(false);
+    const parsed = JSON.parse(r.stdout.trim().split('\n').pop()!);
+    expect(parsed).toMatchObject({ reason: 'token_rate_limited', status: 429, retry_after_s: 900 });
+    expect(parsed.message).toContain('GBRAIN_OAUTH_TOKEN_RATE_LIMIT_MAX');
+    expect(parsed.message).not.toContain('register-client');
+  });
+
   test('mcp smoke 500 → exits 1 with mcp_smoke_http reason', async () => {
     mcpStatus = 500;
     const r = await run([
@@ -296,6 +314,36 @@ describe('gbrain init --mcp-only — pre-flight smoke failures', () => {
 });
 
 describe('gbrain init re-run guard', () => {
+  const remoteArgs = () => ['init', '--mcp-only', '--json', '--issuer-url', `http://127.0.0.1:${port}`, '--mcp-url', `http://127.0.0.1:${port}/mcp`, '--oauth-client-id', 'fixture-client', '--oauth-client-secret', 'fixture-secret'];
+
+  test('local brain requires explicit conversion and preserves both config and data', async () => {
+    const data = join(tmp, '.gbrain', 'brain.pglite'); mkdirSync(data, { recursive: true });
+    writeFileSync(join(data, 'keep'), 'existing memory');
+    const original = JSON.stringify({ engine: 'pglite', database_path: data, schema_pack: 'gbrain-base' });
+    writeFileSync(configPath(), original);
+    const refused = await run(remoteArgs());
+    expect(refused.exitCode).toBe(1);
+    expect(JSON.parse(refused.stdout.trim().split('\n').pop()!).reason).toBe('local_config_present');
+    expect(readFileSync(configPath(), 'utf8')).toBe(original);
+    const converted = await run([...remoteArgs(), '--force'], { OPENAI_API_KEY: 'ambient-not-persisted', DATABASE_URL: 'postgres://foreign.invalid/brain' });
+    expect(converted.exitCode).toBe(0);
+    const config = JSON.parse(readFileSync(configPath(), 'utf8'));
+    expect(config.openai_api_key).toBeUndefined(); expect(config.database_url).toBeUndefined();
+    expect(config.schema_pack).toBe('gbrain-base');
+    expect(readFileSync(join(data, 'keep'), 'utf8')).toBe('existing memory');
+    const backups = readdirSync(join(tmp, '.gbrain')).filter(name => name.startsWith('config.json.before-conversion-'));
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(tmp, '.gbrain', backups[0]), 'utf8')).toBe(original);
+  });
+
+  test('malformed configuration is never treated as an empty installation', async () => {
+    mkdirSync(join(tmp, '.gbrain')); writeFileSync(configPath(), '{conflict');
+    const result = await run([...remoteArgs(), '--force']);
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stdout.trim().split('\n').pop()!).reason).toBe('invalid_existing_config');
+    expect(readFileSync(configPath(), 'utf8')).toBe('{conflict');
+  });
+
   function seedThinClientConfig() {
     mkdirSync(join(tmp, '.gbrain'), { recursive: true });
     writeFileSync(configPath(), JSON.stringify({

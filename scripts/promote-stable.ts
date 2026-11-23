@@ -1,0 +1,705 @@
+#!/usr/bin/env bun
+/**
+ * Stable channel promotion (.github/workflows/promote-stable.yml).
+ *
+ *   PROMOTE_VERSION=<v> PROMOTE_SOAK_RUN_URL=<url> [PROMOTE_SCOREBOARD_URL=<url>]
+ *   [PROMOTE_ROLLBACK=true PROMOTE_REASON=<why>] bun run scripts/promote-stable.ts
+ *
+ * Promotes an already published release (the immutable `v<VERSION>` tag that
+ * release.yml minted) to the stable channel, only after the production-shaped
+ * soak passed on its exact git tree:
+ *
+ * 1. the dispatching actor has the admin or maintain role, or the run is the
+ *    scheduled stable-daily.yml check on the default branch (scheduleAuthorized:
+ *    only code already merged to master runs on a schedule, and it promotes by
+ *    rule, docs/RELEASING.md#daily-stable-check);
+ * 2. `refs/tags/v<VERSION>` exists, its VERSION file says <VERSION>, and its
+ *    GitHub release is published (not a draft); its commit and tree are the
+ *    release;
+ * 3. the soak run URL names a run of this repository whose workflow file is
+ *    the STABLE_SOAK_WORKFLOW repository variable, completed with success;
+ * 4. the run's head commit has the release tree (the same bytes, not merely
+ *    the same version);
+ * 4b. a forward promotion by the schedule names a green upgrade matrix run on
+ *    the release's exact tag and tree (matrix_run_url; scripts/stable-matrix.ts
+ *    judgeMatrixRun), and any matrix run named is checked the same way, so a
+ *    red or foreign run is refused; a maintainer may promote without one, and
+ *    the record then says matrix_run: null with the maintainer as promoted_by;
+ * 5. the version is strictly newer than the current stable, unless this is a
+ *    rollback with a reason; promoting the current stable again moves no
+ *    tag and only writes its evidence record when the published one does
+ *    not name it (recordCurrentStable, the GBRA-346 backfill), else no-ops;
+ * 6. the annotated record tag `stable-v<VERSION>` is created (once per
+ *    version, never moved) and the annotated `stable` tag is moved to the
+ *    release commit, both carrying renderTagMessage();
+ * 7. the evidence record (renderRecord(): version, commit, tree, soak run,
+ *    and the `known_bad` list, carried forward from the previous record plus
+ *    this run's `withdraw` versions, and the `not_promotable` list stable-daily
+ *    skips, carried forward the same way) is committed as `stable.json` on the
+ *    `stable-record` branch, parented on the previous record commit. One
+ *    atomic push moves all three, `stable` and `stable-record` leased on
+ *    the values read, so a failed push leaves the remote unchanged and a
+ *    re-run starts clean.
+ * 8. the release's GitHub release is marked "Latest" (pre-release cleared):
+ *    release.yml publishes every batch release as a pre-release, so the
+ *    stable channel is the one release GitHub calls Latest. A forward
+ *    promotion replaces its notes with a short summary of the behavior
+ *    changes since the previous stable (upgradeSummary()), then every
+ *    CHANGELOG entry since it (rolledUpNotes()); a rollback keeps the notes. If this
+ *    last step fails, stable has already moved: the refusal names
+ *    `bun scripts/release-channel.ts backfill --apply`, which sets it.
+ *
+ * Clients read the record at
+ * https://raw.githubusercontent.com/garrytan/gbrain/stable-record/stable.json
+ * (src/core/stable-channel.ts: no API call, no git) and an explicit upgrade
+ * checks it against `refs/tags/stable^{}` and `v<VERSION>`. Records carry the
+ * soak run and, from the matrix gate on, matrix_run; clients require matrix_run
+ * only once MATRIX_REQUIRED_FROM in src/core/self-upgrade.ts is set.
+ * Side effects (gh, git, clock, log, step summary) come in through
+ * PromoteDeps, so the decisions are tested without network or a real remote
+ * (test/scripts/promote-stable.test.ts). Every refusal exits 1 with one
+ * sentence saying what to do. Docs: docs/RELEASING.md#stable-channel-promotion
+ */
+import { spawnSync } from 'node:child_process';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { upgradeSummary } from '../src/core/upgrade-summary.ts';
+import { judgeMatrixRun, MATRIX_RECEIPT_ARTIFACT, type BreakIssue, type MatrixReceipt, type MatrixRunRow } from './stable-matrix.ts';
+
+export const DOCS = 'docs/RELEASING.md#stable-channel-promotion';
+export const STABLE_REF = 'refs/tags/stable';
+export const RECORD_BRANCH_REF = 'refs/heads/stable-record';
+export const RECORD_REMOTE_REF = 'refs/remotes/origin/stable-record';
+export const RECORD_FILE = 'stable.json';
+const VERSION_RE = /^\d+\.\d+\.\d+(\.\d+)?$/;
+const SHA_RE = /^[0-9a-f]{40}$/;
+const PROMOTER_ROLES = new Set(['admin', 'maintain']);
+const ROLLBACK_NEEDS_REASON = 'A rollback needs a reason: re-run with the reason input saying why stable moves back.';
+
+export class Refusal extends Error {}
+
+export interface PromoteInputs {
+  version: string;
+  soakRunUrl: string;
+  scoreboardUrl: string;
+  rollback: boolean;
+  reason: string;
+  /** Versions to add to the record's known_bad list (withdrawn releases clients move off). */
+  withdraw?: string[];
+  /** Releases to add to the record's not_promotable list: stable-daily never soaks or promotes them; clients never read it. */
+  notPromotable?: NotPromotable[];
+  /** Releases to take off the record's not_promotable list (one listed by mistake, say). */
+  notPromotableRemove?: string[];
+  /** The upgrade matrix run on this release (required for a scheduled forward promotion). */
+  matrixRunUrl?: string;
+  /** The open break issue a security or data-loss promotion passes (stable-daily only); the run may fail only on its named from-versions. */
+  matrixExcuse?: BreakIssue | null;
+}
+
+/** A release outside evidence shows is bad although it may soak clean, with the release that fixes it. */
+export interface NotPromotable { version: string; reason: string; fixed_in: string }
+
+/** The largest stable.json clients accept (src/core/stable-channel.ts RECORD_MAX_BYTES; a test pins the two). */
+export const STABLE_RECORD_MAX_BYTES = 64 * 1024;
+const NOT_PROMOTABLE_REASON_MAX = 500;
+
+export interface GitResult { code: number; stdout: string; stderr: string }
+
+export interface PromoteDeps {
+  repo: string;
+  actor: string;
+  /** True only for the scheduled stable-daily.yml run (scheduleAuthorized); it replaces the role check. */
+  scheduled?: boolean;
+  soakWorkflow: string;
+  ghApi(path: string): Promise<unknown>;
+  /** A write to the GitHub API (only the release edit that marks stable Latest). */
+  ghApiWrite(method: 'PATCH', path: string, body: Record<string, unknown>): Promise<unknown>;
+  git(args: string[], input?: string): Promise<GitResult>;
+  /** The upgrade-matrix-receipt artifact of a matrix run, or null when it cannot be read. */
+  matrixReceipt?(runId: number): Promise<MatrixReceipt | null>;
+  now(): Date;
+  log(line: string): void;
+  summary(markdown: string): void;
+}
+
+export interface SoakRun {
+  status?: string | null;
+  conclusion?: string | null;
+  path?: string | null;
+  head_sha?: string | null;
+}
+
+export interface TagFields {
+  version: string;
+  commit: string;
+  tree: string;
+  soakRun: string;
+  scoreboard: string;
+  /** The upgrade matrix run; absent or empty when a maintainer promoted without one. */
+  matrixRun?: string;
+  promotedBy: string;
+  promotedAt: string;
+  previous: string | null;
+  rollback: boolean;
+  reason: string;
+}
+
+export interface Promotion extends TagFields { recordCreated: boolean; knownBad: string[] }
+
+/** The evidence record clients read (src/core/stable-channel.ts parseStableRecord); generation 1: soak evidence. */
+export function renderRecord(f: TagFields, knownBad: readonly string[], notPromotable: readonly NotPromotable[] = []): string {
+  return JSON.stringify({
+    schema: 1,
+    channel: 'stable',
+    version: f.version,
+    commit: f.commit,
+    tree: f.tree,
+    soak_run: f.soakRun,
+    scoreboard: f.scoreboard,
+    matrix_run: f.matrixRun || null,
+    promoted_by: f.promotedBy,
+    promoted_at: f.promotedAt,
+    previous: f.previous,
+    rollback: f.rollback,
+    reason: f.reason.trim().replace(/\s+/g, ' '),
+    known_bad: [...knownBad],
+    not_promotable: notPromotable.map(e => ({ version: e.version, reason: e.reason, fixed_in: e.fixed_in })),
+  }, null, 2) + '\n';
+}
+
+/** The previous record's known_bad plus this run's withdrawals, deduplicated and sorted; refuses withdrawing the promoted version. */
+export function mergeKnownBad(previous: readonly string[], withdraw: readonly string[], version: string): string[] {
+  for (const v of withdraw) {
+    if (!VERSION_RE.test(v)) throw new Refusal(`withdraw entry "${v}" is not a release version; pass versions like 0.60.361.0, comma-separated.`);
+  }
+  const all = [...new Set([...previous, ...withdraw])].sort(compareVersions);
+  if (all.includes(version)) throw new Refusal(`v${version} is on the stable record's known_bad list (withdrawn); promote a different release.`);
+  return all;
+}
+
+/** The previous record's not_promotable minus `remove`, plus this run's entries (a new entry replaces one for its version), sorted; refuses one naming the promoted version. */
+export function mergeNotPromotable(previous: readonly NotPromotable[], add: readonly NotPromotable[], version: string, remove: readonly string[] = []): NotPromotable[] {
+  for (const v of remove) {
+    if (add.some(e => e.version === v)) throw new Refusal(`v${v} is both added to and removed from the not_promotable list; pass it in one of not_promotable or not_promotable_remove.`);
+    if (!previous.some(e => e.version === v)) throw new Refusal(`v${v} is not on the not_promotable list, so there is nothing to remove; check the version against stable.json on stable-record.`);
+  }
+  for (const e of add) {
+    if (!VERSION_RE.test(e.version)) throw new Refusal(`not_promotable entry "${e.version}" is not a release version; pass versions like 0.60.649.0, comma-separated.`);
+    if (!VERSION_RE.test(e.fixed_in) || compareVersions(e.fixed_in, e.version) <= 0) throw new Refusal(`not_promotable v${e.version} needs fixed_in: the newer release that carries the fix, like 0.60.652.0 (got "${e.fixed_in}").`);
+    if (!e.reason.trim()) throw new Refusal(`not_promotable v${e.version} needs a reason: say what shows the release is bad.`);
+    const length = e.reason.trim().replace(/\s+/g, ' ').length;
+    if (length > NOT_PROMOTABLE_REASON_MAX) throw new Refusal(`not_promotable v${e.version}'s reason is ${length} characters; keep it to ${NOT_PROMOTABLE_REASON_MAX} (link the evidence instead of pasting it).`);
+  }
+  const byVersion = new Map(previous.filter(e => !remove.includes(e.version)).map(e => [e.version, e]));
+  for (const e of add) byVersion.set(e.version, { version: e.version, reason: e.reason.trim().replace(/\s+/g, ' '), fixed_in: e.fixed_in });
+  const all = [...byVersion.values()].sort((a, b) => compareVersions(a.version, b.version));
+  const own = all.find(e => e.version === version);
+  if (own) throw new Refusal(`v${version} is on the stable record's not_promotable list (${own.reason}; fixed in v${own.fixed_in}); promote a different release.`);
+  return all;
+}
+
+export const DAILY_WORKFLOW = '.github/workflows/stable-daily.yml';
+
+/**
+ * The scheduled daily check promotes without a maintainer: a schedule event only ever runs the workflow file as
+ * merged on the default branch, so the rule it applies is reviewed code. Any other event (a dispatch of either
+ * workflow) keeps the role check.
+ */
+export function scheduleAuthorized(env: NodeJS.ProcessEnv, repo: string): boolean {
+  return env.GITHUB_EVENT_NAME === 'schedule' && (env.GITHUB_WORKFLOW_REF ?? '').startsWith(`${repo}/${DAILY_WORKFLOW}@refs/heads/`);
+}
+
+/** The branch release.yml mints release tags from; a scheduled promotion only takes a release whose commit is on it. */
+export const RELEASE_BRANCH_REF = 'refs/remotes/origin/master';
+
+export async function onReleaseBranch(deps: PromoteDeps, commit: string): Promise<boolean> {
+  return (await deps.git(['merge-base', '--is-ancestor', commit, RELEASE_BRANCH_REF])).code === 0;
+}
+
+/** The scheduled daily check promotes by rule; everyone else needs the admin or maintain role. */
+export async function authorize(deps: PromoteDeps): Promise<void> {
+  if (deps.scheduled) {
+    deps.log(`[promote-stable] scheduled daily check (${DAILY_WORKFLOW} on the default branch): promoting by rule.`);
+    return;
+  }
+  // `permission` is the legacy base role (maintain reads as write); `role_name` names maintain.
+  const perm = await deps.ghApi(`repos/${deps.repo}/collaborators/${encodeURIComponent(deps.actor)}/permission`) as { permission?: string; role_name?: string };
+  const role = perm.role_name || perm.permission || 'none';
+  if (perm.permission !== 'admin' && !PROMOTER_ROLES.has(role)) throw new Refusal(`${deps.actor} has the ${role} role on ${deps.repo}; only admins and maintainers promote to stable, so ask one to dispatch this workflow.`);
+  deps.log(`[promote-stable] ${deps.actor} has the ${role} role: allowed to promote.`);
+}
+
+export function compareVersions(a: string, b: string): number {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 4; i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return Math.sign(d);
+  }
+  return 0;
+}
+
+export function parseRunUrl(url: string, repo: string, input: 'soak_run_url' | 'matrix_run_url' = 'soak_run_url'): { runId: string; attempt: string | null } {
+  const what = input === 'soak_run_url' ? 'soak' : 'upgrade matrix';
+  const m = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/actions\/runs\/(\d+)(?:\/attempts\/(\d+))?\/?$/.exec(url.trim());
+  if (!m) throw new Refusal(`${input} "${url}" is not a GitHub Actions run URL; pass https://github.com/${repo}/actions/runs/<run id> (optionally /attempts/<n>) of the ${what} run.`);
+  if (m[1]!.toLowerCase() !== repo.toLowerCase()) throw new Refusal(`${input} names a run of ${m[1]}, not ${repo}; pass the ${what} run from this repository's Actions tab.`);
+  return { runId: m[2]!, attempt: m[3] ?? null };
+}
+
+export function normaliseWorkflowPath(value: string): string {
+  const bare = value.trim().replace(/@.*$/, '').replace(/^\.\//, '');
+  return bare.startsWith('.github/workflows/') ? bare : `.github/workflows/${bare}`;
+}
+
+export function requireSoakWorkflow(soakWorkflow: string): string {
+  if (!soakWorkflow.trim()) throw new Refusal('The soak workflow is not configured: set the repository variable STABLE_SOAK_WORKFLOW to the soak workflow\'s file (Settings → Secrets and variables → Actions → Variables), then re-run this workflow.');
+  return normaliseWorkflowPath(soakWorkflow);
+}
+
+export function checkSoakRun(run: SoakRun, soakWorkflow: string, url: string): void {
+  const expected = requireSoakWorkflow(soakWorkflow);
+  const actual = normaliseWorkflowPath(run.path ?? '');
+  if (actual !== expected) throw new Refusal(`Soak run ${url} ran ${actual}, not the soak workflow ${expected}; pass a run of ${expected} (or fix the STABLE_SOAK_WORKFLOW repository variable).`);
+  if (run.status !== 'completed') throw new Refusal(`Soak run ${url} is ${run.status ?? 'in an unknown state'}, not completed; wait for it to finish, then re-run this workflow.`);
+  if (run.conclusion !== 'success') throw new Refusal(`Soak run ${url} concluded ${run.conclusion ?? 'without a conclusion'}, not success; promote only a release whose soak passed.`);
+}
+
+export function checkOrder(next: string, current: string | null, rollback: boolean, reason: string): void {
+  if (rollback && !reason.trim()) throw new Refusal(ROLLBACK_NEEDS_REASON);
+  if (current === null) return;
+  const cmp = compareVersions(next, current);
+  if (cmp === 0) throw new Refusal(`v${next} is already the stable release, so there is nothing to promote.`);
+  if (cmp < 0 && !rollback) throw new Refusal(`v${next} is older than the current stable v${current}; to move stable back, re-run with rollback=true and a reason.`);
+}
+
+export function renderTagMessage(f: TagFields): string {
+  return [
+    `gbrain stable channel: v${f.version}`,
+    '',
+    `version: ${f.version}`,
+    `commit: ${f.commit}`,
+    `tree: ${f.tree}`,
+    `soak_run: ${f.soakRun}`,
+    `scoreboard: ${f.scoreboard}`,
+    ...(f.matrixRun ? [`matrix_run: ${f.matrixRun}`] : []),
+    `promoted_by: ${f.promotedBy}`,
+    `promoted_at: ${f.promotedAt}`,
+    `previous: ${f.previous ?? 'none'}`,
+    `rollback: ${f.rollback}`,
+    `reason: ${f.reason.trim().replace(/\s+/g, ' ') || '-'}`,
+    '',
+  ].join('\n');
+}
+
+/**
+ * The fields a promotion wrote into the stable tag's message (renderTagMessage), or null when the message is not one.
+ * GBRA-346: promotions made before the evidence record existed left only this message, so it is what stable.json is
+ * backfilled from when the current stable is promoted again (recordCurrentStable).
+ */
+export function parseTagMessage(message: string): TagFields | null {
+  if (!message.startsWith('gbrain stable channel: v')) return null;
+  const kv = new Map<string, string>();
+  for (const line of message.split('\n')) {
+    const m = /^([a-z_]+): (.+)$/.exec(line);
+    if (m && !kv.has(m[1]!)) kv.set(m[1]!, m[2]!);
+  }
+  const [version, commit, tree, soakRun, scoreboard, promotedBy, promotedAt, previous, rollback, reason] =
+    ['version', 'commit', 'tree', 'soak_run', 'scoreboard', 'promoted_by', 'promoted_at', 'previous', 'rollback', 'reason'].map(k => kv.get(k));
+  if (!version || !VERSION_RE.test(version) || !commit || !SHA_RE.test(commit) || !tree || !SHA_RE.test(tree)) return null;
+  if (!soakRun || !scoreboard || !promotedBy || !promotedAt || !reason || (rollback !== 'true' && rollback !== 'false')) return null;
+  if (!previous || (previous !== 'none' && !VERSION_RE.test(previous))) return null;
+  const matrixRun = kv.get('matrix_run');
+  return {
+    version, commit, tree, soakRun, scoreboard, ...(matrixRun ? { matrixRun } : {}), promotedBy, promotedAt,
+    previous: previous === 'none' ? null : previous,
+    rollback: rollback === 'true',
+    reason: reason === '-' ? '' : reason,
+  };
+}
+
+export function renderSummary(p: Promotion, notPromotable: readonly NotPromotable[] = []): string {
+  const rows: Array<[string, string]> = [
+    ['Version', `v${p.version}`],
+    ['Commit', `\`${p.commit}\``],
+    ['Tree', `\`${p.tree}\``],
+    ['Soak run', p.soakRun],
+    ['Scoreboard', p.scoreboard],
+    ['Upgrade matrix', p.matrixRun || 'none (promoted without one)'],
+    ['Previous stable', p.previous ? `v${p.previous}` : 'none'],
+    ['Rollback', p.rollback ? `yes: ${p.reason.trim()}` : 'no'],
+    ['Known bad', p.knownBad.length ? p.knownBad.map(v => `v${v}`).join(', ') : 'none'],
+    ['Not promotable', notPromotable.length ? notPromotable.map(e => `v${e.version} (${e.reason}; fixed in v${e.fixed_in})`).join(', ') : 'none'],
+    ['Record tag', p.recordCreated ? `\`stable-v${p.version}\` created` : `\`stable-v${p.version}\` already existed (re-promotion)`],
+    ['Promoted by', `${p.promotedBy} at ${p.promotedAt}`],
+  ];
+  const cell = (v: string) => v.replace(/\s+/g, ' ').replace(/\|/g, '\\|');
+  return [`## Stable channel: v${p.version}`, '', '| Field | Value |', '|---|---|', ...rows.map(([k, v]) => `| ${k} | ${cell(v)} |`), ''].join('\n');
+}
+
+async function gitOut(deps: PromoteDeps, args: string[], refusal: string, input?: string): Promise<string> {
+  const r = await deps.git(args, input);
+  if (r.code !== 0) throw new Refusal(`${refusal}${r.stderr.trim() ? ` (git: ${r.stderr.trim().split('\n').at(-1)})` : ''}`);
+  return r.stdout.trim();
+}
+
+export async function refExists(deps: PromoteDeps, ref: string): Promise<boolean> {
+  return (await deps.git(['rev-parse', '--verify', '--quiet', ref])).code === 0;
+}
+
+/** The current stable: the highest `v*` tag on the commit `refs/tags/stable` peels to (plus the tag object, for the push lease), or null when stable does not exist. */
+export async function currentStable(deps: PromoteDeps): Promise<{ version: string; tagObject: string } | null> {
+  if (!(await refExists(deps, STABLE_REF))) return null;
+  const tagObject = await gitOut(deps, ['rev-parse', STABLE_REF], `Could not read ${STABLE_REF}; re-run this workflow.`);
+  const commit = await gitOut(deps, ['rev-parse', `${STABLE_REF}^{commit}`], `Could not peel ${STABLE_REF} to a commit; repair the tag by hand (${DOCS}).`);
+  const versions = (await gitOut(deps, ['tag', '--points-at', commit, '--list', 'v*'], `Could not list the tags on ${commit}; re-run this workflow.`))
+    .split('\n').map(t => t.trim().replace(/^v/, '')).filter(v => VERSION_RE.test(v));
+  if (versions.length === 0) throw new Refusal(`${STABLE_REF} points at ${commit}, which carries no v<VERSION> release tag; repair the stable tag by hand before promoting (${DOCS}).`);
+  return { version: versions.sort(compareVersions).at(-1)!, tagObject };
+}
+
+export interface PriorRecord { commit: string; version: string | null; releaseCommit: string | null; knownBad: string[]; notPromotable: NotPromotable[] }
+
+/** The published evidence record (the remote stable-record head), or null before the first record. */
+export async function readPriorRecord(deps: PromoteDeps): Promise<PriorRecord | null> {
+  await deps.git(['fetch', '--no-tags', 'origin', `+${RECORD_BRANCH_REF}:${RECORD_REMOTE_REF}`]);
+  if (!(await refExists(deps, `${RECORD_REMOTE_REF}^{commit}`))) return null;
+  const commit = await gitOut(deps, ['rev-parse', `${RECORD_REMOTE_REF}^{commit}`], `Could not resolve ${RECORD_REMOTE_REF}; re-run this workflow.`);
+  const shown = await deps.git(['show', `${commit}:${RECORD_FILE}`]);
+  let prior: { version?: unknown; commit?: unknown; known_bad?: unknown; not_promotable?: unknown };
+  try {
+    prior = JSON.parse(shown.stdout);
+  } catch {
+    throw new Refusal(`The previous stable record (${commit}:${RECORD_FILE}) is not JSON, so its known_bad list cannot be carried forward; repair the stable-record branch by hand (${DOCS}).`);
+  }
+  const notPromotable = prior.not_promotable ?? [];
+  const entry = (e: unknown): e is NotPromotable => {
+    const r = e as Partial<NotPromotable> | null;
+    return !!r && typeof r.version === 'string' && VERSION_RE.test(r.version) && typeof r.fixed_in === 'string' && VERSION_RE.test(r.fixed_in) && typeof r.reason === 'string';
+  };
+  if (!Array.isArray(notPromotable) || !notPromotable.every(entry)) {
+    throw new Refusal(`The previous stable record (${commit}:${RECORD_FILE}) has a not_promotable list that is not {version, reason, fixed_in} entries, so it cannot be carried forward; repair the stable-record branch by hand (${DOCS}).`);
+  }
+  return {
+    commit,
+    version: typeof prior.version === 'string' ? prior.version : null,
+    releaseCommit: typeof prior.commit === 'string' ? prior.commit : null,
+    knownBad: Array.isArray(prior.known_bad) ? prior.known_bad.filter((v): v is string => typeof v === 'string' && VERSION_RE.test(v)) : [],
+    notPromotable: notPromotable.map(e => ({ version: e.version, reason: e.reason, fixed_in: e.fixed_in })),
+  };
+}
+
+/** Commit stable.json for `fields` on top of the previous record commit (none before the first record). */
+async function commitRecord(deps: PromoteDeps, fields: TagFields, knownBad: string[], notPromotable: NotPromotable[], parent: string | null): Promise<string> {
+  const record = renderRecord(fields, knownBad, notPromotable);
+  const bytes = Buffer.byteLength(record);
+  if (bytes > STABLE_RECORD_MAX_BYTES) throw new Refusal(`stable.json would be ${bytes} bytes, over the ${STABLE_RECORD_MAX_BYTES} clients accept, so nothing was pushed; shorten the not_promotable reasons or take old entries off with not_promotable_remove.`);
+  const blob = await gitOut(deps, ['hash-object', '-w', '--stdin'], 'Could not write the stable record blob; re-run this workflow.', record);
+  const recordTree = await gitOut(deps, ['mktree'], 'Could not write the stable record tree; re-run this workflow.', `100644 blob ${blob}\t${RECORD_FILE}\n`);
+  const recordCommit = await gitOut(deps, ['commit-tree', recordTree, ...(parent ? ['-p', parent] : []), '-m', `stable record: v${fields.version}`],
+    'Could not commit the stable record; re-run this workflow.');
+  deps.log(`[promote-stable] stable record ${recordCommit} (known_bad: ${knownBad.length ? knownBad.join(', ') : 'none'}; not_promotable: ${notPromotable.length ? notPromotable.map(e => e.version).join(', ') : 'none'}).`);
+  return recordCommit;
+}
+
+/**
+ * GBRA-346 bridge: promoting the current stable again writes its stable.json and moves no tag. Promotions made before
+ * the evidence record existed moved `stable` without one, so a client that reads only the record would see
+ * `stable_missing`. The record is the stable tag's own message (the release, its tree and the soak run it was promoted
+ * on), checked against the release just verified and the soak run passed in, with known_bad carried forward. The push
+ * leases both `stable` (re-pushed unchanged) and the record branch, so a stable tag moved since it was read refuses.
+ */
+async function recordCurrentStable(deps: PromoteDeps, inputs: PromoteInputs, release: { version: string; commit: string; tree: string }, current: { tagObject: string }): Promise<Promotion> {
+  const { version, commit, tree } = release;
+  const already = `v${version} is already the stable release`;
+  const tagged = parseTagMessage((await deps.git(['for-each-ref', '--format=%(contents)', STABLE_REF])).stdout);
+  if (!tagged || tagged.version !== version) throw new Refusal(`${already}, but the stable tag carries no promotion message for it (the key: value body this script writes) to write stable.json from; write the record by hand (${DOCS}).`);
+  if (tagged.commit !== commit) throw new Refusal(`${already}, but the stable tag's message names commit ${tagged.commit}, not v${version}'s commit ${commit}; investigate the stable tag before writing its record (${DOCS}).`);
+  if (tagged.tree !== tree) throw new Refusal(`${already}, but the stable tag's message names tree ${tagged.tree}, not v${version}'s tree ${tree}; investigate the stable tag before writing its record (${DOCS}).`);
+  if (tagged.soakRun !== inputs.soakRunUrl.trim()) throw new Refusal(`${already}, promoted on soak run ${tagged.soakRun}, not ${inputs.soakRunUrl.trim()}; pass the soak run the stable tag names to write its record.`);
+
+  const prior = await readPriorRecord(deps);
+  const knownBad = mergeKnownBad(prior?.knownBad ?? [], inputs.withdraw ?? [], version);
+  const notPromotable = mergeNotPromotable(prior?.notPromotable ?? [], inputs.notPromotable ?? [], version, inputs.notPromotableRemove ?? []);
+  const sameNotPromotable = JSON.stringify(notPromotable) === JSON.stringify(mergeNotPromotable(prior?.notPromotable ?? [], [], version));
+  if (prior && prior.version === version && prior.releaseCommit === commit && knownBad.length === new Set(prior.knownBad).size && sameNotPromotable) {
+    throw new Refusal(`${already}, and stable.json on stable-record records it, so there is nothing to promote.`);
+  }
+  deps.log(`[promote-stable] ${already}; writing its stable.json from the stable tag's message (${prior ? `the record named v${prior.version ?? 'nothing'}` : 'no record was published'}).`);
+  const recordCommit = await commitRecord(deps, tagged, knownBad, notPromotable, prior?.commit ?? null);
+  await gitOut(deps, ['push', '--atomic', `--force-with-lease=${STABLE_REF}:${current.tagObject}`, `--force-with-lease=${RECORD_BRANCH_REF}:${prior?.commit ?? ''}`, 'origin',
+    `${STABLE_REF}:${STABLE_REF}`, `${recordCommit}:${RECORD_BRANCH_REF}`],
+    'Writing the stable record failed and nothing changed on the remote (stable or the record may have moved since this run read them); re-run this workflow, which re-reads both.');
+  deps.log(`[promote-stable] stable.json now records v${version} (${commit}); no tag moved.`);
+  const promotion: Promotion = { ...tagged, recordCreated: false, knownBad };
+  deps.summary(renderSummary(promotion, notPromotable));
+  return promotion;
+}
+
+export async function promote(deps: PromoteDeps, inputs: PromoteInputs): Promise<Promotion> {
+  const { version, rollback, reason } = inputs;
+
+  await authorize(deps);
+
+  if (!VERSION_RE.test(version)) throw new Refusal(`version "${version}" is not a release version; pass the VERSION of a published release, like 0.60.361.0.`);
+  if (rollback && !reason.trim()) throw new Refusal(ROLLBACK_NEEDS_REASON);
+  const releaseRef = `refs/tags/v${version}`;
+  if (!(await refExists(deps, `${releaseRef}^{commit}`))) throw new Refusal(`There is no release tag v${version}; promote a version release.yml has already published.`);
+  const commit = await gitOut(deps, ['rev-parse', `${releaseRef}^{commit}`], `Could not resolve ${releaseRef}; re-run this workflow.`);
+  const tree = await gitOut(deps, ['rev-parse', `${releaseRef}^{tree}`], `Could not resolve the tree of ${releaseRef}; re-run this workflow.`);
+  if (deps.scheduled && !(await onReleaseBranch(deps, commit))) throw new Refusal(`v${version} (${commit}) is not on master; the scheduled check only promotes a release minted from master, so a maintainer decides on this one.`);
+  const taggedVersion = (await deps.git(['show', `${releaseRef}:VERSION`])).stdout.trim();
+  if (taggedVersion !== version) throw new Refusal(`v${version}'s VERSION file says "${taggedVersion || 'nothing'}"; promote a tag release.yml minted for its own VERSION.`);
+  let release: { draft?: boolean; id?: unknown };
+  try {
+    release = await deps.ghApi(`repos/${deps.repo}/releases/tags/v${version}`) as { draft?: boolean; id?: unknown };
+  } catch (error) {
+    throw new Refusal(`v${version} has no published GitHub release (${(error as Error).message.split('\n')[0]}); wait for release.yml to publish it, then promote.`);
+  }
+  if (release.draft) throw new Refusal(`The GitHub release for v${version} is still a draft; publish it (release.yml does), then promote.`);
+  if (typeof release.id !== 'number') throw new Refusal(`The GitHub release for v${version} has no id, so it cannot be marked Latest; re-run this workflow.`);
+  const releaseId = release.id;
+  deps.log(`[promote-stable] v${version} is commit ${commit}, tree ${tree}, and its GitHub release is published.`);
+
+  const { runId, attempt } = parseRunUrl(inputs.soakRunUrl, deps.repo);
+  const soakPath = requireSoakWorkflow(deps.soakWorkflow);
+  const run = await deps.ghApi(`repos/${deps.repo}/actions/runs/${runId}${attempt ? `/attempts/${attempt}` : ''}`) as SoakRun;
+  checkSoakRun(run, deps.soakWorkflow, inputs.soakRunUrl);
+  const headSha = run.head_sha ?? '';
+  if (!SHA_RE.test(headSha)) throw new Refusal(`Soak run ${inputs.soakRunUrl} reports no head commit; pass a run that checked out a commit.`);
+  deps.log(`[promote-stable] soak run ${runId}${attempt ? ` attempt ${attempt}` : ''} of ${soakPath} succeeded on ${headSha}.`);
+
+  if (!(await refExists(deps, `${headSha}^{commit}`))) await deps.git(['fetch', '--no-tags', 'origin', headSha]);
+  const soakTree = await gitOut(deps, ['rev-parse', `${headSha}^{tree}`], `Could not fetch the soak run's head commit ${headSha}; check it still exists on the remote, then re-run this workflow.`);
+  if (soakTree !== tree) throw new Refusal(`The soak ran tree ${soakTree} (run head ${headSha}) but v${version} is tree ${tree}; soak this exact release, then promote that run.`);
+  deps.log(`[promote-stable] the soak ran the release's exact tree ${tree}.`);
+
+  const current = await currentStable(deps);
+  if (current && !rollback && compareVersions(version, current.version) === 0) return recordCurrentStable(deps, inputs, { version, commit, tree }, current);
+  checkOrder(version, current?.version ?? null, rollback, reason);
+  const matrixRun = await checkMatrix(deps, inputs, { version, commit, tree });
+  deps.log(`[promote-stable] current stable is ${current ? `v${current.version}` : 'none'}; ${rollback ? `rollback to v${version}: ${reason.trim()}` : `v${version} is newer`}.`);
+
+  const recordRef = `refs/tags/stable-v${version}`;
+  const recordExists = await refExists(deps, recordRef);
+  if (recordExists && !rollback) throw new Refusal(`stable-v${version} already exists, so v${version} was promoted before; to make it stable again, re-run with rollback=true and a reason.`);
+  if (recordExists) {
+    const recordCommit = await gitOut(deps, ['rev-parse', `${recordRef}^{commit}`], `Could not resolve ${recordRef}; re-run this workflow.`);
+    if (recordCommit !== commit) throw new Refusal(`stable-v${version} points at ${recordCommit}, not the release commit ${commit}; investigate the tags before promoting.`);
+  }
+  deps.log(`[promote-stable] record tag stable-v${version} ${recordExists ? 'exists (rollback re-promotion): keeping it' : 'is new: creating it'}.`);
+
+  const fields: TagFields = {
+    version, commit, tree,
+    soakRun: inputs.soakRunUrl.trim(),
+    scoreboard: inputs.scoreboardUrl.trim() || inputs.soakRunUrl.trim(),
+    ...(matrixRun ? { matrixRun } : {}),
+    promotedBy: deps.scheduled ? `schedule (${DAILY_WORKFLOW})` : deps.actor,
+    promotedAt: deps.now().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    previous: current?.version ?? null,
+    rollback, reason,
+  };
+  const message = renderTagMessage(fields);
+  const changelog = rollback ? null : await deps.git(['show', `${releaseRef}:CHANGELOG.md`]);
+  const notes = changelog === null ? null : rolledUpNotes(changelog.code === 0 ? changelog.stdout : '', fields.previous, version, deps.repo, fields.previous ? upgradeSummary(fields.previous, version) : null);
+
+  // The evidence record: carried forward from the previous record commit (none before the first promotion).
+  const prior = await readPriorRecord(deps);
+  const priorRecordCommit = prior?.commit ?? null;
+  const knownBad = mergeKnownBad(prior?.knownBad ?? [], inputs.withdraw ?? [], version);
+  const notPromotable = mergeNotPromotable(prior?.notPromotable ?? [], inputs.notPromotable ?? [], version, inputs.notPromotableRemove ?? []);
+  const recordCommit = await commitRecord(deps, fields, knownBad, notPromotable, priorRecordCommit);
+
+  if (!recordExists) {
+    await gitOut(deps, ['tag', '-a', '--cleanup=verbatim', '-m', message, `stable-v${version}`, commit], `Could not create the tag stable-v${version}; re-run this workflow.`);
+  }
+  await gitOut(deps, ['tag', '-a', '-f', '--cleanup=verbatim', '-m', message, 'stable', commit], 'Could not create the stable tag; re-run this workflow.');
+  // One atomic push: the record tag, stable and the evidence record land together or not at all. stable and the record
+  // branch are leased on the values read above (empty: must not exist yet), so a concurrent move refuses instead of being
+  // overwritten.
+  await gitOut(deps, ['push', '--atomic', `--force-with-lease=${STABLE_REF}:${current?.tagObject ?? ''}`,
+    `--force-with-lease=${RECORD_BRANCH_REF}:${priorRecordCommit ?? ''}`, 'origin',
+    ...(recordExists ? [] : [`${recordRef}:${recordRef}`]), `${STABLE_REF}:${STABLE_REF}`, `${recordCommit}:${RECORD_BRANCH_REF}`],
+    'Moving the stable tag failed and nothing changed on the remote (stable may have moved since this run read it); re-run this workflow, which re-reads the current stable.');
+  if (!recordExists) deps.log(`[promote-stable] pushed record tag stable-v${version}.`);
+  deps.log(`[promote-stable] stable now points at v${version} (${commit}).`);
+  await markLatest(deps, releaseId, version, notes, rollback);
+
+  const promotion: Promotion = { ...fields, recordCreated: !recordExists, knownBad };
+  deps.summary(renderSummary(promotion, notPromotable));
+  return promotion;
+}
+
+/**
+ * The upgrade matrix run a promotion names, judged by judgeMatrixRun (scripts/stable-matrix.ts); refuses a red,
+ * foreign or unreadable run. A scheduled forward promotion must name one; a maintainer may promote without one.
+ */
+async function checkMatrix(deps: PromoteDeps, inputs: PromoteInputs, release: { version: string; commit: string; tree: string }): Promise<string> {
+  const url = (inputs.matrixRunUrl ?? '').trim();
+  if (!url) {
+    if (inputs.rollback) return '';
+    if (deps.scheduled) throw new Refusal(`a scheduled promotion needs a green upgrade matrix run on v${release.version}'s exact tree; the daily check dispatches one (${MATRIX_DOCS}).`);
+    deps.log(`[promote-stable] no upgrade matrix run given: v${release.version} is promoted on ${deps.actor}'s decision, and the record's matrix_run is null.`);
+    return '';
+  }
+  const { runId, attempt } = parseRunUrl(url, deps.repo, 'matrix_run_url');
+  if (attempt) throw new Refusal(`matrix_run_url names attempt ${attempt}; pass the run URL without /attempts/, whose receipt is the run's latest.`);
+  if (!deps.matrixReceipt) throw new Refusal('This caller cannot read upgrade matrix receipts; run the promotion from promote-stable.yml or stable-daily.yml.');
+  const run = await deps.ghApi(`repos/${deps.repo}/actions/runs/${runId}`) as MatrixRunRow;
+  const judged = judgeMatrixRun({ ...run, html_url: url }, await deps.matrixReceipt(Number(runId)), release, inputs.matrixExcuse);
+  if (!judged.ok) throw new Refusal(`${judged.why}; promote only a release whose upgrade matrix run passed on its exact tree (${MATRIX_DOCS}).`);
+  deps.log(`[promote-stable] ${judged.why}.`);
+  return url;
+}
+
+const MATRIX_DOCS = 'docs/RELEASING.md#daily-stable-check';
+
+/** GitHub's limit on a release body is 125,000 characters; stay under it with room for the trailer. */
+export const RELEASE_NOTES_MAX = 120_000;
+
+/**
+ * The stable release's notes: every CHANGELOG.md section newer than `previous` up to and including `version`, newest
+ * first, under one line naming the previous stable. Oldest sections drop first when the roll-up would pass
+ * RELEASE_NOTES_MAX, and a link to the full CHANGELOG at the tag says so. With no previous stable it is the release's
+ * own entry; with no matching section it is the same link stub release.yml writes. The behavior-change summary sits
+ * under the opening line, and is left out when it alone would pass RELEASE_NOTES_MAX.
+ */
+export function rolledUpNotes(changelog: string, previous: string | null, version: string, repo: string, summary: string[] | null = null): string {
+  const link = `https://github.com/${repo}/blob/v${version}/CHANGELOG.md`;
+  const wanted = (v: string) => compareVersions(v, version) <= 0 && (previous === null ? compareVersions(v, version) === 0 : compareVersions(v, previous) > 0);
+  const sections: string[][] = [];
+  let current: string[] | null = null;
+  for (const line of changelog.split('\n')) {
+    if (line.startsWith('## [')) {
+      const v = /^## \[(\d+(?:\.\d+){2,3})\]/.exec(line)?.[1];
+      current = v && wanted(v) ? [line] : null;
+      if (current) sections.push(current);
+      continue;
+    }
+    current?.push(line);
+  }
+  if (sections.length === 0) return `See [CHANGELOG.md](${link}) for v${version}.\n`;
+  const opening = previous === null ? `Stable release v${version}.\n` : `Stable release v${version}: every change since the previous stable release, v${previous}, newest first.\n`;
+  const summarized = summary ? `${opening}\n${summary.join('\n')}\n` : opening;
+  const intro = summarized.length + 200 > RELEASE_NOTES_MAX ? opening : summarized;
+  const bodies = sections.map(s => `${s.join('\n').trimEnd()}\n`);
+  const kept: string[] = [];
+  let size = intro.length;
+  for (const body of bodies) {
+    if (kept.length > 0 && size + body.length + 200 > RELEASE_NOTES_MAX) break;
+    kept.push(body);
+    size += body.length + 1;
+  }
+  if (kept[0]!.length + intro.length + 200 > RELEASE_NOTES_MAX) return `${intro}\nThe notes are too long for this page; read them in [CHANGELOG.md](${link}).\n`;
+  const dropped = bodies.length - kept.length;
+  const tail = dropped ? `\n${dropped} older ${dropped === 1 ? 'entry is' : 'entries are'} in [CHANGELOG.md](${link}).\n` : '';
+  return [intro, ...kept].join('\n') + tail;
+}
+
+/** The version of the release GitHub calls Latest now, or null when there is none or it cannot be read. */
+export async function latestReleaseVersion(deps: Pick<PromoteDeps, 'repo' | 'ghApi'>): Promise<string | null> {
+  return readLatestReleaseVersion(deps).catch(() => null);
+}
+
+/** The current Latest release's version; null when there is none (404). Any other failed read throws. */
+async function readLatestReleaseVersion(deps: Pick<PromoteDeps, 'repo' | 'ghApi'>): Promise<string | null> {
+  let release: { tag_name?: string };
+  try {
+    release = (await deps.ghApi(`repos/${deps.repo}/releases/latest`)) as { tag_name?: string };
+  } catch (error) {
+    if (/HTTP 404/.test((error as Error).message)) return null;
+    throw error;
+  }
+  const v = (release.tag_name ?? '').replace(/^v/, '');
+  return VERSION_RE.test(v) ? v : null;
+}
+
+/**
+ * Mark a release GitHub's "Latest": clear pre-release, set make_latest, and replace the notes when `notes` is given.
+ * A forward promotion never moves Latest to an older release than the current one: binaries released before
+ * pre-releases existed download `releases/latest` as their newest release, so moving it back would downgrade them. Latest
+ * then stays put until stable passes it. A rollback moves it back on purpose.
+ */
+export async function markLatest(deps: PromoteDeps, releaseId: number, version: string, notes: string | null, rollback = false): Promise<void> {
+  let latest: string | null = null;
+  if (!rollback) {
+    try {
+      latest = await readLatestReleaseVersion(deps);
+    } catch (error) {
+      throw new Refusal(`stable now points at v${version}, but GitHub's current Latest release could not be read (${(error as Error).message.split('\n')[0]}), so Latest was left alone; run \`bun scripts/release-channel.ts backfill --apply\` from a checkout to set it (${DOCS}).`);
+    }
+  }
+  if (latest && compareVersions(latest, version) > 0) {
+    deps.log(`[promote-stable] GitHub's Latest stays v${latest}, which is newer than v${version}; it moves to the stable release once stable passes it.`);
+    return;
+  }
+  try {
+    await deps.ghApiWrite('PATCH', `repos/${deps.repo}/releases/${releaseId}`, { prerelease: false, make_latest: 'true', ...(notes === null ? {} : { body: notes }) });
+  } catch (error) {
+    throw new Refusal(`stable now points at v${version}, but marking its GitHub release Latest failed (${(error as Error).message.split('\n')[0]}); run \`bun scripts/release-channel.ts backfill --apply\` from a checkout to set it (${DOCS}).`);
+  }
+  deps.log(`[promote-stable] the GitHub release v${version} is now Latest${notes === null ? '' : ', with notes rolled up since the previous stable'}.`);
+}
+
+export function processDeps(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): PromoteDeps {
+  return {
+    repo: env.GITHUB_REPOSITORY ?? '',
+    actor: env.GITHUB_ACTOR ?? '',
+    soakWorkflow: env.STABLE_SOAK_WORKFLOW ?? '',
+    async ghApi(path) {
+      const r = spawnSync('gh', ['api', path], { cwd, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+      if (r.status !== 0) throw new Error(`gh api ${path} failed: ${(r.stderr || r.error?.message || '').trim()}`);
+      return JSON.parse(r.stdout);
+    },
+    async ghApiWrite(method, path, body) {
+      const r = spawnSync('gh', ['api', '--method', method, path, '--input', '-'], { cwd, env, encoding: 'utf8', input: JSON.stringify(body) });
+      if (r.status !== 0) throw new Error(`gh api ${method} ${path} failed: ${(r.stderr || r.error?.message || '').trim()}`);
+      return JSON.parse(r.stdout || '{}');
+    },
+    async git(args, input) {
+      const r = spawnSync('git', args, { cwd, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...(input !== undefined ? { input } : {}) });
+      return { code: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+    },
+    async matrixReceipt(runId) {
+      const dir = mkdtempSync(join(tmpdir(), 'matrix-'));
+      try {
+        const r = spawnSync('gh', ['run', 'download', String(runId), '-R', env.GITHUB_REPOSITORY ?? '', '-n', MATRIX_RECEIPT_ARTIFACT, '-D', dir], { cwd, env, encoding: 'utf8' });
+        if (r.status !== 0) return null;
+        return JSON.parse(readFileSync(join(dir, `${MATRIX_RECEIPT_ARTIFACT}.json`), 'utf8')) as MatrixReceipt;
+      } catch {
+        return null;
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    now: () => new Date(),
+    log: line => console.log(line),
+    summary: markdown => { if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, markdown); },
+  };
+}
+
+if (import.meta.main) {
+  const env = process.env;
+  const inputs: PromoteInputs = {
+    version: (env.PROMOTE_VERSION ?? '').trim().replace(/^v/, ''),
+    soakRunUrl: env.PROMOTE_SOAK_RUN_URL ?? '',
+    scoreboardUrl: env.PROMOTE_SCOREBOARD_URL ?? '',
+    rollback: env.PROMOTE_ROLLBACK === 'true',
+    reason: env.PROMOTE_REASON ?? '',
+    withdraw: (env.PROMOTE_WITHDRAW ?? '').split(',').map(v => v.trim().replace(/^v/, '')).filter(Boolean),
+    notPromotable: (env.PROMOTE_NOT_PROMOTABLE ?? '').split(',').map(v => v.trim().replace(/^v/, '')).filter(Boolean)
+      .map(version => ({ version, reason: env.PROMOTE_NOT_PROMOTABLE_REASON ?? '', fixed_in: (env.PROMOTE_NOT_PROMOTABLE_FIXED_IN ?? '').trim().replace(/^v/, '') })),
+    notPromotableRemove: (env.PROMOTE_NOT_PROMOTABLE_REMOVE ?? '').split(',').map(v => v.trim().replace(/^v/, '')).filter(Boolean),
+    matrixRunUrl: env.PROMOTE_MATRIX_RUN_URL ?? '',
+  };
+  const deps = processDeps();
+  try {
+    if (!deps.repo || !deps.actor) throw new Refusal('GITHUB_REPOSITORY and GITHUB_ACTOR are unset; run this from the Promote stable workflow (gh workflow run promote-stable.yml).');
+    await promote(deps, inputs);
+  } catch (e) {
+    const why = e instanceof Refusal ? e.message : `the promotion stopped on an unexpected error (${e instanceof Error ? e.message : String(e)}); re-run this workflow, and read the log above if it repeats.`;
+    console.log(`::error::Stable not promoted: ${why} Docs: ${DOCS}`);
+    process.exit(1);
+  }
+}

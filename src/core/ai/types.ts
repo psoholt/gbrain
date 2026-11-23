@@ -22,11 +22,58 @@ export type Implementation =
   | 'native-openai'
   | 'native-google'
   | 'native-anthropic'
-  | 'openai-compatible';
+  | 'openai-compatible'
+  | 'claude-cli';
 
 export interface EmbeddingTouchpoint {
   models: string[];
   default_dims: number;
+  /**
+   * v0.46.3: canonical model for this recipe's embedding touchpoint. Every
+   * "pick a model for the user" surface resolves `default_model ?? models[0]`:
+   * init auto-pick (single-key and multi-key canonical tiebreak), the
+   * `--embedding-model <provider>` shorthand expansion, and the interactive
+   * picker's selection + displayed row. Exists because array order is a bad
+   * carrier for "recommended": Voyage lists voyage-4-large first (quality
+   * order) but the canonical default is voyage-4 (price/quality balance).
+   */
+  default_model?: string;
+  /**
+   * Per-model native dimensions, keyed by bare model id (no `provider:`
+   * prefix). Consulted before `default_dims` when resolving schema width
+   * for a specific model.
+   *
+   * Local recipes (ollama, llama-server) serve models with very different
+   * native widths — nomic-embed-text is 768, bge-m3 and mxbai-embed-large
+   * are 1024, qwen3-embed-8b is 4096. A single recipe-wide `default_dims`
+   * silently picks the wrong width for every model except the one it was
+   * chosen for, producing a schema that only fails at first insert (#2051).
+   *
+   * Partial by design: a model absent from this map falls back to
+   * `default_dims`, so a recipe can declare only the models it knows.
+   */
+  model_dims?: Readonly<Record<string, number>>;
+  /**
+   * PR #5921 / wave 14: models whose endpoint returns the native width whatever `dimensions` asked, and whose model
+   * card documents dynamic sizes as "slice from the start, then L2-normalize". Keyed by folded model id
+   * (`modelMatchKey`). When such a model answers at `native` and the brain expects one of `prefixes`, the gateway fits
+   * the vector (`fitMatryoshkaPrefix`); any other width keeps the dim-mismatch refusal. Partial by design.
+   */
+  matryoshka?: Readonly<Record<string, { native: number; prefixes: readonly number[] }>>;
+  /**
+   * #4530: per-model maximum tokens PER SINGLE INPUT, keyed like model_dims
+   * (partial by design — declare only the models whose limit is known).
+   * Distinct from max_batch_tokens (whole-request budget): some hosted
+   * encoders enforce a hard per-input cap far below any batch budget —
+   * nvidia/nv-embedqa-e5-v5 rejects any single input over 512 tokens with a
+   * non-transient 400, so chunks over the cap can never embed. When the
+   * ACTIVE embedding model declares a value here, the markdown chunker caps
+   * emitted chunks at floor(limit × EMBED_INPUT_SAFETY) estimated tokens
+   * (resolveMaxChunkTokens in src/core/embedding-input-limit.ts) — SPLIT,
+   * never truncated. Models absent from the map keep
+   * DEFAULT_MAX_CHUNK_TOKENS.
+   */
+  max_input_tokens?: Readonly<Record<string, number>>;
   dims_options?: number[]; // for Matryoshka-aware providers
   cost_per_1m_tokens_usd?: number;
   price_last_verified?: string; // ISO date
@@ -54,6 +101,16 @@ export interface EmbeddingTouchpoint {
    * `max_batch_tokens` is also set.
    */
   safety_factor?: number;
+  /**
+   * Maximum number of inputs per embedding request. Some endpoints enforce a
+   * hard COUNT cap independent of token budget — notably llama.cpp's
+   * `llama-server`, which rejects requests with more inputs than its launch
+   * batch size (e.g. `batch size 100 > maximum allowed batch size 32`). The
+   * token-budget pre-split cannot bound item count (many tiny chunks fit under
+   * any token budget), so this is enforced as a separate hard re-split after
+   * the token split. When unset, no count cap is applied.
+   */
+  max_batch_items?: number;
   /**
    * v0.27.1: when true, at least one model in this recipe accepts image
    * inputs via a multimodal embedding endpoint (e.g. Voyage's
@@ -87,6 +144,8 @@ export interface EmbeddingTouchpoint {
    *    for shorthand `--model <provider>` and prints a setup hint.
    */
   user_provided_models?: true;
+
+  trust_custom_dims?: true;
   /**
    * v0.32 (#779 reworked): explicit opt-out of the missing-max_batch_tokens
    * startup warning. Set to `true` for recipes whose batch capacity is
@@ -155,6 +214,14 @@ export interface ExpansionTouchpoint {
   models: string[];
   cost_per_1m_tokens_usd?: number;
   price_last_verified?: string;
+  /**
+   * Recipe-level timeout fallback for `gbrain models doctor`'s expansion
+   * reachability probe. Mirrors `RerankerTouchpoint.default_timeout_ms`: lets
+   * a slow-start provider (e.g. a subprocess-dispatched CLI with real cold-start
+   * latency) declare the headroom it needs instead of the probe's flat 5000ms
+   * default false-failing on every run.
+   */
+  default_timeout_ms?: number;
 }
 
 /**
@@ -183,15 +250,17 @@ export interface ExpansionTouchpoint {
 export interface RerankerTouchpoint {
   models: string[];
   default_model: string;
+  /** Native request/response dialect. Omitted means the standard rerank shape. */
+  wire_format?: 'typesafe-systemone';
+  /** Score semantics: `rubric` scores are level indices, not calibrated relevance (autocut/CRAG ignore them). */
+  score_semantics?: 'rubric';
   cost_per_1m_tokens_usd?: number;
   price_last_verified?: string;
   max_payload_bytes: number;
-  /**
-   * Override the rerank URL path. Defaults to '/models/rerank' (ZeroEntropy's
-   * legacy path; ZE-compatible-wire-shape providers like llama.cpp set
-   * '/v1/rerank').
-   */
+
   path?: string;
+
+  top_param?: 'top_n' | 'top_k';
   /**
    * Recipe-level timeout fallback for `gateway.rerank()` and search-mode
    * resolution. Caller's `input.timeoutMs` and `search.reranker.timeout_ms`
@@ -202,21 +271,75 @@ export interface RerankerTouchpoint {
   default_timeout_ms?: number;
 }
 
+/** Typed decision questions (System One, src/core/ai/decide/). */
+export interface DecideTouchpoint {
+  models: string[];
+  default_model: string;
+  /** Moving aliases accepted with a doctor warning; the response names the version that answered. */
+  aliases: string[];
+  path: string;
+  max_payload_bytes: number;
+  /** Per-request limits: state + all questions, and state + the longest question. */
+  max_request_tokens: number;
+  max_state_question_tokens: number;
+  cost_per_1m_tokens_usd: number;
+  price_last_verified: string;
+}
+
 export interface ChatTouchpoint {
   models: string[];
   /** Provider returns native function/tool calling. */
   supports_tools: boolean;
   /**
    * Stable enough across crashes/replays to drive a Minions subagent loop.
-   * Strictly stronger than supports_tools.
+   * Strictly stronger than supports_tools. Boolean for recipe-wide behavior;
+   * predicate when only some routed model ids are loop-safe (OpenRouter
+   * Anthropic routes vs other proxied families).
    */
-  supports_subagent_loop: boolean;
-  /** Anthropic-style ephemeral prompt cache markers honored. */
-  supports_prompt_cache?: boolean;
+  supports_subagent_loop: boolean | ((modelId: string) => boolean);
+  /**
+   * Prompt caching honored for this chat touchpoint. Static booleans cover
+   * native providers; openai-compatible aggregators may decide per model id
+   * (e.g. OpenRouter caches OpenAI and Anthropic routes but not every routed
+   * model family).
+   */
+  supports_prompt_cache?: boolean | ((modelId: string) => boolean);
+  /**
+   * Model reasons/thinks BY DEFAULT, spending output-token budget on internal
+   * reasoning before any answer text (DeepSeek v4's thinking mode bills
+   * reasoning as output and counts it against `max_tokens`). Consumers that
+   * size output caps (e.g. `think`'s `maxOutputTokensFor`) grant these models
+   * the same headroom as thinking-by-default Claude 5 / OpenAI reasoning
+   * models. Boolean for recipe-wide behavior; predicate when only some routed
+   * model ids think by default. Distinct from "can be asked to think" —
+   * default-off reasoning modes should NOT set this (gbrain#4172).
+   */
+  thinking_by_default?: boolean | ((modelId: string) => boolean);
+  /**
+   * Backend honors OpenAI structured outputs (a strict `json_schema`
+   * response_format). Threaded into `createOpenAICompatible`'s
+   * `supportsStructuredOutputs` so query expansion's `generateObject` sends a
+   * real schema (strict validation) instead of degrading to schemaless JSON.
+   * Default false: an openai-compatible recipe may front arbitrary backends,
+   * most of which lack strict json_schema support, so `expand()` routes them
+   * through the schemaless text path. Opt in per recipe when the backend is
+   * known to honor it.
+   */
+  supports_structured_outputs?: boolean;
+  /** Per-model overrides for providers whose chat models have different context windows. */
+  model_context_tokens?: Record<string, number>;
   max_context_tokens?: number;
   cost_per_1m_input_usd?: number;
   cost_per_1m_output_usd?: number;
   price_last_verified?: string;
+  /**
+   * Recipe-level timeout fallback for `gbrain models doctor`'s chat
+   * reachability probe. Mirrors `RerankerTouchpoint.default_timeout_ms`: lets
+   * a slow-start provider (e.g. a subprocess-dispatched CLI with real cold-start
+   * latency) declare the headroom it needs instead of the probe's flat 5000ms
+   * default false-failing on every run.
+   */
+  default_timeout_ms?: number;
 }
 
 export interface Recipe {
@@ -228,6 +351,23 @@ export interface Recipe {
   tier: 'native' | 'openai-compat';
   /** Maps to the gateway's implementation switch. */
   implementation: Implementation;
+  /**
+   * How the provider bills. `subscription`: calls draw on a flat-rate plan
+   * (claude-cli), so the operator may price every model of the provider at
+   * once with a `<provider>:*` key in `pricing.overrides`. Unset means per
+   * token, where a provider wildcard is refused (one rate cannot be right
+   * for every model of a per-token API).
+   */
+  billing?: 'subscription';
+  /**
+   * Model ids this recipe lists in a touchpoint that gbrain ships no price
+   * for. They run under a default cost cap with a warning; a cap the user
+   * set refuses them with the no_pricing guidance until the operator
+   * registers a rate (`gbrain pricing set`). `bun run check:recipe-pricing`
+   * requires every listed model to be priced or named here, and fails on a
+   * stale entry (now priced, or no longer listed).
+   */
+  unpriced_models?: string[];
   /** For openai-compatible tier: default base URL. May be overridden by env or wizard. */
   base_url_default?: string;
   /** Env var name(s) for auth; first is required, rest are optional. */
@@ -241,6 +381,7 @@ export interface Recipe {
     expansion?: ExpansionTouchpoint;
     chat?: ChatTouchpoint;
     reranker?: RerankerTouchpoint;
+    decide?: DecideTouchpoint;
   };
   /**
    * Optional alias map for friendlier `provider:model` strings.
@@ -274,6 +415,8 @@ export interface Recipe {
     headerName: string;
     token: string;
   };
+  /** With a custom resolveAuth: whether its env credential is present (readiness and no_key preflights). */
+  authPresent?(env: Record<string, string | undefined>): boolean;
   /**
    * v0.37.6.0: static request headers applied to every openai-compatible
    * touchpoint (embedding, expansion, chat, reranker). Use for static-per-recipe
@@ -316,8 +459,20 @@ export interface Recipe {
     fetch?: typeof fetch;
   };
   /**
+   * Optional inbound-response rewriter for openai-compatible recipes whose wire
+   * shape needs normalizing before the AI SDK adapter parses it. `fetch` wraps
+   * the transport and MUST be fail-open (return the original response on any
+   * error). Used by DeepSeek to promote `reasoning_content` into `content` when
+   * the reasoner returns an empty `content` (the adapter reads only `content`).
+   * Applied by `applyOpenAICompatConfig`; a `resolveOpenAICompatConfig`-provided
+   * fetch takes precedence when both are present.
+   */
+  compat?: {
+    fetch?: typeof fetch;
+  };
+  /**
    * v0.32 (D13=A): optional runtime readiness check for local-server
-   * recipes (ollama, llama-server, future lmstudio-recipe). Returns
+   * recipes (ollama, llama-server, lmstudio). Returns
    * `ready: false` when the local endpoint isn't reachable, with a `hint`
    * the wizard / doctor can surface.
    *
@@ -339,6 +494,7 @@ export interface Recipe {
 export interface AIGatewayConfig {
   /** Current embedding model as "provider:modelId" (e.g. "openai:text-embedding-3-large"). */
   embedding_model?: string;
+  embedding_identity_unverified?: boolean;
   /** Target embedding dims. Gateway asserts returned embeddings match this. */
   embedding_dimensions?: number;
   /**
@@ -347,25 +503,31 @@ export interface AIGatewayConfig {
    * Allows brains using OpenAI for text to use Voyage for image embeddings.
    */
   embedding_multimodal_model?: string;
+  /**
+   * Separate model for image OCR (e.g. "openai:gpt-4o-mini"). When set,
+   * generateOcrText() routes to this model instead of expansion_model.
+   * A direct "provider:model" string like embedding_multimodal_model —
+   * deliberately never models.tier-resolved (#4107).
+   */
+  embedding_image_ocr_model?: string;
   /** Current expansion model as "provider:modelId". */
   expansion_model?: string;
   /** Default chat model for `gateway.chat()` callers (subagent default). */
   chat_model?: string;
-  /**
-   * v0.35.0.0+: default reranker model for `gateway.rerank()` callers. As
-   * `'provider:model'` (e.g. `'zeroentropyai:zerank-2'`). Resolved at
-   * configure time and re-resolved by reconfigureGatewayWithEngine() when
-   * mode-bundle or config-key overrides change.
-   */
+
   reranker_model?: string;
   /**
-   * Optional silent-refusal fallback chain ("provider:modelId" entries).
-   * Plumbed for `chatWithFallback()` (commit 3). Blocked from critic/judge/
-   * synthesize flows in their respective handlers.
+   * Optional chat fallback chain ("provider:modelId" entries), walked by
+   * `chatWithFallback()` (chat-fallback.ts) when a chat call fails or refuses.
+   * Judge, critic and eval call sites opt out with `allowFallback: false`.
    */
   chat_fallback_chain?: string[];
+  /** `false` keeps outage fallback but never sends a refused request to the next chain entry. Default true. */
+  chat_fallback_on_refusal?: boolean;
   /** Optional per-provider base URL override (openai-compatible variants). */
   base_urls?: Record<string, string>;
+  /** Optional chat providerOptions overrides keyed by recipe id or "recipe:modelId". */
+  provider_chat_options?: Record<string, Record<string, unknown>>;
   /** Env snapshot read once at configuration time. Gateway never reads process.env at call time. */
   env: Record<string, string | undefined>;
 }

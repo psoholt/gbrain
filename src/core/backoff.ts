@@ -5,8 +5,9 @@
  * the system. Checks CPU load, memory, and concurrent process count.
  *
  * Note on os.loadavg(): returns [0,0,0] on Windows. When load data is
- * unavailable (all zeros on non-Linux/macOS), defaults to "proceed" since
- * we can't determine actual load.
+ * unavailable (all zeros on non-Linux/macOS), the CPU load checks are skipped
+ * since we can't determine actual load; the concurrency and memory limits
+ * still apply.
  */
 
 import { loadavg, freemem, totalmem, cpus } from 'os';
@@ -81,6 +82,20 @@ function getLoad(): number {
 
 /** Get memory usage fraction (0-1) */
 function getMemoryUsage(): number {
+  // Prefer /proc/meminfo MemAvailable on Linux — os.freemem() returns
+  // MemFree which excludes page cache, falsely reading "high pressure"
+  // in any container where the kernel caches files.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require('fs');
+    const meminfo: string = fs.readFileSync('/proc/meminfo', 'utf8');
+    const totalKb = Number(meminfo.match(/MemTotal:\s+(\d+)/)?.[1]);
+    const availKb = Number(meminfo.match(/MemAvailable:\s+(\d+)/)?.[1]);
+    if (totalKb > 0 && availKb >= 0) return 1 - availKb / totalKb;
+  } catch {
+    /* fall through to os.freemem() (non-Linux or /proc unavailable) */
+  }
+  // Non-Linux fallback (macOS, Windows, or any host without /proc/meminfo)
   const total = totalmem();
   if (total === 0) return 0;
   return 1 - (freemem() / total);
@@ -95,11 +110,6 @@ export function shouldProceed(config?: Partial<ThrottleConfig>): ThrottleResult 
   const load = getLoad();
   const memUsed = getMemoryUsage();
 
-  // Windows/unsupported: loadavg returns [0,0,0] — can't determine load, proceed
-  if (loadavg()[0] === 0 && loadavg()[1] === 0 && loadavg()[2] === 0) {
-    return { proceed: true, delay: 0, reason: 'Load data unavailable (Windows?), proceeding', load: 0, memoryUsed: memUsed };
-  }
-
   // Concurrent process limit
   if (_activeProcesses >= MAX_CONCURRENT) {
     return { proceed: false, delay: 5000, reason: `${_activeProcesses} batch processes active (max ${MAX_CONCURRENT})`, load, memoryUsed: memUsed };
@@ -108,6 +118,11 @@ export function shouldProceed(config?: Partial<ThrottleConfig>): ThrottleResult 
   // Memory check
   if (memUsed > cfg.memoryStopPct) {
     return { proceed: false, delay: 30000, reason: `Memory ${(memUsed * 100).toFixed(0)}% > ${(cfg.memoryStopPct * 100).toFixed(0)}% threshold`, load, memoryUsed: memUsed };
+  }
+
+  // Windows/unsupported: loadavg returns [0,0,0] — can't determine load, skip the CPU checks
+  if (loadavg().every(avg => avg === 0)) {
+    return { proceed: true, delay: 0, reason: 'Load data unavailable (Windows?), proceeding', load: 0, memoryUsed: memUsed };
   }
 
   // CPU load checks

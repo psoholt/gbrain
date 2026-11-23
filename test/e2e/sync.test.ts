@@ -70,11 +70,31 @@ function gitCommit(repoPath: string, message: string) {
   execSync(`git add -A && git commit -m "${message}"`, { cwd: repoPath, stdio: 'pipe' });
 }
 
+/**
+ * #2114 (commit 636628fdb): global sync.* anchors only move for the brain repo
+ * they describe. `writeSyncAnchor` proves ownership via `ownsGlobalSyncAnchor`,
+ * which falls back to the default source row's `local_path` when
+ * `config.sync.repo_path` is unset — and `setupDB()` truncates `config` but
+ * NOT `sources`, so a stale `local_path` from a previously-run e2e file (e.g.
+ * sync-credential-preflight.test.ts, which sorts before this file in the full
+ * lane) survives in the shared DB and silently refuses every anchor write
+ * here. That wedges the bookmark: every sync re-runs as `first_sync` and
+ * `sync.last_commit` never persists. Reset the default-source identity so this
+ * file's mkdtemp repo is a legitimate fresh-brain bootstrap.
+ */
+async function resetBrainRepoIdentity() {
+  const engine = getEngine();
+  await engine.executeRaw(
+    `UPDATE sources SET local_path = NULL, last_commit = NULL WHERE id = 'default'`,
+  );
+}
+
 describeE2E('E2E: Git-to-DB Sync Pipeline', () => {
   let repoPath: string;
 
   beforeAll(async () => {
     await setupDB();
+    await resetBrainRepoIdentity();
     repoPath = createTestRepo();
   }, 30_000);
 
@@ -224,7 +244,7 @@ describeE2E('E2E: Git-to-DB Sync Pipeline', () => {
     expect(bob).toBeNull();
   });
 
-  test('sync skips non-syncable files (README, hidden, .raw)', async () => {
+  test('sync skips non-syncable files (README, hidden, .raw) but imports ops/ (#2404)', async () => {
     const { performSync } = await import('../../src/commands/sync.ts');
     const engine = getEngine();
 
@@ -249,8 +269,9 @@ describeE2E('E2E: Git-to-DB Sync Pipeline', () => {
     const raw = await engine.getPage('.raw/data');
     expect(raw).toBeNull();
 
+    // ops/ is ordinary content and DOES sync (#2404).
     const ops = await engine.getPage('ops/deploy');
-    expect(ops).toBeNull();
+    expect(ops).not.toBeNull();
   });
 
   test('sync stores last_commit and last_run in config', async () => {
@@ -416,6 +437,12 @@ describeE2E('E2E: sync --skip-failed structured summary loop (v0.22.12, issue #5
 
   beforeAll(async () => {
     await setupDB();
+    // #2114: see resetBrainRepoIdentity above — setupDB truncates config but
+    // not sources, and this block syncs a brand-new mkdtemp repo.
+    await resetBrainRepoIdentity();
+    // #5988: content refusals are held by default; this block pins the
+    // fail-closed ledger gate, which sync.holds=fail keeps.
+    await getEngine().setConfig('sync.holds', 'fail');
 
     // Save+clear the real ~/.gbrain/sync-failures.jsonl so the test starts from
     // a known-empty state. Restored in afterAll. This file is per-machine, NOT

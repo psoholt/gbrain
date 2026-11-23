@@ -10,7 +10,7 @@
  *    openai-compatible path (line 167) — Azure-OpenAI hosts text-3 via the
  *    compat adapter, same validation contract there.
  *
- * Why: the v0.36.0.0 wave flips the default embedding to ZE at 1024d. The
+ * Why: the v0.36.0.0 wave flips the default embedding to Voyage at 1024d. The
  * fallback path is OpenAI text-embedding-3-large at 1024d (also valid per
  * Matryoshka). Without range validation, a user who mis-configures
  * `embedding_dimensions=5000` against text-embedding-3-small gets opaque
@@ -34,7 +34,7 @@ describe('OpenAI text-embedding-3 model recognition', () => {
 
   test('isOpenAITextEmbedding3Model rejects ada-002 and unrelated', () => {
     expect(isOpenAITextEmbedding3Model('text-embedding-ada-002')).toBe(false);
-    expect(isOpenAITextEmbedding3Model('zembed-1')).toBe(false);
+    expect(isOpenAITextEmbedding3Model('fixture-embedding-v1')).toBe(false);
     expect(isOpenAITextEmbedding3Model('voyage-3-large')).toBe(false);
   });
 
@@ -101,7 +101,8 @@ describe('dimsProviderOptions — OpenAI native path', () => {
       expect(msg).toContain('3072');
       // Paste-ready fix appears in the `fix` property of AIConfigError.
       const fix = (err as AIConfigError).fix ?? '';
-      expect(fix).toContain('gbrain config set embedding_dimensions');
+      expect(fix).toContain('gbrain migrate embeddings --to openai:text-embedding-3-large --dim 1024 --dry-run');
+      expect(fix).not.toContain('config set embedding_dimensions');
     }
   });
 
@@ -132,5 +133,51 @@ describe('dimsProviderOptions — OpenAI on openai-compatible adapter (Azure cas
     const opts = dimsProviderOptions('openai-compatible', 'text-embedding-3-large', 1024, 'query');
     expect(opts).toEqual({ openaiCompatible: { dimensions: 1024 } });
     expect(JSON.stringify(opts)).not.toContain('input_type');
+  });
+});
+
+describe('dimsProviderOptions — prefixed model IDs (OpenRouter / proxy providers)', () => {
+  test('openai/text-embedding-3-large at 1536d returns dimensions=1536', () => {
+    const opts = dimsProviderOptions('openai-compatible', 'openai/text-embedding-3-large', 1536);
+    expect(opts).toEqual({ openaiCompatible: { dimensions: 1536 } });
+  });
+
+  test('openai/text-embedding-3-small at 768d returns dimensions=768', () => {
+    const opts = dimsProviderOptions('openai-compatible', 'openai/text-embedding-3-small', 768);
+    expect(opts).toEqual({ openaiCompatible: { dimensions: 768 } });
+  });
+
+  test('openai/text-embedding-3-large at 5000d throws AIConfigError', () => {
+    expect(() => dimsProviderOptions('openai-compatible', 'openai/text-embedding-3-large', 5000))
+      .toThrow(AIConfigError);
+  });
+
+  test('error message preserves full prefixed model ID for clarity', () => {
+    try {
+      dimsProviderOptions('openai-compatible', 'openai/text-embedding-3-large', 5000);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(AIConfigError);
+      expect((err as Error).message).toContain('openai/text-embedding-3-large');
+    }
+  });
+});
+
+describe('mixed-case ids on the openai-compatible path (#4123)', () => {
+  test('cased Azure-hosted text-embedding-3 id pins dimensions', () => {
+    expect(dimsProviderOptions('openai-compatible', 'azure/Text-Embedding-3-Small', 1024))
+      .toEqual({ openaiCompatible: { dimensions: 1024 } });
+  });
+
+  test('cased id out of range throws with the ORIGINAL casing in the message (paste-ready)', () => {
+    expect(() => dimsProviderOptions('openai-compatible', 'azure/Text-Embedding-3-Small', 5000))
+      .toThrow(/Text-Embedding-3-Small/);
+    expect(() => dimsProviderOptions('openai-compatible', 'azure/Text-Embedding-3-Small', 5000))
+      .toThrow(/1\.\.1536/);
+  });
+
+  test('predicates fold: cased ids recognized, max resolved', () => {
+    expect(isOpenAITextEmbedding3Model('Text-Embedding-3-Large')).toBe(true);
+    expect(maxOpenAITextEmbedding3Dim('TEXT-EMBEDDING-3-SMALL')).toBe(1536);
   });
 });

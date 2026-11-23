@@ -10,7 +10,13 @@
  *   3. handler invocation + JSON serialization (ToolResult shape)
  *   4. Error path: OperationError → isError + JSON envelope
  *   5. Trust gate: ctx.remote === true on get_recent_transcripts must
- *      reach the handler and produce a permission_denied error.
+ *      reach the handler and produce a permission_denied error. Since
+ *      commit 6a905a1e5 (v0.45.13.0, #4096 WP1/D7) localOnly ops only
+ *      DISPATCH on the stdio local pipe (transport: 'stdio'); any other
+ *      or unset transport is denied fail-closed with the unknown_tool
+ *      envelope BEFORE the handler (pinned in
+ *      test/dispatch-localonly.test.ts). The trust axis (`remote`) is a
+ *      separate, in-handler check.
  *
  * Runs against PGLite in-memory. No DATABASE_URL, no API keys.
  */
@@ -73,7 +79,7 @@ describe('v0.29 E2E — dispatchToolCall for the three new ops', () => {
     const result = await dispatchToolCall(engine, 'get_recent_salience', {
       days: 7,
       limit: 10,
-    }, { remote: true });
+    }, { remote: true, sourceId: 'default' });
 
     expect(result.isError).toBeFalsy();
     expect(result.content[0].type).toBe('text');
@@ -89,7 +95,7 @@ describe('v0.29 E2E — dispatchToolCall for the three new ops', () => {
     const result = await dispatchToolCall(engine, 'find_anomalies', {
       lookback_days: 30,
       sigma: 1.5, // lower threshold so the small fixture tips the cohort
-    }, { remote: true });
+    }, { remote: true, sourceId: 'default' });
 
     expect(result.isError).toBeFalsy();
     const rows = JSON.parse(result.content[0].text);
@@ -111,26 +117,48 @@ describe('v0.29 E2E — dispatchToolCall for the three new ops', () => {
   test('get_recent_transcripts rejects with permission_denied when ctx.remote === true', async () => {
     // Defense-in-depth: even though serve-http filters localOnly: true ops
     // out of the MCP tool list, the in-handler ctx.remote check is the
-    // last line. dispatchToolCall defaults remote=true, which is what
-    // every MCP transport sets, so the reject must fire here.
+    // last line. This dispatch shape (remote: true, transport: 'stdio') is
+    // exactly what the real stdio MCP server sets (src/mcp/server.ts) —
+    // stdio passes the #4096 WP1/D7 locality backstop but stays
+    // remote/untrusted, so the in-handler trust gate must fire.
     const result = await dispatchToolCall(engine, 'get_recent_transcripts', {
       days: 7,
-    }, { remote: true });
+    }, { remote: true, transport: 'stdio', sourceId: 'default' });
 
     expect(result.isError).toBe(true);
     const err = JSON.parse(result.content[0].text);
     // OperationError.toJSON() serializes the code as `error:`, not `code:`.
     expect(err.error).toBe('permission_denied');
-    expect(err.message.toLowerCase()).toContain('local-only');
+    // Agent contract v1 (F5): refused at dispatch with the exact CLI command.
+    expect(err.code).toBe('trusted_local_only');
+    expect(err.message.toLowerCase()).toContain('trusted local cli');
+    expect(err.fix.command).toBe('gbrain transcripts recent --brain host --source default');
   });
 
-  test('get_recent_transcripts succeeds when ctx.remote === false (CLI path)', async () => {
-    // The local-CLI path explicitly sets remote: false. Op should run
-    // (returning [] is fine — no corpus dir is configured in this test
-    // fixture; the test just asserts the trust gate didn't reject).
+  test('get_recent_transcripts is denied fail-closed (unknown_tool) when the transport marker is unset', async () => {
+    // #4096 WP1/D7 backstop: localOnly ops dispatch only on the stdio local
+    // pipe. An unset transport marker — even from a trusted (remote: false)
+    // caller — gets the same envelope as a nonexistent op, so the catalog
+    // never leaks which localOnly names exist.
+    for (const remote of [true, false]) {
+      const result = await dispatchToolCall(engine, 'get_recent_transcripts', {
+        days: 7,
+      }, { remote, sourceId: 'default' });
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text).error).toBe('unknown_tool');
+    }
+  });
+
+  test('get_recent_transcripts succeeds when ctx.remote === false (trusted local dispatch)', async () => {
+    // Trusted local callers set remote: false; the dispatch must arrive on
+    // the stdio local pipe to pass the #4096 locality backstop (the real
+    // CLI path in src/cli.ts invokes handlers directly with remote: false
+    // and never crosses the backstop). Op should run (returning [] is fine
+    // — no corpus dir is configured in this test fixture; the test just
+    // asserts the trust gate didn't reject).
     const result = await dispatchToolCall(engine, 'get_recent_transcripts', {
       days: 7,
-    }, { remote: false });
+    }, { remote: false, transport: 'stdio' });
 
     expect(result.isError).toBeFalsy();
     const rows = JSON.parse(result.content[0].text);
@@ -142,8 +170,85 @@ describe('v0.29 E2E — dispatchToolCall for the three new ops', () => {
   test('unknown tool returns Unknown tool error envelope (regression guard)', async () => {
     // Generic dispatch shape contract — protects against typos in op
     // names accidentally short-circuiting elsewhere in the dispatcher.
-    const result = await dispatchToolCall(engine, 'get_recent_definitely_not_a_real_op', {}, { remote: true });
+    const result = await dispatchToolCall(engine, 'get_recent_definitely_not_a_real_op', {}, { remote: true, sourceId: 'default' });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/Unknown tool/);
+  });
+});
+
+describe('dispatch source-scope guard — remote callers must carry a resolved sourceId', () => {
+  test('remote call without sourceId is refused (missing_source_scope), never lands in default', async () => {
+    const result = await dispatchToolCall(engine, 'get_recent_salience', { days: 7 }, { remote: true });
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(result.content[0].text);
+    expect(body.error).toBe('missing_source_scope');
+  });
+
+  test('remote default (opts.remote omitted) is treated as remote and refused too', async () => {
+    const result = await dispatchToolCall(engine, 'get_recent_salience', { days: 7 }, {});
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(result.content[0].text);
+    expect(body.error).toBe('missing_source_scope');
+  });
+
+  test('trusted local callers (remote === false) keep the historical default fallback', async () => {
+    const result = await dispatchToolCall(engine, 'get_recent_salience', { days: 7 }, { remote: false });
+    expect(result.isError).toBeFalsy();
+  });
+
+  test('the guard runs after op lookup: unknown tool still reports Unknown tool, not scope', async () => {
+    const result = await dispatchToolCall(engine, 'not_a_real_op_scope_guard', {}, { remote: true });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/Unknown tool/);
+  });
+});
+
+describe('ingest log source scoping — log_ingest threads ctx.sourceId, get_ingest_log honors the grant', () => {
+  beforeAll(async () => {
+    for (const [sourceId, slug] of [['u-alice', 'people/carol'], ['u-bob', 'people/dave']] as const) {
+      await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1) ON CONFLICT DO NOTHING', [sourceId]);
+      await engine.putPage(slug, { type: 'person', title: slug, compiled_truth: 'Ingested page.', timeline: '', frontmatter: {} }, { sourceId });
+    }
+    await dispatchToolCall(engine, 'log_ingest', {
+      source_type: 'chat', source_ref: 'alice-conv-1', pages_updated: ['people/carol'], summary: 'alice private context',
+    }, { remote: true, sourceId: 'u-alice' });
+    await dispatchToolCall(engine, 'log_ingest', {
+      source_type: 'chat', source_ref: 'bob-conv-1', pages_updated: ['people/dave'], summary: 'bob private context',
+    }, { remote: true, sourceId: 'u-bob' });
+  });
+
+  test('log_ingest attributes the entry to the caller source, not default', async () => {
+    const result = await dispatchToolCall(engine, 'get_ingest_log', {}, { remote: false });
+    const rows = JSON.parse(result.content[0].text) as Array<{ source_id: string; source_ref: string }>;
+    expect(rows.find(r => r.source_ref === 'alice-conv-1')?.source_id).toBe('u-alice');
+    expect(rows.find(r => r.source_ref === 'bob-conv-1')?.source_id).toBe('u-bob');
+  });
+
+  test('remote scalar-scoped caller only sees its own source rows', async () => {
+    const result = await dispatchToolCall(engine, 'get_ingest_log', {}, { remote: true, sourceId: 'u-alice' });
+    const rows = JSON.parse(result.content[0].text) as Array<{ source_id: string }>;
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every(r => r.source_id === 'u-alice')).toBe(true);
+  });
+
+  test('federated grant sees exactly the granted sources', async () => {
+    const result = await dispatchToolCall(engine, 'get_ingest_log', {}, {
+      remote: true,
+      sourceId: 'u-alice',
+      auth: { token: 't', clientId: 'c', scopes: ['read'], allowedSources: ['u-alice', 'u-bob'] },
+    });
+    const rows = JSON.parse(result.content[0].text) as Array<{ source_id: string }>;
+    const seen = new Set(rows.map(r => r.source_id));
+    expect(seen.has('u-alice')).toBe(true);
+    expect(seen.has('u-bob')).toBe(true);
+    expect(seen.has('default')).toBe(false);
+  });
+
+  test('trusted local caller keeps the whole-brain view', async () => {
+    const result = await dispatchToolCall(engine, 'get_ingest_log', {}, { remote: false });
+    const rows = JSON.parse(result.content[0].text) as Array<{ source_id: string }>;
+    const seen = new Set(rows.map(r => r.source_id));
+    expect(seen.has('u-alice')).toBe(true);
+    expect(seen.has('u-bob')).toBe(true);
   });
 });

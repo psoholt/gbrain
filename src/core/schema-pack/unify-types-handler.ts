@@ -37,6 +37,9 @@ import { runStatsCore } from './stats.ts';
 import { runSyncCore } from './sync.ts';
 import { tryAcquireDbLock, type DbLockHandle } from '../db-lock.ts';
 import type { PackMappingRule } from './manifest-v1.ts';
+import { opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
+import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 
 export interface UnifyTypesInput {
   /** The pack name to upgrade TO (e.g. 'gbrain-base-v2'). */
@@ -68,6 +71,60 @@ export interface UnifyTypesResult {
   warnings: string[];
 }
 
+const MANAGED_PREVIEW_WARNING = 'unify-types apply is not supported on a managed brain while pages need retyping, linking or aliasing; with nothing to change, apply only switches the pack. This dry run is a preview.';
+
+/**
+ * #5634 / #6196: the retype, link and alias phases write canonical tables
+ * outside the persistence coordinator, which a managed brain refuses mid-run.
+ * A managed apply runs the dry run first: with nothing to change it only
+ * switches the active pack (config writes are allowed there); otherwise it
+ * refuses with the counts before the lock or any write.
+ */
+async function applyOnManagedBrain(ctx: OperationContext, input: UnifyTypesInput): Promise<UnifyTypesResult> {
+  const preview = await runUnifyTypes(ctx, { ...input, apply: false });
+  const p = preview.per_phase;
+  const counts = [
+    [p.retype_explicit.would_apply + p.retype_catch_all.would_apply + p.final_sync.total_would_apply, 'to retype'],
+    [p.page_to_link.would_convert, 'to convert to links'],
+    [p.page_to_alias.would_alias, 'to convert to aliases'],
+  ] as const;
+  if (counts.some(([n]) => n > 0)) {
+    throw opError('writer_coordinator_required',
+      `unify-types apply is not supported on a managed brain while pages need changing (${counts.filter(([n]) => n > 0).map(([n, what]) => `${n} page(s) ${what}`).join(', ')}): its retype runs outside the persistence coordinator. No page was changed.`,
+      'Coordinated retype is not available yet; keep the current pack and preview the upgrade read-only.',
+      { fix: readFix('Previews the pack upgrade read-only; applying waits for coordinated retype on a managed brain.', { argv: ['gbrain', 'onboard', '--check', '--explain'] }) });
+  }
+  const warnings = preview.warnings.filter((w) => w !== MANAGED_PREVIEW_WARNING);
+  const pack_identity_after = await flipActivePack(ctx, input.target_pack, warnings, input.onProgress ?? (() => {}), preview.pack_identity_before);
+  return { ...preview, apply: true, pack_identity_after, active_pack_flipped: true, warnings };
+}
+
+/** D13: write schema_pack to the DB config and the file plane; returns the new pack identity. */
+async function flipActivePack(ctx: OperationContext, targetPack: string, warnings: string[], onProgress: (msg: string) => void, identityBefore: string | null): Promise<string> {
+  // Write to BOTH:
+  //   - DB config (engine.setConfig) — covers federated/multi-source brains
+  //     where future loadActivePack calls thread dbConfig from `config` table.
+  //   - File-plane config (saveConfig) — covers loadActivePack({ cfg, ... })
+  //     callers that read from ~/.gbrain/config.json (homeConfig tier).
+  // Without the file-plane write the local CLI loadActivePack callers
+  // wouldn't see the flip and pack_upgrade_available would keep firing.
+  await ctx.engine.setConfig('schema_pack', targetPack);
+  try {
+    const { loadConfigFileOnly, saveConfig } = await import('../config.ts');
+    const existing = loadConfigFileOnly() ?? ({} as Record<string, unknown>);
+    saveConfig({ ...existing, schema_pack: targetPack } as never);
+  } catch (e) {
+    warnings.push(
+      `Active-pack flip wrote to DB but file-plane saveConfig failed: ` +
+      `${(e as Error).message}. Run \`gbrain schema use ${targetPack}\` ` +
+      `manually to ensure local CLI sees the flip.`,
+    );
+  }
+  const activeAfter = await loadActivePack({ cfg: { schema_pack: targetPack } as never, remote: false });
+  onProgress(`[unify-types] active pack flipped: ${identityBefore} → ${activeAfter.identity}`);
+  return activeAfter.identity;
+}
+
 /**
  * Pure orchestrator for the unify-types handler. Engine is supplied via
  * OperationContext. Caller (jobs.ts wrapper) wires engine + onProgress.
@@ -83,7 +140,9 @@ export async function runUnifyTypes(
   const apply = input.apply === true;
   const sourceId = input.sourceId;
   const onProgress = input.onProgress ?? (() => {});
-  const warnings: string[] = [];
+  const managed = await managedPersistenceEnabled(ctx.engine);
+  if (managed && apply) return applyOnManagedBrain(ctx, input);
+  const warnings = managed ? [MANAGED_PREVIEW_WARNING] : [];
 
   onProgress(`[unify-types] starting (apply=${apply}, target_pack=${input.target_pack})`);
 
@@ -131,7 +190,13 @@ export async function runUnifyTypes(
   try {
     // Partition mapping_rules by kind
     const explicitRetypeRules: RetypeRule[] = [];
-    let catchAllRule: { to_type: string; subtype?: string; subtype_field?: string } | null = null;
+    let catchAllRule: {
+      to_type: string;
+      subtype?: string;
+      subtype_field?: string;
+      path_filter?: string;
+      slug_filter?: string;
+    } | null = null;
     const pageToLinkRules: PageToLinkRule[] = [];
     const pageToAliasRules: PageToAliasRule[] = [];
     for (const rule of targetPack.manifest.mapping_rules as PackMappingRule[]) {
@@ -144,6 +209,12 @@ export async function runUnifyTypes(
             to_type: rule.to_type,
             subtype: rule.subtype,
             subtype_field: rule.subtype_field,
+            // #4651: carry the disambiguation filters through — dropping
+            // them silently widened the catch-all's selection to every page
+            // of an unknown type (the explicit-rule path below always
+            // copied them).
+            path_filter: rule.path_filter,
+            slug_filter: rule.slug_filter,
           };
         } else {
           explicitRetypeRules.push({
@@ -152,6 +223,7 @@ export async function runUnifyTypes(
             subtype: rule.subtype,
             subtype_field: rule.subtype_field,
             path_filter: rule.path_filter,
+            slug_filter: rule.slug_filter,
           });
         }
       } else if (rule.kind === 'page_to_link') {
@@ -222,6 +294,10 @@ export async function runUnifyTypes(
           subtype: catchAllRule!.subtype === ORIGINAL_TYPE_SENTINEL
             ? ut
             : catchAllRule!.subtype,
+          // #4651: runRetypeCore honors both filters for explicit rules;
+          // synthesized catch-all rules must respect the same boundaries.
+          path_filter: catchAllRule!.path_filter,
+          slug_filter: catchAllRule!.slug_filter,
         }));
         const result = await runRetypeCore(ctx, { rules: synthesized, apply, sourceId });
         retypeCatchAll = {
@@ -252,32 +328,8 @@ export async function runUnifyTypes(
     let active_pack_flipped = false;
     let pack_identity_after = pack_identity_before;
     if (apply) {
-      // Write to BOTH:
-      //   - DB config (engine.setConfig) — covers federated/multi-source brains
-      //     where future loadActivePack calls thread dbConfig from `config` table.
-      //   - File-plane config (saveConfig) — covers loadActivePack({ cfg, ... })
-      //     callers that read from ~/.gbrain/config.json (homeConfig tier).
-      // Without the file-plane write the local CLI loadActivePack callers
-      // wouldn't see the flip and pack_upgrade_available would keep firing.
-      await ctx.engine.setConfig('schema_pack', input.target_pack);
-      try {
-        const { loadConfigFileOnly, saveConfig } = await import('../config.ts');
-        const existing = loadConfigFileOnly() ?? ({} as Record<string, unknown>);
-        saveConfig({ ...existing, schema_pack: input.target_pack } as never);
-      } catch (e) {
-        warnings.push(
-          `Active-pack flip wrote to DB but file-plane saveConfig failed: ` +
-          `${(e as Error).message}. Run \`gbrain schema use ${input.target_pack}\` ` +
-          `manually to ensure local CLI sees the flip.`,
-        );
-      }
+      pack_identity_after = await flipActivePack(ctx, input.target_pack, warnings, onProgress, pack_identity_before);
       active_pack_flipped = true;
-      const activeAfter = await loadActivePack({
-        cfg: { schema_pack: input.target_pack } as never,
-        remote: false,
-      });
-      pack_identity_after = activeAfter.identity;
-      onProgress(`[unify-types] active pack flipped: ${pack_identity_before} → ${pack_identity_after}`);
     }
 
     // 7. Verify

@@ -149,6 +149,9 @@ describe('list_schema_packs', () => {
       seedPack('mine');
       const result = await operationsByName.list_schema_packs!.handler(ctxOf(), {}) as { bundled: string[]; installed: string[] };
       expect(result.bundled).toContain('gbrain-base');
+      expect(result.bundled).toContain('gbrain-recommended');
+      expect(result.bundled).toContain('gbrain-base-v2');
+      expect(result.bundled).toContain('gbrain-investor');
       expect(result.installed).toContain('mine');
     });
   });
@@ -241,7 +244,10 @@ describe('schema_review_orphans', () => {
       );
     }
     const result = await operationsByName.schema_review_orphans!.handler(ctxOf(), { limit: 2 }) as Record<string, unknown>;
-    expect(result.orphan_count).toBe(2);
+    // #5879: limit caps the returned rows; orphan_count is the true total.
+    expect((result.orphans as unknown[]).length).toBe(2);
+    expect(result.orphan_count).toBe(5);
+    expect(result.truncated).toBe(true);
   });
 });
 
@@ -280,19 +286,79 @@ describe('schema_apply_mutations', () => {
     });
   });
 
-  it('returns partial_results on mid-batch failure with a single batch_id', async () => {
+  it('mid-batch failure reports nothing applied — no partial_results implying a landed write (#2581)', async () => {
     await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_AUDIT_DIR: auditDir }, async () => {
-      seedPack('mine');
+      const packPath = seedPack('mine');
+      const before = readFileSync(packPath, 'utf-8');
       const result = await operationsByName.schema_apply_mutations!.handler(ctxOf(), {
         pack: 'mine',
         mutations: [
           { op: 'add_type', name: 'company', primitive: 'entity', prefix: 'companies/' },
-          { op: 'add_type', name: 'person', primitive: 'entity', prefix: 'people/' }, // collides with seed
+          { op: 'add_type', name: 'person', primitive: 'entity', prefix: 'people/' }, // name collision with seed
         ],
       }) as Record<string, unknown>;
       expect(result.error).toBe('mutation_failed');
-      const partial = result.partial_results as Array<unknown>;
-      expect(partial.length).toBe(1);  // first mutation succeeded
+      expect(result.code).toBe('TYPE_EXISTS');
+      // Nothing was written: mutations_applied is 0, the response says so
+      // explicitly, and there is no `partial_results` field implying the
+      // first mutation landed on disk (it never did — see the byte-identical
+      // assertion in the dedicated regression test below).
+      expect(result.mutations_applied).toBe(0);
+      expect(result.pack_unchanged).toBe(true);
+      expect(result.failed_at_index).toBe(1);
+      expect('partial_results' in result).toBe(false);
+      expect(readFileSync(packPath, 'utf-8')).toBe(before);
+    });
+  });
+
+  // Regression test for #2581: schema_apply_mutations documented itself as
+  // ATOMIC ("all mutations succeed or all roll back"), but each mutation
+  // independently read/validated/WROTE the pack file as the batch loop ran.
+  // A batch that failed partway therefore left every earlier mutation
+  // permanently applied to disk — the exact repro from the issue (7
+  // add_type mutations, a later one fails prefix_collision, and the type
+  // from index 0 is found already written to pack.yaml). This test fails
+  // on pre-fix code (the sha8/content changes) and passes once the batch
+  // validates entirely in-memory before a single write.
+  it('#2581: a batch that fails partway leaves the pack file byte-identical to its pre-batch state', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_AUDIT_DIR: auditDir }, async () => {
+      const packPath = seedPack('mine');
+      const beforeContent = readFileSync(packPath, 'utf-8');
+
+      const result = await operationsByName.schema_apply_mutations!.handler(ctxOf(), {
+        pack: 'mine',
+        mutations: [
+          { op: 'add_type', name: 'alpha', primitive: 'entity', prefix: 'alpha/' },
+          { op: 'add_type', name: 'beta', primitive: 'entity', prefix: 'beta/' },
+          // Same path_prefix as `alpha` — fails schema_apply_mutations'
+          // prefix_collision lint rule, matching the issue's repro.
+          { op: 'add_type', name: 'gamma', primitive: 'entity', prefix: 'alpha/' },
+        ],
+      }) as Record<string, unknown>;
+
+      expect(result.error).toBe('mutation_failed');
+      expect(result.code).toBe('INVALID_RESULT');
+      expect(String(result.message)).toContain('prefix_collision');
+      expect(result.mutations_applied).toBe(0);
+      expect(result.pack_unchanged).toBe(true);
+      expect(result.failed_at_index).toBe(2);
+
+      const afterContent = readFileSync(packPath, 'utf-8');
+      expect(afterContent).toBe(beforeContent);
+
+      // A corrected re-submission (without the colliding prefix) must
+      // succeed cleanly — pre-fix, this failed with TYPE_EXISTS for
+      // `alpha` because it was already stuck on disk from the failed
+      // batch, wedging the user until they restored from a backup.
+      const retry = await operationsByName.schema_apply_mutations!.handler(ctxOf(), {
+        pack: 'mine',
+        mutations: [
+          { op: 'add_type', name: 'alpha', primitive: 'entity', prefix: 'alpha/' },
+          { op: 'add_type', name: 'beta', primitive: 'entity', prefix: 'beta/' },
+        ],
+      }) as Record<string, unknown>;
+      expect(retry.error).toBeUndefined();
+      expect(retry.mutations_applied).toBe(2);
     });
   });
 
@@ -352,5 +418,79 @@ describe('reload_schema_pack', () => {
   it('invalidates a specific pack by name', async () => {
     const result = await operationsByName.reload_schema_pack!.handler(ctxOf(), { pack: 'foo' }) as { invalidated: string[] };
     expect(result.invalidated).toContain('foo');
+  });
+});
+
+// ── #4653: DB-plane schema_pack (tier 4) honored by every inspection op ─
+
+describe('#4653 inspection ops honor the DB-plane schema_pack tier', () => {
+  // `tweet` is declared ONLY in gbrain-base-v2 — the discriminator between
+  // "resolved through the DB tier" and "fell through to the default".
+  it('schema_explain_type resolves a type declared only in the DB-configured pack', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: undefined }, async () => {
+      await engine.setConfig('schema_pack', 'gbrain-base-v2');
+      const result = await operationsByName.schema_explain_type!.handler(ctxOf(), { type: 'tweet' }) as Record<string, unknown>;
+      expect(result.error).toBeUndefined();
+      expect(result.pack).toBe('gbrain-base-v2');
+    });
+  });
+
+  it('schema_graph reports the DB-configured pack', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: undefined }, async () => {
+      await engine.setConfig('schema_pack', 'gbrain-base-v2');
+      const result = await operationsByName.schema_graph!.handler(ctxOf(), {}) as Record<string, unknown>;
+      expect(result.pack).toBe('gbrain-base-v2');
+    });
+  });
+
+  it('get_active_schema_pack and schema_graph agree on the same ctx (no split resolution)', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: undefined }, async () => {
+      await engine.setConfig('schema_pack', 'gbrain-base-v2');
+      const ctx = ctxOf();
+      const active = await operationsByName.get_active_schema_pack!.handler(ctx, {}) as Record<string, unknown>;
+      const graph = await operationsByName.schema_graph!.handler(ctx, {}) as Record<string, unknown>;
+      expect(active.source_tier).toBe('db-config');
+      expect(graph.pack).toBe(active.pack_name);
+    });
+  });
+
+  it('schema_lint (no pack arg) lints the DB-configured pack', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: undefined }, async () => {
+      // A user pack with a deliberate alias_shadows_type error; each LintIssue
+      // names its pack, so the report itself says which pack was linted.
+      // Pre-fix: the bundled gbrain-base is linted instead → clean report.
+      const dir = join(tmpDir, '.gbrain', 'schema-packs', 'lintme');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'pack.yaml'), `api_version: gbrain-schema-pack-v1
+name: lintme
+version: 1.0.0
+description: ""
+gbrain_min_version: 0.38.0
+extends: null
+borrow_from: []
+page_types:
+  - name: person
+    primitive: entity
+    path_prefixes: [people/]
+    aliases: [company]
+    extractable: false
+    expert_routing: false
+  - name: company
+    primitive: entity
+    path_prefixes: [companies/]
+    aliases: []
+    extractable: false
+    expert_routing: false
+link_types: []
+frontmatter_links: []
+takes_kinds: [fact]
+enrichable_types: []
+filing_rules: []
+`, 'utf-8');
+      await engine.setConfig('schema_pack', 'lintme');
+      const result = await operationsByName.schema_lint!.handler(ctxOf(), {}) as { ok: boolean; errors: Array<{ rule: string; pack: string }> };
+      expect(result.ok).toBe(false);
+      expect(result.errors).toContainEqual(expect.objectContaining({ rule: 'alias_shadows_type', pack: 'lintme' }));
+    });
   });
 });

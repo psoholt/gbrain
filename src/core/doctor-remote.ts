@@ -15,8 +15,15 @@
 import type { GBrainConfig } from './config.ts';
 import { discoverOAuth, mintClientCredentialsToken, smokeTestMcp } from './remote-mcp-probe.ts';
 import { callRemoteTool, RemoteMcpError, unpackToolResult } from './mcp-client.ts';
+import { isScopeErrorCode } from './error-catalogue.ts';
 import { safeCompare, driftLevel, loadPromptState } from './thin-client-upgrade-prompt.ts';
 import { VERSION } from '../version.ts';
+import { writeJsonDocument } from './cli-force-exit.ts';
+
+/** A status-only host's envelope on a failed check: the code, its fix and the words to relay. */
+function statusOnlyDetail(env: Record<string, unknown> | undefined): Record<string, unknown> {
+  return env ? { code: 'serve_status_only', fix: env.fix, user_message: env.user_message, retry_after_s: env.retry_after_s } : {};
+}
 
 export interface RemoteCheck {
   name: string;
@@ -46,7 +53,7 @@ export async function runRemoteDoctor(config: GBrainConfig, args: string[]): Pro
   const report = await collectRemoteDoctorReport(config);
 
   if (jsonOutput) {
-    console.log(JSON.stringify(report));
+    await writeJsonDocument(JSON.stringify(report));
   } else {
     printHumanReport(report);
   }
@@ -156,7 +163,7 @@ export async function collectRemoteDoctorReport(
       name: 'oauth_discovery',
       status: 'fail',
       message: disco.message,
-      detail: { reason: disco.reason, ...(disco.status ? { status: disco.status } : {}) },
+      detail: { reason: disco.reason, ...(disco.status ? { status: disco.status } : {}), ...statusOnlyDetail(disco.status_only) },
     });
     return finalize(remote, checks);
   }
@@ -173,7 +180,10 @@ export async function collectRemoteDoctorReport(
       name: 'oauth_token',
       status: 'fail',
       message: tokenRes.message,
-      detail: { reason: tokenRes.reason, ...(tokenRes.status ? { status: tokenRes.status } : {}) },
+      detail: {
+        reason: tokenRes.reason, ...(tokenRes.status ? { status: tokenRes.status } : {}),
+        ...(tokenRes.retry_after_s !== undefined ? { retry_after_s: tokenRes.retry_after_s } : {}), ...statusOnlyDetail(tokenRes.status_only),
+      },
     });
     return finalize(remote, checks);
   }
@@ -308,20 +318,20 @@ export async function runOrphanRatioCheck(config: GBrainConfig): Promise<RemoteC
   // locally; point them at the brain server's operator.
   const url = config.remote_mcp?.mcp_url ?? '<your brain server>';
   const hint =
-    `Ask the brain operator at ${url} to run: gbrain extract links --by-mention ` +
+    `Ask the brain operator at ${url} to run: gbrain extract links --by-mention --source db ` +
     `(auto-links entity mentions in body text).`;
   if (ratio > 0.8) {
     return {
       name: 'orphan_ratio',
       status: 'fail',
-      message: `Orphan ratio ${pct}% (${data.total_orphans}/${entityCount} linkable pages have no inbound links). ${hint}`,
+      message: `Orphan ratio ${pct}% (${data.total_orphans}/${entityCount} linkable pages have no links in either direction). ${hint}`,
     };
   }
   if (ratio > 0.5) {
     return {
       name: 'orphan_ratio',
       status: 'warn',
-      message: `Orphan ratio ${pct}% (${data.total_orphans}/${entityCount} linkable pages have no inbound links). ${hint}`,
+      message: `Orphan ratio ${pct}% (${data.total_orphans}/${entityCount} linkable pages have no links in either direction). ${hint}`,
     };
   }
   return {
@@ -430,7 +440,7 @@ async function probeScopes(config: GBrainConfig): Promise<ScopeProbeResult> {
     result.read_ok = true;
   } catch (e) {
     if (e instanceof RemoteMcpError) {
-      result.read_error = e.detail?.code === 'missing_scope' ? 'missing_scope' : e.reason;
+      result.read_error = isScopeErrorCode(e.detail?.code, e.detail?.canonical_code, e.detail?.reason) ? 'missing_scope' : e.reason;
     } else {
       result.read_error = e instanceof Error ? e.message : String(e);
     }
@@ -443,7 +453,7 @@ async function probeScopes(config: GBrainConfig): Promise<ScopeProbeResult> {
     result.admin_ok = true;
   } catch (e) {
     if (e instanceof RemoteMcpError) {
-      result.admin_error = e.detail?.code === 'missing_scope' ? 'missing_scope' : e.reason;
+      result.admin_error = isScopeErrorCode(e.detail?.code, e.detail?.canonical_code, e.detail?.reason) ? 'missing_scope' : e.reason;
     } else {
       result.admin_error = e instanceof Error ? e.message : String(e);
     }
@@ -461,8 +471,10 @@ export function buildScopeCheck(grantedScope: string, probe: ScopeProbeResult): 
   // status doesn't flap on probe noise.
   //
   //   - read.missing_scope  → 'fail' (broken setup; nothing works)
-  //   - admin.missing_scope → 'warn' (the load-bearing case for v0.29.2 thin
-  //     clients that registered with read+write only; pinpoint hint follows)
+  //   - admin.missing_scope → 'ok' when the grant never claimed admin (a
+  //     read or read+write client is narrow by design; #8543 — doctor never
+  //     recommends adding a scope), 'warn' only when the grant lists admin
+  //     and the host still refuses it
   //   - both succeed        → 'ok'
   //   - other probe errors  → 'ok' with inconclusive=true
   const readMissing = !probe.read_ok && probe.read_error === 'missing_scope';
@@ -477,6 +489,19 @@ export function buildScopeCheck(grantedScope: string, probe: ScopeProbeResult): 
         granted: grantedScope || null,
         read_ok: false,
         admin_ok: probe.admin_ok,
+      },
+    };
+  }
+  if (adminMissing && !grantedScope.split(/[\s,]+/).includes('admin')) {
+    return {
+      name: 'oauth_client_scopes_probe',
+      status: 'ok',
+      message: `read works; this client was granted "${grantedScope || 'unspecified'}" without admin, so admin-only operations are refused by design. Nothing to fix.`,
+      detail: {
+        granted: grantedScope || null,
+        read_ok: true,
+        admin_ok: false,
+        admin_granted: false,
       },
     };
   }

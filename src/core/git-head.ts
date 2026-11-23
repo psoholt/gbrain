@@ -22,7 +22,8 @@
  * gate. See plan note "v0.41.27.1+ TODOs" in
  * ~/.claude/plans/system-instruction-you-are-working-eager-bird.md.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from './spawn.ts';
+import { gitChildEnv } from './git-env.ts';
 
 export type GitHeadProbe = (localPath: string) => string | null;
 // `null` distinguishes probe error from known-dirty (false). Doctor treats
@@ -36,6 +37,7 @@ export type GitCleanProbe = (localPath: string, ignoreUntracked?: boolean) => bo
 const DEFAULT_HEAD_PROBE: GitHeadProbe = (localPath) => {
   try {
     const out = execFileSync('git', ['-C', localPath, 'rev-parse', 'HEAD'], {
+      env: gitChildEnv(),
       encoding: 'utf8',
       timeout: 5000,
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -56,6 +58,7 @@ const DEFAULT_CLEAN_PROBE: GitCleanProbe = (localPath, ignoreUntracked) => {
     const args = ['-C', localPath, 'status', '--porcelain'];
     if (ignoreUntracked) args.push('--untracked-files=no');
     const out = execFileSync('git', args, {
+      env: gitChildEnv(),
       encoding: 'utf8',
       timeout: 5000,
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -96,29 +99,71 @@ export interface GitFreshnessOpts {
 }
 
 /**
- * Returns true iff `localPath` is a git repo whose current HEAD matches
- * `lastCommit`, AND (when `requireCleanWorkingTree`) the working tree
- * is clean.
+ * Three-state git probe verdict for a federated source clone.
+ *
+ *   - `'unchanged'`:   HEAD matches `last_commit` (and, when requested, the
+ *                      working tree is clean). Sync has nothing to do.
+ *   - `'changed'`:     the clone is readable but HEAD moved, the tree is
+ *                      dirty, or the DB never recorded a `last_commit` —
+ *                      sync genuinely has (or may have) work.
+ *   - `'unavailable'`: the HEAD probe itself could not run — the clone
+ *                      directory is missing, not a git repo, or git errored.
+ *                      On stateless deploys (containers on EB / K8s / Fly,
+ *                      where `local_path` dies with the filesystem and is
+ *                      lazily re-materialized by the next per-source sync)
+ *                      this is a NORMAL steady state for quiet sources, not
+ *                      evidence of pending work. Callers can fall back to a
+ *                      DB-only freshness signal instead of wall-clock age.
+ */
+export type SourceGitState = 'unchanged' | 'changed' | 'unavailable';
+
+/**
+ * Probe a source clone and classify it (see `SourceGitState`).
  *
  * This is NOT a full mirror of `gbrain sync`'s "do work?" predicate.
  * Chunker-version match is computed by the caller because it depends on
  * engine state (`sources.chunker_version` vs `CURRENT_CHUNKER_VERSION`).
- * See `src/commands/doctor.ts:checkSyncFreshness` for the AND
+ * See `src/commands/doctor/checks/extraction-sync.ts:checkSyncFreshness` for the AND
  * combination at the call site.
+ *
+ * NULL-input guard stays first: a NULL `last_commit` (legacy row) returns
+ * `'changed'` WITHOUT running the head probe — same short-circuit contract
+ * `isSourceUnchangedSinceSync` always had (pinned by doctor.test.ts case 4).
+ */
+export function probeSourceGitState(
+  localPath: string | null | undefined,
+  lastCommit: string | null | undefined,
+  opts?: GitFreshnessOpts,
+): SourceGitState {
+  if (!localPath || !lastCommit) return 'changed';
+  const head = _headProbe(localPath);
+  if (head === null) return 'unavailable';
+  if (head !== lastCommit) return 'changed';
+  if (opts?.requireCleanWorkingTree) {
+    const ignoreUntracked = opts.requireCleanWorkingTree === 'ignore-untracked';
+    const isClean = _cleanProbe(localPath, ignoreUntracked);
+    // null (probe error) AND false (known dirty) both fail the gate. A clean
+    // probe error with a READABLE head is not classified 'unavailable' —
+    // fail toward "may have work" so the gate can only relax, never mask.
+    if (isClean !== true) return 'changed';
+  }
+  return 'unchanged';
+}
+
+/**
+ * Returns true iff `localPath` is a git repo whose current HEAD matches
+ * `lastCommit`, AND (when `requireCleanWorkingTree`) the working tree
+ * is clean.
+ *
+ * Boolean façade over `probeSourceGitState` — `'unavailable'` and
+ * `'changed'` both collapse to `false`, preserving the v0.41.27.0
+ * fail-open contract for callers that only care about the short-circuit
+ * (`src/core/source-health.ts`).
  */
 export function isSourceUnchangedSinceSync(
   localPath: string | null | undefined,
   lastCommit: string | null | undefined,
   opts?: GitFreshnessOpts,
 ): boolean {
-  if (!localPath || !lastCommit) return false;
-  const head = _headProbe(localPath);
-  if (head === null || head !== lastCommit) return false;
-  if (opts?.requireCleanWorkingTree) {
-    const ignoreUntracked = opts.requireCleanWorkingTree === 'ignore-untracked';
-    const isClean = _cleanProbe(localPath, ignoreUntracked);
-    // null (probe error) AND false (known dirty) both fail the gate.
-    if (isClean !== true) return false;
-  }
-  return true;
+  return probeSourceGitState(localPath, lastCommit, opts) === 'unchanged';
 }

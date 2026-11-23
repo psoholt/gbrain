@@ -20,10 +20,115 @@
 
 import type { BrainEngine } from './../engine.ts';
 import { registerBackgroundWorkDrainer } from '../background-work.ts';
+import { reflexPointerRationale } from './reflex-rationale.ts';
 
 export const VOLUNTEER_EVENTS_TTL_DAYS = 90;
 
-export type VolunteerChannel = 'op' | 'reflex' | 'watch';
+/** Single source of truth for channel values — type + guards derive from it.
+ * 'openclaw' (2026-08 wave) is the IN-PROCESS OpenClaw reflex lane's volunteer
+ * channel — deliberately NOT in HARNESS_CHANNELS below: it is never
+ * wire-claimable (a hook client claiming it would spoof production
+ * attribution; outside-voice codex-2 #7). 'brief' (wave 5 D5) is the
+ * proactive brief's channel, stamped by the serve and likewise never
+ * wire-claimable. */
+export const VOLUNTEER_CHANNELS = ['op', 'reflex', 'watch', 'openclaw', 'claude-code', 'codex', 'opencode', 'brief'] as const;
+export type VolunteerChannel = (typeof VOLUNTEER_CHANNELS)[number];
+
+/** The harness subset — the ONLY channels a wire caller may claim. */
+export const HARNESS_CHANNELS = ['claude-code', 'codex', 'opencode'] as const;
+export type HarnessChannel = (typeof HARNESS_CHANNELS)[number];
+
+/** Wire fallback: the only harness bootstrap registers hooks for today. */
+export const DEFAULT_HOOK_CHANNEL: HarnessChannel = 'claude-code';
+
+/** session_id trust-boundary clamp — shared with the volunteer_context op. */
+export const SESSION_ID_MAX_LEN = 256;
+
+export function isVolunteerChannel(v: unknown): v is VolunteerChannel {
+  return (VOLUNTEER_CHANNELS as readonly string[]).includes(v as string);
+}
+
+/**
+ * Wire-facing guard: a secret-holding IPC client may attribute deliveries to
+ * a HARNESS channel only — accepting internal channels ('op'/'reflex'/'watch')
+ * from the wire would let a hook client pollute the internal channels'
+ * precision stats (the same corruption class the delivery-point rule guards).
+ */
+export function isHarnessChannel(v: unknown): v is HarnessChannel {
+  return (HARNESS_CHANNELS as readonly string[]).includes(v as string);
+}
+
+/**
+ * The hook lane's feedback loop (#2095 closed over turn_context): log a
+ * DELIVERED turn-context block's post-trim volunteered pages + reflex
+ * pointers to context_volunteer_events under the request's channel, so
+ * `volunteer-context --stats` and the volunteer_channels doctor check see
+ * per-harness firing. Serve wires this as resolve-ipc's onTurnContextDelivered
+ * callback — which fires ONLY after the response write succeeded (an
+ * abandoned block was never injected and must not be counted). Channel is
+ * validated; absent/unknown → 'claude-code' (the only harness bootstrap
+ * registers hooks for today). sessionId is clamped like the op path's
+ * trust-boundary clamp. Fire-and-forget: never throws into the server.
+ */
+export function logTurnContextDeliveryFireAndForget(
+  engine: BrainEngine,
+  result: {
+    volunteered?: Array<Parameters<typeof volunteerEventRowsFrom>[0][number]>;
+    pointers?: import('./retrieval-reflex.ts').ReflexPointer[];
+  },
+  req: { channel?: string; sessionId?: string },
+): void {
+  try {
+    // Harness channels ONLY from the wire — see isHarnessChannel. A present-
+    // but-unknown value ALSO maps to the default: ACCEPTED misattribution
+    // (a typo'd local registration is the operator's own config; a dedicated
+    // 'unknown' bucket was considered and declined to keep the channel value
+    // set closed while bootstrap registers exactly one harness).
+    const channel: VolunteerChannel = isHarnessChannel(req.channel) ? req.channel : DEFAULT_HOOK_CHANNEL;
+    const sessionId = typeof req.sessionId === 'string' ? req.sessionId.slice(0, SESSION_ID_MAX_LEN) : null;
+    // Pointer rows use the shared reflex rationale template; mapped inline
+    // (not via logDeliveredReflexPointers) so the pending write registers
+    // synchronously (a late registration can be dropped at process exit).
+    const rows = [
+      ...(result.volunteered?.length
+        ? volunteerEventRowsFrom(result.volunteered, { channel, session_id: sessionId })
+        : []),
+      ...(result.pointers?.length
+        ? volunteerEventRowsFrom(
+            result.pointers.map((p) => ({ ...p, rationale: reflexPointerRationale(p) })),
+            { channel, session_id: sessionId },
+          )
+        : []),
+    ];
+    if (rows.length) logVolunteerEventsFireAndForget(engine, rows);
+  } catch {
+    /* telemetry only — a logging bug must never surface into the IPC server */
+  }
+}
+
+/**
+ * Wave 5 D5: log a DELIVERED proactive brief, one row per item under channel
+ * 'brief' with match_arm `brief-<trigger>` and the deterministic rationale
+ * `<kind>:<id>` (no stored text). The derived "used" join reads these rows
+ * as a page-open proxy for the item's source slug, not as item use; D6
+ * measures use. Fire-and-forget: never throws into the server.
+ */
+export function logBriefDeliveryFireAndForget(
+  engine: BrainEngine,
+  brief: import('./proactive-brief.ts').BriefView | undefined,
+  sessionId?: string,
+): void {
+  try {
+    if (!brief?.items.length) return;
+    const rows = volunteerEventRowsFrom(
+      brief.items.map((i) => ({ source_id: i.source_id, slug: i.slug, confidence: i.confidence, arm: `brief-${brief.trigger}`, rationale: `${i.kind}:${i.id}` })),
+      { channel: 'brief', session_id: typeof sessionId === 'string' ? sessionId.slice(0, SESSION_ID_MAX_LEN) : null },
+    );
+    logVolunteerEventsFireAndForget(engine, rows);
+  } catch {
+    /* telemetry only */
+  }
+}
 
 /**
  * Map volunteered pages to event rows for one channel — the ONE place the
@@ -63,6 +168,12 @@ export interface VolunteerEventRow {
  * RTTs ≈ 355ms on a cross-region deployment; eng-review D4). Throws on
  * failure; callers run it through the volunteer-events background-work sink
  * with try/catch so logging can never fail the op.
+ *
+ * #9068: it writes only rows whose page still exists, probed under the
+ * feedback writers' key-share lock on the page row, so a write built before a
+ * page purge and landing after it (or while the purge is open) drops that
+ * page's slug and rationale instead of restoring them (insertEvalCandidate
+ * does the same for eval captures).
  */
 export async function insertVolunteerEvents(
   engine: BrainEngine,
@@ -82,13 +193,14 @@ export async function insertVolunteerEvents(
       r.session_id ?? null,
       r.turn ?? null,
     );
-    const ph = Array.from({ length: 8 }, (_, i) => `$${base + i + 1}`);
-    return `(${ph.join(', ')})`;
+    const types = ['text', 'text', 'float8', 'text', 'text', 'text', 'text', 'int'];
+    return `(${types.map((t, i) => `$${base + i + 1}::${t}`).join(', ')})`;
   });
   await engine.executeRaw(
     `INSERT INTO context_volunteer_events
        (source_id, slug, confidence, match_arm, rationale, channel, session_id, turn)
-     VALUES ${tuples.join(', ')}`,
+     SELECT v.* FROM (VALUES ${tuples.join(', ')}) AS v(source_id, slug, confidence, match_arm, rationale, channel, session_id, turn)
+     WHERE EXISTS (SELECT 1 FROM pages pg WHERE pg.source_id = v.source_id AND pg.slug = v.slug FOR KEY SHARE)`,
     params,
   );
 }

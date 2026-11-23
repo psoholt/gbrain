@@ -27,9 +27,11 @@ import {
   writeFileSync,
 } from 'fs';
 import { join } from 'path';
-import { execFileSync } from 'child_process';
+import { execFileSync } from '../spawn.ts';
 import { gbrainPath, loadConfig } from '../config.ts';
 import { getEffectiveNiceness } from './niceness.ts';
+import { VERSION } from '../../version.ts';
+import { runtimeInstallRoot } from '../runtime-build.ts';
 
 /** On-disk shape of a `worker-<pid>.json` entry. */
 export interface WorkerRegistryEntry {
@@ -43,12 +45,38 @@ export interface WorkerRegistryEntry {
   nice_requested: number | null;
   /** Niceness actually in effect when the worker registered. */
   nice_effective: number | null;
+  /** #7245: the gbrain version the worker runs (in memory); absent on an entry an older worker wrote. */
+  version?: string;
+  /** #7245: the package root the worker loaded its code from (local path, never in remote output); null in a compiled binary. */
+  install_root?: string | null;
 }
 
 /** A live worker as returned by readWorkers(): on-disk entry + fresh re-measure. */
 export interface LiveWorker extends WorkerRegistryEntry {
   /** Niceness re-measured NOW via getEffectiveNiceness(pid). */
   nice_now: number | null;
+}
+
+/**
+ * The registry directory exists but cannot be listed (EACCES on it or a
+ * parent, ENOTDIR, ...). Worker liveness is unknown: callers report it as
+ * unknown with this errno and path, never as zero workers.
+ */
+export class WorkerRegistryUnreadableError extends Error {
+  readonly path: string;
+  readonly errno: string;
+  constructor(path: string, errno: string, cause: unknown) {
+    super(`worker registry unreadable (${errno}): ${path}`, { cause });
+    this.name = 'WorkerRegistryUnreadableError';
+    this.path = path;
+    this.errno = errno;
+  }
+}
+
+/** The safe evidence of a failed registry read: errno and path, or the error class name for anything else. */
+export function workerRegistryReadFailure(err: unknown): { errno: string; path: string | null } {
+  if (err instanceof WorkerRegistryUnreadableError) return { errno: err.errno, path: err.path };
+  return { errno: err instanceof Error ? err.name : 'unknown', path: null };
 }
 
 /** Directory holding one file per live worker. Brain-isolated via GBRAIN_HOME. */
@@ -101,6 +129,8 @@ export function registerWorker(info: {
     started_at: info.started_at,
     nice_requested: info.nice_requested,
     nice_effective: info.nice_effective,
+    version: VERSION,
+    install_root: runtimeInstallRoot(),
   };
   const path = entryPath(info.pid);
   try {
@@ -142,22 +172,55 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
   }
 }
 
+/** Parses portable `ps -o etime=` output (`[[dd-]hh:]mm:ss`) to milliseconds. */
+export function parseEtimeToMs(etime: string): number | null {
+  const raw = etime.trim();
+  if (!raw) return null;
+
+  let days = 0;
+  let rest = raw;
+  const dash = rest.indexOf('-');
+  if (dash !== -1) {
+    days = Number(rest.slice(0, dash));
+    rest = rest.slice(dash + 1);
+    if (!Number.isInteger(days) || days < 0) return null;
+  }
+
+  const parts = rest.split(':');
+  if (parts.length < 2 || parts.length > 3) return null;
+  if (!parts.every(part => part.length > 0 && /^\d+$/.test(part))) return null;
+
+  const numbers = parts.map(Number);
+  const [hours, minutes, seconds] =
+    numbers.length === 3 ? numbers : [0, numbers[0]!, numbers[1]!];
+
+  return (((days * 24 + hours!) * 60 + minutes!) * 60 + seconds!) * 1000;
+}
+
 /**
  * Best-effort process start time (epoch ms) via `ps`. Used for the PID-reuse
  * guard: a stale `worker-<pid>.json` plus an OS-reused pid would otherwise make
  * us report an unrelated process's niceness (Codex #8). Returns null when
  * undeterminable — callers must NOT treat null as "reused".
+ *
+ * Elapsed time (`etime`) is zone-free. The previous `lstart` path printed a
+ * zoneless local timestamp in the libc zone while `Date.parse` read it in the
+ * runtime zone; the two can differ (bun test pins UTC without exporting TZ,
+ * `TZ=:/etc/localtime` resolves to UTC in ICU, and Bun does not propagate a
+ * runtime `process.env.TZ` change to the ps child), shifting every start by
+ * the offset and dropping live workers on UTC+ hosts (#4885). `etime` is used
+ * instead of Linux-only `etimes` so this also works on macOS.
  */
 function processStartMs(pid: number): number | null {
   try {
-    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    const out = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], {
       encoding: 'utf8',
       timeout: 2000,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     if (!out) return null;
-    const t = Date.parse(out);
-    return Number.isNaN(t) ? null : t;
+    const elapsedMs = parseEtimeToMs(out);
+    return elapsedMs === null ? null : Date.now() - elapsedMs;
   } catch {
     return null;
   }
@@ -173,23 +236,26 @@ const PID_REUSE_TOLERANCE_MS = 5000;
  * confirmed-dead entries (pruning their files), filters by brain id, applies the
  * PID-reuse guard, and re-measures each live worker's niceness now.
  *
+ * Only a missing registry directory (ENOENT) is an empty registry; any other
+ * listing failure throws WorkerRegistryUnreadableError (existsSync() answers
+ * false for an unsearchable parent too, so it is not used as the gate).
  * `getNice` is injectable for tests.
  */
 export function readWorkers(
   getNice: (pid: number) => number | null = (pid) => getEffectiveNiceness(pid),
 ): LiveWorker[] {
   const dir = workerRegistryDir();
-  if (!existsSync(dir)) return [];
-
-  const brainId = currentBrainId();
-  const live: LiveWorker[] = [];
-
   let files: string[];
   try {
     files = readdirSync(dir).filter((f) => f.startsWith('worker-') && f.endsWith('.json'));
-  } catch {
-    return [];
+  } catch (e) {
+    const errno = (e as NodeJS.ErrnoException)?.code;
+    if (errno === 'ENOENT') return [];
+    throw new WorkerRegistryUnreadableError(dir, errno ?? 'unknown', e);
   }
+
+  const brainId = currentBrainId();
+  const live: LiveWorker[] = [];
 
   for (const f of files) {
     const full = join(dir, f);

@@ -39,9 +39,15 @@ pass:
    `ctx.remote === true` (MCP callers). Independent of the env flag. Remote
    agents can never submit shell jobs. `MinionQueue.add('shell', ...)` has its
    own guard too, so an in-process handler can't programmatically bypass this.
-2. **Env flag.** The worker only registers the shell handler when
-   `GBRAIN_ALLOW_SHELL_JOBS=1` is set on the worker process. Default: off. Your
-   agent opts in per-host.
+2. **Worker opt-in.** The shell handler is ALWAYS registered on the worker, but
+   it is guarded: unless the worker was started with
+   `gbrain jobs work --allow-shell-jobs` (equivalently, `GBRAIN_ALLOW_SHELL_JOBS=1`
+   exported in the worker's environment), a claimed shell job throws
+   `UnrecoverableError` and goes straight to `dead` (no retries). Default: off.
+   Your agent opts in per-host. A `.env` file in the worker's working directory
+   cannot set the variable — gbrain ignores it there. (Always-registered guarded
+   mode — not "unregistered", so unflagged workers fail shell jobs loudly
+   instead of leaving them `waiting` forever.)
 
 **What the env allowlist does AND does not do.** Shell jobs run with a minimal
 env: `PATH, HOME, USER, LANG, TZ, NODE_ENV`. Your secrets like `OPENAI_API_KEY`
@@ -73,7 +79,7 @@ secrets in `env:` instead.
 On one terminal, start a persistent worker:
 
 ```bash
-GBRAIN_ALLOW_SHELL_JOBS=1 gbrain jobs work
+gbrain jobs work --allow-shell-jobs        # or: GBRAIN_ALLOW_SHELL_JOBS=1 gbrain jobs work
 ```
 
 Rewrite crontab to submit shell jobs (no `--follow`):
@@ -109,7 +115,9 @@ Note: `--follow` blocks the crontab slot until the job finishes. If 14 shell
 crons land at the same minute and each takes 30s, they serialize through
 crontab's spawning limits. Postgres + persistent worker scales better.
 
-### Calling `gbrain` itself from a shell job — use `inherit:` for DATABASE_URL {#secrets}
+<a id="secrets"></a>
+
+### Calling `gbrain` itself from a shell job — use `inherit:` for DATABASE_URL
 
 A common pattern is submitting shell jobs that run `gbrain` CLI commands:
 
@@ -127,13 +135,14 @@ env as `GBRAIN_DATABASE_URL`. The job row in `minion_jobs.data` stores
 `inherit: ["database_url"]` — **names only, never values**. The shell-audit
 JSONL records the same. Pre-enqueue validation rejects the submission if the
 worker can't resolve the requested key, with a paste-ready
-`gbrain config set database_url <value>` hint.
+`gbrain config set database_url <value>` hint (that command is file-plane
+routed — it writes `~/.gbrain/config.json`, exactly where the worker's
+`loadConfig()` looks, and works even when the DB is unreachable).
 
-**Why not just write the URL into `env:` directly?** Pre-v0.36.5.0 callers
-wrote things like:
+**Why not just write the URL into `env:` directly?** You *can*:
 
 ```jsonc
-// ❌ Deprecated as of v0.36.5.0 — REJECTED at submit time.
+// ❌ Works, but plants the secret in the job row. Prefer inherit:.
 {
   "cmd": "gbrain stats",
   "cwd": "/data/gbrain",
@@ -141,22 +150,23 @@ wrote things like:
 }
 ```
 
-This planted plaintext secrets in `minion_jobs.data` (DB row) and in the
+This plants plaintext secrets in `minion_jobs.data` (DB row) and in the
 shell-audit JSONL. Anyone with read access to the brain DB (or a brain dump,
-or a shared brain via the mounts feature) saw the URL. v0.36.5.0 doesn't
-forbid that pattern — the validator trusts the agent — but **prefer
+or a shared brain via the mounts feature) sees the URL. The validator
+doesn't forbid the pattern — it trusts the agent — but **prefer
 `inherit:`** for any secret you want kept out of the row. Names land in the
 row; values resolve at child-spawn from the worker's config.
 
-**Scope:** v0.36.5.0 `inherit:` is **free-form**. Pass any snake_case
+**Scope:** `inherit:` is **free-form**. Pass any snake_case
 config-key name and the worker resolves the value from `loadConfig()` at
 child-spawn time:
 
 - `inherit: ["database_url"]` → child env `GBRAIN_DATABASE_URL`
 - `inherit: ["anthropic_api_key"]` → child env `ANTHROPIC_API_KEY`
 - `inherit: ["openai_api_key"]` → child env `OPENAI_API_KEY`
+- `inherit: ["openrouter_api_key"]` → child env `OPENROUTER_API_KEY`
 - `inherit: ["voyage_api_key"]` → child env `VOYAGE_API_KEY`
-- `inherit: ["groq_api_key", "zeroentropy_api_key"]` → both injected
+- `inherit: ["groq_api_key"]` → child env `GROQ_API_KEY`
 - Or any arbitrary config-key your worker has (`my_custom_field` →
   `MY_CUSTOM_FIELD`)
 
@@ -244,9 +254,13 @@ gbrain jobs get 42
 # Submission audit log (operator trail, not forensic)
 cat ~/.gbrain/audit/shell-jobs-*.jsonl | jq '.'
 
-# First-time failure mode: submitted without env flag on the worker
-gbrain jobs list --status waiting --name shell
-# If rows pile up here, no worker with GBRAIN_ALLOW_SHELL_JOBS=1 is running.
+# First-time failure mode: submitted without env flag on the worker.
+# The handler is always registered but guarded: an unflagged worker that claims
+# a shell job dead-letters it immediately (UnrecoverableError, no retries).
+gbrain jobs list --status dead --json | jq '.[] | select(.name == "shell")'
+# → error_text: "shell handler disabled on this worker (start it with --allow-shell-jobs or GBRAIN_ALLOW_SHELL_JOBS=1 ...)"
+# `waiting` pileups mean NO worker is running at all (flagged or not) — check
+# `gbrain jobs supervisor status` in that case.
 ```
 
 ---
@@ -265,7 +279,9 @@ gbrain jobs list --status waiting --name shell
 
 ---
 
-## Errors {#errors}
+<a id="errors"></a>
+
+## Errors
 
 | Error | What it means | Fix |
 |---|---|---|
@@ -278,7 +294,7 @@ gbrain jobs list --status waiting --name shell
 | `shell: inherit name "<X>" must match [a-z][a-z0-9_]*` | Name failed snake_case regex (uppercase, leading digit/underscore, special char). | Use the config-key name verbatim — `database_url`, not `DATABASE_URL`. |
 | `shell: inherit requested "<X>" but worker has no <X> configured` | Worker can't resolve the requested name from `loadConfig()`. | Run `gbrain config set <X> <value>` on the worker host, OR check the config file at `~/.gbrain/config.json`. |
 | `shell: redact_secrets must be a boolean if set` | Caller passed a non-boolean for `redact_secrets`. | Pass `true` or `false` (or omit). The CLI `--redact-secrets` flag sets it automatically. |
-| `permission_denied: shell jobs cannot be submitted over MCP` | An MCP client tried to submit a shell job. By design CLI-only. | Submit from CLI or via a trusted operation handler (`ctx.remote === false`). |
-| `protected job name 'shell' requires CLI or operation-local submitter` | A caller invoked `MinionQueue.add('shell', ...)` without the `trusted` opt-in. | Pass `{ allowProtectedSubmit: true }` as the 4th arg. CLI and `submit_job` do this automatically. |
+| `permission_denied` with an unsupported remote job message | An MCP client tried to submit a shell job. Shell submission requires local authority. | Submit from the local CLI or an authorized application handler. |
+| `protected job name 'shell' requires CLI or operation-local submitter` | An application called `MinionQueue.add('shell', ...)` without the protected-job opt-in. | An authorized local submitter supplies `{ allowProtectedSubmit: true }` as the fourth argument. The local CLI handles this; remote `submit_job` cannot grant it. |
 | `aborted: timeout` / `aborted: cancel` / `aborted: shutdown` / `aborted: lock-lost` | The worker's abort signal fired mid-execution. Child got SIGTERM, 5s grace, then SIGKILL. | Expected: timeout / user cancel / deploy restart / stall. Inspect `gbrain jobs get` to see which. |
 | `exit N: <stderr_tail_500>` | Script exited non-zero. | Read `stderr_tail` in `gbrain jobs get`. |

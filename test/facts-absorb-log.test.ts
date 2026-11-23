@@ -10,6 +10,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   writeFactsAbsorbLog,
+  writeFactsAbsorbFailure,
   classifyFactsAbsorbError,
   FACTS_ABSORB_REASONS,
 } from '../src/core/facts/absorb-log.ts';
@@ -118,7 +119,36 @@ describe('writeFactsAbsorbLog — ingest_log row shape', () => {
     expect(FACTS_ABSORB_REASONS).toContain('queue_shutdown');
     expect(FACTS_ABSORB_REASONS).toContain('embed_failure');
     expect(FACTS_ABSORB_REASONS).toContain('pipeline_error');
-    expect(FACTS_ABSORB_REASONS.length).toBe(6);
+    // Extraction-outcome codes (keyed-but-failing states; keyless writes no row).
+    expect(FACTS_ABSORB_REASONS).toContain('chat_unavailable');
+    expect(FACTS_ABSORB_REASONS).toContain('refusal');
+    expect(FACTS_ABSORB_REASONS).toContain('content_filter');
+    expect(FACTS_ABSORB_REASONS).toContain('malformed_output');
+    expect(FACTS_ABSORB_REASONS).toContain('non_terminal_stop');
+    expect(FACTS_ABSORB_REASONS).toContain('truncated_output');
+    expect(FACTS_ABSORB_REASONS).toContain('gateway_auth');
+    expect(FACTS_ABSORB_REASONS).toContain('gateway_billing');
+    expect(FACTS_ABSORB_REASONS).toContain('gateway_rate_limit');
+    // B-N7: a provider 404 (unknown or inaccessible model) is not an auth failure.
+    expect(FACTS_ABSORB_REASONS).toContain('gateway_model_not_found');
+    // #5362: write-path refusals record their own code.
+    expect(FACTS_ABSORB_REASONS).toContain('write_refused');
+    expect(FACTS_ABSORB_REASONS).toContain('write_pending_accepted');
+    expect(FACTS_ABSORB_REASONS).toContain('write_deferred_unadmitted');
+    expect(FACTS_ABSORB_REASONS.length).toBe(19);
+  });
+
+  test.each([
+    ['typed-auth', Object.assign(new Error('invalid api key sk-sensitive-auth'), { status: 401 }), 'gateway_auth'],
+    ['typed-billing', new Error('credit balance is too low: acct-sensitive'), 'gateway_billing'],
+    ['typed-rate', Object.assign(new Error('rate limit: req-sensitive'), { status: 429 }), 'gateway_rate_limit'],
+    ['typed-model-not-found', Object.assign(new Error('The model gpt-x does not exist or you do not have access to it (org-sensitive)'), { status: 404 }), 'gateway_model_not_found'],
+  ])('%s provider failure records only its typed class', async (ref, err, reason) => {
+    await writeFactsAbsorbFailure(engine, `meetings/${ref}`, err);
+    const log = await engine.getIngestLog({ limit: 30 });
+    const ours = log.find(r => r.source_ref === `meetings/${ref}`);
+    expect(ours?.summary).toBe(`${reason}: provider request failed (Error)`);
+    expect(ours?.summary).not.toContain('sensitive');
   });
 });
 

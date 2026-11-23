@@ -44,6 +44,7 @@
  * is honored by the CALLER (import-file.ts), not by this module. The
  * assessor stays pure so unit tests don't need env mutation.
  */
+import { isLargePageBytes, PAGE_MAX_BYTES } from './page-size-policy.ts';
 
 /** Maximum number of body bytes scanned for pattern matches. The body
  *  is sliced to this size before regex/substring evaluation so pattern
@@ -58,12 +59,12 @@ export const SCAN_HEAD_BYTES = 2048;
  *  stderr warn. Page still writes. */
 export const DEFAULT_BYTES_WARN = 50_000;
 
-/** Default block threshold. Operator override via
+/** Default block threshold: the page ceiling (page-size-policy.ts), so size
+ *  alone never decides searchability below it. Operator override via
  *  `content_sanity.bytes_block` config key or `GBRAIN_PAGE_BLOCK_BYTES`
- *  env var. Above this, page writes but `frontmatter.embed_skip` is set
- *  and the embedder skips on next sweep. Page is still queryable; just
- *  not searchable until manually re-embedded or split. */
-export const DEFAULT_BYTES_BLOCK = 500_000;
+ *  env var. Above an operator's lower value the page writes with
+ *  `frontmatter.embed_skip` and zero chunks, as before. */
+export const DEFAULT_BYTES_BLOCK = PAGE_MAX_BYTES;
 
 /** Default max markup ratio. When the prose pass runs (warn-tier window,
  *  `prose_check_enabled`, non-code page) and `markup_ratio` exceeds this,
@@ -279,6 +280,9 @@ export interface ProseAssessment {
 // and excluded from the denominator entirely (Codex #2 — a code-heavy doc
 // must not read as high-markup). The remaining strips count toward markup.
 const FENCED_CODE_RE = /```[\s\S]*?```|~~~[\s\S]*?~~~/g;
+// gbrain's own facts/takes fences (#5822): their table cells are the page's
+// structured facts, written by gbrain itself, so they are excluded like code.
+const GBRAIN_FENCE_RE = /<!--- gbrain:([a-z_-]+):begin -->[\s\S]*?<!--- gbrain:\1:end -->/g;
 const INLINE_CODE_RE = /`[^`\n]*`/g;
 const HTML_TAG_RE = /<\/?[a-z][^>]*>/gi;
 const MD_IMAGE_RE = /!\[[^\]]*\]\([^)]*\)/g;
@@ -291,7 +295,7 @@ const MD_EMPHASIS_RE = /[*_~]{1,3}/g;
 const TABLE_PIPE_RE = /\|/g;
 
 /**
- * Pure prose-vs-markup assessment. Strips code (excluded from the ratio),
+ * Pure prose-vs-markup assessment. Strips code and gbrain facts/takes fences (excluded from the ratio),
  * then measures how much of the REMAINING content is markup syntax vs real
  * sentences. Returns a ratio in [0, 1]; high = boilerplate/nav shape.
  *
@@ -300,8 +304,8 @@ const TABLE_PIPE_RE = /\|/g;
  * than catching the obvious nav-blob shape without nuking legit prose.
  */
 export function assessProse(body: string): ProseAssessment {
-  // Code excluded from the denominator (Codex #2): a code doc isn't junk.
-  const noCode = body.replace(FENCED_CODE_RE, ' ').replace(INLINE_CODE_RE, ' ');
+  // Code and gbrain-managed fences are excluded from the denominator (Codex #2): a code doc isn't junk.
+  const noCode = body.replace(GBRAIN_FENCE_RE, ' ').replace(FENCED_CODE_RE, ' ').replace(INLINE_CODE_RE, ' ');
   const total_chars = noCode.replace(/\s+/g, '').length;
   if (total_chars === 0) {
     return { prose_chars: 0, total_chars: 0, markup_ratio: 0 };
@@ -320,6 +324,60 @@ export function assessProse(body: string): ProseAssessment {
   // guard against pathological inputs so the ratio stays in [0, 1].
   const ratio = Math.min(1, Math.max(0, (total_chars - prose_chars) / total_chars));
   return { prose_chars, total_chars, markup_ratio: ratio };
+}
+
+/** Characters in each head / middle / tail window of a large-page sample. */
+export const JUNK_SAMPLE_CHARS = 65_536;
+
+/** The head, middle and tail windows of `body` (the whole body when it is shorter than three windows). */
+export function sampleWindows(body: string, size = JUNK_SAMPLE_CHARS): string[] {
+  if (body.length <= size * 3) return [body];
+  const middle = Math.floor((body.length - size) / 2);
+  return [body.slice(0, size), body.slice(middle, middle + size), body.slice(body.length - size)];
+}
+
+/** assessProse over the sample windows: their summed prose and character counts. */
+function sampledProse(body: string): ProseAssessment {
+  const parts = sampleWindows(body).map(assessProse);
+  const total_chars = parts.reduce((n, part) => n + part.total_chars, 0);
+  const prose_chars = parts.reduce((n, part) => n + part.prose_chars, 0);
+  return { prose_chars, total_chars, markup_ratio: total_chars ? Math.min(1, Math.max(0, (total_chars - prose_chars) / total_chars)) : 0 };
+}
+
+export interface SampledJunkAssessment {
+  junk: boolean;
+  /** `sampled_markup_heavy` when every window is over the markup ratio; `sampled_junk_pattern` when two or more windows open with a junk pattern or operator literal. */
+  reasons: Array<'sampled_markup_heavy' | 'sampled_junk_pattern'>;
+  /** Markup ratio of each window, in head / middle / tail order. */
+  markup_ratios: number[];
+}
+
+/**
+ * The junk check a large page gets before it is embedded (the import-time
+ * scan reads only the first 2 KB). Boilerplate walls (the 890K-char nav dump
+ * the 500 KB block was first written for) read as markup in every window;
+ * a scraped error page repeats its pattern through the body. One hit in one
+ * window is not enough: a conversation may quote any of the patterns.
+ */
+export function assessSampledJunk(body: string, opts: { max_markup_ratio?: number;
+  extra_literals?: ReadonlyArray<OperatorLiteral>; disabled_patterns?: ReadonlyArray<string> }): SampledJunkAssessment {
+  return assessJunkWindows(sampleWindows(body), opts);
+}
+
+/** `assessSampledJunk` over windows the caller already sampled (a segmented page reads them from its segments). */
+export function assessJunkWindows(windows: string[], opts: { max_markup_ratio?: number;
+  extra_literals?: ReadonlyArray<OperatorLiteral>; disabled_patterns?: ReadonlyArray<string> }): SampledJunkAssessment {
+  const markup_ratios = windows.map(window => assessProse(window).markup_ratio);
+  const max = opts.max_markup_ratio ?? DEFAULT_MAX_MARKUP_RATIO;
+  const hits = windows.filter(window => {
+    const r = assessContentSanity({ compiled_truth: window, timeline: '', title: '', bytes_warn: Infinity, bytes_block: Infinity,
+      prose_check_enabled: false, extra_literals: opts.extra_literals, disabled_patterns: opts.disabled_patterns });
+    return r.junk_pattern_matches.length + r.literal_substring_matches.length > 0;
+  }).length;
+  const reasons: SampledJunkAssessment['reasons'] = [];
+  if (windows.length === 3 && markup_ratios.every(ratio => ratio > max)) reasons.push('sampled_markup_heavy');
+  if (hits >= 2) reasons.push('sampled_junk_pattern');
+  return { junk: reasons.length > 0, reasons, markup_ratios };
 }
 
 /**
@@ -341,6 +399,8 @@ export function assessContentSanity(opts: {
   timeline: string;
   /** Post-parseMarkdown title. Some patterns key on title alone. */
   title: string;
+  /** UTF-8 bytes of the whole body when `compiled_truth`/`timeline` hold only its head (a streamed page over the single-string ceiling). */
+  body_bytes?: number;
   /** Effective warn threshold; defaults to DEFAULT_BYTES_WARN. */
   bytes_warn?: number;
   /** Effective block threshold; defaults to DEFAULT_BYTES_BLOCK. */
@@ -357,6 +417,22 @@ export function assessContentSanity(opts: {
    *  `~/.gbrain/junk-substrings.txt` via `src/core/content-sanity-literals.ts`.
    *  Empty array (default) means built-ins only. */
   extra_literals?: ReadonlyArray<OperatorLiteral>;
+  /** Built-in junk patterns to skip, by `name`. Resolved by the caller from
+   *  `content_sanity.disabled_patterns` (#4702).
+   *
+   *  Why per-pattern rather than the existing coarser knobs: the patterns
+   *  are aimed at scraped web content, and a brain built from mail, chat or
+   *  transcripts holds none of it — but it does hold people *writing about*
+   *  the things the patterns name. `access_denied` is a line-anchored body
+   *  match, so a page that quotes "Access Denied when I open the staging
+   *  dashboard" at the start of a line is hidden from search. Today the
+   *  escapes are `content_sanity.junk_patterns_enabled: false` (all
+   *  patterns off) or the `content_sanity.disabled` kill-switch (also drops
+   *  the load-bearing size gates); an operator who needs ONE pattern off
+   *  should not have to give up the rest. Unknown names are ignored rather
+   *  than rejected: the built-in set changes between releases and a config
+   *  naming a retired pattern must not fail an import. */
+  disabled_patterns?: ReadonlyArray<string>;
 }): ContentSanityResult {
   const bytes_warn = opts.bytes_warn ?? DEFAULT_BYTES_WARN;
   const bytes_block = opts.bytes_block ?? DEFAULT_BYTES_BLOCK;
@@ -368,7 +444,7 @@ export function assessContentSanity(opts: {
   // octet_length() does at the DB layer, so the two surfaces agree on
   // the same page (D2 parity).
   const body = opts.compiled_truth + (opts.timeline ? '\n' + opts.timeline : '');
-  const bytes = Buffer.byteLength(body, 'utf-8');
+  const bytes = opts.body_bytes ?? Buffer.byteLength(body, 'utf-8');
   const oversize = bytes > bytes_block;
 
   // Head-slice for pattern evaluation. Cost stays O(SCAN_HEAD_BYTES)
@@ -382,8 +458,10 @@ export function assessContentSanity(opts: {
   const title = String(opts.title ?? '');
   const titleLower = title.toLowerCase();
 
+  const disabledPatterns = new Set(opts.disabled_patterns ?? []);
   const junk_pattern_matches: string[] = [];
   for (const p of BUILT_IN_JUNK_PATTERNS) {
+    if (disabledPatterns.has(p.name)) continue;
     const scope = p.applies_to ?? 'both';
     let matched = false;
     if (scope === 'title' || scope === 'both') {
@@ -423,7 +501,9 @@ export function assessContentSanity(opts: {
   let high_markup = false;
   const inProseWindow = bytes > bytes_warn && bytes <= bytes_block;
   if (prose_check_enabled && inProseWindow && opts.page_kind !== 'code') {
-    const prose = assessProse(body);
+    // A large page is judged on its head, middle and tail windows, so the
+    // regex pass stays bounded however big the page is.
+    const prose = isLargePageBytes(bytes) ? sampledProse(body) : assessProse(body);
     prose_chars = prose.prose_chars;
     markup_ratio = prose.markup_ratio;
     high_markup = markup_ratio > max_markup_ratio;

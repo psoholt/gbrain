@@ -5,7 +5,7 @@
  *   - Multi-column search: same query against `embedding` and against an
  *     ad-hoc `embedding_voyage` column produces different orderings
  *     consistent with the seeded vectors.
- *   - Halfvec column: ALTER TABLE ADD `embedding_ze halfvec(2560)` and
+ *   - Halfvec column: ALTER TABLE ADD `embedding_fixture halfvec(2560)` and
  *     confirm the `$1::halfvec(2560)` cast works.
  *   - Image branch unaffected: `embedding_image` still works via the
  *     existing operations.ts path.
@@ -18,6 +18,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { installFixtureChunks } from '../helpers/page-projection.ts';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { hybridSearch } from '../../src/core/search/hybrid.ts';
 import {
@@ -27,6 +28,7 @@ import {
 import {
   configureGateway,
   resetGateway,
+  __unconfigureGatewayForTests,
   __setEmbedTransportForTests,
 } from '../../src/core/ai/gateway.ts';
 import type { ResolvedColumn } from '../../src/core/types.ts';
@@ -45,13 +47,13 @@ beforeAll(async () => {
   await engine.connect({});
   await engine.initSchema();
 
-  // Add the ad-hoc Voyage + ZE columns the way a user with a multi-provider
+  // Add the ad-hoc Voyage + synthetic columns the way a user with a multi-provider
   // brain has done it (outside the committed schema, per-instance ALTER).
   await (engine as any).db.exec(
     `ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS embedding_voyage vector(1024)`,
   );
   await (engine as any).db.exec(
-    `ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS embedding_ze halfvec(2560)`,
+    `ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS embedding_fixture halfvec(2560)`,
   );
 
   // Two pages with one chunk each.
@@ -66,10 +68,10 @@ beforeAll(async () => {
     compiled_truth: 'Page B discusses dogs and their habits.',
   });
 
-  await engine.upsertChunks('docs/page-a', [
+  await installFixtureChunks(engine, 'docs/page-a', [
     { chunk_index: 0, chunk_text: 'cats behavior chunk A', chunk_source: 'compiled_truth' },
   ]);
-  await engine.upsertChunks('docs/page-b', [
+  await installFixtureChunks(engine, 'docs/page-b', [
     { chunk_index: 0, chunk_text: 'dogs habits chunk B', chunk_source: 'compiled_truth' },
   ]);
 
@@ -131,20 +133,20 @@ describe('PGLite engine: searchVector accepts ResolvedColumn descriptor (D11)', 
     const ze1 = `[${new Array(2560).fill(0.5).join(',')}]`;
     const ze2 = `[${new Array(2560).fill(0.6).join(',')}]`;
     await (engine as any).db.query(
-      `UPDATE content_chunks SET embedding_ze = $1::halfvec WHERE id = $2`,
+      `UPDATE content_chunks SET embedding_fixture = $1::halfvec WHERE id = $2`,
       [ze1, chunkIdA],
     );
     await (engine as any).db.query(
-      `UPDATE content_chunks SET embedding_ze = $1::halfvec WHERE id = $2`,
+      `UPDATE content_chunks SET embedding_fixture = $1::halfvec WHERE id = $2`,
       [ze2, chunkIdB],
     );
 
     const queryVec = new Float32Array(2560).fill(0.5);
     const descriptor: ResolvedColumn = {
-      name: 'embedding_ze',
+      name: 'embedding_fixture',
       type: 'halfvec',
       dimensions: 2560,
-      embeddingModel: 'zeroentropyai:zembed-1',
+      embeddingModel: 'fixture-provider:embedding-v1',
     };
     const results = await engine.searchVector(queryVec, {
       embeddingColumn: descriptor,
@@ -216,8 +218,132 @@ describe('hybridSearch + resolver — unknown column at entry (D11)', () => {
   });
 });
 
+describe('upsertChunks — model provenance uses gateway-resolved model, not compiled default', () => {
+  // Regression (zbrain-rfi): when a caller builds ChunkInputs without an
+  // explicit `model` (as src/commands/embed.ts does), the engine used to
+  // stamp the compile-time DEFAULT_EMBEDDING_MODEL ('fixture-provider:embedding-v1')
+  // onto content_chunks.model — even though the vector was produced by the
+  // config-resolved model. That corrupted provenance the signature-drift +
+  // dim-migration logic trusts. The engine must fall back to the model the
+  // gateway ACTUALLY resolves at write time.
+  test('unspecified chunk.model records the resolved model, not fixture-provider:embedding-v1', async () => {
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      env: { OPENAI_API_KEY: 'sk-test' },
+    });
+
+    await engine.putPage('docs/provenance-page', {
+      type: 'concept',
+      title: 'Provenance test page',
+      compiled_truth: 'Chunk whose model column must reflect the resolved model.',
+    });
+    // No `model` field on the input — the write-side fallback must fill it.
+    await engine.upsertChunks('docs/provenance-page', [
+      { chunk_index: 0, chunk_text: 'provenance chunk', chunk_source: 'compiled_truth' },
+    ]);
+
+    const rows = await engine.executeRaw<{ model: string }>(
+      `SELECT cc.model FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = 'docs/provenance-page'`,
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].model).toBe('openai:text-embedding-3-large');
+    expect(rows[0].model).not.toBe('fixture-provider:embedding-v1');
+
+    resetGateway();
+  });
+
+  // #3461: getEmbeddingModel() THROWS when the gateway is unconfigured — it
+  // never returns falsy — so the reland's `|| resolvedModel` guard was dead
+  // code and the catch path still stamped the compile-time default onto rows
+  // whose vectors came from the config-resolved provider. The engine must
+  // fall back to the brain's own `config.embedding_model` row instead.
+  test('#3461: unconfigured gateway falls back to the brain config model, never the compiled default', async () => {
+    await engine.setConfig('embedding_model', 'voyage:voyage-3-large');
+    // The preload's beforeEach re-configures the gateway before every test,
+    // so the unconfigure must happen INSIDE the test body. Since commit
+    // 3aa064bcc (#3554), `resetGateway()` RESTORES the preload's OpenAI/1536
+    // baseline instead of unconfiguring — this test needs genuine no-gateway
+    // behavior (getEmbeddingModel() must THROW), which is exactly what
+    // `__unconfigureGatewayForTests()` was added for. The preload's
+    // beforeEach restores the baseline before the next test.
+    __unconfigureGatewayForTests();
+
+    await engine.putPage('docs/provenance-throw-path', {
+      type: 'concept',
+      title: 'Provenance throw-path page',
+      compiled_truth: 'Chunk written while the gateway is unconfigured.',
+    });
+    await engine.upsertChunks('docs/provenance-throw-path', [
+      { chunk_index: 0, chunk_text: 'throw-path provenance chunk', chunk_source: 'compiled_truth' },
+    ]);
+
+    const rows = await engine.executeRaw<{ model: string }>(
+      `SELECT cc.model FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = 'docs/provenance-throw-path'`,
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].model).toBe('voyage:voyage-3-large');
+
+    // Restore the value initSchema wrote for the rest of the file.
+    await engine.setConfig('embedding_model', 'openai:text-embedding-3-large');
+  });
+
+  // #3461 sibling: on a partial re-upsert that carries NO new embedding (the
+  // exact shape `embed --stale` produces for a page's non-stale chunks), the
+  // preserved vector must KEEP its original model label. The old
+  // COALESCE(EXCLUDED.model, …) relabeled it with the current gateway model.
+  test('#3461: preserved vector keeps its original model label on a no-embedding re-upsert', async () => {
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      env: { OPENAI_API_KEY: 'sk-test' },
+    });
+
+    await engine.putPage('docs/provenance-preserve', {
+      type: 'concept',
+      title: 'Provenance preserve page',
+      compiled_truth: 'Chunk embedded under model A, re-upserted under model B.',
+    });
+    await engine.upsertChunks('docs/provenance-preserve', [
+      {
+        chunk_index: 0,
+        chunk_text: 'stable chunk text',
+        chunk_source: 'compiled_truth',
+        embedding: new Float32Array(VEC1536_A),
+      },
+    ]);
+
+    // Model swap: the gateway now resolves a different model, and the
+    // re-upsert (same chunk_text) carries no new embedding.
+    configureGateway({
+      embedding_model: 'voyage:voyage-3-large',
+      embedding_dimensions: 1536,
+      env: { VOYAGE_API_KEY: 'test' },
+    });
+    await engine.upsertChunks('docs/provenance-preserve', [
+      { chunk_index: 0, chunk_text: 'stable chunk text', chunk_source: 'compiled_truth' },
+    ]);
+
+    const rows = await engine.executeRaw<{ model: string; has_embedding: boolean }>(
+      `SELECT cc.model, cc.embedding IS NOT NULL AS has_embedding
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = 'docs/provenance-preserve'`,
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].has_embedding).toBe(true); // vector preserved…
+    expect(rows[0].model).toBe('openai:text-embedding-3-large'); // …and its label still describes it
+
+    resetGateway();
+  });
+});
+
 describe('buildVectorCastFragment — engine SQL composer (D3)', () => {
-  test('vector descriptor emits $1::vector', () => {
+  test('vector descriptor emits $1::text::vector', () => {
     const r: ResolvedColumn = {
       name: 'embedding',
       type: 'vector',
@@ -226,18 +352,18 @@ describe('buildVectorCastFragment — engine SQL composer (D3)', () => {
     };
     const { col, castSql } = buildVectorCastFragment(r);
     expect(col).toBe('"embedding"');
-    expect(castSql).toBe('$1::vector');
+    expect(castSql).toBe('$1::text::vector');
   });
 
-  test('halfvec descriptor emits $1::halfvec(N) with parenthesized N', () => {
+  test('halfvec descriptor emits $1::text::halfvec(N) with parenthesized N', () => {
     const r: ResolvedColumn = {
-      name: 'embedding_ze',
+      name: 'embedding_fixture',
       type: 'halfvec',
       dimensions: 2560,
-      embeddingModel: 'zeroentropyai:zembed-1',
+      embeddingModel: 'fixture-provider:embedding-v1',
     };
     const { col, castSql } = buildVectorCastFragment(r);
-    expect(col).toBe('"embedding_ze"');
-    expect(castSql).toBe('$1::halfvec(2560)');
+    expect(col).toBe('"embedding_fixture"');
+    expect(castSql).toBe('$1::text::halfvec(2560)');
   });
 });

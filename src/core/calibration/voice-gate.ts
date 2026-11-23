@@ -27,6 +27,7 @@
 
 import { chat as gatewayChat } from '../ai/gateway.ts';
 import type { VoiceGateMode } from './templates.ts';
+import { resolveTierDefault } from '../model-config.ts';
 
 /**
  * Verdict the Haiku judge returns for a candidate string. Pass-through
@@ -159,8 +160,11 @@ export async function defaultJudge(input: {
     .replace('{CANDIDATE}', input.candidate);
   const result = await gatewayChat({
     messages: [{ role: 'user', content: prompt }],
-    model: 'claude-haiku-4-5',
+    // #5165: the key-aware utility tier, not the Anthropic floor, so an
+    // install without Anthropic credit judges with a provider it has.
+    model: resolveTierDefault('utility'),
     maxTokens: 100,
+    allowFallback: false,
   });
   return parseJudgeOutput(result.text);
 }

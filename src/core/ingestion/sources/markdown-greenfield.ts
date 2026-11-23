@@ -43,10 +43,11 @@
  * ideas/. Defaults to ~/git/brain when omitted.
  */
 
+import { gbrainPath } from '../../config.ts';
 import { readFileSync, readdirSync, existsSync, statSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, relative, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import matter from 'gray-matter';
+import { dataFrontmatter as matter } from '../../data-frontmatter.ts';
 import { computeContentHash } from '../types.ts';
 import type {
   IngestionSource,
@@ -113,7 +114,7 @@ export class MarkdownGreenfieldSource implements IngestionSource {
       repoPath: opts.repoPath ?? join(homedir(), 'git', 'brain'),
       dryRun: opts.dryRun ?? false,
       limit: opts.limit,
-      auditDir: opts.auditDir ?? join(homedir(), '.gbrain', 'audit'),
+      auditDir: opts.auditDir ?? gbrainPath('audit'),
       _readFile: opts._readFile ?? ((p) => readFileSync(p, 'utf-8')),
       _existsSync: opts._existsSync ?? existsSync,
       _readdirSync: opts._readdirSync ?? ((p) => readdirSync(p)),

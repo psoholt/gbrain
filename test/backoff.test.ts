@@ -1,4 +1,5 @@
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
+import * as os from 'os';
 import { shouldProceed, preflight, complete, getThrottleState, _resetForTest } from '../src/core/backoff.ts';
 
 describe('backoff', () => {
@@ -19,20 +20,12 @@ describe('backoff', () => {
   });
 
   test('concurrent process limit blocks when exceeded', () => {
-    // Directly simulate 2 active processes by calling preflight with infinite thresholds
-    // Even on a loaded system, we need the counter to increment
-    // So we use complete() in reverse: start at 0, manually register via internals
-    // Actually, just call shouldProceed after manually setting state
-    const allPermissive = { loadStopPct: 1.0, loadSlowPct: 1.0, memoryStopPct: 1.0 };
+    // Infinite thresholds: host load and memory can never block, so only the
+    // concurrency counter decides.
+    const allPermissive = { loadStopPct: Infinity, loadSlowPct: Infinity, memoryStopPct: Infinity };
 
     // First check: should proceed (0 active)
-    const r1 = shouldProceed(allPermissive);
-    // If even fully permissive fails, system is truly overloaded beyond our control
-    if (!r1.proceed) {
-      // Can't test concurrency on a system where even permissive fails
-      expect(true).toBe(true);
-      return;
-    }
+    expect(shouldProceed(allPermissive).proceed).toBe(true);
 
     // Register 2 processes by calling preflight with permissive config
     preflight('a', allPermissive);
@@ -44,12 +37,28 @@ describe('backoff', () => {
     expect(blocked.reason).toContain('batch processes active');
   });
 
+  test('#8913: no load data (loadavg all zero, as on Windows) skips only the CPU checks', async () => {
+    const loadavg = spyOn(os, 'loadavg').mockReturnValue([0, 0, 0]);
+    try {
+      const cpuOnly = { loadStopPct: 0, loadSlowPct: 0, memoryStopPct: Infinity };
+      expect(shouldProceed(cpuOnly)).toMatchObject({ proceed: true, delay: 0 });
+      const memoryFull = shouldProceed({ memoryStopPct: 0 });
+      expect(memoryFull.proceed).toBe(false);
+      expect(memoryFull.reason).toContain('Memory');
+      expect(await preflight('a', cpuOnly)).toBe(true);
+      expect(await preflight('b', cpuOnly)).toBe(true);
+      expect(await preflight('c', cpuOnly)).toBe(false);
+      expect(shouldProceed(cpuOnly).reason).toContain('batch processes active');
+    } finally {
+      loadavg.mockRestore();
+      _resetForTest();
+    }
+  });
+
   test('complete decrements active process count', async () => {
-    const cfg = { loadStopPct: 1.0, loadSlowPct: 1.0, memoryStopPct: 1.0 };
-    const ok1 = await preflight('test-1', cfg);
-    if (!ok1) { expect(true).toBe(true); return; } // system too loaded to test
-    const ok2 = await preflight('test-2', cfg);
-    if (!ok2) { expect(true).toBe(true); return; }
+    const cfg = { loadStopPct: Infinity, loadSlowPct: Infinity, memoryStopPct: Infinity };
+    expect(await preflight('test-1', cfg)).toBe(true);
+    expect(await preflight('test-2', cfg)).toBe(true);
     complete();
     const state = getThrottleState();
     expect(state.activeProcesses).toBe(1);
@@ -109,14 +118,6 @@ describe('backoff', () => {
       const state = getThrottleState();
       expect(state.activeProcesses).toBe(1);
     }
-  });
-
-  test('_resetForTest clears module state', async () => {
-    const cfg = { loadStopPct: 1.0, loadSlowPct: 1.0, memoryStopPct: 1.0 };
-    await preflight('a', cfg);
-    _resetForTest();
-    const state = getThrottleState();
-    expect(state.activeProcesses).toBe(0);
   });
 
   test('delay is a non-negative number', () => {

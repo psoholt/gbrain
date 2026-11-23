@@ -4,6 +4,7 @@ import { canonicalLookup } from './model-pricing.ts';
 import { lookupEmbeddingPrice, estimateCostFromChars } from './embedding-pricing.ts';
 import { getRecipe } from './ai/recipes/index.ts';
 import { parseModelId } from './ai/model-resolver.ts';
+import { getGatewayAnthropicKeySnapshot } from './ai/anthropic-key.ts';
 
 /**
  * v0.40.x: env-var name → file/DB config field, for hosted embedding providers
@@ -11,42 +12,53 @@ import { parseModelId } from './ai/model-resolver.ts';
  * RecommendationContext (doctor + autopilot) use this to build a sync
  * `resolveKey` closure without re-parsing recipes.
  *
- * Only OPENAI_API_KEY and ZEROENTROPY_API_KEY appear here because those are the
- * only embedding keys `buildGatewayConfig` (src/cli.ts) folds from config into
- * the gateway env. VOYAGE_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY are deliberately
- * absent: their config fields are NOT threaded to the gateway today, so the
- * producer closures fall through to checking `process.env` ONLY for them. That
- * matches what the gateway can actually use (the recipes read those keys from
- * env). Counting a config-plane voyage_api_key/google_api_key here would be a
- * false positive: doctor/autopilot would call the provider "configured" and
- * dispatch an embed.stale job that then fails auth at the gateway. When a future
- * change threads voyage_api_key/google_api_key into buildGatewayConfig (the open
- * voyage-config-mapping work), re-add the matching entry here in the same change.
+ * Only keys that `buildGatewayConfig` (src/core/ai/build-gateway-config.ts)
+ * actually folds from config into the gateway env may appear here.
+ *
+ * VOYAGE_API_KEY → voyage_api_key was the same kind of gap (#2662) until
+ * buildGatewayConfig started folding it — now safe to list here too.
+ * GOOGLE_GENERATIVE_AI_API_KEY → google_api_key and DASHSCOPE_API_KEY →
+ * dashscope_api_key joined for the same reason (#3500): both are folded by
+ * buildGatewayConfig now, so a config-plane key is genuinely usable by the
+ * gateway and counting it here is no longer a false positive.
+ *
+ * The historical DB-plane/file-plane split for these fields is closed
+ * (#2119 read-side): `loadConfigWithEngine()` sparse-merges every
+ * `DB_MERGED_PROVIDER_KEY_FIELDS` entry from the DB plane (env > file > DB)
+ * before `buildGatewayConfig` folds the merged config into the gateway env,
+ * so a key that reads "configured" via `engine.getConfig()` is genuinely
+ * usable by the gateway on any path that runs the DB merge.
  */
 export const HOSTED_EMBED_KEY_CONFIG: Record<string, string> = {
   OPENAI_API_KEY: 'openai_api_key',
-  ZEROENTROPY_API_KEY: 'zeroentropy_api_key',
+  VOYAGE_API_KEY: 'voyage_api_key',
+  GOOGLE_GENERATIVE_AI_API_KEY: 'google_api_key',
+  DASHSCOPE_API_KEY: 'dashscope_api_key',
 };
 
 /**
- * v0.40.x: is the configured embedding provider usable for the remediation
- * planner? Recipe-aware:
- *   - empty `auth_env.required` (ollama, llama-server, ...) ⇒ local, no hosted
- *     key needed ⇒ true.
- *   - hosted (openai, zeroentropyai, voyage, google, ...) ⇒ true iff every
- *     required key resolves.
- *
- * `resolveKey(envVar)` is supplied by the caller so each producer reads config
- * from its own source (doctor → file plane; autopilot → engine.getConfig).
- * Only the recipe logic is shared, not the config lookup.
- *
- * NOTE: deliberately NOT the same as `gateway.isAvailable('embedding')`.
- * isAvailable returns false for user_provided_models recipes (llama-server,
- * models: []) because it can't validate the model id. For a remediation
- * verdict we WANT true there — local embeddings work. Do not "align" them.
- * Uses the recipe registry (pure data), not the gateway runtime, so this
- * module stays free of AI-SDK coupling and works before engine.connect().
+ * #3944: chat-key presence for the remediation planner, judged on the planes
+ * both planner surfaces can rely on — process env, the FILE config plane,
+ * and the gateway env snapshot (a DB-plane key that loadConfigWithEngine
+ * already merged into the RUNNING gateway, i.e. a key that is actually
+ * serving chat right now). NOT a raw `engine.getConfig()` read: a DB-only
+ * key that never reached the gateway is unusable on planner paths, and the
+ * raw read is what diverged autopilot from doctor pre-#3944 (doctor's
+ * planner judges the file plane, #2662 is the same rule for embed keys).
+ * The snapshot keeps both surfaces CONVERGENT — it flows through this one
+ * shared helper — while a genuinely-usable key no longer reads as missing.
+ * Shared by loadRecommendationContext and the autopilot dispatch loop.
  */
+export function chatApiKeyConfigured(
+  fileCfg: { anthropic_api_key?: unknown } | null | undefined,
+): boolean {
+  return !!(
+    process.env.ANTHROPIC_API_KEY ||
+    fileCfg?.anthropic_api_key ||
+    getGatewayAnthropicKeySnapshot()
+  );
+}
+
 export function embeddingProviderConfigured(
   embeddingModel: string | undefined,
   resolveKey: (envVar: string) => boolean,
@@ -142,10 +154,30 @@ export interface RecommendationContext {
    * needed. Compute via `embeddingProviderConfigured()`.
    */
   embeddingProviderConfigured?: boolean;
+  /**
+   * E2: embeddings are off by choice (`init --no-embedding`). No embed step is
+   * planned and `missing_embeddings` classifies as `human_only` with the
+   * enable reason, never as a remediable or blocked gap.
+   */
+  embeddingsDisabled?: boolean;
   /** Configured chat / synthesis model id. */
   chatModel?: string;
   /** Whether the chat provider has a usable API key. */
   hasChatApiKey?: boolean;
+  /**
+   * D12: embedded chunks on pages with NO recorded embedding signature
+   * (unknown provenance — possibly a previous model's space). Probed by the
+   * engine-holding caller (loadRecommendationContext); this module is sync.
+   * When > 0, the embed.stale step widens with includeNullSignature so the
+   * cohort is re-embedded instead of grandfathered forever.
+   */
+  nullSignatureCohort?: number;
+  /**
+   * #5609: why `extract --stale` cannot run on this brain right now (it would
+   * fail every dispatch). Probed by `staleExtractionBlocked()`; when set, the
+   * `extract.stale` step is withheld and its check classifies as blocked.
+   */
+  staleExtractionBlocked?: string;
 }
 
 /** Triage result for one check. */
@@ -192,33 +224,26 @@ export function computeRecommendations(
   const source = ctx.sourceId ?? 'default';
 
   // ---------------------------------------------------------------------
-  // sync.repo — fires when sync hasn't run recently OR pages are stale
+  // embed.stale — missing embeddings AND/OR the NULL-signature cohort
+  // (unknown-provenance vectors that the grandfather clause would otherwise
+  // keep in a previous model's space forever). Critical: invisible to (or
+  // wrong in) vector search.
   // ---------------------------------------------------------------------
-  if (ctx.repoPath && health.stale_pages > 0) {
-    const params = { repoPath: ctx.repoPath, sourceId: ctx.sourceId, noEmbed: true };
-    out.push({
-      id: 'sync.repo',
-      job: 'sync',
-      params,
-      idempotency_key: idemKey(source, 'sync', params),
-      severity: health.stale_pages > 50 ? 'high' : 'medium',
-      est_seconds: Math.min(600, 30 + health.stale_pages * 0.5),
-      est_usd_cost: 0,  // sync is fs+DB only
-      depends_on: [],
-      rationale: `${health.stale_pages} stale page${health.stale_pages === 1 ? '' : 's'} on disk`,
-      status: 'remediable',
-    });
-  }
-
-  // ---------------------------------------------------------------------
-  // embed.stale — missing embeddings. Critical: invisible to vector search
-  // ---------------------------------------------------------------------
-  if (health.missing_embeddings > 0 && ctx.embeddingProviderConfigured !== false) {
-    const params = { stale: true, sourceId: ctx.sourceId };
+  const nullSigCohort = ctx.nullSignatureCohort ?? 0;
+  if ((health.missing_embeddings > 0 || nullSigCohort > 0) && ctx.embeddingProviderConfigured !== false && !ctx.embeddingsDisabled) {
+    const params = {
+      stale: true,
+      sourceId: ctx.sourceId,
+      // D12: widen only when the cohort exists — the params feed the
+      // idempotency key, so a cohort appearing/clearing is semantically
+      // different work (one-time dedupe miss on transition, accepted).
+      ...(nullSigCohort > 0 && { includeNullSignature: true }),
+    };
     const embedModel = ctx.embeddingModel ?? 'openai:text-embedding-3-large';
     const embedDims = ctx.embeddingDimensions ?? 3072;
-    // Rough char estimate per chunk ~ 1.5k chars (chunker target).
-    const estChars = health.missing_embeddings * 1500;
+    // Rough char estimate per chunk ~ 1.5k chars (chunker target). The
+    // cohort is real re-embed spend too — count it (round-2 #12).
+    const estChars = (health.missing_embeddings + nullSigCohort) * 1500;
     let est_usd_cost = 0;
     try {
       const priceLookup = lookupEmbeddingPrice(embedModel);
@@ -228,17 +253,23 @@ export function computeRecommendations(
     } catch {
       /* unknown model — leave at 0, surface as warning elsewhere */
     }
+    const rationaleParts: string[] = [];
+    if (health.missing_embeddings > 0) {
+      rationaleParts.push(`${health.missing_embeddings} chunk${health.missing_embeddings === 1 ? '' : 's'} invisible to vector search`);
+    }
+    if (nullSigCohort > 0) {
+      rationaleParts.push(`${nullSigCohort} chunk${nullSigCohort === 1 ? '' : 's'} with no recorded embedding signature (unknown provenance)`);
+    }
     out.push({
       id: 'embed.stale',
       job: 'embed',
       params,
       idempotency_key: idemKey(source, 'embed', { ...params, embedModel, embedDims }),
       severity: 'critical',
-      est_seconds: Math.min(3600, 5 + health.missing_embeddings * 0.05),
+      est_seconds: Math.min(3600, 5 + (health.missing_embeddings + nullSigCohort) * 0.05),
       est_usd_cost,
-      // sync should run first so embed sees fresh pages.
-      depends_on: ctx.repoPath && health.stale_pages > 0 ? ['sync.repo'] : [],
-      rationale: `${health.missing_embeddings} chunk${health.missing_embeddings === 1 ? '' : 's'} invisible to vector search`,
+      depends_on: [],
+      rationale: rationaleParts.join('; '),
       status: 'remediable',
     });
   }
@@ -262,23 +293,18 @@ export function computeRecommendations(
     });
   }
 
-  // ---------------------------------------------------------------------
-  // extract.all — runs after sync to materialize links + timeline.
-  // Triggered when sync.repo fires (because sync was set to noEmbed:true,
-  // and noExtract:true after T5 lands → extract job is the materializer).
-  // ---------------------------------------------------------------------
-  if (ctx.repoPath && health.stale_pages > 0) {
-    const params = { mode: 'all', dir: ctx.repoPath };
+  if (health.stale_pages > 0 && !ctx.staleExtractionBlocked) {
+    const params = { stale: true, ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}) };
     out.push({
-      id: 'extract.all',
+      id: 'extract.stale',
       job: 'extract',
       params,
       idempotency_key: idemKey(source, 'extract', params),
-      severity: 'medium',
-      est_seconds: Math.min(600, 30 + health.page_count * 0.01),
+      severity: health.stale_pages > 50 ? 'high' : 'medium',
+      est_seconds: Math.min(600, 30 + health.stale_pages * 0.01),
       est_usd_cost: 0,
-      depends_on: ['sync.repo'],
-      rationale: 'Materialize link + timeline edges from fresh pages',
+      depends_on: [],
+      rationale: `Materialize link + timeline edges for ${health.stale_pages} stale database page${health.stale_pages === 1 ? '' : 's'}`,
       status: 'remediable',
     });
   }
@@ -335,9 +361,15 @@ function classifyOne(check: Check, ctx: RecommendationContext): CheckClassificat
       }
       return { check: check.name, status: 'remediable' };
     case 'missing_embeddings':
+      if (ctx.embeddingsDisabled) {
+        return { check: check.name, status: 'human_only', reason: 'embeddings disabled by choice (keyless brain); enabling them is the user\'s decision' };
+      }
       if (ctx.embeddingProviderConfigured === false) {
         return { check: check.name, status: 'blocked', reason: 'embedding provider not configured' };
       }
+      return { check: check.name, status: 'remediable' };
+    case 'links_extraction_lag':
+      if (ctx.staleExtractionBlocked) return { check: check.name, status: 'blocked', reason: ctx.staleExtractionBlocked };
       return { check: check.name, status: 'remediable' };
     case 'dead_links':
       if (!ctx.repoPath) {
@@ -400,8 +432,9 @@ function pickMax(current: number, max: number, status: RemediationStatus | undef
 
 // ---------------------------------------------------------------------
 // Idempotency key construction (D9 — content-hash, no time-slot).
-// Same params produce the same key across runs. Failed-row replay
-// appends `:r<N>` (caller responsibility — handled by --remediate loop).
+// Same params produce the same key across runs. Terminal-row replay
+// (a completed/failed row holds the key forever) rotates the key to
+// `:r:<doctor_run_id>` in the --remediate loop (#3626, remediation/run.ts).
 // ---------------------------------------------------------------------
 
 function idemKey(source: string, job: string, params: Record<string, unknown>): string {

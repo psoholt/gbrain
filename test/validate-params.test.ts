@@ -1,0 +1,566 @@
+/**
+ * WP3 (T6) — strict/warn param validation + unknown_tool did-you-mean.
+ *
+ * Covers, per the plan's verify list:
+ *   1. normalize→validate call order: null/'' optional-absence idioms are
+ *      normalized away BEFORE unknown-key detection (never reported unknown);
+ *   2. warn mode: unknown keys accepted, `_meta.warnings` collected with the
+ *      amendment-13 shape, model-visible warn block appended;
+ *   3. reject mode: invalid_params envelope, did-you-mean in `suggestion`,
+ *      raw unknown key NEVER in `message` (the one field persisted to
+ *      mcp_request_log.error_message);
+ *   4. enum membership rejects in BOTH modes (type error, not unknown key);
+ *   5. `_meta` / `dry_run` allowlist;
+ *   6. unknown_tool leak pins: gated + localOnly names never suggested;
+ *      hidden-vs-nonexistent envelopes identical (same builder, same
+ *      candidate set).
+ */
+
+import { beforeEach, describe, expect, test } from 'bun:test';
+import { dispatchToolCall } from '../src/mcp/dispatch.ts';
+import {
+  normalizeOptionalParams,
+  validateParams,
+  findUnknownParams,
+  buildUnknownParamWarnBlock,
+  resolveStrictParamsMode,
+  resetStrictParamsModeCache,
+  parseStrictParamsMode,
+  UNKNOWN_PARAM_ALLOWLIST,
+  narrowingUnknownParams,
+} from '../src/mcp/validate-params.ts';
+import { operations, operationsByName, type Operation } from '../src/core/operations.ts';
+import type { BrainEngine } from '../src/core/engine.ts';
+
+/**
+ * Minimal engine stub. `mcp.strict_params` resolves from the DB plane first,
+ * so pinning the stub's getConfig makes each test deterministic regardless of
+ * the runner's file config. resolveSlugs/getStats back the two trivial op
+ * handlers the dispatch-level tests exercise.
+ */
+function stubEngine(strictMode: 'warn' | 'reject' | null): BrainEngine {
+  return {
+    kind: 'pglite',
+    getConfig: async (k: string) => (k === 'mcp.strict_params' ? strictMode : null),
+    resolveSlugs: async () => [],
+    getStats: async () => ({ pages: 0 }),
+    getTimeline: async () => [],
+    // #4352 gate surface: remote get_timeline probes for private-only slugs.
+    executeRaw: async () => [],
+  } as unknown as BrainEngine;
+}
+
+const DISPATCH_OPTS = { remote: true, transport: 'http' as const, sourceId: 'default' };
+
+function body(result: { content: Array<{ text: string }> }) {
+  return JSON.parse(result.content[0].text);
+}
+
+// ---------------------------------------------------------------------------
+// 1. normalize → validate → unknown-detection order
+// ---------------------------------------------------------------------------
+
+describe('normalize→validate order (absence idioms are not unknown keys)', () => {
+  test('null / empty-string optional idioms are normalized away before unknown detection', () => {
+    const recall = operationsByName['recall'];
+    const normalized = normalizeOptionalParams(recall, { since: '', entity: null, query: 'x' });
+    expect('since' in normalized).toBe(false);
+    expect('entity' in normalized).toBe(false);
+    expect(normalized.query).toBe('x');
+    // The normalized object carries no unknown keys — the idioms were
+    // DECLARED optionals, not stray keys.
+    expect(findUnknownParams(recall, normalized)).toEqual([]);
+    expect(validateParams(recall, normalized)).toBeNull();
+  });
+
+  test('dispatch accepts null/"" optional idioms without warnings (order pin)', async () => {
+    const out = await dispatchToolCall(stubEngine('warn'), 'get_timeline', {
+      slug: 'people/alice-example',
+      since: null,
+      until: '',
+    }, DISPATCH_OPTS);
+    expect(out.isError ?? false).toBe(false);
+    expect(out._meta?.warnings).toBeUndefined();
+    expect(out.content.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2. warn mode
+// ---------------------------------------------------------------------------
+
+describe('warn mode (default) — accept + _meta.warnings only, never a content block', () => {
+  test('unknown key collected with amendment-13 shape and nearest-declared suggestion', async () => {
+    const out = await dispatchToolCall(stubEngine('warn'), 'resolve_slugs', {
+      partial: 'alice-ex',
+      partal: 'typo-key',
+    }, DISPATCH_OPTS);
+    expect(out.isError ?? false).toBe(false);
+    expect(out._meta?.warnings).toEqual([
+      { code: 'unknown_param', param: 'partal', suggestion: 'partial' },
+    ]);
+    // HARN-15: the warning rides _meta.warnings alone; harnesses store content in the turn, so no block is added.
+    expect(out.content.length).toBe(1);
+    expect(JSON.stringify(out.content)).not.toContain('partal');
+    expect(out._meta?.gbrain_notices).toBeUndefined();
+  });
+
+  test('unresolved (absent) config defaults to warn', async () => {
+    const out = await dispatchToolCall(stubEngine(null), 'resolve_slugs', {
+      partial: 'a',
+      totally_unrelated_key: 1,
+    }, DISPATCH_OPTS);
+    expect(out.isError ?? false).toBe(false);
+    const warnings = out._meta?.warnings as Array<{ param: string; suggestion?: string }>;
+    expect(warnings.length).toBe(1);
+    expect(warnings[0].param).toBe('totally_unrelated_key');
+    // Nothing within edit distance → no suggestion key at all.
+    expect('suggestion' in warnings[0]).toBe(false);
+    expect(out.content.length).toBe(1);
+    expect(JSON.stringify(out.content)).not.toContain('totally_unrelated_key');
+  });
+
+  test('suggestion candidates are the op\'s DECLARED params only', () => {
+    // 'quer' is nearest to resolve_slugs' declared 'partial'? No — nothing
+    // within distance; but against the search op it suggests 'query'. The
+    // candidate pool is per-op, never the global param namespace.
+    const search = operationsByName['search'];
+    const found = findUnknownParams(search, { query: 'x', quer: 'y' });
+    expect(found).toEqual([{ code: 'unknown_param', param: 'quer', suggestion: 'query' }]);
+    const resolveSlugs = operationsByName['resolve_slugs'];
+    const foreign = findUnknownParams(resolveSlugs, { partial: 'x', quer: 'y' });
+    expect(foreign.length).toBe(1);
+    expect(foreign[0].suggestion).not.toBe('query');
+  });
+
+  test('remember\'s `source` points at provenance, not source_id: agents pass it for where a fact came from (GST-2351)', () => {
+    const found = findUnknownParams(operationsByName['remember'], { fact: 'x', source: 'user said in chat' });
+    expect(found).toEqual([{ code: 'unknown_param', param: 'source', suggestion: 'provenance' }]);
+    expect(operationsByName['remember'].description).not.toMatch(/\bsource\b/);
+  });
+
+  test('buildUnknownParamWarnBlock joins one line per unknown key', () => {
+    const block = buildUnknownParamWarnBlock([
+      { code: 'unknown_param', param: 'a', suggestion: 'b' },
+      { code: 'unknown_param', param: 'c' },
+    ]);
+    const lines = block.split('\n');
+    expect(lines.length).toBe(2);
+    expect(lines[0]).toContain('"a"');
+    expect(lines[0]).toContain('did you mean "b"');
+    expect(lines[1]).toContain('"c"');
+    expect(lines[1]).not.toContain('did you mean');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3. reject mode
+// ---------------------------------------------------------------------------
+
+describe('reject mode — invalid_params envelope, raw key only in suggestion', () => {
+  test('unknown key → invalid_params with did-you-mean in suggestion', async () => {
+    const out = await dispatchToolCall(stubEngine('reject'), 'resolve_slugs', {
+      partial: 'alice-ex',
+      partal: 'typo-key',
+    }, DISPATCH_OPTS);
+    expect(out.isError).toBe(true);
+    const envelope = body(out);
+    expect(envelope.error).toBe('invalid_params');
+    expect(envelope.suggestion).toContain('"partal"');
+    expect(envelope.suggestion).toContain('did you mean "partial"');
+    // Privacy (amendment 11): serve-http persists `message` to
+    // mcp_request_log.error_message — the raw unknown key must not be there.
+    expect(envelope.message).not.toContain('partal');
+    expect(envelope.message).toContain('unknown parameter');
+  });
+
+  test('declared params + allowlisted keys still dispatch under reject', async () => {
+    const out = await dispatchToolCall(stubEngine('reject'), 'resolve_slugs', {
+      partial: 'alice-ex',
+      _meta: { session_id: 'topic-1' },
+      dry_run: false,
+    }, DISPATCH_OPTS);
+    expect(out.isError ?? false).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. enum membership — both modes
+// ---------------------------------------------------------------------------
+
+describe('enum membership rejects in BOTH strict modes', () => {
+  for (const mode of ['warn', 'reject'] as const) {
+    test(`list_pages sort=bogus → invalid_params naming the allowed values (${mode} mode)`, async () => {
+      const out = await dispatchToolCall(stubEngine(mode), 'list_pages', {
+        sort: 'bogus_order',
+      }, DISPATCH_OPTS);
+      expect(out.isError).toBe(true);
+      const envelope = body(out);
+      expect(envelope.error).toBe('invalid_params');
+      expect(envelope.message).toBe(
+        'Parameter "sort" must be one of: updated_desc, updated_asc, created_desc, slug',
+      );
+    });
+  }
+
+  test('validateParams: valid enum value passes, non-member fails', () => {
+    const listPages = operationsByName['list_pages'];
+    expect(validateParams(listPages, { sort: 'slug' })).toBeNull();
+    expect(validateParams(listPages, { sort: 'name' })).toContain('must be one of');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. `_meta` / `dry_run` allowlist
+// ---------------------------------------------------------------------------
+
+describe('_meta / dry_run allowlist', () => {
+  test('the allowlist is exactly the two dispatch passthrough keys', () => {
+    expect([...UNKNOWN_PARAM_ALLOWLIST].sort()).toEqual(['_meta', 'dry_run']);
+  });
+
+  test('allowlisted keys are never flagged (op with an empty param schema)', async () => {
+    const out = await dispatchToolCall(stubEngine('warn'), 'get_stats', {
+      _meta: { session_id: 'topic-1' },
+      dry_run: false,
+    }, DISPATCH_OPTS);
+    expect(out.isError ?? false).toBe(false);
+    expect(out._meta?.warnings).toBeUndefined();
+    expect(out.content.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. unknown_tool did-you-mean — leak pins
+// ---------------------------------------------------------------------------
+
+const EXCLUDED_FROM_SUGGESTIONS = new Set(
+  operations
+    .filter(op => op.localOnly || op.publishGateKey)
+    .map(op => op.name),
+);
+
+function suggestedName(envelope: { suggestion?: string }): string | null {
+  const m = envelope.suggestion?.match(/^Did you mean "(.+)"\?$/);
+  return m ? m[1] : null;
+}
+
+describe('unknown_tool did-you-mean (leak-hardened)', () => {
+  test('a near-miss of a visible op gets a suggestion', async () => {
+    const out = await dispatchToolCall(stubEngine(null), 'get_pag', {}, DISPATCH_OPTS);
+    expect(out.isError).toBe(true);
+    const envelope = body(out);
+    expect(envelope.error).toBe('unknown_tool');
+    expect(envelope.suggestion).toBe('Did you mean "get_page"?');
+  });
+
+  test('gated + localOnly names are NEVER suggested (near-miss sweep)', async () => {
+    for (const hidden of EXCLUDED_FROM_SUGGESTIONS) {
+      // Probe with the hidden name minus its last character — within edit
+      // distance 1 of the hidden op, so it WOULD be the best suggestion if
+      // the candidate set failed to exclude it.
+      const probe = hidden.slice(0, -1);
+      const out = await dispatchToolCall(stubEngine(null), probe, {}, DISPATCH_OPTS);
+      expect(out.isError).toBe(true);
+      const envelope = body(out);
+      expect(envelope.error).toBe('unknown_tool');
+      const suggested = suggestedName(envelope);
+      if (suggested !== null) {
+        expect(EXCLUDED_FROM_SUGGESTIONS.has(suggested)).toBe(false);
+      }
+    }
+  });
+
+  test('hidden-op path (allowedOps miss) and nonexistent path emit byte-identical envelopes', async () => {
+    // Same input name through BOTH code paths: 'get_pag' does not exist
+    // (nonexistent path when allowedOps admits it / is unset) and is not in
+    // the allow set (hidden path when allowedOps is set). The builder and
+    // candidate set are shared, so the envelopes must match byte-for-byte
+    // when the candidate pools coincide.
+    const viaNonexistent = await dispatchToolCall(stubEngine(null), 'get_pag', {}, DISPATCH_OPTS);
+    const viaHidden = await dispatchToolCall(stubEngine(null), 'get_pag', {}, {
+      ...DISPATCH_OPTS,
+      allowedOps: new Set(operations.filter(op => !op.localOnly).map(o => o.name)),
+    });
+    expect(viaHidden.content[0].text).toBe(viaNonexistent.content[0].text);
+    expect(viaHidden.isError).toBe(true);
+  });
+
+  test('a REAL hidden op is indistinguishable from a nonexistent one (same shape, no oracle)', async () => {
+    const allowed: ReadonlySet<string> = new Set(['recall', 'remember', 'entity']);
+    const hiddenReal = await dispatchToolCall(stubEngine(null), 'get_page', { slug: 'x' }, {
+      ...DISPATCH_OPTS, allowedOps: allowed,
+    });
+    const nonexistent = await dispatchToolCall(stubEngine(null), 'zz_no_such_op', {}, {
+      ...DISPATCH_OPTS, allowedOps: allowed,
+    });
+    expect(hiddenReal.isError).toBe(true);
+    expect(nonexistent.isError).toBe(true);
+    const a = body(hiddenReal);
+    const b = body(nonexistent);
+    // Identical key sets — no extra field betrays that get_page exists.
+    expect(Object.keys(a)).toEqual(Object.keys(b));
+    expect(a.error).toBe('unknown_tool');
+    expect(b.error).toBe('unknown_tool');
+  });
+
+  test('localOnly op over HTTP uses the same builder (suggestion never names it)', async () => {
+    const out = await dispatchToolCall(stubEngine(null), 'file_list', {}, DISPATCH_OPTS);
+    expect(out.isError).toBe(true);
+    const envelope = body(out);
+    expect(envelope.error).toBe('unknown_tool');
+    const suggested = suggestedName(envelope);
+    if (suggested !== null) {
+      expect(EXCLUDED_FROM_SUGGESTIONS.has(suggested)).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveStrictParamsMode — dual-plane resolution
+// ---------------------------------------------------------------------------
+
+describe('resolveStrictParamsMode (DB > file > warn)', () => {
+  const engineWith = (v: unknown) =>
+    ({ getConfig: async () => v } as unknown as BrainEngine);
+  const throwingEngine = {
+    getConfig: async () => { throw new Error('no config table'); },
+  } as unknown as BrainEngine;
+
+  // The resolver holds the last successfully read DB mode per engine
+  // (adversarial fix: a transient outage must not re-open warn mode) —
+  // isolate each case from its neighbors.
+  beforeEach(() => resetStrictParamsModeCache());
+
+  /** One engine whose config read answers `state.value`, or fails while `state.down`. */
+  const flakyEngine = (state: { value: unknown; down: boolean }) =>
+    ({ getConfig: async () => { if (state.down) throw new Error('no config table'); return state.value; } } as unknown as BrainEngine);
+
+  test('a failed DB read holds the last-known-good DB mode (reject survives an outage)', async () => {
+    const state = { value: 'reject' as unknown, down: false };
+    const engine = flakyEngine(state);
+    expect(await resolveStrictParamsMode(engine, null)).toBe('reject');
+    // DB now unreadable + file plane says warn → cached reject still wins.
+    state.down = true;
+    expect(await resolveStrictParamsMode(engine, { engine: 'pglite', mcp: { strict_params: 'warn' } } as never)).toBe('reject');
+    // A later successful read of "unset" clears the cache → file plane decides.
+    state.down = false; state.value = null;
+    expect(await resolveStrictParamsMode(engine, { engine: 'pglite', mcp: { strict_params: 'warn' } } as never)).toBe('warn');
+    state.down = true;
+    expect(await resolveStrictParamsMode(engine, null)).toBe('warn');
+  });
+
+  test('DB plane wins over the file plane', async () => {
+    expect(await resolveStrictParamsMode(engineWith('reject'), { engine: 'pglite', mcp: { strict_params: 'warn' } } as never)).toBe('reject');
+  });
+
+  test('file plane decides when DB is unset or unreadable', async () => {
+    expect(await resolveStrictParamsMode(engineWith(null), { engine: 'pglite', mcp: { strict_params: 'reject' } } as never)).toBe('reject');
+    expect(await resolveStrictParamsMode(throwingEngine, { engine: 'pglite', mcp: { strict_params: 'reject' } } as never)).toBe('reject');
+  });
+
+  test('absent / garbage on both planes → warn (grace-period default)', async () => {
+    expect(await resolveStrictParamsMode(engineWith(null), null)).toBe('warn');
+    expect(await resolveStrictParamsMode(engineWith('yes'), { engine: 'pglite', mcp: { strict_params: 'strict' } } as never)).toBe('warn');
+  });
+
+  test('parseStrictParamsMode admits only the two modes', () => {
+    expect(parseStrictParamsMode('warn')).toBe('warn');
+    expect(parseStrictParamsMode('reject')).toBe('reject');
+    expect(parseStrictParamsMode('true')).toBeNull();
+    expect(parseStrictParamsMode(undefined)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// query op guard — neither `query` nor `image` → typed invalid_params
+// ---------------------------------------------------------------------------
+
+describe('query op with neither `query` nor `image` (WP3 typed envelope)', () => {
+  test('dispatch classifies the caller mistake as invalid_params, never internal_error', async () => {
+    // Both params are optional in the schema (image is the alternative entry
+    // point), so validation passes and the HANDLER must throw the typed
+    // OperationError — before any search runs (the stub engine has no search
+    // methods; reaching one would blow up as internal_error).
+    const out = await dispatchToolCall(stubEngine('reject'), 'query', {}, DISPATCH_OPTS);
+    expect(out.isError).toBe(true);
+    const envelope = body(out);
+    expect(envelope.error).toBe('invalid_params');
+    expect(envelope.message).toContain('either `query`');
+    expect(envelope.message).toContain('`image`');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B3 — schema failures carry the param's type, choices and an example
+// ---------------------------------------------------------------------------
+
+describe('schema invalid_params hints (agent contract B3)', () => {
+  test('a wrong type names the param type, its description and an example call', async () => {
+    const out = await dispatchToolCall(stubEngine('warn'), 'search', { query: 'x', limit: 'ten' }, DISPATCH_OPTS);
+    const envelope = body(out);
+    expect(envelope).toMatchObject({ error: 'invalid_params', code: 'invalid_params', message: 'Parameter "limit" must be a number' });
+    expect(envelope.suggestion).toMatch(/^Pass `limit` as a number/);
+    expect(envelope.suggestion).toContain('Example: search {"limit": ');
+    expect(envelope.suggestion).not.toContain('ten');
+  });
+
+  test('a missing required param gets an example; verbs keep protocol_version', async () => {
+    const envelope = body(await dispatchToolCall(stubEngine('warn'), 'forget', {}, DISPATCH_OPTS));
+    expect(envelope).toMatchObject({ error: 'invalid_params', message: 'Missing required parameter: id', protocol_version: 1 });
+    expect(envelope.suggestion).toMatch(/^Pass `id` as a string.*Example: forget \{"id": "value"\}\.$/);
+    const search = body(await dispatchToolCall(stubEngine('warn'), 'search', {}, DISPATCH_OPTS));
+    expect(search.message).toBe('Missing required parameter: query');
+    expect(search.suggestion).toMatch(/^Pass `query` as a string/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #5970 — write operations reject unknown parameters in every mode
+// ---------------------------------------------------------------------------
+
+describe('write operations reject unknown parameters even in warn mode (#5970)', () => {
+  const timelineOp = operations.find(o => o.name === 'add_timeline_entry')!;
+  const searchOp = operations.find(o => o.name === 'search')!;
+
+  test('add_timeline_entry with a complete request plus `content` → invalid_params before the handler runs', async () => {
+    const original = timelineOp.handler;
+    let handlerCalls = 0;
+    timelineOp.handler = async () => { handlerCalls += 1; return { ok: true }; };
+    try {
+      const out = await dispatchToolCall(stubEngine('warn'), 'add_timeline_entry', {
+        slug: 'people/alice-example', date: '2026-04-03', summary: 'Met for coffee', content: 'A long note that belongs in detail',
+      }, DISPATCH_OPTS);
+      expect(out.isError).toBe(true);
+      const envelope = body(out);
+      expect(envelope.error).toBe('invalid_params');
+      expect(handlerCalls).toBe(0);
+      // Privacy: the key rides `suggestion` only; `message` counts and explains why writes reject.
+      expect(envelope.message).toContain('1 unknown parameter');
+      expect(envelope.message).toContain('write operations always reject unknown parameters');
+      expect(envelope.message).not.toContain('content');
+      expect(envelope.suggestion).toContain('Unknown parameter "content"');
+      expect(envelope.suggestion).toContain('did you mean "detail"');
+    } finally {
+      timelineOp.handler = original;
+    }
+  });
+
+  test('a read with an unknown key still succeeds with the warning in warn mode', async () => {
+    const original = searchOp.handler;
+    let handlerCalls = 0;
+    searchOp.handler = async () => { handlerCalls += 1; return { results: [] }; };
+    try {
+      const out = await dispatchToolCall(stubEngine('warn'), 'search', { query: 'alice', limt: 3 }, DISPATCH_OPTS);
+      expect(out.isError ?? false).toBe(false);
+      expect(handlerCalls).toBe(1);
+      expect(out._meta?.warnings).toEqual([{ code: 'unknown_param', param: 'limt', suggestion: 'limit' }]);
+      // HARN-15 regression: a read's content carries no notice text for an ignored parameter.
+      const text = out.content.map(c => c.text).join('\n');
+      expect(text).not.toContain('limt');
+      expect(text).not.toContain('unknown_param');
+      expect(text).not.toContain('unknown parameter');
+      expect(text).not.toContain('[gbrain notice');
+    } finally {
+      searchOp.handler = original;
+    }
+  });
+
+  test('allowlisted `_meta` and `dry_run` are still accepted on a write', async () => {
+    const original = timelineOp.handler;
+    let handlerCalls = 0;
+    timelineOp.handler = async () => { handlerCalls += 1; return { ok: true }; };
+    try {
+      const out = await dispatchToolCall(stubEngine('warn'), 'add_timeline_entry', {
+        slug: 'people/alice-example', date: '2026-04-03', summary: 'Met for coffee', _meta: { session_id: 's' }, dry_run: true,
+      }, DISPATCH_OPTS);
+      expect(out.isError ?? false).toBe(false);
+      expect(handlerCalls).toBe(1);
+    } finally {
+      timelineOp.handler = original;
+    }
+  });
+
+  test('every mutating op in the manifest is covered by the rule (no write keeps the grace period)', () => {
+    const writes = operations.filter(o => o.mutating === true).map(o => o.name);
+    expect(writes).toContain('add_timeline_entry');
+    expect(writes).toContain('put_page');
+    expect(writes).toContain('remember');
+    expect(writes).not.toContain('search');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GBRA-431 — a read rejects a misspelled scope or filter in every mode
+// ---------------------------------------------------------------------------
+
+describe('a read rejects an unknown scope or filter parameter even in warn mode (GBRA-431)', () => {
+  const ops = ['search', 'query', 'list_pages'].map(name => operations.find(o => o.name === name)!);
+
+  async function withCountedHandlers(fn: (calls: () => number) => Promise<void>) {
+    const originals = ops.map(op => op.handler);
+    let handlerCalls = 0;
+    for (const op of ops) op.handler = async () => { handlerCalls += 1; return { results: [] }; };
+    try { await fn(() => handlerCalls); } finally { ops.forEach((op, i) => { op.handler = originals[i]; }); }
+  }
+
+  test('a misspelled source or type filter answers invalid_params naming the declared param, before any read runs', async () => {
+    await withCountedHandlers(async calls => {
+      for (const [op, params, param, suggestion] of [
+        ['search', { query: 'roadmap', source: 'source-a' }, 'source', 'source_id'],
+        ['search', { query: 'roadmap', sources: ['source-a'] }, 'sources', 'source_ids'],
+        ['search', { query: 'roadmap', sourceId: 'source-a' }, 'sourceId', 'source_id'],
+        ['query', { query: 'roadmap', source: 'source-a' }, 'source', 'source_id'],
+        ['query', { query: 'roadmap', type: 'meeting' }, 'type', 'types'],
+        ['list_pages', { source: 'source-a' }, 'source', 'source_id'],
+      ] as const) {
+        for (const mode of ['warn', null] as const) {
+          const out = await dispatchToolCall(stubEngine(mode), op, { ...params }, DISPATCH_OPTS);
+          const env = body(out);
+          expect({ op, param, mode, isError: out.isError, code: env.code, suggestion: env.suggestion })
+            .toEqual({ op, param, mode, isError: true, code: 'invalid_params', suggestion: expect.stringContaining(`Unknown parameter "${param}" — did you mean "${suggestion}"?`) });
+          expect(env.message).not.toContain(param + '"');
+        }
+      }
+      expect(calls()).toBe(0);
+    });
+  });
+
+  test('an unknown parameter that narrows nothing keeps the warn grace period', async () => {
+    await withCountedHandlers(async calls => {
+      const out = await dispatchToolCall(stubEngine('warn'), 'search', { query: 'roadmap', limt: 3 }, DISPATCH_OPTS);
+      expect(out.isError ?? false).toBe(false);
+      expect(calls()).toBe(1);
+    });
+  });
+
+  test('narrowingUnknownParams picks keys whose nearest declared param is a scope or filter of the op', () => {
+    expect(narrowingUnknownParams([
+      { code: 'unknown_param', param: 'source', suggestion: 'source_id' }, { code: 'unknown_param', param: 'Source-IDs', suggestion: 'source_ids' },
+      { code: 'unknown_param', param: 'srcid', suggestion: 'source_id' }, { code: 'unknown_param', param: 'tag', suggestion: 'types' },
+      { code: 'unknown_param', param: 'limt', suggestion: 'limit' }, { code: 'unknown_param', param: 'partal', suggestion: 'partial' },
+    ], ['source_id', 'source_ids', 'types', 'limit', 'partial']).map(w => w.param)).toEqual(['source', 'Source-IDs', 'srcid', 'tag']);
+  });
+
+  test('a scope key sent to an op that declares no scope param keeps the warn grace period', () => {
+    expect(narrowingUnknownParams([
+      { code: 'unknown_param', param: 'source_id' }, { code: 'unknown_param', param: 'source_id', suggestion: 'request_id' },
+    ], ['request_id', 'applied'])).toEqual([]);
+  });
+
+  const refusedOn = (declared: string[], key: string) => {
+    const op = { name: 'family_probe', params: Object.fromEntries(declared.map(name => [name, { type: 'string' }])) } as unknown as Operation;
+    return narrowingUnknownParams(findUnknownParams(op, { [key]: 'x' }), declared).map(w => w.param);
+  };
+
+  test('a key in a scope or filter family the op declares is refused even with no near suggestion', () => {
+    expect(refusedOn(['source_ids', 'limit'], 'source')).toEqual(['source']);
+    expect(refusedOn(['source_id', 'limit'], 'source_name')).toEqual(['source_name']);
+    expect(refusedOn(['types', 'limit'], 'kind')).toEqual(['kind']);
+  });
+
+  test('a key whose family the op does not declare keeps the warn grace period', () => {
+    expect(refusedOn(['types', 'limit'], 'source_id')).toEqual([]);
+    expect(refusedOn(['source_id', 'limit'], 'since')).toEqual([]);
+  });
+});

@@ -8,8 +8,9 @@ triggers:
   - "ingest this into my brain"
   - "drop this in the inbox"
   - "save to brain"
-writes_pages:
-  - "inbox/*"
+writes_pages: true
+writes_to:
+  - inbox/
 ---
 
 # capture — the single ingestion entrypoint
@@ -62,7 +63,7 @@ gbrain capture "..." --json           # structured output for agents
 - **Slug:** `inbox/YYYY-MM-DD-<hash8>` (stable for same content; the daemon's 24h dedup catches re-captures).
 - **Type:** `note` (override with `--type idea` etc.).
 - **Frontmatter stamps:** `captured_via: capture-cli`, `captured_at: <ISO>`.
-- **Title:** first non-empty line of the body, capped at 80 chars.
+- **Title:** first non-empty line of the body, capped at 80 chars (truncation appends `…`).
 
 ## Output Format
 
@@ -79,6 +80,14 @@ captured:
 
 `--quiet` prints only the slug (use for `SLUG=$(gbrain capture "..." --quiet)`).
 `--json` prints structured output for downstream tools.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- Exit 10 (`write_pending`): the thought was accepted and may still commit. Tell the user it is saved and pending, and poll `gbrain write-request <request_id>`; never capture it a second time.
+- A secret-scan or slug-fence refusal: nothing was saved. Tell the user what was refused; do not edit the content to sneak past the scanner.
+- `source_binding_required` or `insufficient_scope` over MCP: this connection cannot write the target source; tell the user which source needs a grant from the brain host's operator.
 
 ## Anti-Patterns
 

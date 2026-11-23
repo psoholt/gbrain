@@ -10,6 +10,7 @@ import {
   DEFAULT_SYNC_STALL_ABORT_SEC,
   HARD_DEADLINE_GRACE_SEC,
 } from '../src/commands/sync.ts';
+import { syncDeadlineStopNotice } from '../src/core/sync-reconcile.ts';
 
 const GRACE_MS = HARD_DEADLINE_GRACE_SEC * 1000;
 
@@ -53,9 +54,9 @@ describe('resolveSyncHardDeadline', () => {
     expect(() => resolveSyncHardDeadline(['--hard-deadline', '0'], { isTty: true })).toThrow();
   });
 
-  test('--timeout (single-source) auto-arms the hard backstop', () => {
+  test('--timeout (single-source) auto-arms the hard backstop one grace window after the timeout', () => {
     const r = resolveSyncHardDeadline(['--source', 'briefings', '--timeout', '480'], { isTty: false });
-    expect(r).toEqual({ deadlineMs: 480_000, graceMs: GRACE_MS, reason: 'flag:--timeout' });
+    expect(r).toEqual({ deadlineMs: 480_000 + GRACE_MS, graceMs: GRACE_MS, reason: 'flag:--timeout' });
   });
 
   test('--timeout + --all does NOT auto-arm (per-source budgets); falls through', () => {
@@ -68,7 +69,7 @@ describe('resolveSyncHardDeadline', () => {
 
   test('env GBRAIN_SYNC_MAX_RUNTIME_SECONDS sets the deadline', () => {
     const r = resolveSyncHardDeadline([], { isTty: true, env: { GBRAIN_SYNC_MAX_RUNTIME_SECONDS: '900' } });
-    expect(r).toEqual({ deadlineMs: 900_000, graceMs: GRACE_MS, reason: 'env:GBRAIN_SYNC_MAX_RUNTIME_SECONDS' });
+    expect(r).toEqual({ deadlineMs: 900_000, graceMs: GRACE_MS, reason: 'env:GBRAIN_SYNC_MAX_RUNTIME_SECONDS', progressWindowMs: 900_000 });
   });
 
   test('env 0 disables (overrides the non-TTY default)', () => {
@@ -78,7 +79,7 @@ describe('resolveSyncHardDeadline', () => {
 
   test('non-TTY default is 3600s', () => {
     const r = resolveSyncHardDeadline([], { isTty: false });
-    expect(r).toEqual({ deadlineMs: 3_600_000, graceMs: GRACE_MS, reason: 'default:non-tty' });
+    expect(r).toEqual({ deadlineMs: 3_600_000, graceMs: GRACE_MS, reason: 'default:non-tty', progressWindowMs: 900_000 });
   });
 
   test('TTY interactive with no flag/env arms nothing', () => {
@@ -88,6 +89,40 @@ describe('resolveSyncHardDeadline', () => {
   test('defaultNonTtySec override is honored', () => {
     const r = resolveSyncHardDeadline([], { isTty: false, defaultNonTtySec: 60 });
     expect(r?.deadlineMs).toBe(60_000);
+  });
+});
+
+// F4d: the default and env deadlines must never stop a sync that is still
+// importing; the explicit flags stay strict wall-clock caps.
+describe('progress-aware sync deadline (large-brain ceiling)', () => {
+  test('default and env deadlines carry the stall window as their progress window', () => {
+    expect(resolveSyncHardDeadline([], { isTty: false, env: { GBRAIN_SYNC_STALL_ABORT_SECONDS: '120' } })?.progressWindowMs).toBe(120_000);
+    expect(resolveSyncHardDeadline([], { isTty: true, env: { GBRAIN_SYNC_MAX_RUNTIME_SECONDS: '60', GBRAIN_SYNC_STALL_ABORT_SECONDS: '30' } })?.progressWindowMs).toBe(30_000);
+  });
+
+  test('a disabled stall watchdog still leaves a default progress window, never a hair trigger', () => {
+    expect(resolveSyncHardDeadline([], { isTty: false, env: { GBRAIN_SYNC_STALL_ABORT_SECONDS: '0' } })?.progressWindowMs)
+      .toBe(DEFAULT_SYNC_STALL_ABORT_SEC * 1000);
+  });
+
+  test('--hard-deadline and --timeout stay strict (no progress window)', () => {
+    expect(resolveSyncHardDeadline(['--hard-deadline', '120'], { isTty: false })?.progressWindowMs).toBeUndefined();
+    expect(resolveSyncHardDeadline(['--source', 'x', '--timeout', '60'], { isTty: false })?.progressWindowMs).toBeUndefined();
+  });
+
+  test('the stop notice names the cause, the code and the exact resume command', () => {
+    const res = resolveSyncHardDeadline([], { isTty: false })!;
+    const line = syncDeadlineStopNotice(['--source', 'notes', '--no-pull'], res);
+    expect(line).toContain('code=sync_deadline_stop');
+    expect(line).toContain('the 3600s sync deadline (default:non-tty) passed and the run made no progress for 900s');
+    expect(line).toContain('Resume with: gbrain sync --source notes --no-pull.');
+  });
+
+  test('under --json the stop notice is one parseable object', () => {
+    const res = resolveSyncHardDeadline(['--hard-deadline', '60'], { isTty: false })!;
+    const notice = JSON.parse(syncDeadlineStopNotice(['--hard-deadline', '60', '--json'], res));
+    expect(notice).toMatchObject({ status: 'stopped', code: 'sync_deadline_stop', deadline_seconds: 60, progress_window_seconds: null,
+      resume_command: 'gbrain sync --hard-deadline 60 --json' });
   });
 });
 

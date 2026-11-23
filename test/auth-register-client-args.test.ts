@@ -12,6 +12,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import { parseRegisterClientArgs } from '../src/commands/auth.ts';
+import { assertAllowedScopes, parseScopeString } from '../src/core/scope.ts';
 
 describe('parseRegisterClientArgs', () => {
   test('empty args → all defaults', () => {
@@ -22,6 +23,12 @@ describe('parseRegisterClientArgs', () => {
     expect(out.federatedRead).toBeUndefined();
     expect(out.redirectUris).toEqual([]);
     expect(out.tokenEndpointAuthMethod).toBeUndefined();
+    expect(out.boundTools).toBeUndefined();
+    expect(out.boundSourceId).toBeUndefined();
+    expect(out.boundBrainId).toBeUndefined();
+    expect(out.boundSlugPrefixes).toBeUndefined();
+    expect(out.boundMaxConcurrent).toBeUndefined();
+    expect(out.budgetUsdPerDay).toBeUndefined();
   });
 
   test('--grant-types comma-separated → array', () => {
@@ -32,6 +39,75 @@ describe('parseRegisterClientArgs', () => {
   test('--scopes preserves the whitespace-joined string', () => {
     const out = parseRegisterClientArgs(['--scopes', 'read write']);
     expect(out.scopes).toBe('read write');
+  });
+
+  // init.ts's own `gbrain auth register-client` hint (line ~730) recommends
+  // `--scopes read,write,admin`, but the parser previously only split on
+  // whitespace, so the comma-joined string fell through as a single
+  // unrecognized token and registerClientManual's assertAllowedScopes
+  // rejected it with `Unknown scope "read,write,admin"` — self-contradicting
+  // the hint it printed. These pin the comma form as accepted, alongside the
+  // pre-existing space form, without changing the shared OAuth-wire-format
+  // parseScopeString (RFC 6749 space-delimited) used for DCR/refresh/request
+  // scope parsing.
+  describe('--scopes comma-separated (matches init.ts hint)', () => {
+    test('comma-separated → normalized to the space-joined wire form', () => {
+      const out = parseRegisterClientArgs(['--scopes', 'read,write,admin']);
+      expect(out.scopes).toBe('read write admin');
+    });
+
+    test('mixed comma+space form normalizes the same way', () => {
+      const out = parseRegisterClientArgs(['--scopes', 'read, write ,admin']);
+      expect(out.scopes).toBe('read write admin');
+    });
+
+    test('single scope (no separators) is unaffected', () => {
+      const out = parseRegisterClientArgs(['--scopes', 'read']);
+      expect(out.scopes).toBe('read');
+    });
+
+    test('comma, space, and mixed forms all parse to the identical scope set downstream', () => {
+      const comma = parseRegisterClientArgs(['--scopes', 'read,write,admin']).scopes;
+      const spaced = parseRegisterClientArgs(['--scopes', 'read write admin']).scopes;
+      const mixed = parseRegisterClientArgs(['--scopes', 'read, write ,admin']).scopes;
+      const expected = ['read', 'write', 'admin'];
+      expect(parseScopeString(comma)).toEqual(expected);
+      expect(parseScopeString(spaced)).toEqual(expected);
+      expect(parseScopeString(mixed)).toEqual(expected);
+      // Control: all three forms also clear the registration-time allowlist
+      // gate that init.ts's hint promises works.
+      expect(() => assertAllowedScopes(parseScopeString(comma))).not.toThrow();
+      expect(() => assertAllowedScopes(parseScopeString(spaced))).not.toThrow();
+      expect(() => assertAllowedScopes(parseScopeString(mixed))).not.toThrow();
+    });
+
+    // Control: comma-splitting must not smuggle a genuinely unknown scope
+    // past the registration-time allowlist gate.
+    test('a genuinely unknown scope in comma form is still rejected downstream', () => {
+      const out = parseRegisterClientArgs(['--scopes', 'read,flying-unicorn']);
+      expect(out.scopes).toBe('read flying-unicorn');
+      expect(() => assertAllowedScopes(parseScopeString(out.scopes)))
+        .toThrow(/Unknown scope "flying-unicorn"/);
+    });
+
+    // Codex review finding (round 1): separator-only input (e.g. "," or
+    // ",,,") split to zero tokens under the comma/whitespace regex, which
+    // collapsed to `''` and would have passed assertAllowedScopes
+    // vacuously downstream (empty scope list silently accepted).
+    //
+    // Codex review finding (round 2, P1): an initial fix that forwarded the
+    // raw string only for comma-only input left whitespace-only (`"   "`)
+    // and empty-string (`""`) inputs unguarded — those also normalize to
+    // zero tokens under the same regex (whitespace is a supported
+    // separator too), so the same silent-empty-scope-set hole remained for
+    // them. The parser now rejects ANY input that normalizes to zero
+    // tokens, uniformly, with a clear CLI usage error.
+    test('zero-token --scopes input (commas, whitespace, or empty) is rejected at parse time', () => {
+      for (const raw of [',', ',,,', ' , ', '   ', '']) {
+        expect(() => parseRegisterClientArgs(['--scopes', raw]))
+          .toThrow(/--scopes requires at least one scope/);
+      }
+    });
   });
 
   test('--source scopes the OAuth client', () => {
@@ -147,6 +223,26 @@ describe('parseRegisterClientArgs', () => {
     });
   });
 
+  describe('submit_agent binding flags', () => {
+    test('parses register-time submit_agent bindings', () => {
+      const out = parseRegisterClientArgs([
+        '--scopes', 'read agent',
+        '--bound-tools', 'search, get_page,put_page',
+        '--bound-source', 'dept-x',
+        '--bound-brain', 'company-brain',
+        '--bound-slug-prefixes', 'wiki/agents/alice/,notes/',
+        '--bound-max-concurrent', '3',
+        '--budget-usd-per-day', '12.50',
+      ]);
+      expect(out.boundTools).toEqual(['search', 'get_page', 'put_page']);
+      expect(out.boundSourceId).toBe('dept-x');
+      expect(out.boundBrainId).toBe('company-brain');
+      expect(out.boundSlugPrefixes).toEqual(['wiki/agents/alice/', 'notes/']);
+      expect(out.boundMaxConcurrent).toBe(3);
+      expect(out.budgetUsdPerDay).toBe('12.50');
+    });
+  });
+
   describe('error cases', () => {
     test('--redirect-uri without value → throws', () => {
       expect(() => parseRegisterClientArgs(['--redirect-uri'])).toThrow(/requires a value/);
@@ -159,5 +255,40 @@ describe('parseRegisterClientArgs', () => {
     test('unknown --flag throws', () => {
       expect(() => parseRegisterClientArgs(['--frobnicate', 'value'])).toThrow(/Unknown flag/);
     });
+
+    test('--bound-max-concurrent requires a positive integer', () => {
+      expect(() => parseRegisterClientArgs(['--bound-max-concurrent', '0'])).toThrow(/positive integer/);
+      expect(() => parseRegisterClientArgs(['--bound-max-concurrent', '1.5'])).toThrow(/positive integer/);
+    });
+
+    test('--budget-usd-per-day requires a currency-shaped decimal', () => {
+      expect(() => parseRegisterClientArgs(['--budget-usd-per-day', '1.234'])).toThrow(/non-negative decimal/);
+      expect(() => parseRegisterClientArgs(['--budget-usd-per-day', 'abc'])).toThrow(/non-negative decimal/);
+    });
+  });
+});
+
+describe('--token-ttl (cathedral-6 T2)', () => {
+  const { TOKEN_TTL_MIN_SECONDS, TOKEN_TTL_MAX_SECONDS } = require('../src/commands/auth.ts');
+
+  test('accepts the bounds and passes the value through', () => {
+    expect(parseRegisterClientArgs(['--token-ttl', String(TOKEN_TTL_MIN_SECONDS)]).tokenTtlSeconds).toBe(60);
+    expect(parseRegisterClientArgs(['--token-ttl', String(TOKEN_TTL_MAX_SECONDS)]).tokenTtlSeconds).toBe(7_776_000);
+    expect(parseRegisterClientArgs(['--token-ttl', '2592000']).tokenTtlSeconds).toBe(2_592_000);
+  });
+
+  test('omitted flag leaves tokenTtlSeconds undefined (server default applies)', () => {
+    expect(parseRegisterClientArgs([]).tokenTtlSeconds).toBeUndefined();
+  });
+
+  test.each([['0'], ['-1'], ['abc'], ['10000000'], ['59'], ['3600.5']])(
+    'rejects %s with the range in the message',
+    (raw) => {
+      expect(() => parseRegisterClientArgs(['--token-ttl', raw])).toThrow(/between 60 and 7776000/);
+    },
+  );
+
+  test('requires a value', () => {
+    expect(() => parseRegisterClientArgs(['--token-ttl'])).toThrow(/requires a value/);
   });
 });

@@ -35,10 +35,14 @@ fi
 
 if [ -z "${DATABASE_URL:-}" ]; then
   echo "[build_legacy_fixtures] DATABASE_URL not set." >&2
-  echo "  Local: docker run -d --name gbrain-test-pg -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=gbrain_test -p 5434:5432 pgvector/pgvector:pg16" >&2
+  echo "  Local: docker run -d --name gbrain-test-pg -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=gbrain_test -p 127.0.0.1:5434:5432 pgvector/pgvector:pg16" >&2
   echo "  Then: export DATABASE_URL=postgresql://postgres:postgres@localhost:5434/gbrain_test" >&2
   exit 2
 fi
+
+# #3485 name floor (shared): this script DROPs the public schema of whatever
+# DATABASE_URL names — refuse non-test-shaped names without an explicit opt-in.
+source "$(dirname "$0")/_db_floor.sh"
 
 SQL_FILE="tests/heavy/fixtures/down-mutate-${SHAPE}.sql"
 if [ ! -f "$SQL_FILE" ]; then

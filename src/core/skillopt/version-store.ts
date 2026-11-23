@@ -23,6 +23,7 @@
  *
  *   history.json
  *   best.md
+ *   proposed.md
  *   versions/
  *     v0001_e1_s1.md
  *     v0002_e1_s2.md
@@ -32,6 +33,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { atomicWrite } from './apply-edits.ts';
+import { assertLegacySkillFilesystemWrite } from '../skillpack/writer-guard.ts';
 import type { EditOp, HistoryRow } from './types.ts';
 
 // ─── Path helpers ────────────────────────────────────────────────────────
@@ -50,6 +52,10 @@ export function historyPath(skillsDir: string, skillName: string): string {
 
 export function bestPath(skillsDir: string, skillName: string): string {
   return path.join(skilloptDir(skillsDir, skillName), 'best.md');
+}
+
+export function proposedPath(skillsDir: string, skillName: string): string {
+  return path.join(skilloptDir(skillsDir, skillName), 'proposed.md');
 }
 
 export function skillPath(skillsDir: string, skillName: string): string {
@@ -93,6 +99,7 @@ export function loadHistory(skillsDir: string, skillName: string): HistoryRow[] 
 
 function writeHistory(skillsDir: string, skillName: string, rows: HistoryRow[]): void {
   const p = historyPath(skillsDir, skillName);
+  assertLegacySkillFilesystemWrite(p);
   fs.mkdirSync(path.dirname(p), { recursive: true });
   atomicWrite(p, JSON.stringify({ schema: 1, rows } satisfies HistoryFile, null, 2) + '\n');
 }
@@ -125,6 +132,8 @@ export interface AcceptResult {
  */
 export function acceptCandidate(input: AcceptInput): AcceptResult {
   const { skillsDir, skillName, runId, epoch, step, edits, candidateText, selScore, delta } = input;
+  for (const file of [skillPath(skillsDir, skillName), historyPath(skillsDir, skillName),
+    versionsDir(skillsDir, skillName), bestPath(skillsDir, skillName)]) assertLegacySkillFilesystemWrite(file);
 
   // Ensure dir exists.
   fs.mkdirSync(versionsDir(skillsDir, skillName), { recursive: true });
@@ -135,6 +144,11 @@ export function acceptCandidate(input: AcceptInput): AcceptResult {
     .filter((r) => r.status === 'committed')
     .reduce((m, r) => Math.max(m, r.version_n), 0);
   const versionN = maxCommitted + 1;
+  const verPath = versionPath(skillsDir, skillName, versionN, epoch, step);
+  for (const file of [skillPath(skillsDir, skillName), historyPath(skillsDir, skillName), verPath, bestPath(skillsDir, skillName)]) {
+    assertLegacySkillFilesystemWrite(file);
+    assertLegacySkillFilesystemWrite(`${file}.tmp`);
+  }
 
   // Step 1: append history row (pending).
   const ts = new Date().toISOString();
@@ -150,7 +164,6 @@ export function acceptCandidate(input: AcceptInput): AcceptResult {
   writeHistory(skillsDir, skillName, [...history, pendingRow]);
 
   // Step 2: write snapshot.
-  const verPath = versionPath(skillsDir, skillName, versionN, epoch, step);
   atomicWrite(verPath, candidateText);
 
   // Step 3: write best.md pointer.
@@ -171,17 +184,22 @@ export function acceptCandidate(input: AcceptInput): AcceptResult {
 }
 
 /**
- * Write the candidate to `best.md` (which doubles as `proposed.md`) WITHOUT
- * touching SKILL.md or the history ledger. Used by the `--no-mutate` /
- * bundled-without-allow paths: the optimizer found a better candidate but the
- * caller opted out of in-place mutation, so we surface it for human review.
- * Returns the path written. Atomic (.tmp + rename).
+ * Write the candidate to both `best.md` and `proposed.md` WITHOUT touching
+ * SKILL.md or the history ledger. `best.md` remains the optimizer's current
+ * best pointer; `proposed.md` is the stable human-review artifact promised by
+ * `--no-mutate`. Returns the proposal path. Each write is atomic (.tmp + rename).
  */
 export function writeProposed(skillsDir: string, skillName: string, candidateText: string): string {
-  const p = bestPath(skillsDir, skillName);
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  atomicWrite(p, candidateText);
-  return p;
+  const best = bestPath(skillsDir, skillName);
+  const proposed = proposedPath(skillsDir, skillName);
+  assertLegacySkillFilesystemWrite(best);
+  assertLegacySkillFilesystemWrite(proposed);
+  assertLegacySkillFilesystemWrite(`${best}.tmp`);
+  assertLegacySkillFilesystemWrite(`${proposed}.tmp`);
+  fs.mkdirSync(path.dirname(best), { recursive: true });
+  atomicWrite(best, candidateText);
+  atomicWrite(proposed, candidateText);
+  return proposed;
 }
 
 /**
@@ -202,6 +220,8 @@ export function revertAllPending(skillsDir: string, skillName: string): number {
   const history = loadHistory(skillsDir, skillName);
   const pending = history.filter((r) => r.status === 'pending');
   if (pending.length === 0) return 0;
+  for (const file of [skilloptDir(skillsDir, skillName), historyPath(skillsDir, skillName),
+    versionsDir(skillsDir, skillName), bestPath(skillsDir, skillName)]) assertLegacySkillFilesystemWrite(file);
 
   for (const row of pending) {
     // Delete the snapshot. We don't know epoch/step from the history row
@@ -211,6 +231,7 @@ export function revertAllPending(skillsDir: string, skillName: string): number {
     if (fs.existsSync(dir)) {
       for (const entry of fs.readdirSync(dir)) {
         if (entry.startsWith(`v${verN}_`)) {
+          assertLegacySkillFilesystemWrite(path.join(dir, entry));
           try { fs.unlinkSync(path.join(dir, entry)); } catch { /* ignore */ }
         }
       }
@@ -223,6 +244,7 @@ export function revertAllPending(skillsDir: string, skillName: string): number {
   const bestP = bestPath(skillsDir, skillName);
   if (committed.length === 0) {
     if (fs.existsSync(bestP)) {
+      assertLegacySkillFilesystemWrite(bestP);
       try { fs.unlinkSync(bestP); } catch { /* ignore */ }
     }
   } else {

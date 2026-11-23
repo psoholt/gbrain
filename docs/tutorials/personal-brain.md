@@ -2,11 +2,13 @@
 
 By the end of this tutorial you'll have your own AI agent running on a server you control, talking to you over Telegram, with a brain that remembers everything you tell it. About two hours end-to-end, $100 to $150 a month sustained.
 
+> **Want the result without the two hours?** [gbrain.io](https://gbrain.io/?ref=personal-brain) is hosted GBrain: nothing to deploy, always on, and connected to ChatGPT, Claude and Cursor. Prefer a hand? Email support@gbrain.io and a person will set up your first skill with you. Read on if you want to own every piece of the stack.
+
 This is the install I'd run if I were setting up the whole stack from scratch today. I documented it live during a setup session with a collaborator (we used Granola to capture the screen because "this is already too complicated for an archetypical person"). The tutorial is the cleaned-up version of that session.
 
 > "This is the Apple I, we're just soldering breadboards over here."
 
-If you only want the **brain layer** (no agent, no Telegram, just gbrain as memory for an MCP client you already use), skip to the [CLI standalone install](../INSTALL.md#2-cli-standalone) in INSTALL.md. If you want the whole agent **shared with a team**, read the [company brain tutorial](company-brain.md) instead. This tutorial is the solo, full-stack, talk-to-it-on-Telegram path.
+If you only want the **brain layer** (no agent, no Telegram, just gbrain as memory for an MCP client you already use), skip to the [CLI standalone install](../INSTALL.md#2-cli-standalone) in INSTALL.md. If your daily driver is a **coding agent** (Claude Code / Codex) and you want it to bootstrap its own full agent — identity, per-turn context, schedules, a private repo as its durable body — that's `gbrain bootstrap`: see the paste blocks in the README and [docs/guides/bootstrap.md](../guides/bootstrap.md). If you want the whole agent **shared with a team**, read the [company brain tutorial](company-brain.md) instead. This tutorial is the solo, full-stack, talk-to-it-on-Telegram path.
 
 ---
 
@@ -17,7 +19,7 @@ A personal AI agent with four pieces:
 - **A brain** (git repo). Your knowledge base, constantly ingesting and growing.
 - **A harness** (OpenClaw via AlphaClaw). The runtime that gives the LLM tools, memory, and integrations.
 - **A chat interface** (Telegram). How you talk to it.
-- **Skills** (60+ installed via GBrain). Reusable capabilities the agent can invoke.
+- **Skills** (50+ installed via GBrain). Reusable capabilities the agent can invoke.
 
 Architecture:
 
@@ -95,6 +97,8 @@ AlphaClaw is the setup harness that manages OpenClaw deployment.
 
 Render will build a Docker container with the harness. First deploy takes about 5 minutes.
 
+**Known issue (October 2026).** On a fresh deploy with AlphaClaw 0.9.37 and OpenClaw 2026.10.x, onboarding can loop on `AUTH_PROFILE_MIGRATION_REQUIRED` and the gateway never starts. The fix is on OpenClaw's main branch ([openclaw/openclaw#187903](https://github.com/openclaw/openclaw/issues/187903)) and ships in its next release; until then, follow that issue.
+
 **Memory matters.** If the instance runs out of memory during install, upgrade to Render Pro. The base tier is too small for GBrain + OpenClaw together. My production instance runs 48 cores and 64GB RAM (about $1,500 a month) but that's overkill for a new setup. Pro tier ($85 a month) is the minimum viable.
 
 ---
@@ -106,8 +110,7 @@ In the AlphaClaw UI (Providers tab):
 - **OpenAI API Key.** Required for embeddings if you use the OpenAI provider.
 - **Anthropic API Key.** Required for Claude (the main model the agent talks through).
 - **Perplexity API Key.** Optional, for web search.
-- **Voyage API Key.** Optional, alternative to OpenAI for embeddings.
-- **ZeroEntropy API Key.** Recommended. GBrain ships with ZeroEntropy as the default embedder + reranker because it's about 2× faster than OpenAI and about 2.6× cheaper.
+- **Voyage API Key.** Recommended. GBrain ships with Voyage as the default embedder + reranker (`voyage-4` + `rerank-3-lite`) — one key covers both, at about half OpenAI's embedding price.
 
 You can use the same keys across multiple agents.
 
@@ -115,21 +118,21 @@ You can use the same keys across multiple agents.
 
 ## Step 6: Install GBrain
 
-Once OpenClaw is running:
+Once OpenClaw is running, installation is two commands — one in the brain repo, one in the agent workspace:
 
 ```bash
-gbrain install
+# In the BRAIN repo (the git repo that holds your markdown pages):
+gbrain init --supabase
+
+# In the AGENT WORKSPACE repo (where OpenClaw runs):
+gbrain skillpack scaffold --harness openclaw --workspace .
 ```
 
-This installs:
+`gbrain init --supabase` walks a short wizard that asks for your Supabase connection string and creates the schema. You'll get that connection string in Step 7 — read 7a and 7b first so you paste the right one (the transaction pooler, not the direct connection). If you'd rather try things locally before paying for a database, `gbrain init --pglite` gives you a zero-config embedded engine instead; you can move it to Supabase later with `gbrain migrate --to postgres` ([guide](../guides/move-to-postgres.md)).
 
-- About 60 skills
-- About 9 skill packs
-- Default brain structure
-- MCP server configuration
-- Supabase connection (for embeddings and search)
+`gbrain skillpack scaffold --harness openclaw` copies the five brain-first skills (`query`, `brain-ops`, `capture`, `data-loss-gate`, `resolve-before-asking`) into your agent workspace as first-class files you can edit freely. OpenClaw lists every workspace skill in every prompt, so add the others by name as the agent needs them (`--skill meeting-ingestion`), or all 50+ with `--all`.
 
-GBrain populates the brain repo with its default directory structure, skill files, and configuration. From this point, the agent has working memory and access to every skill.
+From this point, the agent has working memory and the core skills.
 
 ---
 
@@ -156,14 +159,20 @@ In the Supabase dashboard, click **Connect** in the top navigation bar, then **C
 You want the **Transaction pooler** string. Format looks like:
 
 ```
-postgresql://postgres.YOUR-PROJECT:YOUR-PASSWORD@aws-0-us-west-1.pooler.supabase.com:6543/postgres
+postgresql://postgres.YOUR-PROJECT:YOUR-PASSWORD@aws-0-us-west-1.pooler.supabase.com:6543/postgres?sslmode=require
 ```
+
+Keep the `?sslmode=require` on the end. It makes the connection encrypted, which gbrain requires for any database that isn't on your own machine (it adds it for you if you leave it off). It does not check the server's certificate, though. To check it too, download Supabase's CA certificate (**Project Settings → Database → SSL Configuration**), set `NODE_EXTRA_CA_CERTS` to its path in `~/.gbrain/env`, and use `?sslmode=verify-full` instead ([details](../ENGINES.md#tls-for-postgres-connections)).
 
 Configure it via:
 
 ```bash
-gbrain config set database_url "postgresql://postgres.YOUR-PROJECT:YOUR-PASSWORD@aws-0-us-west-1.pooler.supabase.com:6543/postgres"
+gbrain config set database_url "postgresql://postgres.YOUR-PROJECT:YOUR-PASSWORD@aws-0-us-west-1.pooler.supabase.com:6543/postgres?sslmode=require"
 ```
+
+This writes `~/.gbrain/config.json` (file-plane routed) and infers
+`engine: postgres` — it works even when the database is unreachable, so you can
+also use it later to point an existing brain at a new URL.
 
 ### 7c. Fix the IPv4 gotcha for migrations, DDL, and worker locks
 
@@ -174,7 +183,7 @@ Two ways to fix it. The free one first:
 **Free: point GBrain's direct connection at the Session pooler.** The session pooler is the same Supavisor host on port 5432, and it's IPv4. Copy the **Session pooler** string from the same **Connect → Connection String** panel and set it as the direct-connection override:
 
 ```bash
-export GBRAIN_DIRECT_DATABASE_URL="postgresql://postgres.YOUR-PROJECT:YOUR-PASSWORD@aws-0-us-west-1.pooler.supabase.com:5432/postgres"
+export GBRAIN_DIRECT_DATABASE_URL="postgresql://postgres.YOUR-PROJECT:YOUR-PASSWORD@aws-0-us-west-1.pooler.supabase.com:5432/postgres?sslmode=require"
 ```
 
 Now both pools — reads on the transaction pooler (6543), DDL and locks on the session pooler (5432) — run over IPv4 at zero extra cost.
@@ -236,7 +245,7 @@ Brains share through git. My main agent can populate another agent's brain by pu
 |-----------|-------------|
 | Render Pro (minimum viable) | about $85 |
 | Supabase (small) | free to $25 |
-| OpenAI API (embeddings) | $5 to $20 (much less if you use ZeroEntropy as the default) |
+| OpenAI API (embeddings) | $5 to $20 (about half that on the default Voyage stack) |
 | Anthropic API (Claude) | $50 to $500 (usage dependent) |
 | **Total minimum** | **about $100 to $150 a month** |
 
@@ -252,7 +261,7 @@ My production setup is about $10,000 a month, but that's 10 instances, 200 crons
 2. **GitHub PAT can't see the repos.** Reload the page after creating repos. Make sure the fine-grained token has the correct repo selection.
 3. **Telegram bot doesn't respond.** Check the bot token in AlphaClaw. Make sure the Render instance is actually running.
 4. **Supabase bottleneck on heavy ingestion.** Upgrade the DB instance size before the small one chokes.
-5. **GBrain.io provisioning fails.** The hosted instance may need Pro tier. Check the machine allocation in the AlphaClaw UI.
+5. **Hosted-instance provisioning fails.** If you're using a hosted brain instance instead of self-hosting, it may need the Pro tier. Check the machine allocation in the AlphaClaw UI.
 
 ---
 

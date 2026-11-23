@@ -69,6 +69,7 @@ describe('assessContentSanity — size boundaries', () => {
       compiled_truth: 'a'.repeat(600_000),
       timeline: '',
       title: '',
+      bytes_block: 500_000,
     });
     expect(r.oversize).toBe(true);
     expect(r.reasons).toContain('oversize_block');
@@ -77,15 +78,29 @@ describe('assessContentSanity — size boundaries', () => {
     expect(r.shouldHardBlock).toBe(false);
   });
 
-  test('the original 890K reproduction trips block alone (no junk)', () => {
+  test('the original 890K reproduction trips block alone (no junk) under a 500 KB bytes_block', () => {
     // 890K of clean text (no Cloudflare phrases) → soft-block only.
     const r = assessContentSanity({
       compiled_truth: 'normal prose. '.repeat(70_000), // ~890K bytes
       timeline: '',
       title: 'A Long Article',
+      bytes_block: 500_000,
     });
     expect(r.shouldSkipEmbed).toBe(true);
     expect(r.shouldHardBlock).toBe(false);
+  });
+
+  test('large pages: the default bytes_block is the 24 MiB page ceiling, so 890K of clean prose is chunked and embedded', () => {
+    const r = assessContentSanity({
+      compiled_truth: 'normal prose. '.repeat(70_000),
+      timeline: '',
+      title: 'A Long Article',
+    });
+    expect(r.oversize).toBe(false);
+    expect(r.reasons).toContain('oversize_warn');
+    expect(r.shouldSkipEmbed).toBe(false);
+    expect(r.shouldHardBlock).toBe(false);
+    expect(r.shouldQuarantine).toBe(false);
   });
 
   test('custom thresholds override defaults', () => {
@@ -101,7 +116,7 @@ describe('assessContentSanity — size boundaries', () => {
 
   test('defaults are exported and reasonable', () => {
     expect(DEFAULT_BYTES_WARN).toBe(50_000);
-    expect(DEFAULT_BYTES_BLOCK).toBe(500_000);
+    expect(DEFAULT_BYTES_BLOCK).toBe(24 * 1024 * 1024);
   });
 });
 
@@ -358,6 +373,7 @@ describe('assessContentSanity — reason ordering', () => {
       compiled_truth: 'a'.repeat(600_000),
       timeline: '',
       title: '',
+      bytes_block: 500_000,
     });
     const joined = r.reason_messages.join(' ');
     expect(joined).toContain('PAGE_OVERSIZED:');
@@ -372,6 +388,7 @@ describe('assessContentSanity — reason ordering', () => {
       compiled_truth: 'Cloudflare Ray ID: abc\n' + 'a'.repeat(600_000),
       timeline: '',
       title: '',
+      bytes_block: 500_000,
     });
     expect(r.reasons).toContain('oversize_block');
     expect(r.reasons).toContain('junk_pattern');
@@ -619,7 +636,7 @@ describe('assessContentSanity — confidence split (Q1=A)', () => {
   });
 
   test('oversize → shouldSkipEmbed + shouldFlag(oversized), pure-prose 890K stays NOT-quarantined', () => {
-    const r = assessContentSanity({ compiled_truth: 'normal prose. '.repeat(70_000), timeline: '', title: 'book' });
+    const r = assessContentSanity({ compiled_truth: 'normal prose. '.repeat(70_000), timeline: '', title: 'book', bytes_block: 500_000 });
     expect(r.oversize).toBe(true);
     expect(r.shouldSkipEmbed).toBe(true);
     expect(r.shouldFlag).toBe(true);
@@ -634,6 +651,7 @@ describe('assessContentSanity — confidence split (Q1=A)', () => {
       compiled_truth: 'Cloudflare Ray ID: x\n' + 'a'.repeat(600_000),
       timeline: '',
       title: 't',
+      bytes_block: 500_000,
     });
     expect(r.shouldQuarantine).toBe(true);
     expect(r.shouldSkipEmbed).toBe(false);
@@ -663,5 +681,69 @@ describe('issue #1939 — non-string title defensive coercion', () => {
     const r = assessContentSanity({ ...base, title: undefined as unknown as string });
     expect(r).toBeDefined();
     expect(typeof r.shouldQuarantine).toBe('boolean');
+  });
+});
+
+// ─── DISABLED PATTERNS (#4702) ────────────────────────────────
+
+describe('assessContentSanity — content_sanity.disabled_patterns', () => {
+  // The built-in patterns target scraped web content. A brain built from
+  // mail, chat or transcripts holds none of that, but does hold people
+  // writing ABOUT the things the patterns name — and `access_denied` is a
+  // line-anchored body match, so a page whose body has a line starting
+  // "Access Denied …" is hidden from search even when the page is a
+  // discussion of that error rather than an instance of it. Before this
+  // option the escapes were `junk_patterns_enabled: false` (all patterns)
+  // or `content_sanity.disabled` (which also turns off the size gates).
+  const page = {
+    compiled_truth: 'Could we get access to the staging environment?\nAccess Denied when I open the staging dashboard.\n',
+    timeline: '',
+    title: 'Re: staging access',
+  };
+
+  test('the pattern trips by default', () => {
+    const r = assessContentSanity(page);
+    expect(r.junk_pattern_matches).toContain('access_denied');
+    expect(r.shouldQuarantine).toBe(true);
+  });
+
+  test('naming it in disabled_patterns lets the page through', () => {
+    const r = assessContentSanity({ ...page, disabled_patterns: ['access_denied'] });
+    expect(r.junk_pattern_matches).not.toContain('access_denied');
+    expect(r.shouldQuarantine).toBe(false);
+  });
+
+  test('disabling one pattern leaves the others live', () => {
+    const captcha = {
+      compiled_truth: 'Please complete the security check to continue.',
+      timeline: '',
+      title: 'Verify you are human',
+    };
+    const r = assessContentSanity({ ...captcha, disabled_patterns: ['access_denied'] });
+    expect(r.junk_pattern_matches.length).toBeGreaterThan(0);
+  });
+
+  test('the size gates are untouched — this is not the kill-switch', () => {
+    const r = assessContentSanity({
+      compiled_truth: 'x'.repeat(DEFAULT_BYTES_BLOCK + 1),
+      timeline: '',
+      title: 'big',
+      disabled_patterns: ['access_denied'],
+    });
+    expect(r.oversize).toBe(true);
+    expect(r.shouldSkipEmbed).toBe(true);
+  });
+
+  test('an unknown name is ignored, not rejected', () => {
+    // The built-in set changes between releases; a config naming a pattern
+    // that has since been retired must not fail an import.
+    const r = assessContentSanity({ ...page, disabled_patterns: ['no_such_pattern'] });
+    expect(r.junk_pattern_matches).toContain('access_denied');
+  });
+
+  test('every built-in name can be disabled', () => {
+    const all = BUILT_IN_JUNK_PATTERNS.map((p) => p.name);
+    const r = assessContentSanity({ ...page, disabled_patterns: all });
+    expect(r.junk_pattern_matches).toEqual([]);
   });
 });

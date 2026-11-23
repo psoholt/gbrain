@@ -25,8 +25,9 @@
  * profiles per source for the same holder.
  */
 
-import { BaseCyclePhase, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
-import { chat as gatewayChat } from '../ai/gateway.ts';
+import { BaseCyclePhase, effectivePhaseDeadlineMs, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
+import { resolveOwnerHolder } from '../owner-holder.ts';
+import { chat as gatewayChat, getChatModel } from '../ai/gateway.ts';
 import { gateVoice, type VoiceGateGenerator, type VoiceGateJudge } from '../calibration/voice-gate.ts';
 import { patternStatementTemplate, type PatternStatementSlots } from '../calibration/templates.ts';
 // v0.41 T10 — domain widening. The aggregator module resolves the active
@@ -89,13 +90,15 @@ export type PatternStatementsGenerator = (input: {
   holder: string;
   attempt: number;
   feedback?: string;
+  /** Provider-prefixed model the phase resolved; drives the generator's chat call. */
+  modelHint?: string;
 }) => Promise<string[]>;
 
 /** Generator function for bias tags (test seam). */
 export type BiasTagsGenerator = (patterns: string[]) => Promise<string[]>;
 
 export interface CalibrationProfileOpts extends BasePhaseOpts {
-  /** Holder to generate the profile for. Default 'garry'. */
+  /** Holder to generate the profile for. Default resolves via resolveOwnerHolder (config emotional_weight.user_holder, else 'self'). */
   holder?: string;
   /** Inject the patterns generator (tests). */
   patternsGenerator?: PatternStatementsGenerator;
@@ -226,9 +229,19 @@ class CalibrationProfilePhase extends BaseCyclePhase {
     _ctx: OperationContext,
     opts: CalibrationProfileOpts,
   ): Promise<{ summary: string; details: Record<string, unknown>; status?: PhaseStatus }> {
-    const holder = opts.holder ?? 'garry';
+    const holder = resolveOwnerHolder({
+      override: opts.holder,
+      configValue: await engine.getConfig('emotional_weight.user_holder'),
+    });
     const promptVersion = opts.promptVersion ?? CALIBRATION_PROFILE_PROMPT_VERSION;
-    const modelId = opts.model ?? 'claude-sonnet-4-6';
+    // Follow the gateway's configured chat model, matching propose_takes
+    // (v0.42.62) and grade_takes: previously the generator stayed pinned to
+    // the TIER_DEFAULTS.reasoning constant, ignoring a configured
+    // chat_model. getChatModel() is provider-prefixed, preserving the #2451
+    // contract (a bare id fed back into gateway.chat() throws), and its
+    // default IS 'anthropic:claude-sonnet-4-6' — identical to the old
+    // constant — so stock installs are unchanged.
+    const modelId = opts.model ?? getChatModel();
     const gradeCompletion = opts.gradeCompletion ?? 1.0;
     const patternsGenerator = opts.patternsGenerator ?? defaultPatternsGenerator;
     const biasTagsGenerator = opts.biasTagsGenerator ?? defaultBiasTagsGenerator;
@@ -244,6 +257,24 @@ class CalibrationProfilePhase extends BaseCyclePhase {
       warnings: [],
     };
 
+    // gbrain#4168: this phase runs last in the calibration trio and makes
+    // 1-2 LLM calls with no interior loop to break out of — so the deadline
+    // check is a pre-flight gate: if the job budget is already inside the
+    // reserve, skip cleanly (the next cycle regenerates from fresher data
+    // anyway) instead of starting an LLM call the worker will kill mid-write.
+    const remainingMs = effectivePhaseDeadlineMs(
+      Number.MAX_SAFE_INTEGER,
+      opts.deadlineAtMs,
+      Date.now(),
+    );
+    if (remainingMs <= 0) {
+      return {
+        summary: 'calibration_profile: skipped — job deadline inside the reserve window',
+        details: { ...result, deadline_hit: true },
+        status: 'warn',
+      };
+    }
+
     // Load the holder's scorecard.
     const scorecard = await engine.getScorecard({ holder }, undefined);
     result.total_resolved = scorecard.resolved;
@@ -258,12 +289,35 @@ class CalibrationProfilePhase extends BaseCyclePhase {
       };
     }
 
+    // The profile is a function of the scorecard and the model: when neither
+    // changed since the latest stored profile, there is nothing to buy (a new
+    // prompt takes effect at the next scorecard change). REAL columns are
+    // compared against the scorecard rounded the same way.
+    const sourceId = scope.sourceId ?? 'default';
+    const [latest] = await engine.executeRaw<{ unchanged: boolean }>(
+      `SELECT COALESCE(total_resolved = $3 AND brier IS NOT DISTINCT FROM $4::real AND accuracy IS NOT DISTINCT FROM $5::real
+                AND partial_rate IS NOT DISTINCT FROM $6::real AND model_id = $7, false) AS unchanged
+         FROM calibration_profiles WHERE source_id = $1 AND holder = $2
+        ORDER BY generated_at DESC, id DESC LIMIT 1`,
+      [sourceId, holder, scorecard.resolved, scorecard.brier, scorecard.accuracy, scorecard.partial_rate, modelId],
+    );
+    if (latest?.unchanged) {
+      return {
+        summary: `calibration_profile: holder=${holder} unchanged since the latest profile (${scorecard.resolved} resolved, same scorecard and model); no model call`,
+        details: { ...result, skipped: 'unchanged_scorecard' },
+        status: 'ok',
+      };
+    }
+
     // Generate pattern statements via the voice gate.
     const generate: VoiceGateGenerator = async ({ attempt, feedback }) => {
       const lines = await patternsGenerator({
         scorecard,
         holder,
         attempt,
+        // The same resolved string that is persisted to model_id drives the
+        // generator's chat call — the phase can't record a model it didn't run.
+        modelHint: modelId,
         ...(feedback !== undefined ? { feedback } : {}),
       });
       return lines.join('\n');
@@ -313,8 +367,6 @@ class CalibrationProfilePhase extends BaseCyclePhase {
     }
 
     // Write the profile row.
-    const sourceId = scope.sourceId ?? 'default';
-
     // v0.41 T10 — domain_scorecards widening (replaces v0.36.1.0 `{}`
     // placeholder). Resolve the active pack's calibration_domains
     // declarations and run each one's aggregator. Per-domain fail-soft:

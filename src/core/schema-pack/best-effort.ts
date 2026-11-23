@@ -22,16 +22,19 @@
 // pack-load problem) — not silent (results look normal but contradict
 // user intent).
 
-import { loadConfig } from '../config.ts';
+import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../operations.ts';
-import { loadActivePack } from './load-active.ts';
+import { loadActivePackForEngine } from './engine-resolution.ts';
+import { rethrowCapabilityMissing } from '../rust-engine/errors.ts';
+export { readDbSchemaPack } from './engine-resolution.ts';
 import type { ResolvedPack } from './registry.ts';
 
 /**
  * Best-effort loader for the active schema pack. Returns null on any
  * failure path so callers can apply empty-filter semantics.
  *
- * NEVER throws. Never logs to stderr (callers don't need the noise on
+ * Never throws, except a capability refusal when the caller passes
+ * `rethrowRefusal`. Never logs to stderr (callers don't need the noise on
  * routine queries; the underlying pack-load errors surface through
  * `gbrain doctor`'s schema_pack_coverage / schema_pack_writability
  * checks).
@@ -46,14 +49,55 @@ import type { ResolvedPack } from './registry.ts';
  */
 export async function loadActivePackBestEffort(
   ctx: OperationContext,
+  opts: { rethrowRefusal?: boolean } = {},
 ): Promise<ResolvedPack | null> {
   try {
-    return await loadActivePack({
-      cfg: loadConfig(),
+    return await loadActivePackForEngine(ctx.engine, {
       remote: ctx.remote ?? true,
       sourceId: ctx.sourceId,
     });
+  } catch (e) {
+    // `rethrowRefusal`: a capability refusal (an engine that cannot read config) throws instead of reading as no pack.
+    if (opts.rethrowRefusal) rethrowCapabilityMissing(e);
+    return null;
+  }
+}
+
+/**
+ * Resolve the active pack for a LOCAL, engine-backed surface.
+ *
+ * Same null contract as `loadActivePackBestEffort` (D4): null means the pack
+ * could not be resolved and is NOT a license to fall back to hardcoded
+ * defaults. Callers acting on a *capability* question must additionally
+ * surface null DISTINCTLY from "resolved, but lacks the capability" —
+ * collapsing the two converts a loud failure into a silent one.
+ */
+export async function loadActivePackForLocalEngine(
+  engine: Pick<BrainEngine, 'getConfig'>,
+  options: { sourceId?: string } = {},
+): Promise<ResolvedPack | null> {
+  try {
+    return await loadActivePackForEngine(engine, { remote: false, ...options });
   } catch {
     return null;
   }
+}
+
+/**
+ * Does the active pack declare at least one `link_types[].inference.regex`
+ * rule? This is the EXACT capability `extractNerLinks` requires — without it,
+ * NER extraction is a structural no-op (returns `pack_unavailable`, 0 links).
+ *
+ * Shared so the onboard recommender (`checks.ts`, which suggests `extract-ner`)
+ * and the handler (`extract-ner.ts`) gate on ONE definition. Recommending a
+ * fix the handler will silently skip is the phantom-recommendation bug this
+ * closes; co-locating the predicate with the loader keeps the two from drifting
+ * (same anti-drift rationale as `loadActivePackBestEffort` above).
+ */
+export function packSupportsNerInference(pack: ResolvedPack | null | undefined): boolean {
+  const linkTypes = pack?.manifest?.link_types;
+  if (!linkTypes || linkTypes.length === 0) return false;
+  return linkTypes.some(
+    (lt) => lt.inference && typeof lt.inference === 'object' && 'regex' in lt.inference,
+  );
 }

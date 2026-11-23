@@ -1,0 +1,297 @@
+/**
+ * GST-359 C2 (GBRA-218): member facts. A fact a member saves remotely (an attested actor, or a credential bound to a
+ * member reading as itself) lives on that member's own page, `memory/members/<member>`, whose frontmatter names the
+ * member as its only reader. The fact row is `visibility: private`, so every fact read that admits only world facts
+ * hides it from everyone, and the page's readers (git-backed where a repo exists, the database row on a repo-less
+ * brain) decide the one caller allowed to read it back: `memberFactAdmitSql` admits a private fact only when it sits
+ * on the caller's own member page and that page's readers admit the caller. A fence rebuild re-derives the row from
+ * the page it lives on, so it keeps both.
+ *
+ * Caches and per-session state that a caller's identity changes are keyed by `callerIdentityKey()`, so two people
+ * behind one attest credential and one session id never share an entry.
+ */
+import { createHash } from 'node:crypto';
+import type { OperationContext } from '../ops/contract.ts';
+import { currentCallerAccess, folderRestrictedSql, isDerivationPrivate, privateFactSources, privatePagesFilterForCaller, withFolderRestricted } from '../search/private-visibility.ts';
+import { factPagesOpenSql, unpagedFactSql } from '../facts/private-fact-pages.ts';
+import { ownedMemorySubjectSql, unbackedEntitySql } from '../facts/withdrawal-schema.ts';
+import type { BrainEngine } from '../engine.ts';
+import { ACCESS_ID_RE, MEMBER_PAGE_PREFIX, normalizeReaders, SCOPE_PAGE_SLUG } from './principals.ts';
+import { opError, type OperationError } from '../ops/contract.ts';
+import { slugifyPath } from '../sync.ts';
+
+export { MEMBER_PAGE_PREFIX, SCOPE_PAGE_SLUG };
+
+/** GST-1113: the scope page or anything under its reserved prefix. */
+export const isScopePageSlug = (slug: string): boolean => slug === SCOPE_PAGE_SLUG || slug.startsWith(`${SCOPE_PAGE_SLUG}/`);
+
+export const memberPageSlug = (member: string): string => `${MEMBER_PAGE_PREFIX}${member}`;
+
+/** The member the current caller reads as: the attested actor's, else a lone member identity (never an audience of several). */
+export function callerMember(): string | null {
+  const access = currentCallerAccess();
+  if (access.actor) return access.actor.member;
+  if (access.audienceIdentities.length) return null;
+  const member = access.identity.find(p => p.startsWith('member:'))?.slice('member:'.length) ?? null;
+  return member && ACCESS_ID_RE.test(member) ? member : null;
+}
+
+/** GST-2897 B: the member a people page names: `people/<member>` or a page under it. */
+export function peoplePageMember(slug: string | null | undefined): string | null {
+  const id = /^people\/([^/]+)/.exec(slug ?? '')?.[1];
+  return id && ACCESS_ID_RE.test(id) ? id : null;
+}
+
+/** GST-2897 B: the enabled member other than the caller whose people page `entitySlug` is, else null. */
+export async function otherMemberSubject(engine: Pick<BrainEngine, 'executeRaw'>, entitySlug: string | null): Promise<string | null> {
+  const id = peoplePageMember(entitySlug);
+  if (!id || id === callerMember()) return null;
+  const rows = await engine.executeRaw('SELECT 1 FROM access_members WHERE id = $1 AND disabled_at IS NULL AND tombstoned_at IS NULL', [id]);
+  return rows.length ? id : null;
+}
+
+/**
+ * The member page a remote memory write goes to, or null when the caller writes as no single member (local or
+ * unbound). A member id whose page slug a repo brain would rename on sync (`a--b`, `zed-`) is refused: its facts
+ * would land on another path.
+ */
+export function memberFactPage(ctx: Pick<OperationContext, 'remote'>): string | null {
+  if (ctx.remote === false) return null;
+  const member = callerMember();
+  if (!member) return null;
+  const slug = memberPageSlug(member);
+  if (slugifyPath(slug) !== slug) {
+    throw opError('invalid_params', `Member id ${member} cannot hold member facts: its page ${slug} would be stored as ${slugifyPath(slug)}.`,
+      'Nothing was saved. The brain host gives this person a member id without repeated, leading or trailing separators (gbrain access member add) and links it instead.');
+  }
+  return slug;
+}
+
+/**
+ * GST-2346 D1: whether the caller is the brain owner's own credential speaking for itself: CallerAccess.owner with no
+ * attested actor and no asserted audience, outside a subagent and every slug-prefix fence. Its facts then save as a
+ * caller with no member page saves them, on the subject's page, and its forget reaches a fact off its member page the
+ * same way; a fact it asks to keep private, or one the page or the brain's default keeps private, stays on its member
+ * page. Every other member caller keeps its member page (GST-359 C2).
+ */
+export function ownerSpeaksForItself(ctx: Pick<OperationContext, 'remote' | 'viaSubagent' | 'allowedSlugPrefixes' | 'auth'>): boolean {
+  const access = currentCallerAccess();
+  return ctx.remote !== false && access.owner && !access.actor && access.audience === null && ctx.viaSubagent !== true
+    && !ctx.allowedSlugPrefixes?.length && !ctx.auth?.boundSlugPrefixes && !ctx.auth?.fenceProjectionDegraded;
+}
+
+/**
+ * GST-2249 W1: a save made for an attested person (x-qm-actor) stays on that person's member page. Sharing it would be
+ * a write every reader of the source sees, made with no owner approval, so remember refuses share: true (and an explicit
+ * visibility "world") at the call, and a stored write that carries it is refused when it is prepared.
+ */
+export function attestedShareRefused(make: (code: 'invalid_params', message: string, suggestion: string) => OperationError): OperationError {
+  return Object.assign(make('invalid_params',
+    'remember: a fact saved for a person (x-qm-actor) stays on that person\'s own member page and is never shared with every reader of the source; nothing was saved.',
+    'Retry with no share and no visibility to keep the fact on the person\'s own member page. Knowledge for the whole team waits for the brain owner: propose it as a dated timeline entry or a link with memory_propose, which holds it until the owner approves.'),
+  { reason: 'attested_share_refused' });
+}
+
+/** Whether a member page is that member's own: its readers are exactly the member (a squatted or widened page is not). */
+export function memberPageIsOwn(slug: string, frontmatter: unknown): boolean {
+  const readers = normalizeReaders(frontmatter);
+  return readers?.length === 1 && readers[0] === `member:${slug.slice(MEMBER_PAGE_PREFIX.length)}`;
+}
+
+/** The refusal for a member fact whose member page names any readers but that member alone. */
+export function memberPageNotOwned(slug: string): OperationError {
+  return opError('permission_denied', `${slug} does not name its member alone as its reader, so no member fact is saved there.`,
+    `Nothing was saved. The brain host restores readable_by: [member:${slug.slice(MEMBER_PAGE_PREFIX.length)}] on ${slug}, then the fact can be saved again.`);
+}
+
+/** A remote write under memory/members/ goes only to the caller's own member page; trusted local callers are unaffected. */
+export function assertMemberPageWriter(ctx: Pick<OperationContext, 'remote'>, slug: string, opName: string): void {
+  if (ctx.remote === false || !slug.startsWith(MEMBER_PAGE_PREFIX)) return;
+  const member = callerMember();
+  if (member && slug === memberPageSlug(member)) return;
+  throw opError('permission_denied', `${opName}: ${slug} is written remotely only by its own member.`,
+    `Nothing was written. Pages under ${MEMBER_PAGE_PREFIX} hold one member's own facts; write elsewhere, or save a fact with remember as that member.`);
+}
+
+/**
+ * GST-1113: a remote write to the scope page (memory/scope, or under it) is only an attested memory_write that named its
+ * scope source (access/attest-sources.ts); trusted local callers are unaffected. A receipt read (write_request) is not a
+ * write: ownRequestAccessible has already kept it to the member who wrote it.
+ */
+export function assertScopePageWriter(ctx: Pick<OperationContext, 'remote' | 'attestedOp' | 'attestedSource'>, slug: string, opName: string): void {
+  if (ctx.remote === false || !isScopePageSlug(slug) || opName === 'write_request') return;
+  if (slug === SCOPE_PAGE_SLUG && ctx.attestedOp === 'memory_write' && ctx.attestedSource !== undefined && currentCallerAccess().actor) return;
+  throw opError('permission_denied', `${opName}: ${slug} is written remotely only by an attested memory_write to its scope source.`,
+    `Nothing was written. ${SCOPE_PAGE_SLUG} holds a shared scope's memory; write elsewhere.`);
+}
+
+/** Whether a scope page is shared with its whole source: no readers, no privacy and no folder rule narrow it (a squatted page is not). */
+export async function scopePageIsShared(engine: Pick<BrainEngine, 'executeRaw' | 'isFolderRestricted'>, page: { source_id: string; slug: string; type?: string | null; frontmatter?: unknown }): Promise<boolean> {
+  return normalizeReaders(page.frontmatter) === null && !isDerivationPrivate(await withFolderRestricted(engine, page));
+}
+
+export function scopePageNotShared(sourceId: string): OperationError {
+  return opError('permission_denied', `${SCOPE_PAGE_SLUG} in source ${sourceId} names readers, is private or sits under a folder rule, so no scope fact is saved there.`,
+    `Nothing was saved. The brain host removes readable_by and visibility: private from ${SCOPE_PAGE_SLUG} in ${sourceId}, or the folder rule covering it (the scope source's read grant is its audience), then the fact can be saved again.`,
+    { reason: 'scope_page_not_shared' });
+}
+
+/** The frontmatter of the scope page its first fact creates: no readers, so the source's read grant is its audience. */
+export function scopePageFrontmatter(): string {
+  return ['---', 'type: note', 'title: Scope memory', '---', ''].join('\n');
+}
+
+/** The frontmatter of a member page its first fact creates: the member is its only reader. */
+export function memberPageFrontmatter(member: string): string {
+  return ['---', 'type: note', `title: Memory of ${member}`, 'readable_by:', `  - member:${member}`, '---', ''].join('\n');
+}
+
+/**
+ * The private facts the current caller may read: those on its own member page, while the caller may read that live
+ * page itself (its readers, folder rules and privacy, as get_page judges it). FALSE outside a member caller record. `alias` is a code-provided facts alias; the
+ * member id passed ACCESS_ID_RE, whose alphabet has no quote.
+ */
+export function memberFactAdmitSql(alias: string): string {
+  const member = callerMember();
+  if (!member) return 'FALSE';
+  return `(${alias}.visibility = 'private' AND ${alias}.source_markdown_slug = '${memberPageSlug(member)}' AND EXISTS (
+    SELECT 1 FROM pages member_page WHERE member_page.source_id = ${alias}.source_id AND member_page.slug = ${alias}.source_markdown_slug
+      AND member_page.deleted_at IS NULL AND member_page.page_readers && ARRAY['member:${member}']::text[]
+      AND ${privatePagesFilterForCaller('member_page')}))`;
+}
+
+/**
+ * GST-2407: the facts among `ids` in `sourceId` that sit on the current caller's own member page, by memberFactAdmitSql.
+ * forget_fact withdraws a remote member's fact only when it is in this set, and memory_recall reports the same set as
+ * own_page, so the two never disagree. Empty outside a member caller record.
+ */
+export async function ownMemberFactIds(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, ids: readonly number[]): Promise<Set<number>> {
+  if (!ids.length || !callerMember()) return new Set();
+  const rows = await engine.executeRaw<{ id: number | string }>(`SELECT id FROM facts WHERE id = ANY($1::bigint[]) AND source_id = $2 AND ${memberFactAdmitSql('facts')}`, [[...ids], sourceId]);
+  return new Set(rows.map(r => Number(r.id)));
+}
+
+/**
+ * GBRA-575: the private facts the current caller's private-facts grant admits: a fact stamped private in a source the
+ * grant lists by id (privateFactSources) whose holding, provenance and entity pages are none of member,
+ * derivation-private (private, privacy alias, readable_by, folder rule), missing or quarantined (factPagesOpenSql, the
+ * same pages `gbrain repair open-facts` refuses to open), and that has a page to check: never an unpaged or
+ * transcript-lane fact (unpagedFactSql), conversation archive included. FALSE outside such a grant. Source ids passed
+ * isValidSourceId, so they embed as literals. GST-2979: a held row (a restatement with a visibility proposal) is admitted
+ * only when the grant also reads every copy its proposals name, and a copy that is itself a held row counts only when the
+ * grant reads it by this same rule (the hold chain, followed to its end), so no fact read hands a grant text the page
+ * overlay holds from it (fence-overlay.ts heldRowSql uses this same predicate).
+ */
+export function grantedPrivateFactSql(alias: string): string {
+  const sources = privateFactSources();
+  if (!sources.length) return 'FALSE';
+  const opens = (a: string) => `(${a}.visibility = 'private' AND ${a}.source_id IN (${sources.map(s => `'${s}'`).join(', ')}) AND NOT COALESCE(${unpagedFactSql(a)}, false) AND ${factPagesOpenSql(a)})`;
+  const holds = (p: string) => `${p}.related_table = 'facts' AND ${p}.action IN ('supersede_fact', 'confirm') AND ${p}.before_state->'visibility' IS NOT NULL`;
+  return `(${opens(alias)} AND ${alias}.id NOT IN (WITH RECURSIVE held_refused(id) AS (
+      SELECT held_prop.related_id FROM trust_proposals held_prop
+        LEFT JOIN facts held_copy ON held_prop.target_table = 'facts' AND held_copy.id = held_prop.target_id
+        WHERE ${holds('held_prop')} AND (held_copy.id IS NULL OR NOT (${memberFactAdmitSql('held_copy')} OR ${opens('held_copy')}))
+      UNION
+      SELECT held_next.related_id FROM held_refused
+        JOIN trust_proposals held_next ON held_next.target_table = 'facts' AND held_next.target_id = held_refused.id
+        JOIN facts held_via ON held_via.id = held_refused.id
+        WHERE ${holds('held_next')} AND NOT ${memberFactAdmitSql('held_via')})
+    SELECT id FROM held_refused WHERE id IS NOT NULL))`;
+}
+
+/** A remote fact read's visibility list as SQL: the listed values, widened only by memberFactAdmitSql and grantedPrivateFactSql. */
+export function factVisibilitySql(alias: string, visibility: readonly string[]): string {
+  const known = (['world', 'private'] as const).filter(v => visibility.includes(v));
+  const listed = known.length ? `${alias}.visibility IN (${known.map(v => `'${v}'`).join(', ')})` : 'FALSE';
+  if (known.includes('private')) return listed;
+  const widened = [memberFactAdmitSql(alias), grantedPrivateFactSql(alias)].filter(sql => sql !== 'FALSE');
+  return widened.length ? `(${[listed, ...widened].join(' OR ')})` : listed;
+}
+
+/**
+ * Facts on any owned memory page (a member page or a scope page), as SQL: writers that dedup, supersede or contest never
+ * cross from one such page to another or to an ordinary page.
+ */
+export function onOwnedMemoryPageSql(alias: string): string {
+  return `(starts_with(COALESCE(${alias}.source_markdown_slug, ''), '${MEMBER_PAGE_PREFIX}') OR COALESCE(${alias}.source_markdown_slug, '') = '${SCOPE_PAGE_SLUG}')`;
+}
+
+/**
+ * GST-359 D: the withdrawal-ledger subject of a fact, as SQL. A fact on an owned memory page (a member page, GST-1113 a
+ * scope page) is withdrawn for that page alone (its slug), so forgetting it never reaches another copy of the same claim;
+ * any other fact keeps its entity ('*' without one, and GBRA-574 '*' for an unbacked entity).
+ */
+export function factWithdrawalSubjectSql(alias: string): string {
+  return `CASE WHEN ${onOwnedMemoryPageSql(alias)} THEN ${alias}.source_markdown_slug WHEN ${unbackedEntitySql(alias)} THEN '*'
+    ELSE COALESCE(${alias}.entity_slug, '*') END`;
+}
+
+/**
+ * Whether withdrawal row `w` covers fact `f`, as SQL: every subject ('*'), the fact's entity, or the owned memory page it
+ * sits on. GST-2346: a fact on a member page is covered by that page's own withdrawals alone, as the insert guards
+ * judge it (facts/withdrawal-schema.ts): a withdrawal of another subject expired it when it was made, or the row is one
+ * its member saved since, checked against the claims that member reads.
+ */
+export function withdrawalCoversFactSql(w: string, f: string): string {
+  return `(CASE WHEN starts_with(COALESCE(${f}.source_markdown_slug, ''), '${MEMBER_PAGE_PREFIX}') THEN ${w}.subject = ${f}.source_markdown_slug
+    ELSE ${withdrawalReachedFactSql(w, f)} END)`;
+}
+
+/** Whether withdrawal row `w` expired fact `f` when it was made (recordFactWithdrawal's reach), as SQL: every subject ('*'), the fact's entity, any subject but an owned memory page for an unbacked entity, or the owned memory page it sits on. */
+export function withdrawalReachedFactSql(w: string, f: string): string {
+  return `(${w}.subject = '*' OR ${w}.subject = COALESCE(${f}.entity_slug, '*') OR (${unbackedEntitySql(f)} AND NOT ${ownedMemorySubjectSql(`${w}.subject`)}) OR (${onOwnedMemoryPageSql(f)} AND ${w}.subject = ${f}.source_markdown_slug))`;
+}
+
+/** The owned memory page a claim is checked on for withdrawals, or null: `slug` when it is one, so a page-scoped withdrawal applies there alone. */
+export function ownedPageWithdrawalSubject(slug: string | null | undefined): string | null {
+  return slug && (slug.startsWith(MEMBER_PAGE_PREFIX) || slug === SCOPE_PAGE_SLUG) ? slug : null;
+}
+
+/**
+ * Facts whose source page names readers or sits under a folder rule, as SQL. Derivations that write their output onto
+ * another page (consolidation into takes, relinking onto an entity page) skip them: the output would lose the readers.
+ */
+export function readersSourcedFactSql(alias: string): string {
+  return `EXISTS (SELECT 1 FROM pages readers_page WHERE readers_page.source_id = ${alias}.source_id AND readers_page.slug = ${alias}.source_markdown_slug
+    AND (readers_page.page_readers IS NOT NULL OR readers_page.frontmatter ? 'readable_by' OR ${folderRestrictedSql('readers_page')}))`;
+}
+
+/**
+ * A short hash of everything about the current caller that changes what a read returns (the attested actor, the
+ * member identity, an audience), or '' outside a member or audience record. Cache and session-state keys append it.
+ */
+export function callerIdentityKey(): string {
+  const access = currentCallerAccess();
+  if (!access.actor && !access.identity.length && !access.audienceIdentities.length && !access.audience) return '';
+  const parts = { actor: access.actor ? [access.actor.system, access.actor.member] : null, identity: access.identity, audience: access.audienceIdentities, entries: access.audience,
+    ...(access.lineage ? { owner_reads: access.owner ? (access.ownerReadsRestricted ? 'restricted' : 'lineage') : 'member_lineage' } : {}),
+    ...(access.audienceKindMembers.length ? { audience_kind: access.audienceKindMembers } : {}),
+    ...(access.labelledOnly ? { labelled_only: true } : {}) };
+  return createHash('sha256').update(JSON.stringify(parts)).digest('hex').slice(0, 16);
+}
+
+/**
+ * A per-session state key (the delta cursor) for the current caller: `base` for a credential reading as itself, so a
+ * change to its member's groups or the upgrade keeps its cursor; otherwise `base` plus the person the call serves (the
+ * attested member, or the asserted audience entries), never the group-derived identity.
+ */
+export function callerSessionKey(base: string | null): string | null {
+  const access = currentCallerAccess();
+  const person = access.actor ? { actor: [access.actor.system, access.actor.member] } : access.audience ? { audience: [...access.audience].sort() } : null;
+  return person ? `${base ?? 'remote'}#id:${createHash('sha256').update(JSON.stringify(person)).digest('hex').slice(0, 16)}` : base;
+}
+
+/**
+ * Whether a stored write's actingFor is the current caller's, compared the way submissionAuthority stores it: the same
+ * attested system and member, else the same audience (distinct entries, any order), else neither.
+ */
+export function sameAttestedActor(stored: unknown): boolean {
+  const { actor, audience } = currentCallerAccess();
+  if (actor) {
+    const row = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored as { system?: unknown; member?: unknown } : null;
+    return !!row && row.system === actor.system && row.member === actor.member;
+  }
+  if (!audience?.length) return stored === undefined || stored === null;
+  const key = (list: readonly unknown[]) => [...new Set(list)].map(String).sort().join(',');
+  return Array.isArray(stored) && key(stored) === key(audience);
+}

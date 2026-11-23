@@ -22,13 +22,12 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { readFileSync } from 'fs';
-import { join } from 'path';
+import { surfaceFileSource } from './helpers/source-surface.ts';
 
-const SRC = readFileSync(
-  join(import.meta.dir, '..', 'src', 'core', 'postgres-engine.ts'),
-  'utf-8',
-);
+const SRC = surfaceFileSource('postgres-engine', 'src/core/postgres-engine.ts');
+// #5824: the vector statement (SQL text, date bounds, timeout constant) is
+// built in search/vector-statement.ts, shared with PGLite and doctor.
+const VECTOR_STATEMENT_SRC = surfaceFileSource('postgres-engine', 'src/core/search/vector-statement.ts');
 
 describe('postgres-engine / search path timeout isolation', () => {
   test('no bare `SET statement_timeout` statement survives', () => {
@@ -48,21 +47,44 @@ describe('postgres-engine / search path timeout isolation', () => {
     expect(bare).toBeNull();
   });
 
-  test('searchKeyword wraps its query in sql.begin()', () => {
+  test('searchKeyword wraps its query in a transaction (via withScopedReadTransaction alwaysTransaction)', () => {
+    // Post-RLS-scope-binding invariant: the search methods route through
+    // withScopedReadTransaction with alwaysTransaction: true, which
+    // guarantees a sql.begin() wrap in BOTH modes — flag off (identical to
+    // master's pre-helper wrap) and flag on (scoped transaction with
+    // set_config). See the helper tests in
+    // test/postgres-engine-rls-scope.test.ts for the behavioral pins.
     const fn = extractMethod(SRC, 'searchKeyword');
-    expect(fn).toMatch(/sql\.begin\s*\(\s*async\s+sql\s*=>/);
+    expect(fn).toMatch(/withScopedReadTransaction\s*\(/);
+    expect(fn).toMatch(/alwaysTransaction:\s*true/);
   });
 
-  test('searchVector wraps its query in sql.begin()', () => {
+  test('searchVector wraps its query in a transaction (via withScopedReadTransaction alwaysTransaction)', () => {
     const fn = extractMethod(SRC, 'searchVector');
-    expect(fn).toMatch(/sql\.begin\s*\(\s*async\s+sql\s*=>/);
+    expect(fn).toMatch(/withScopedReadTransaction\s*\(/);
+    expect(fn).toMatch(/alwaysTransaction:\s*true/);
   });
 
-  test('both search methods use SET LOCAL for the timeout', () => {
-    const keyword = extractMethod(SRC, 'searchKeyword');
-    const vector = extractMethod(SRC, 'searchVector');
-    expect(keyword).toMatch(/SET\s+LOCAL\s+statement_timeout/);
-    expect(vector).toMatch(/SET\s+LOCAL\s+statement_timeout/);
+  test('withScopedReadTransaction uses the composable transaction when needed', () => {
+    // Keep the inspected body bounded; behavioral scope/savepoint coverage
+    // lives in postgres-engine-rls-scope.test.ts.
+    const helper = stripComments(SRC).split('private async withScopedReadTransaction<T>')[1]!.split('async connect(')[0]!;
+    expect(helper).toMatch(/this\.transaction\(async engine =>/);
+    expect(helper).toMatch(/const tx = \(engine as PostgresEngine\)\.sql;/);
+    // One settings statement (scope, JIT off, the caller's settings) runs before the callback; nested reads restore.
+    expect(helper).toMatch(/withSearchSettings\(tx, this\._pageTransaction, settings, \(\) => callback\(tx\), VECTOR_SETTING_DEFAULTS\)/);
+    // Flag off without a transaction requirement preserves pool passthrough.
+    expect(helper).toMatch(
+      /if\s*\(!this\.rlsScopeBindingEnabled\s*&&\s*!opts\?\.alwaysTransaction\)\s*\{\s*return\s+await\s+callback\(this\.sql\);/,
+    );
+  });
+
+  test('both search methods bind a transaction-local timeout through the transaction settings', () => {
+    const keyword = stripComments(extractMethod(SRC, 'searchKeyword'));
+    const attempt = stripComments(SRC).split('private runVectorAttempt(')[1]!.split('async getEmbeddingsByChunkIds(')[0]!;
+    expect(keyword).toMatch(/settings: relaxed \|\| candidates !== pageJoin \? \{ statement_timeout: statementTimeout, enable_seqscan: 'off', \.\.\.KEYWORD_STATEMENT_SETTINGS \} : \{ statement_timeout: statementTimeout, \.\.\.KEYWORD_STATEMENT_SETTINGS \}/);
+    // A thunk: the deadline's remaining budget is read after BEGIN, one round trip before the query.
+    expect(attempt).toMatch(/settings: \(\) => vectorScanSettings\(iterative, innerLimit, maxScanTuples, deadline,/);
   });
 
   test('connect() with poolSize honors resolvePrepare (PgBouncer regression guard)', () => {
@@ -94,10 +116,37 @@ describe('postgres-engine / search path timeout isolation', () => {
   });
 });
 
+describe('postgres-engine / search date filtering', () => {
+  test('search paths filter since/until on effective_date before import-time fallback', () => {
+    const expectedDateExpr = 'COALESCE(p.effective_date, p.updated_at, p.created_at)';
+    const staleDatePredicate = /COALESCE\(p\.updated_at,\s*p\.created_at\)\s*[<>]\s*\$/;
+
+    for (const methodName of ['searchKeyword', 'searchKeywordChunks']) {
+      const fn = stripComments(extractMethod(SRC, methodName));
+
+      expect(countOccurrences(fn, expectedDateExpr)).toBe(2);
+      expect(fn).not.toMatch(staleDatePredicate);
+    }
+  });
+
+  test('vector search spells the same effective_date-first fallback per column (#5824)', () => {
+    const builder = stripComments(VECTOR_STATEMENT_SRC);
+    expect(builder).toContain('`AND (p.effective_date ${op} ${bound} OR (p.effective_date IS NULL AND (p.updated_at ${op} ${bound} OR (p.updated_at IS NULL AND p.created_at ${op} ${bound}))))`');
+    expect(builder).toMatch(/opts\?\.afterDate\) filters\.push\(dateBound\(/);
+    expect(builder).toMatch(/opts\?\.beforeDate\) filters\.push\(dateBound\(/);
+    expect(builder).not.toMatch(/COALESCE\(p\.updated_at,\s*p\.created_at\)/);
+    expect(stripComments(extractMethod(SRC, 'searchVector'))).toContain('buildVectorSearchStatement(');
+  });
+});
+
 function stripComments(s: string): string {
   return s
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/(^|\s)\/\/[^\n]*/g, '$1');
+}
+
+function countOccurrences(s: string, needle: string): number {
+  return s.split(needle).length - 1;
 }
 
 // extractMethod grabs the body of a class method by brace-matching from

@@ -71,6 +71,13 @@ The session output to the user is a one-line success summary plus
 a list of files written. JSON mode (`--json`) returns the full
 `HarvestResult` shape for machine consumption.
 
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `lint_failed`: the privacy linter caught a real name or private detail; go back to Phase 3 and replace it with placeholders (`alice-example`, `acme-example`, `fund-a`).
+- `gbrain skillpack check --strict` reports drift after the harvest: regenerate the bundle and re-run; never ship a drifting skillpack.
+
 ## Anti-Patterns
 
 - **Skipping the dry-run.** Always preview first. Files land in
@@ -91,8 +98,8 @@ a list of files written. JSON mode (`--json`) returns the full
 
 ## When to invoke
 
-- The user developed a skill in their host fork (Wintermute, Neuromancer,
-  Zion, etc.) and wants other gbrain clients to be able to use it
+- The user developed a skill in their host fork (your OpenClaw or any
+  private downstream fork) and wants other gbrain clients to be able to use it
 - A skill has proven itself in production and is ready to generalize
 - The user explicitly asks to "harvest" or "publish" a skill upstream
 
@@ -123,7 +130,7 @@ Ask the user:
 - What slug should the harvested skill have? (Slugs must be kebab-case,
   globally unique in the gbrain bundle.)
 - Which host repo is the source? (Path to repo root, not to the skill
-  directory — e.g. `~/git/wintermute`, not `~/git/wintermute/skills/foo`.)
+  directory — e.g. `~/git/agent-fork`, not `~/git/agent-fork/skills/foo`.)
 - Should paired source files come along? (Check the host SKILL.md's
   frontmatter `sources:` array.)
 
@@ -153,9 +160,9 @@ files and apply this checklist. If anything matches, edit the host
 file FIRST, then run harvest.
 
 1. **Fork-specific names → generic phrasing**
-   - `Wintermute` → `your OpenClaw` (or `OpenClaw deployment`)
-   - `Neuromancer`, `Zion`, `<personal-fork-name>` → same treatment
-   - Personal first names (`garry`, `jane`, etc.) → `the user` /
+   - `<personal-fork-name>` → `your OpenClaw` (or `OpenClaw deployment`);
+     any pet name for the user's private agent gets the same treatment
+   - Personal first names (`alice`, `jane`, etc.) → `the user` /
      `you` / a generic placeholder
 
 2. **Real entities → placeholders**
@@ -175,7 +182,7 @@ file FIRST, then run harvest.
 4. **Triggers array generalizes**
    - Read every entry in frontmatter `triggers:`. None should
      reference the user's name, fork name, or internal tools.
-   - "Have garry sign off on it" → "have the user sign off on it"
+   - "Have alice sign off on it" → "have the user sign off on it"
 
 5. **routing-eval.jsonl examples are scrubbed**
    - Open `skills/<slug>/routing-eval.jsonl`. Every `intent` field
@@ -197,7 +204,8 @@ gbrain skillpack harvest <slug> --from <host-repo-root>
 Default behavior:
 - Path-confinement + symlink rejection at file copy
 - Privacy linter runs against `~/.gbrain/harvest-private-patterns.txt`
-  (plus built-in defaults: `\bWintermute\b`, email, Slack channels)
+  (plus built-in defaults — the canonical private fork name, email
+  addresses, Slack channels; see `src/core/skillpack/harvest-lint.ts`)
 - On any match → rollback (delete the harvested files) + exit non-zero
 - `openclaw.plugin.json` updated to add the slug, sorted
 
@@ -240,7 +248,7 @@ gbrain skillpack harvest <slug> --from <host-repo-root> --no-lint
 ```
 
 **Document the bypass in the commit message.** Future maintainers
-should be able to see WHY the lint was bypassed (e.g. "Wintermute
+should be able to see WHY the lint was bypassed (e.g. "the fork name
 appears in a citation, not a real reference — verified manually").
 
 Never bypass the linter on a casual basis. The whole point of the
@@ -266,4 +274,5 @@ editorial pass.
   (e.g. `src/commands/<slug>.ts` if the host SKILL.md declares it
   in frontmatter)
 - gbrain's `openclaw.plugin.json` — adds the slug to `skills:`
-  array, sorted alphabetically
+  array, sorted alphabetically, without removing OpenClaw-native plugin fields
+  like `id`, `configSchema`, or `contracts`

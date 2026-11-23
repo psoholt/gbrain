@@ -4,23 +4,29 @@
  * v0.41.6.0 D5 — registry + signal handlers so abnormal termination
  * (SIGTERM/SIGHUP/SIGPIPE, EPIPE on stdout, uncaughtException) releases
  * locks instead of leaking them for up to 30 minutes until the TTL
- * expires. Pre-v0.41.6.0, `gbrain sync --full | head -20` would SIGPIPE
- * gbrain, finally blocks wouldn't run, and the next sync would report
+ * expires. Pre-v0.41.6.0, a full `gbrain sync` piped into `head` would
+ * SIGPIPE gbrain, finally blocks wouldn't run, and the next sync would report
  * "Another sync is in progress" because the lock row was orphaned.
+ *
+ * (The flag name is spelled out rather than written literally: the CLI
+ * flag-registry generator scans comments, so a bare double-dash token here
+ * would be inherited as an accepted flag by every command that imports this
+ * module. Pinned by `test/cli-flag-validation.test.ts`.)
  *
  * Design (per eng-review D7 + outside-voice F9-F11, 2026-05-24):
  *
  *  - Signal scope: SIGTERM, SIGHUP, SIGPIPE, uncaughtException,
  *    unhandledRejection. **NOT SIGINT** — gbrain has an existing
- *    SIGINT-via-AbortController path at cli.ts:254 that propagates
+ *    SIGINT-via-AbortController path in cli.ts that propagates
  *    abort to in-flight operations (clean cancel). Installing cleanup
  *    on SIGINT here would preempt that flow. Lock release on user
  *    cancel belongs in the AbortController path, not in a parallel
  *    signal handler.
  *
- *  - Idempotent: a second signal during the cleanup pass is a NO-OP.
- *    First pass runs to its 3s deadline; users who want a forced exit
- *    can SIGKILL.
+ *  - Idempotent: callbacks run once. A second signal during the cleanup
+ *    pass waits for that pass (bounded by its 3s deadline) before
+ *    exiting, so it cannot exit ahead of the lock DELETE; users who want
+ *    a forced exit can SIGKILL.
  *
  *  - Single ownership: `tryAcquireDbLock` auto-registers; the returned
  *    handle's `release()` deregisters. `withRefreshingLock` just
@@ -37,7 +43,9 @@
  *    double-DELETE.
  */
 
-const CLEANUP_DEADLINE_MS = 3_000;
+import { noteInterrupted } from './read-heartbeat.ts';
+
+export const CLEANUP_DEADLINE_MS = 3_000;
 
 interface CleanupEntry {
   name: string;
@@ -45,8 +53,23 @@ interface CleanupEntry {
 }
 
 const registry = new Map<symbol, CleanupEntry>();
+/** #5062: long-lived commands that run their own ordered shutdown. The most
+ *  recent registration wins; while one is registered, termination signals
+ *  and a broken stdout/stderr pipe go to it instead of the generic
+ *  cleanup-then-exit pass. */
+const signalOwners: Array<{ key: symbol; onSignal: (signal: NodeJS.Signals) => void; signals?: readonly NodeJS.Signals[] }> = [];
 let installed = false;
-let cleanupInFlight = false;
+let cleanupPass: Promise<void> | null = null;
+/** Refs to every listener attached by installSignalHandlers, keyed by
+ *  target+event, so _resetForTests can DETACH them — without this, a test
+ *  that installs and "resets" leaves a live SIGTERM→exit(143) listener on
+ *  the shared bun test runner, and any later synthetic
+ *  `process.emit('SIGTERM')` kills the entire suite. */
+const installedListeners: Array<{
+  target: NodeJS.Process | NodeJS.WriteStream;
+  event: string;
+  fn: (...args: never[]) => void;
+}> = [];
 
 /**
  * Register a cleanup callback. Returns a deregister handle (idempotent
@@ -68,6 +91,57 @@ export function registerCleanup(name: string, fn: () => Promise<void>): () => vo
 }
 
 /**
+ * An AbortSignal that aborts when the cleanup pass runs (an unowned
+ * SIGTERM/SIGHUP, a crash, a broken stdout pipe), for in-flight work that
+ * must not outlive the process, such as a child process gbrain started.
+ * Call `release` when that work settles; a released signal never aborts.
+ */
+export function abortOnCleanupPass(name: string): { signal: AbortSignal; release: () => void } {
+  const controller = new AbortController();
+  const release = registerCleanup(name, async () => { controller.abort(); });
+  return { signal: controller.signal, release };
+}
+
+/**
+ * #5062: claim the process's termination signals (SIGTERM, SIGHUP, SIGPIPE
+ * and a broken stdout/stderr pipe). Without an owner the generic handler
+ * runs every cleanup callback (which DELETEs held DB locks) and exits at
+ * once, so a supervisor or worker loses its singleton lock and dies before
+ * it can drain. With an owner registered the generic handler only forwards
+ * the signal; the owner stops admissions, drains, releases its own locks and
+ * then calls `triggerCleanupAndExit` (or exits) itself. Repeated signals are
+ * forwarded again, so `onSignal` must be idempotent. Crashes
+ * (uncaughtException / unhandledRejection) keep the generic path.
+ * GST-2869: `signals` narrows the claim; a signal it leaves out (a broken pipe for `gbrain sync`) takes the generic path.
+ *
+ * Returns a deregister handle (idempotent).
+ */
+export function registerSignalOwner(name: string, onSignal: (signal: NodeJS.Signals) => void, signals?: readonly NodeJS.Signals[]): () => void {
+  const key = Symbol(name);
+  signalOwners.push({ key, onSignal, ...(signals ? { signals } : {}) });
+  return () => {
+    const i = signalOwners.findIndex((o) => o.key === key);
+    if (i >= 0) signalOwners.splice(i, 1);
+  };
+}
+
+/** Whether a command already claimed the termination signals (`registerSignalOwner`). */
+export function hasSignalOwner(): boolean {
+  return signalOwners.length > 0;
+}
+
+function forwardToSignalOwner(signal: NodeJS.Signals): boolean {
+  const owner = signalOwners.findLast(o => !o.signals || o.signals.includes(signal));
+  if (!owner) return false;
+  try { owner.onSignal(signal); }
+  catch (err) {
+    try { process.stderr.write(`[process-cleanup] signal owner: ${err instanceof Error ? err.message : String(err)}\n`); }
+    catch { /* stderr might be broken */ }
+  }
+  return true;
+}
+
+/**
  * Read the currently registered cleanup count. Test seam.
  *
  * @internal
@@ -86,10 +160,12 @@ export async function triggerCleanupAndExit(code: number): Promise<void> {
   process.exit(code);
 }
 
-async function runCleanupPass(): Promise<void> {
-  if (cleanupInFlight) return; // Idempotent: second signal during cleanup is NO-OP.
-  cleanupInFlight = true;
+function runCleanupPass(): Promise<void> {
+  cleanupPass ??= runCleanupCallbacks();
+  return cleanupPass;
+}
 
+async function runCleanupCallbacks(): Promise<void> {
   const entries = Array.from(registry.values());
   if (entries.length === 0) return;
 
@@ -117,16 +193,28 @@ async function runCleanupPass(): Promise<void> {
 
 /**
  * Install signal handlers + the EPIPE-on-stdout handler. Idempotent
- * (second call is NO-OP). MUST be called once at CLI module load AFTER
- * any existing signal handlers (so we don't preempt the SIGINT
- * AbortController at cli.ts:254 — we don't listen to SIGINT here, but
- * documenting the install order keeps future maintainers aware).
+ * (second call is NO-OP). MUST be called once from the CLI ENTRYPOINT —
+ * inside cli.ts's `import.meta.main` seam, before main() dispatches —
+ * and NOT at module load: a module-load install leaks a process-wide
+ * SIGTERM→exit(143) handler into any process that merely imports cli.ts
+ * (a bun test runner died mid-suite when a test emitted a synthetic
+ * SIGTERM). The SIGINT AbortController path in cli.ts stays untouched —
+ * we don't listen to SIGINT here.
  */
-export function installSignalHandlers(): void {
+export function installSignalHandlers(opts: { keepServingOnLogEpipe?: boolean } = {}): void {
   if (installed) return;
   installed = true;
+  // #5079: for `serve --http`, stdout/stderr are only log streams (the MCP
+  // transport is the HTTP socket), so a closed log pipe must not stop the
+  // server: the log write is dropped and it keeps serving. Everywhere else a
+  // broken pipe still exits (for stdio `serve` it means the client left).
+  const keepServing = opts.keepServingOnLogEpipe === true;
 
   const handleSignal = (signal: NodeJS.Signals) => {
+    if (forwardToSignalOwner(signal)) return;
+    // A slow read (sync status, doctor, ...) says it was cut off before cleanup runs, so a harness that follows its
+    // SIGTERM with SIGKILL still sees the note.
+    if (signal !== 'SIGPIPE') noteInterrupted(signal);
     void runCleanupPass().finally(() => {
       // Match GNU `kill` exit-code convention: 128 + signal number for
       // signal-terminated processes. The actual integer doesn't matter
@@ -137,19 +225,27 @@ export function installSignalHandlers(): void {
     });
   };
 
-  process.on('SIGTERM', () => handleSignal('SIGTERM'));
-  process.on('SIGHUP', () => handleSignal('SIGHUP'));
-  // SIGPIPE in Node is rarely raised directly (Node ignores it by default
-  // and surfaces an EPIPE write error on the stream instead). Listen anyway
-  // for environments where it does fire.
-  process.on('SIGPIPE', () => handleSignal('SIGPIPE'));
+  const attach = (
+    target: NodeJS.Process | NodeJS.WriteStream,
+    event: string,
+    fn: (...args: never[]) => void,
+  ): void => {
+    (target as NodeJS.Process).on(event as 'exit', fn as () => void);
+    installedListeners.push({ target, event, fn });
+  };
 
-  process.on('uncaughtException', (err) => {
+  attach(process, 'SIGTERM', () => handleSignal('SIGTERM'));
+  attach(process, 'SIGHUP', () => handleSignal('SIGHUP'));
+  // Bun delivers SIGPIPE on a broken pipe (Node ignores it by default and
+  // surfaces only an EPIPE write error on the stream, handled below).
+  attach(process, 'SIGPIPE', () => { if (!keepServing) handleSignal('SIGPIPE'); });
+
+  attach(process, 'uncaughtException', (err: unknown) => {
     try { process.stderr.write(`[uncaughtException] ${err instanceof Error ? err.stack ?? err.message : err}\n`); }
     catch { /* stderr might be broken */ }
     void runCleanupPass().finally(() => process.exit(1));
   });
-  process.on('unhandledRejection', (reason) => {
+  attach(process, 'unhandledRejection', (reason: unknown) => {
     try { process.stderr.write(`[unhandledRejection] ${reason instanceof Error ? reason.stack ?? reason.message : reason}\n`); }
     catch { /* stderr might be broken */ }
     void runCleanupPass().finally(() => process.exit(1));
@@ -157,15 +253,17 @@ export function installSignalHandlers(): void {
 
   // EPIPE on stdout — the canonical `gbrain sync | head -N` case. Route
   // through the cleanup pass so locks release BEFORE we exit.
-  process.stdout.on('error', (err: NodeJS.ErrnoException) => {
-    if (err.code === 'EPIPE') {
+  attach(process.stdout, 'error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EPIPE' && !keepServing) {
+      if (forwardToSignalOwner('SIGPIPE')) return;
       void triggerCleanupAndExit(0);
     }
   });
   // Same for stderr — less common but possible (e.g. `2>&1 | head` after
   // stderr was rerouted to stdout).
-  process.stderr.on('error', (err: NodeJS.ErrnoException) => {
-    if (err.code === 'EPIPE') {
+  attach(process.stderr, 'error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EPIPE' && !keepServing) {
+      if (forwardToSignalOwner('SIGPIPE')) return;
       // No stderr means no useful logs on the way out; still cleanup.
       void triggerCleanupAndExit(0);
     }
@@ -180,6 +278,15 @@ export function installSignalHandlers(): void {
  */
 export function _resetForTests(): void {
   registry.clear();
+  signalOwners.length = 0;
+  // Detach every listener installSignalHandlers attached — clearing flags
+  // alone leaves a live SIGTERM→exit(143) listener on the shared test-runner
+  // process, which a later synthetic `process.emit('SIGTERM')` would trigger,
+  // killing the whole suite.
+  for (const { target, event, fn } of installedListeners) {
+    (target as NodeJS.Process).off(event as 'exit', fn as () => void);
+  }
+  installedListeners.length = 0;
   installed = false;
-  cleanupInFlight = false;
+  cleanupPass = null;
 }

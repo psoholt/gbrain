@@ -18,6 +18,8 @@ health_checks:
       Content-Type: "application/json"
     body: '{"jsonrpc":"2.0","method":"tools/list","id":1}'
     label: "Circleback API"
+output_paths:
+  - meetings/
 setup_time: 15 min
 cost_estimate: "$0-17/mo (Circleback free for 10 meetings/mo, Pro $17/mo unlimited)"
 ---
@@ -104,7 +106,7 @@ tags: [team, weekly, sync]
 ```
 
 **Attendee filtering:**
-- Skip calendar resources (e.g., "YC-SF Conference Room")
+- Skip calendar resources (e.g., "HQ Conference Room")
 - Skip group addresses (e.g., "team@company.com")
 - Extract display names, not email addresses
 
@@ -340,14 +342,20 @@ tags: [sync]
 
 ```
 if new_meetings_created > 0:
-  shell('git add -A', cwd=BRAIN_DIR)
   msg = f'sync: {count} meeting(s) from Circleback ({start} to {end})'
-  shell(f'git commit -m "{msg}"', cwd=BRAIN_DIR)
-  shell('git push', cwd=BRAIN_DIR)
+  paths = written_paths  # the meeting and people files this run wrote
+  run(['scripts/brain-commit-push.sh', msg, *paths], cwd=BRAIN_DIR)
+  # without the helper: ['gbrain', 'git', 'commit-push', '-m', msg, '--', *paths]
 ```
 
-The sync script commits and pushes automatically. This triggers GBrain's
-live sync to index the new pages.
+The sync script commits only the files it wrote and pushes them. This
+triggers GBrain's live sync to index the new pages. Other agents may share
+the brain checkout, so it never stages the whole tree. On a non-zero exit
+the script stops and reports the error code: retry once on `commit_lock_busy`;
+stop and tell the user on `integrate_conflict` or
+`writer_coordinator_required` (a managed brain: write the pages with
+`put_page` instead); never fall back to stash, `pull --rebase` or a plain
+push ([outcomes](../docs/guides/shared-checkout-git.md#outcomes)).
 
 ### What the Agent Should Test After Setup
 

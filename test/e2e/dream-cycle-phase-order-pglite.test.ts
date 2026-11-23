@@ -48,6 +48,21 @@ mock.module('../../src/core/embedding.ts', () => ({
   estimateEmbeddingCostUsd: (tokens: number) => (tokens / 1000) * 0.00013,
   // v0.41.31: embed phase reads the current signature to stamp provenance.
   currentEmbeddingSignature: () => 'text-embedding-3-large:1536',
+  // The cycle sync phase reaches commands/sync.ts, whose static embedding.ts
+  // imports must all resolve against this mock (missing names are a load-time
+  // SyntaxError, not a runtime undefined).
+  currentEmbeddingPricePerMTok: () => 0.13,
+  willEmbedSynchronously: (opts: { v2Enabled: boolean; serialFlag: boolean; noEmbed: boolean }) => {
+    const effectiveNoEmbed = opts.v2Enabled && !opts.serialFlag && !opts.noEmbed ? true : opts.noEmbed;
+    return effectiveNoEmbed ? 'deferred' : 'inline';
+  },
+  // wave-G PGLite backfill-admission hardening added this worker-capability-
+  // aware sibling of willEmbedSynchronously; sync-embed-backfill.ts imports it
+  // statically, so the mock must carry it (mirror of the real pure fn).
+  resolveWorkerBackedSyncEmbedMode: (opts: { deferEligible: boolean; noEmbed: boolean }) =>
+    opts.deferEligible || opts.noEmbed ? 'deferred' : 'inline',
+  shouldBlockSync: (costUsd: number, floorUsd: number, mode: string, posture: 'gated' | 'tokenmax' = 'gated') =>
+    posture === 'tokenmax' ? false : mode === 'inline' && costUsd > floorUsd,
 }));
 
 const { runCycle, ALL_PHASES } = await import('../../src/core/cycle.ts');
@@ -115,6 +130,9 @@ const EXPECTED_PHASES: CyclePhase[] = [
   'lint',
   'backlinks',
   'sync',
+  'fence_repair',                // #6188 — fence repair (global maintenance lane)
+  'content_repair',              // #6377 — the rest of the content-repair lane (slug conflicts)
+  'unindexed_files',             // #6865 — committed files with no page and no hold, scheduled for a re-screen
   'synthesize',
   'extract',
   'extract_facts',               // v0.32.2 — reconcile fence → DB facts index
@@ -127,6 +145,12 @@ const EXPECTED_PHASES: CyclePhase[] = [
   'propose_takes',              // v0.36.1.0 — hindsight calibration wave
   'grade_takes',                // v0.36.1.0
   'calibration_profile',        // v0.36.1.0
+  'edge_contradictions',        // temporal typed edges (proposals by default)
+  'claim_conflicts',             // GBRA-216 keyless typed-claim conflicts (default off)
+  'drift',                       // #2653 — drift detection (default OFF, report-only)
+  'standing_questions',          // C4 pinned questions (no pins = skipped)
+  'chronicle',                   // #5876 — Life Chronicle events (default ON)
+  'facts_drain',                 // GBRA-40 Lane D — automatic facts drain (PGLite)
   'conversation_facts_backfill', // v0.41.11.0 — opt-in conversation backfill
   'enrich_thin',                 // v0.41.39 (#1700) — brain-internal stub enrichment (default OFF)
   'skillopt',                    // v0.42.0.0 — self-evolving skills (default OFF)
@@ -134,6 +158,7 @@ const EXPECTED_PHASES: CyclePhase[] = [
   'orphans',
   'schema-suggest',              // v0.39.0.0 — passive schema-suggest after orphans
   'purge',                       // v0.26.5
+  'bookkeeping_gc',              // GBRA-438: the GC that used to ride inside purge
 ];
 
 describe('E2E full cycle phase order', () => {

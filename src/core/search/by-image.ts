@@ -73,9 +73,15 @@ export async function searchByImage(
     offset: 0,
     sourceId: opts.sourceId,
     sourceIds: opts.sourceIds,
+    excludePrivate: opts.excludePrivate,
+    requireSafeChunks: opts.requireSafeChunks,
+    takesHoldersAllowList: opts.takesHoldersAllowList,
     // Both branches use the same source-scope threading.
   };
 
+  // A brain that opted out of embedding refuses image search before anything is sent to a provider.
+  const { assertBrainEmbeddingEnabled } = await import('../embedding-dim-check.ts');
+  await assertBrainEmbeddingEnabled(engine);
   // Image branch — always runs.
   const imageEmbedding = await embedQueryMultimodalImage({
     data: input.base64,

@@ -27,6 +27,7 @@
  */
 
 import { detectTini } from './spawn-helpers.ts';
+import { OwnerProcessingState, type OwnerProcessingStatus } from './processing-state.ts';
 import { resolveDefaultMaxRssMb } from './rss-default.ts';
 import {
   ChildWorkerSupervisor,
@@ -42,10 +43,16 @@ import {
   unlinkSync,
   writeSync,
 } from 'fs';
-import { dirname } from 'path';
+import { dirname, resolve } from 'path';
+import { hostname } from 'os';
 import type { BrainEngine } from '../engine.ts';
-import { tryAcquireDbLock, type DbLockHandle } from '../db-lock.ts';
-import { currentBrainId } from './worker-registry.ts';
+import { tryAcquireDbLock, waitForDbLockTakeover, inspectLock, isLockHolderLive, type DbLockHandle } from '../db-lock.ts';
+import { currentBrainId, readWorkers, workerRegistryReadFailure } from './worker-registry.ts';
+import { autopilotOperatorPauseMarkerPath, autopilotPaused } from '../autopilot-paths.ts';
+import { gbrainPath } from '../config.ts';
+import { registerSignalOwner, triggerCleanupAndExit } from '../process-cleanup.ts';
+import { resolveEnvNumber } from '../env-number.ts';
+import { pidFileContents, processStartStamp } from './supervisor-pid.ts';
 
 export type SupervisorEvent =
   | 'started'
@@ -70,7 +77,7 @@ export interface SupervisorOpts {
   concurrency: number;
   /** Queue name (passed to child). Default: 'default'. */
   queue: string;
-  /** PID file path. Default: `${HOME}/.gbrain/supervisor.pid` (parent dir auto-created). */
+  /** PID file path. Default: `<gbrain home>/supervisor-<brain-id>.pid`, GBRAIN_HOME honoured (parent dir auto-created). */
   pidFile: string;
   /** Max consecutive crashes before giving up. Default: 10. */
   maxCrashes: number;
@@ -78,7 +85,10 @@ export interface SupervisorOpts {
   healthInterval: number;
   /** Path to the gbrain CLI executable (MUST be a compiled binary; .ts sources cannot be spawned). */
   cliPath: string;
-  /** Allow shell jobs on child worker. Default: false. When true, sets GBRAIN_ALLOW_SHELL_JOBS=1 on child env. */
+  cliArgsPrefix?: string[];
+  /** Allow shell jobs on child worker. Default: false. When true, sets GBRAIN_ALLOW_SHELL_JOBS=1 on the
+   *  child env AND passes `--allow-shell-jobs` (buildWorkerArgs) so the worker's cwd-.env quarantine
+   *  cannot silently drop the opt-in. */
   allowShellJobs: boolean;
   /** JSON mode: emit JSONL events on stderr, reserve stdout for data payloads. Default: false. */
   json: boolean;
@@ -96,6 +106,10 @@ export interface SupervisorOpts {
   nice_requested?: number;
   /** Effective niceness of the supervisor process after its own renice attempt. */
   nice_effective?: number;
+  /** issue #5: when 'process', the spawned worker runs each claimed job in a
+   *  SIGKILL-able child process (passed through as `--job-isolation process`).
+   *  Omitted/inline: today's shared-process execution. */
+  jobIsolation?: 'inline' | 'process';
   /** Error string if the supervisor's own renice failed (e.g. EPERM). */
   nice_error?: string;
   /**
@@ -132,7 +146,6 @@ export interface SupervisorOpts {
 export const DEFAULT_PID_FILE: string = (() => {
   const envOverride = process.env.GBRAIN_SUPERVISOR_PID_FILE;
   if (envOverride && envOverride.length > 0) return envOverride;
-  const home = process.env.HOME ?? '/tmp';
   // #1849: key the default pidfile on the brain id so two DIFFERENT brains
   // under one HOME don't share `supervisor.pid` and falsely block each other's
   // pidfile guard. Derived from config (no DB connect), so it's safe to
@@ -141,7 +154,7 @@ export const DEFAULT_PID_FILE: string = (() => {
   // singleton authority; this just removes the common-case footgun.
   let brainId = 'default';
   try { brainId = currentBrainId(); } catch { /* fallback 'default' */ }
-  return `${home}/.gbrain/supervisor-${brainId}.pid`;
+  return gbrainPath(`supervisor-${brainId}.pid`);
 })();
 
 const DEFAULTS: Omit<SupervisorOpts, 'cliPath'> = {
@@ -172,7 +185,8 @@ const DEFAULTS: Omit<SupervisorOpts, 'cliPath'> = {
  * niceness also inherits to the worker's own children automatically.
  */
 export function buildWorkerArgs(
-  opts: Pick<SupervisorOpts, 'concurrency' | 'queue' | 'maxRssMb' | 'nice_requested'>,
+  opts: Pick<SupervisorOpts, 'concurrency' | 'queue' | 'maxRssMb' | 'nice_requested' | 'jobIsolation'> &
+    Partial<Pick<SupervisorOpts, 'allowShellJobs'>>,
 ): string[] {
   const args = [
     'jobs', 'work',
@@ -185,12 +199,32 @@ export function buildWorkerArgs(
   if (opts.nice_requested !== undefined) {
     args.push('--nice', String(opts.nice_requested));
   }
+  // Conditional push (issue #5): omitted for inline so existing deployments'
+  // argv is byte-identical (pinned by supervisor-build-worker-args.test.ts).
+  if (opts.jobIsolation === 'process') {
+    args.push('--job-isolation', 'process');
+  }
+  // Conditional push: the shell opt-in travels as a flag as well as env. The
+  // worker's startup cwd-.env quarantine (core/env-trust.ts) drops
+  // GBRAIN_ALLOW_SHELL_JOBS whenever a .env in the worker's cwd assigns it,
+  // so an env-only handoff could silently disable shell jobs; `jobs work`
+  // re-asserts the env from this flag after its preflight.
+  if (opts.allowShellJobs) {
+    args.push('--allow-shell-jobs');
+  }
   return args;
 }
 
 /** Grace before SIGKILL when restarting a wedged child — reuses the 35s
  *  shutdown() drain window (issue #1801, D3). */
 const WEDGE_RESTART_GRACE_MS = 35_000;
+/** #5062: shutdown drain window for the worker (its own 30s job drain + slack). */
+const WORKER_DRAIN_GRACE_MS = 35_000;
+/** #5062: how long to wait for the kernel to confirm a SIGKILLed worker. */
+const WORKER_KILL_CONFIRM_MS = 5_000;
+/** Shutdown reasons that come from an operator signal (always honored, even
+ *  when the owner is configuration-blocked). */
+const SIGNAL_REASONS: ReadonlySet<string> = new Set(['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGPIPE']);
 
 /**
  * issue #1994: resolve the hard permanent-give-up ceiling. Default
@@ -225,7 +259,8 @@ function isProcessAlive(pid: number): boolean {
 }
 
 /**
- * issue #1801 — queue + name-scoped wedge signals. Exported (with the SQL) so
+ * issue #1801 — queue + name-scoped wedge signals (the `readWedgeSignals` member,
+ * engine-sql/jobs-health.ts; its statement and rules live there). Exported so
  * the FILTER semantics are testable against a real engine (PGLite) without
  * spinning a supervisor process:
  *   - `activeHealthy` counts only LIVE-lock active rows, so an expired-lock
@@ -248,43 +283,139 @@ export async function queryWedgeSignals(
   engine: BrainEngine,
   queue: string,
   handlerNames: string[],
+  opts?: { signal?: AbortSignal },
 ): Promise<WedgeSignals> {
-  const rows = await engine.executeRaw<{
-    stalled: string;
-    active_healthy: string;
-    waiting: string;
-    waiting_claimable: string;
-    last_completed: string | null;
-    last_completed_claimable: string | null;
-  }>(
-    `SELECT
-       count(*) FILTER (WHERE status = 'active' AND lock_until < now())::text AS stalled,
-       count(*) FILTER (WHERE status = 'active' AND lock_until > now())::text AS active_healthy,
-       count(*) FILTER (WHERE status = 'waiting')::text AS waiting,
-       count(*) FILTER (WHERE (status = 'waiting'
-                          OR (status = 'delayed' AND delay_until <= now()))
-                         AND name = ANY($2::text[]))::text AS waiting_claimable,
-       max(updated_at) FILTER (WHERE status = 'completed')::text AS last_completed,
-       max(updated_at) FILTER (WHERE status = 'completed'
-                               AND name = ANY($2::text[]))::text AS last_completed_claimable
-     FROM minion_jobs
-     WHERE queue = $1`,
-    [queue, handlerNames],
-  );
-  const row = rows[0] ?? {
-    stalled: '0', active_healthy: '0', waiting: '0',
-    waiting_claimable: '0', last_completed: null, last_completed_claimable: null,
+  return engine.readWedgeSignals(queue, handlerNames, opts);
+}
+
+/**
+ * Submit-time queue truthfulness snapshot, attached to submit_job/submit_agent
+ * responses so a job id handed back over a dead lane stops meaning nothing.
+ * Every field is best-effort: a probe failure or timeout collapses to
+ * `{probe_failed: true}` and NEVER errors the (already enqueued, possibly
+ * paid) submission — the enqueue result stands on its own.
+ */
+export interface QueueSubmitState {
+  /** Waiting-job count on the target queue (includes the job just enqueued). */
+  depth?: number;
+  /** Age of the oldest waiting job on the queue, or null when depth is 0. */
+  oldest_waiting_age_seconds?: number | null;
+  /** A supervisor DB lock is live, a registered worker serves the queue, or a live-lock active job proves one exists. Absent when the worker registry is unreadable and nothing else proves a worker (liveness unknown). */
+  worker_alive?: boolean;
+  /** The autopilot pause marker is present — nothing will start until it clears. */
+  paused?: boolean;
+  /** Human-readable submit-time caution; absent when the lane looks healthy. */
+  warning?: string;
+  /** The probe itself failed or timed out; the other fields are absent. */
+  probe_failed?: boolean;
+}
+
+/** Total wall-clock budget for the whole submit-time probe. */
+export const QUEUE_PROBE_TIMEOUT_MS = 1500;
+
+/**
+ * Probe the health of a queue right after a job was enqueued on it.
+ *
+ * Composes three signals the codebase already computes elsewhere:
+ *   - `queryWedgeSignals` (depth + live-lock active evidence) plus the
+ *     doctor-style oldest-waiting age, generalized past embed-backfill;
+ *   - supervisor DB-lock liveness (`inspectLock`/`isLockHolderLive` on
+ *     `supervisorLockId(queue)` — the HOME-independent authority, #2227)
+ *     plus the host-local worker registry (standalone `gbrain jobs work`
+ *     holds no supervisor lock; the MCP server runs on the brain host);
+ *   - the autopilot pause marker (a paused system makes `worker_alive`
+ *     truthful-but-misleading on its own).
+ *
+ * Fail-open by contract: any throw or a `timeoutMs` overrun returns
+ * `{probe_failed: true}`. Warn-only — callers must never gate the enqueue
+ * on this result.
+ */
+export async function probeQueueState(
+  engine: BrainEngine,
+  queue: string,
+  handlerNames: string[],
+  opts: { timeoutMs?: number } = {},
+): Promise<QueueSubmitState> {
+  const timeoutMs = opts.timeoutMs ?? QUEUE_PROBE_TIMEOUT_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // issue #6 / TODOS "cancel timed-out submit-time queue probes": the losing
+  // inner probe used to keep running on the pool after the race resolved —
+  // under pool exhaustion the abandoned query held a slot and made the
+  // exhaustion worse. The timeout now aborts a per-probe signal so the
+  // in-flight SQL is cancelled (postgres.js .cancel()) and its slot released.
+  const probeAbort = new AbortController();
+  const timeout = new Promise<QueueSubmitState>((resolveTimeout) => {
+    timer = setTimeout(() => {
+      probeAbort.abort();
+      resolveTimeout({ probe_failed: true });
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      probeQueueStateInner(engine, queue, handlerNames, { signal: probeAbort.signal }),
+      timeout,
+    ]);
+  } catch {
+    return { probe_failed: true };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function probeQueueStateInner(
+  engine: BrainEngine,
+  queue: string,
+  handlerNames: string[],
+  opts?: { signal?: AbortSignal },
+): Promise<QueueSubmitState> {
+  const sig = await queryWedgeSignals(engine, queue, handlerNames, opts);
+
+  // Oldest-waiting age, same filter shape as the wedge signals. Perf: the
+  // wave's migration (landing in another lane) adds the btree
+  // (queue, status, updated_at) wedge index whose (queue, status) prefix
+  // covers this WHERE; until it lands, minion_jobs is small enough that a
+  // scan fits comfortably inside the probe's wall-clock budget.
+  const oldestAge = await engine.readOldestWaitingAge(queue, opts);
+
+  let supervisorLive = false;
+  try {
+    const snap = await inspectLock(engine, supervisorLockId(queue));
+    supervisorLive = snap !== null && isLockHolderLive(snap, SUPERVISOR_LOCK_TTL_MIN);
+  } catch {
+    // Pre-migration brains lack the locks table — registry/active signals stand.
+  }
+  // An unreadable registry leaves the other signals standing, but their absence is then unknown liveness, not "no worker".
+  let registeredWorker = false, registryErrno: string | null = null;
+  try {
+    registeredWorker = readWorkers().some((w) => w.queue === queue);
+  } catch (e) { registryErrno = workerRegistryReadFailure(e).errno; }
+
+  const workerAlive = supervisorLive || registeredWorker || sig.activeHealthy > 0;
+  const livenessUnknown = !workerAlive && registryErrno !== null;
+  const paused = autopilotPaused();
+
+  // Same operator knob the doctor's queue_health depth check reads.
+  const threshold = resolveEnvNumber('GBRAIN_QUEUE_WAITING_THRESHOLD', 10);
+  const warnings: string[] = [];
+  if (paused) {
+    warnings.push(existsSync(autopilotOperatorPauseMarkerPath())
+      ? 'system paused by the operator (gbrain autopilot resume clears it) — job will not start until the pause clears'
+      : 'system paused for migration — job will not start until the pause clears');
+  }
+  if (livenessUnknown) warnings.push(`worker liveness unknown for queue '${queue}': the worker registry is unreadable (${registryErrno}); check gbrain jobs supervisor status`);
+  else if (!workerAlive) warnings.push(`no live worker detected for queue '${queue}' — job will wait until one starts (gbrain jobs work --queue ${queue})`);
+  if (sig.waiting > threshold) {
+    warnings.push(`waiting depth ${sig.waiting} exceeds GBRAIN_QUEUE_WAITING_THRESHOLD (${threshold})`);
+  }
+
+  const state: QueueSubmitState = {
+    depth: sig.waiting,
+    oldest_waiting_age_seconds: oldestAge,
+    ...(livenessUnknown ? {} : { worker_alive: workerAlive }),
   };
-  return {
-    stalled: parseInt(row.stalled ?? '0', 10),
-    activeHealthy: parseInt(row.active_healthy ?? '0', 10),
-    waiting: parseInt(row.waiting ?? '0', 10),
-    waitingClaimable: parseInt(row.waiting_claimable ?? '0', 10),
-    lastCompleted: row.last_completed ? new Date(row.last_completed) : null,
-    lastCompletedClaimable: row.last_completed_claimable
-      ? new Date(row.last_completed_claimable)
-      : null,
-  };
+  if (paused) state.paused = true;
+  if (warnings.length > 0) state.warning = warnings.join('; ');
+  return state;
 }
 
 /** Exit codes for documented agent branching. */
@@ -318,6 +449,23 @@ const SUPERVISOR_LOCK_REFRESH_MS = 60_000;
 const SUPERVISOR_LOCK_REFRESH_MAX_FAILURES = 3; // 3 × 60s = 180s < 5min TTL
 
 /**
+ * #2308 — how long start() waits for a held queue lock to become takeable
+ * (dead cross-host holder whose TTL hasn't lapsed yet).
+ *   0            → disabled (pre-#2308 one-shot LOCK_HELD exit)
+ *   positive int → hard bound in seconds
+ *   unset/other  → -1 (waitForDbLockTakeover derives TTL + steal-grace + margin)
+ * Exported for tests.
+ */
+export function resolveSupervisorLockWaitSeconds(): number {
+  const raw = process.env.GBRAIN_SUPERVISOR_LOCK_WAIT_SECONDS;
+  if (raw !== undefined && raw !== '') {
+    const n = Number(raw);
+    if (Number.isInteger(n) && n >= 0) return n;
+  }
+  return -1;
+}
+
+/**
  * #1849: the queue-scoped supervisor singleton lock id. Keyed ONLY on the
  * queue, because the lock ROW lives inside the target database — the (database)
  * half of the mutex domain is physical, not part of the key. Keying on a
@@ -342,7 +490,8 @@ export function supervisorLockId(queue: string): string {
  *   - `no_lock`  — no live lock holder (nothing to assert).
  *   - `single`   — the live lock holder IS the local pidfile holder. Healthy.
  *   - `mismatch` — a live lock holder differs from the local pidfile holder:
- *                  a second supervisor likely ran with a different --max-rss.
+ *                  a second supervisor likely ran with a different --max-rss. PR #6463: the same pid whose `pidfileHost`
+ *                  (recorded in the PID file at lock time) equals the lock holder's host is `single` despite a drifted `localHost`.
  */
 export function classifySupervisorSingleton(args: {
   lockLive: boolean;
@@ -350,16 +499,23 @@ export function classifySupervisorSingleton(args: {
   lockHolderPid: number | null;
   localHost: string;
   localPid: number | null;
+  pidfileHost?: string | null;
 }): 'no_lock' | 'single' | 'mismatch' {
   if (!args.lockLive || args.lockHolderHost === null || args.lockHolderPid === null) {
     return 'no_lock';
   }
-  if (args.localPid === null) return 'mismatch';
-  const matches = args.lockHolderHost === args.localHost && args.lockHolderPid === args.localPid;
-  return matches ? 'single' : 'mismatch';
+  if (args.localPid === null || args.lockHolderPid !== args.localPid) return 'mismatch';
+  return args.lockHolderHost === args.localHost || (args.pidfileHost != null && args.lockHolderHost === args.pidfileHost) ? 'single' : 'mismatch';
 }
 
 export class MinionSupervisor {
+  private processingState: OwnerProcessingState | null = null;
+
+  get processingStatus(): OwnerProcessingStatus | null { return this.processingState?.snapshot ?? null; }
+
+  private get configurationBlocked(): boolean {
+    return this.processingState?.blocked ?? false;
+  }
   private opts: SupervisorOpts;
   private engine: BrainEngine;
   /**
@@ -376,6 +532,8 @@ export class MinionSupervisor {
   private exitListener: (() => void) | null = null;
   private sigtermListener: (() => void) | null = null;
   private sigintListener: (() => void) | null = null;
+  private releaseSignalOwner: (() => void) | null = null;
+  private shutdownPromise: Promise<void> | null = null;
   private lockAcquired = false;
   private consecutiveHealthFailures = 0;
   // #1849: queue-scoped DB singleton lock (the real authority) + its refresh
@@ -521,6 +679,8 @@ export class MinionSupervisor {
       process.exit(ExitCodes.PID_UNWRITABLE);
     }
 
+    this.processingState = new OwnerProcessingState('supervisor', resolve(this.opts.pidFile));
+
     // 2. Cleanup on process exit (covers any exit path including process.exit).
     //    Installed BEFORE the DB-lock acquisition below: acquirePidLock just
     //    wrote OUR pid into the pidfile, so any early `process.exit` after this
@@ -529,6 +689,7 @@ export class MinionSupervisor {
     //    only unlinks when the file still holds our pid, so it's a no-op on the
     //    'held'/'unwritable' paths above (those never created our pidfile).
     this.exitListener = () => {
+      this.processingState?.close();
       try {
         if (existsSync(this.opts.pidFile)) {
           const contents = readFileSync(this.opts.pidFile, 'utf8').trim().split('\n')[0];
@@ -547,6 +708,54 @@ export class MinionSupervisor {
     // mutex is physical (the lock row lives in this DB).
     this.dbLock = await tryAcquireDbLock(this.engine, this.supervisorLockId(), SUPERVISOR_LOCK_TTL_MIN);
     if (!this.dbLock) {
+      // #2308: a DEAD holder on ANOTHER host leaves a row whose TTL is still
+      // live — tryAcquireDbLock correctly refuses to steal it (cross_host),
+      // but a one-shot exit here turns a self-healing condition (the row is
+      // takeable after TTL + steal-grace) into an operator page. Wait,
+      // bounded, for the takeover; bail fast when the holder's heartbeat
+      // advances (a genuinely live supervisor). CROSS-HOST holders only:
+      // same-host liveness is already probed by tryAcquireDbLock's
+      // auto-takeover (a dead local holder was reclaimed above; a live one
+      // should keep the immediate LOCK_HELD exit).
+      // GBRAIN_SUPERVISOR_LOCK_WAIT_SECONDS=0 disables the wait (pre-#2308
+      // one-shot behavior); a positive value overrides the derived TTL+grace bound.
+      const waitSeconds = resolveSupervisorLockWaitSeconds();
+      let holderIsCrossHost = false;
+      if (waitSeconds !== 0) {
+        try {
+          const snap = await inspectLock(this.engine, this.supervisorLockId());
+          holderIsCrossHost = snap !== null && snap.holder_host !== hostname();
+        } catch { /* stay one-shot on inspect failure */ }
+      }
+      if (waitSeconds !== 0 && holderIsCrossHost) {
+        console.error(
+          `Supervisor queue lock for '${this.opts.queue}' is held (possibly by a dead ` +
+          `process on another host). Waiting up to ${waitSeconds > 0 ? waitSeconds : 'TTL+grace'}s ` +
+          `for the holder to expire or heartbeat; set GBRAIN_SUPERVISOR_LOCK_WAIT_SECONDS=0 to exit immediately.`,
+        );
+        this.dbLock = await waitForDbLockTakeover(
+          this.engine,
+          this.supervisorLockId(),
+          SUPERVISOR_LOCK_TTL_MIN,
+          {
+            ...(waitSeconds > 0 ? { maxWaitMs: waitSeconds * 1000 } : {}),
+            onWait: ({ snapshot, waitedMs, maxWaitMs }) => {
+              const holder = snapshot
+                ? `pid=${snapshot.holder_pid} host=${snapshot.holder_host}`
+                : 'holder row gone';
+              console.error(
+                `[supervisor] still waiting for queue lock '${this.opts.queue}' ` +
+                `(${holder}, waited ${Math.round(waitedMs / 1000)}s of ${Math.round(maxWaitMs / 1000)}s)`,
+              );
+            },
+          },
+        );
+        if (this.dbLock) {
+          console.error(`[supervisor] queue lock '${this.opts.queue}' taken over from expired holder.`);
+        }
+      }
+    }
+    if (!this.dbLock) {
       console.error(
         `Supervisor already running for queue '${this.opts.queue}' on this database ` +
         `(another supervisor holds the queue lock, regardless of pidfile path). Exiting.`,
@@ -563,6 +772,12 @@ export class MinionSupervisor {
     this.sigintListener = () => { void this.shutdown('SIGINT', ExitCodes.CLEAN); };
     process.on('SIGTERM', this.sigtermListener);
     process.on('SIGINT', this.sigintListener);
+    // #5062: own the CLI's termination signals so the generic cleanup pass
+    // (which DELETEs this supervisor's lock row and exits 143) cannot pre-empt
+    // the drain above.
+    this.releaseSignalOwner = registerSignalOwner('jobs-supervisor', (signal) => {
+      void this.shutdown(signal, ExitCodes.CLEAN);
+    });
 
     // 4. Health monitoring. Skip when healthInterval=0 — that's the explicit
      // "disable" contract documented on `--health-interval 0`. setInterval(0)
@@ -574,7 +789,14 @@ export class MinionSupervisor {
     // 5. Announce start.
     this.emit('started', {
       supervisor_pid: process.pid,
-      pid_file: this.opts.pidFile,
+      ...processStartStamp('supervisor_start', process.pid),
+      // Resolved to absolute at emit time (relative to THIS process's cwd,
+      // the only context in which a relative --pid-file was meaningful) so a
+      // later reader (e.g. `gbrain doctor`, possibly running from a
+      // different cwd) doesn't misresolve it. `this.opts.pidFile` itself
+      // stays as-given for this process's own reads/writes below, which are
+      // already correctly relative to this same cwd.
+      pid_file: resolve(this.opts.pidFile),
       concurrency: this.opts.concurrency,
       queue: this.opts.queue,
       max_crashes: this.opts.maxCrashes,
@@ -594,6 +816,7 @@ export class MinionSupervisor {
 
     // 7. Run the supervise loop (respawn on crash, bounded by maxCrashes).
     await this.runSuperviseLoop();
+    if (this.configurationBlocked) await new Promise<void>(() => {});
   }
 
   /**
@@ -631,12 +854,49 @@ export class MinionSupervisor {
     }
   }
 
-  /** Unified shutdown path. Reason becomes the audit event name; exitCode is process exit. */
-  private async shutdown(reason: string, exitCode: number): Promise<void> {
-    if (this.stopping) return;
+  /**
+   * Unified shutdown path. Reason becomes the audit event name; exitCode is
+   * process exit. #5062: every caller (repeated signals included) joins the
+   * same promise. The ordered sequence is: stop restarts (and, via
+   * `stopping`, health actions), keep refreshing the singleton lock while the worker drains (a second
+   * supervisor cannot start mid-drain), stop the worker (SIGTERM, 35s drain,
+   * SIGKILL by liveness, confirmed exit), release the lock, emit `stopped`
+   * with whether the worker actually drained, then run the remaining cleanup
+   * callbacks and exit.
+   */
+  private shutdown(reason: string, exitCode: number): Promise<void> {
+    if (this.configurationBlocked && !SIGNAL_REASONS.has(reason)) return Promise.resolve();
+    this.shutdownPromise ??= this.runShutdown(reason, exitCode);
+    return this.shutdownPromise;
+  }
+
+  private async runShutdown(reason: string, exitCode: number): Promise<void> {
     this.stopping = true;
 
     this.emit('shutting_down', { reason, exit_code: exitCode });
+
+    // Stop the worker: SIGTERM, drain window, SIGKILL by liveness, then wait
+    // for the kernel to confirm the kill.
+    const child = this.childSupervisor;
+    const hadWorker = child?.childAlive === true;
+    let forced = false;
+    let workerGone = true;
+    if (child) {
+      child.killChild('SIGTERM');
+      await child.awaitChildExit(WORKER_DRAIN_GRACE_MS);
+      if (child.childAlive) {
+        forced = true;
+        child.killChild('SIGKILL');
+        await child.awaitChildExit(WORKER_KILL_CONFIRM_MS);
+      }
+      workerGone = !(child as ChildWorkerSupervisor).childAlive;
+    }
+    const workerExit = hadWorker ? child?.lastExit ?? null : null;
+    if (this.configurationBlocked && !SIGNAL_REASONS.has(reason)) {
+      this.stopping = false;
+      this.shutdownPromise = null;
+      return;
+    }
 
     if (this.healthTimer) {
       clearInterval(this.healthTimer);
@@ -646,23 +906,17 @@ export class MinionSupervisor {
     // #1849: stop refreshing + release the DB singleton lock so a clean
     // restart (or a different host) can re-acquire immediately instead of
     // waiting out the TTL. release() is best-effort; the TTL covers a crash.
+    // #5062: only now, after the worker is gone; the refresh timer kept the
+    // lock alive through the drain.
     if (this.lockRefreshTimer) {
       clearInterval(this.lockRefreshTimer);
       this.lockRefreshTimer = null;
     }
+    let lockReleased = this.dbLock === null;
     if (this.dbLock) {
       const lock = this.dbLock;
       this.dbLock = null;
-      try { await lock.release(); } catch { /* best-effort; TTL fallback covers it */ }
-    }
-
-    if (this.childSupervisor) {
-      this.childSupervisor.killChild('SIGTERM');
-      await this.childSupervisor.awaitChildExit(35_000);
-      // If the child is still up after the 35s drain window, escalate.
-      if (this.childSupervisor.childAlive) {
-        this.childSupervisor.killChild('SIGKILL');
-      }
+      try { await lock.release(); lockReleased = true; } catch { /* best-effort; TTL fallback covers it */ }
     }
 
     // Remove signal handlers so tests that spin up multiple supervisors on
@@ -676,9 +930,22 @@ export class MinionSupervisor {
       process.removeListener('SIGINT', this.sigintListener);
       this.sigintListener = null;
     }
+    this.releaseSignalOwner?.();
+    this.releaseSignalOwner = null;
 
-    this.emit('stopped', { reason, exit_code: exitCode });
-    process.exit(exitCode);
+    // A worker that needed SIGKILL, is still alive, or exited with anything
+    // but a clean drain did not drain: `jobs supervisor stop` reads this flag.
+    const drained = !hadWorker || (!forced && workerGone && workerExit?.code === 0);
+    this.emit('stopped', {
+      reason,
+      exit_code: exitCode,
+      drained,
+      worker_forced: forced,
+      worker_exit_code: workerExit?.code ?? null,
+      worker_signal: workerExit?.signal ?? null,
+      lock_released: lockReleased,
+    });
+    await triggerCleanupAndExit(exitCode);
   }
 
   /** #1849: the queue-scoped DB lock id for this supervisor's queue. */
@@ -704,12 +971,35 @@ export class MinionSupervisor {
    * tolerated (counter resets on the next success).
    */
   private async refreshDbLock(): Promise<void> {
-    if (!this.dbLock || this.stopping) return;
+    if (!this.dbLock) return;
+    if (this.stopping) {
+      // #5062: still the singleton while the worker drains; a failed refresh
+      // here cannot start a second shutdown (the TTL still covers the drain).
+      try { await this.dbLock.refresh(); } catch { /* best-effort during drain */ }
+      return;
+    }
     try {
-      await this.dbLock.refresh();
+      const stillOwned = await this.dbLock.refresh();
+      if (this.configurationBlocked) return;
+      if (stillOwned === false) {
+        // W0 fix-wave (D5.10): the fenced refresh matched 0 rows — the lock
+        // was stolen or force-cleared. That is CERTAIN loss, not a blip:
+        // counting it toward the failure threshold (or worse, resetting the
+        // counter as a "success") would let two supervisors drain the same
+        // queue for up to two more refresh windows. Exit immediately; the
+        // process manager restarts a single clean supervisor.
+        this.emit('health_error', {
+          reason: 'supervisor_lock_lost',
+          detail: 'fenced refresh matched 0 rows (stolen or force-cleared)',
+          queue: this.opts.queue,
+        });
+        await this.shutdown('supervisor_lock_lost', ExitCodes.LOCK_LOST);
+        return;
+      }
       this.lockRefreshFailures = 0;
     } catch (e) {
       this.lockRefreshFailures++;
+      if (this.configurationBlocked) return;
       this.emit('health_warn', {
         reason: 'supervisor_lock_refresh_failed',
         consecutive_failures: this.lockRefreshFailures,
@@ -758,7 +1048,7 @@ export class MinionSupervisor {
       // O_CREAT | O_EXCL | O_WRONLY — fails with EEXIST if the file exists.
       const fd = openSync(this.opts.pidFile, 'wx');
       try {
-        writeSync(fd, String(process.pid));
+        writeSync(fd, pidFileContents());
       } finally {
         closeSync(fd);
       }
@@ -784,7 +1074,7 @@ export class MinionSupervisor {
         try {
           const fd = openSync(this.opts.pidFile, 'wx');
           try {
-            writeSync(fd, String(process.pid));
+            writeSync(fd, pidFileContents());
           } finally {
             closeSync(fd);
           }
@@ -841,8 +1131,16 @@ export class MinionSupervisor {
     env.GBRAIN_SUPERVISED = '1';
 
     this.childSupervisor = new ChildWorkerSupervisor({
+      processingState: this.processingState ?? undefined,
+      onConfigurationBlocked: (status) => {
+        this.emit('health_error', {
+          reason: 'configuration_blocked',
+          reason_code: status?.reason_code ?? null,
+          queue: this.opts.queue,
+        });
+      },
       cliPath: this.opts.cliPath,
-      args: workerArgs,
+      args: [...(this.opts.cliArgsPrefix ?? []), ...workerArgs],
       env,
       maxCrashes: this.opts.maxCrashes,
       // issue #1994: hard permanent-give-up ceiling (the runaway backstop).
@@ -873,6 +1171,9 @@ export class MinionSupervisor {
    */
   private relayChildEvent(event: ChildSupervisorEvent): void {
     switch (event.kind) {
+      case 'worker_startup_timeout':
+        this.emit('health_error', { reason: 'worker_startup_timeout', timeout_ms: event.timeoutMs, queue: this.opts.queue });
+        return;
       case 'worker_spawned':
         // issue #1801: anchor the startup grace + reset the wedge counter so a
         // fresh child is judged on its own forward progress, not the prior
@@ -881,6 +1182,7 @@ export class MinionSupervisor {
         this.consecutiveWedgedChecks = 0;
         this.emit('worker_spawned', {
           pid: event.pid >= 0 ? event.pid : undefined,
+          ...(event.pid >= 0 ? processStartStamp('pid_start', event.pid) : {}),
           cli_path: this.opts.cliPath,
           ...(event.tini ? { tini: true } : {}),
           ...(this.opts.nice_requested !== undefined ? { nice: this.opts.nice_requested } : {}),
@@ -901,6 +1203,7 @@ export class MinionSupervisor {
           ? `signal ${event.signal}`
           : `code ${event.code ?? 'null'}`;
         this.emit('worker_exited', {
+          pid: event.pid ?? null,
           code: event.code,
           signal: event.signal,
           reason: exitReason,
@@ -950,11 +1253,13 @@ export class MinionSupervisor {
    * connection shouldn't stack duplicate checks).
    */
   private async healthCheck(): Promise<void> {
-    if (this.healthInFlight) return;
+    if (this.healthInFlight || this.configurationBlocked || this.stopping) return;
+    if (this.processingState && !this.processingState.snapshot.processing_ready) return;
     this.healthInFlight = true;
 
     try {
       const sig = await queryWedgeSignals(this.engine, this.opts.queue, this.handlerNames);
+      if (this.configurationBlocked || this.stopping) return;
 
       // Reset consecutive failure counter on successful health check
       this.consecutiveHealthFailures = 0;
@@ -1040,6 +1345,7 @@ export class MinionSupervisor {
       }
     } catch (e) {
       this.consecutiveHealthFailures++;
+      if (this.configurationBlocked || this.stopping) return;
       const errMsg = e instanceof Error ? e.message : String(e);
 
       if (this.consecutiveHealthFailures >= 3) {
@@ -1097,6 +1403,7 @@ export class MinionSupervisor {
     waitingClaimable: number,
     minutesSinceCompletion: number | null,
   ): Promise<void> {
+    if (this.configurationBlocked || this.stopping) return;
     const cs = this.childSupervisor;
     if (!cs) return;
 

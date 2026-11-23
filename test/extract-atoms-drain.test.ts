@@ -16,13 +16,14 @@ import {
   type ExtractAtomsDrainDeps,
 } from '../src/core/cycle/extract-atoms-drain.ts';
 import { isProtectedJobName, PROTECTED_JOB_NAMES } from '../src/core/minions/protected-names.ts';
+import { surfaceFileSource } from './helpers/source-surface.ts';
 
 function seq(values: Array<number | null>): () => Promise<number | null> {
   let i = 0;
   return async () => values[Math.min(i++, values.length - 1)];
 }
 
-const passThroughLock: ExtractAtomsDrainDeps['withLock'] = (work) => work();
+const passThroughLock: ExtractAtomsDrainDeps['withLock'] = (work) => work(new AbortController().signal);
 
 describe('runExtractAtomsDrain (issue #1678)', () => {
   it('drains to empty and reports stopped=drained', async () => {
@@ -77,6 +78,62 @@ describe('runExtractAtomsDrain (issue #1678)', () => {
     expect(result.stopped).toBe('no_progress');
     expect(batches).toBe(1);
     expect(result.remaining).toBe(5);
+    expect(result.status).toBe('ok');
+  });
+
+  // issue #3218 — a batch where every attempted item errored (providerFailure)
+  // must surface distinctly from an ordinary no_progress/drained/window stop,
+  // so the Minion handler can retry instead of completing the durable job.
+  it('stops with status=provider_failure when a batch reports providerFailure', async () => {
+    let batches = 0;
+    const result = await runExtractAtomsDrain(
+      {
+        withLock: passThroughLock,
+        countRemaining: async () => 5,
+        runBatch: async () => {
+          batches++;
+          return { extracted: 0, skipped: 0, providerFailure: true };
+        },
+        now: () => 0,
+      },
+      { windowMs: 1_000_000 },
+    );
+    expect(result.status).toBe('provider_failure');
+    expect(result.stopped).toBe('provider_failure');
+    expect(batches).toBe(1);
+    expect(result.remaining).toBe(5);
+  });
+
+  // issue #3218 (codex P2) — a final recount of 0 must NOT overwrite
+  // stopped='provider_failure' back to 'drained'. Otherwise the caller sees
+  // the contradictory {status: 'provider_failure', stopped: 'drained'}.
+  it('preserves stopped=provider_failure even when the final recount is 0', async () => {
+    const result = await runExtractAtomsDrain(
+      {
+        withLock: passThroughLock,
+        countRemaining: seq([3, 0]), // before-check: 3; final post-loop recount: 0
+        runBatch: async () => ({ extracted: 0, skipped: 0, providerFailure: true }),
+        now: () => 0,
+      },
+      { windowMs: 1_000_000 },
+    );
+    expect(result.status).toBe('provider_failure');
+    expect(result.stopped).toBe('provider_failure');
+    expect(result.remaining).toBe(0);
+  });
+
+  it('does not flag provider_failure for an ordinary partial-success batch', async () => {
+    const result = await runExtractAtomsDrain(
+      {
+        withLock: passThroughLock,
+        countRemaining: seq([3, 0, 0]),
+        runBatch: async () => ({ extracted: 1, skipped: 0, providerFailure: false }),
+        now: () => 0,
+      },
+      { windowMs: 1_000_000 },
+    );
+    expect(result.status).toBe('ok');
+    expect(result.stopped).toBe('drained');
   });
 
   it('propagates a busy-lock error (caller reports cycle_already_running)', async () => {
@@ -112,7 +169,7 @@ describe('runExtractAtomsDrain (issue #1678)', () => {
 
 // #1685 GAP D (CODEX #1) — the auto-drain Minion job burns Haiku, so it must be
 // PROTECTED: no MCP/OAuth-scoped caller can submit it; only trusted local
-// callers (autopilot, explicit CLI with --allow-protected) can.
+// callers (autopilot, an explicit `gbrain jobs submit` from the CLI) can.
 describe('extract-atoms-drain protected-name membership', () => {
   it('extract-atoms-drain is PROTECTED', () => {
     expect(isProtectedJobName('extract-atoms-drain')).toBe(true);
@@ -132,5 +189,129 @@ describe('shared wiring helper holds the cycle lock (5A)', () => {
     expect(src).toContain('runExtractAtomsDrainForSource');
     expect(src).toContain('cycleLockIdFor(opts.sourceId)');
     expect(src).toContain('withRefreshingLock(engine, lockId');
+  });
+
+  // issue #3218 — the wiring's `runBatch` must derive `providerFailure` from
+  // the SAME per-item counts pinned by
+  // `extract-atoms-synthesize-concepts.test.ts`'s "all items fail" case
+  // (failures.length > 0 && transcripts_processed + pages_processed === 0),
+  // not from `r.status` (which collapses partial and total failure into the
+  // same 'warn' value — the exact discard the issue reports).
+  it('runBatch derives providerFailure from failures.length + zero processed items, not r.status', () => {
+    const runBatchBlock = src.slice(src.indexOf('runBatch: async ({ signal, stopSignal }) => {'));
+    expect(runBatchBlock).toContain('d.failures');
+    expect(runBatchBlock).toContain('transcripts_processed');
+    expect(runBatchBlock).toContain('pages_processed');
+    expect(runBatchBlock).toContain('providerFailure: failures.length > 0 && itemsSucceeded === 0');
+  });
+});
+
+// The register comment is the only place an operator learns how a PROTECTED
+// name gets submitted from the CLI. `jobs submit` sets allowProtectedSubmit
+// itself for protected names; there is no allow-protected flag, and a
+// comment advertising one sends operators to a flag that exits "unknown".
+// The repo-wide form of this pin is test/no-allow-protected-flag.test.ts.
+describe('protected-names register comment names the real trust mechanism', () => {
+  const src = readFileSync(join(import.meta.dir, '../src/core/minions/protected-names.ts'), 'utf8');
+  const flag = ['--allow', 'protected'].join('-');
+  it('does not advertise the non-existent allow-protected flag', () => {
+    expect(src).not.toContain(flag);
+    expect(src).toContain('allowProtectedSubmit');
+  });
+});
+
+// issue #3218 — the Minion handler must throw (not complete) when the drain
+// reports status='provider_failure', so the worker's ordinary failJob path
+// (attempt+backoff / dead-letter) retries the durable job instead of the
+// backlog silently completing untouched.
+describe('extract-atoms-drain Minion handler retries on provider_failure (issue #3218)', () => {
+  const jobsSrc = surfaceFileSource('jobs', 'src/commands/jobs.ts');
+  // W4 jobs: the handler body moved into its own module; jobs.ts keeps the registration.
+  const handlerSrc = surfaceFileSource('jobs', 'src/core/minions/handlers/extract-atoms-drain.ts');
+  const handlerBlock = handlerSrc.slice(handlerSrc.indexOf('export function makeExtractAtomsDrainHandler('));
+
+  it('jobs.ts registers the extract-atoms-drain handler module', () => {
+    expect(jobsSrc).toContain("registerBuiltinJob(worker, engine, 'extract-atoms-drain', makeExtractAtomsDrainHandler(engine))");
+    expect(handlerSrc.indexOf('export function makeExtractAtomsDrainHandler(')).toBeGreaterThan(-1);
+  });
+
+  it("throws when result.status === 'provider_failure' instead of returning it", () => {
+    expect(handlerBlock).toMatch(/result\.status === 'provider_failure'/);
+    expect(handlerBlock).toMatch(/if \(result\.status === 'provider_failure'\) \{\s*throw new Error/);
+  });
+
+  it('still returns the deferred/skipped shape on LockUnavailableError (unchanged)', () => {
+    expect(handlerBlock).toContain('e instanceof LockUnavailableError');
+    expect(handlerBlock).toContain(
+      "{ phase: 'extract_atoms', status: 'skipped', deferred: true, reason: 'cycle_already_running' }",
+    );
+  });
+});
+
+describe('#2144: zero-yield tombstone progress semantics', () => {
+  it('continues when a zero-atom batch still shrinks the backlog (tombstoned pages)', async () => {
+    let batches = 0;
+    const result = await runExtractAtomsDrain(
+      {
+        withLock: passThroughLock,
+        // consumed: before#1=4, after#1=2 (<4 → progress), before#2=2,
+        // after#2=0 (<2 → progress), before#3=0 → drained; final repeats 0.
+        countRemaining: seq([4, 2, 2, 0, 0]),
+        runBatch: async () => { batches++; return { extracted: 0, skipped: 0 }; },
+        now: () => 0,
+      },
+      { windowMs: 1_000_000 },
+    );
+    expect(result.stopped).toBe('drained');
+    expect(result.batches).toBe(2);
+    expect(result.extracted).toBe(0);
+    expect(result.remaining).toBe(0);
+    expect(batches).toBe(2);
+  });
+
+  it('stops no_progress when a zero-atom batch leaves the backlog flat', async () => {
+    let batches = 0;
+    const result = await runExtractAtomsDrain(
+      {
+        withLock: passThroughLock,
+        countRemaining: seq([5, 5]),
+        runBatch: async () => { batches++; return { extracted: 0, skipped: 0 }; },
+        now: () => 0,
+      },
+      { windowMs: 1_000_000 },
+    );
+    expect(result.stopped).toBe('no_progress');
+    expect(result.batches).toBe(1);
+    expect(result.remaining).toBe(5);
+    expect(batches).toBe(1);
+  });
+  it('#8445: stops no_progress when a batch only skips items the backlog keeps counting', async () => {
+    let batches = 0;
+    const result = await runExtractAtomsDrain(
+      {
+        withLock: passThroughLock,
+        countRemaining: async () => 1,
+        runBatch: async () => { batches++; return { extracted: 0, skipped: 1 }; },
+        now: () => 0,
+      },
+      { windowMs: 1_000_000, maxBatches: 20 },
+    );
+    expect(result).toMatchObject({ stopped: 'no_progress', batches: 1, skipped: 1, remaining: 1 });
+    expect(batches).toBe(1);
+  });
+
+  it('#8445: a skip-only batch that shrinks the backlog keeps draining', async () => {
+    let batches = 0;
+    const result = await runExtractAtomsDrain(
+      {
+        withLock: passThroughLock,
+        countRemaining: async () => Math.max(0, 3 - batches),
+        runBatch: async () => { batches++; return { extracted: 0, skipped: 2 }; },
+        now: () => 0,
+      },
+      { windowMs: 1_000_000, maxBatches: 20 },
+    );
+    expect(result).toMatchObject({ stopped: 'drained', batches: 3, skipped: 6, remaining: 0 });
+    expect(batches).toBe(3);
   });
 });

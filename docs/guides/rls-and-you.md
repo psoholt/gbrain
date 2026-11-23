@@ -1,8 +1,9 @@
 # RLS and you
 
 Short version: every table in your gbrain's `public` schema needs Row Level
-Security enabled. If one doesn't, `gbrain doctor` now fails, not warns, and the
-process exits 1.
+Security enabled. If one doesn't and the schema may be reachable with an anon
+key (Supabase, or PostgREST roles on the database), `gbrain doctor` fails and
+the process exits 1. On a plain Postgres with no such exposure it warns.
 
 This guide explains why, what to do when you hit the check, and the escape hatch
 for the cases where you really do want a table to stay readable by the anon key.
@@ -34,35 +35,47 @@ docs/guides/rls-and-you.md for the GBRAIN:RLS_EXEMPT comment escape hatch.
 
 99% of the time, you want the fix. Run the SQL. Re-run `gbrain doctor`. Done.
 
-## v0.26.7 — auto-RLS event trigger and one-time backfill
+## Auto-RLS: the event trigger and the one-time backfill
 
-Starting in v0.26.7 (migration v35), gbrain ships two changes that close the
-gap where a table could exist in your `public` schema without RLS for any
-amount of time at all.
+gbrain ships two mechanisms (schema migration v35) that close the gap where a
+table could exist in your `public` schema without RLS for any amount of time
+at all.
 
 **1. The event trigger.** A Postgres DDL event trigger named
 `auto_rls_on_create_table` runs `ALTER TABLE … ENABLE ROW LEVEL SECURITY`
 on every newly created `public.*` table. It covers `CREATE TABLE`,
 `CREATE TABLE AS … SELECT`, and `SELECT … INTO` — every syntax Postgres
 reports as a table-creation command. Tables created by gbrain itself, by
-your other apps sharing the same Supabase project (Baku, Hermes, anything),
-or by a human running raw SQL all get RLS enabled the moment they exist.
+any other app sharing the same Supabase project, or by a human running raw
+SQL all get RLS enabled the moment they exist.
 Non-`public` schemas (`auth`, `storage`, `realtime`, etc.) are explicitly
 ignored — Supabase manages those, and we should not touch them.
 
-**2. The one-time backfill.** When you upgrade to v0.26.7, the migration
+**2. The one-time backfill.** The first upgrade that applies migration v35
 walks every existing `public.*` base table whose RLS is off and whose comment
 doesn't carry the `GBRAIN:RLS_EXEMPT` exemption (see below) and enables RLS
 on each. After the upgrade, `gbrain doctor`'s `rls` check should be a no-op
 on every brain.
 
-### Breaking change: read this before upgrading
+**3. The gbrain-table backfill.** Schema migration v275 enables RLS on every
+table gbrain itself creates that is still without it. A gbrain table could
+miss RLS when its RLS came only from a full schema replay, which
+`gbrain apply-migrations --yes` does not run, or only from the event trigger
+above, which needs a superuser and is absent on many managed brains. v275
+touches only gbrain's own tables, leaves a table that already has RLS or
+carries the `GBRAIN:RLS_EXEMPT` comment alone, and reads or writes no row. It
+acts only when the migrating role bypasses RLS and owns the table; otherwise
+it names the table on stderr and leaves it, and doctor's `rls` check keeps
+naming it.
+
+### Keeping a table RLS-off through the backfill
 
 If you have public tables that are intentionally RLS-off and you want them
 to stay that way, you MUST add the `GBRAIN:RLS_EXEMPT` comment **before**
-running `gbrain upgrade` to v0.26.7. The backfill flips RLS on for any public
-table that doesn't carry the exact comment contract documented below. There
-is no `--dry-run` flag on the migration.
+migration v35 (the RLS backfill) runs on that brain (for one of gbrain's own
+tables, before v275). The backfill flips RLS on for any
+public table that doesn't carry the exact comment contract documented below.
+There is no `--dry-run` flag on the migration.
 
 The minimum cost of getting this wrong is one round-trip: the operator runs
 the SQL to enable RLS on a table that should have been exempt, then
@@ -71,7 +84,7 @@ prevent a re-flip on a later doctor run. No data is lost.
 
 ### Cross-app implications
 
-If a non-gbrain app (Baku, Hermes, a script you wrote, anything) creates
+If a non-gbrain app (a side project, a script you wrote, anything) creates
 tables in the same Supabase project, the trigger will enable RLS on those
 tables too. Two ways to handle that:
 
@@ -90,17 +103,41 @@ ship a policy.
 
 ### What if the trigger gets dropped?
 
-`gbrain doctor` includes a new `rls_event_trigger` check that verifies the
+`gbrain doctor` includes an `rls_event_trigger` check that verifies the
 trigger is installed and enabled. If you drop it manually for any reason
-(debugging, migration testing, anything), doctor warns and gives you the
-recovery command:
+(debugging, migration testing, anything), doctor warns and points you here.
 
-```
-gbrain apply-migrations --force-retry 35
+Recreate it by re-running the trigger DDL from migration v35 — idempotent
+(`CREATE OR REPLACE` + `DROP EVENT TRIGGER IF EXISTS`), safe to paste into
+psql as a BYPASSRLS role (e.g. `postgres`):
+
+```sql
+CREATE OR REPLACE FUNCTION auto_enable_rls()
+RETURNS event_trigger SET search_path = pg_catalog, public, pg_temp AS $$
+DECLARE
+  obj record;
+BEGIN
+  FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
+    WHERE object_type = 'table'
+    AND schema_name = 'public'
+  LOOP
+    EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', obj.object_identity);
+  END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP EVENT TRIGGER IF EXISTS auto_rls_on_create_table;
+CREATE EVENT TRIGGER auto_rls_on_create_table
+  ON ddl_command_end
+  WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO')
+  EXECUTE FUNCTION auto_enable_rls();
 ```
 
-Re-running migration v35 is idempotent — it `DROP EVENT TRIGGER IF EXISTS`
-and recreates cleanly.
+(This is the DDL migration v35 runs, with the `SET search_path` later migrations add: keep that clause when you
+paste it, or doctor's `function_search_path` check fails until you run the `ALTER FUNCTION` it prints. The
+original lives in `src/core/schema-migrations/v035-auto-rls-event-trigger.ts`, one file per schema migration. There's no CLI shortcut:
+`gbrain apply-migrations --force-retry` targets the vX.Y.Z orchestrator
+registry, not numeric schema migrations like v35.)
 
 ### Why no FORCE ROW LEVEL SECURITY?
 
@@ -147,7 +184,7 @@ Rules:
 ```sql
 ALTER TABLE public.expenses_ramp DISABLE ROW LEVEL SECURITY;
 COMMENT ON TABLE public.expenses_ramp IS
-  'GBRAIN:RLS_EXEMPT reason=analytics-only, anon-readable ok, owner=garry, 2026-04-22';
+  'GBRAIN:RLS_EXEMPT reason=analytics-only, anon-readable ok, owner=you, 2026-04-22';
 ```
 
 After that, `gbrain doctor` reports:
@@ -204,6 +241,46 @@ COMMENT ON TABLE public.expenses_ramp IS NULL;
 `gbrain doctor` stops listing the table as exempt and goes back to checking
 it like any other.
 
+## Adding a gbrain table (contributors)
+
+A new gbrain-owned table gets RLS in both places a brain can receive it. For
+fresh installs, add `ALTER TABLE <table> ENABLE ROW LEVEL SECURITY;` to the
+BYPASSRLS-guarded RLS block in `src/schema.sql`, then run
+`bun run build:schema`; the generator keeps that block out of the PGLite
+template by an explicit rule (PGLite has no role system). For existing
+brains, the schema migration that creates the table
+(`bun run new:migration <name>`, one file in `src/core/schema-migrations/`)
+enables RLS too, with a `sqlFor: { pglite: ... }` variant that leaves it out.
+The auto-RLS event trigger and doctor's `rls` check backstop a table that
+slips through on Postgres, but they are the safety net, not the plan: the
+trigger needs a superuser and is missing on many managed brains, and
+`gbrain apply-migrations --yes` runs migrations without replaying
+`src/schema.sql`. `test/e2e/rls-every-table-postgres.test.ts` checks every
+public table after a fresh install and after that migrations-only upgrade,
+both with the trigger inert, so a table that relies on either one fails it.
+
+## Function search_path
+
+Every plpgsql function gbrain installs pins `search_path = pg_catalog, public, pg_temp`,
+so a same-named object in another schema can never change what the function
+reads or writes. `pg_temp` is named last because PostgreSQL otherwise searches the
+caller's temporary schema first for tables and views: a session, the owner included,
+could shadow a purge or withdrawal ledger a guard reads with an empty temporary one of
+the same name and store purged content again. On an older brain, migration v277 appends
+`pg_temp` to every gbrain function it owns with `ALTER FUNCTION` (no body changes), and
+`gbrain doctor` (`function_search_path`) names any function it could not change, with the
+`ALTER FUNCTION` to run as its owner. Since migration v318 (gbrain#7632, gbrain#7659) a
+write role that RLS keeps from reading a ledger is refused with `writer_coordinator_required`
+(`unreadable_state`) on the writes that guard checks, instead of reading the ledger as empty
+and letting purged or withdrawn content through; [docs/ENGINES.md](../ENGINES.md#purge-and-withdrawal-guards)
+has the policies a scoped write role needs. The three fact-fingerprint functions
+(`gbrain_fact_fingerprint`, `gbrain_fact_fingerprint_v1`,
+`gbrain_fact_normalize`) are SQL functions that an index expression uses, so
+they call `pg_catalog.`-qualified built-ins instead of pinning a setting (a
+pinned setting would stop Postgres inlining them). Supabase's database linter
+still reports those three under "Function Search Path Mutable"; that warning
+is expected and safe to dismiss for them.
+
 ## PGLite
 
 If you're on PGLite (the zero-config default), doctor skips this check
@@ -220,14 +297,21 @@ running and will flag any table that came over without RLS.
 ## Self-hosted Postgres
 
 If you're running Postgres without PostgREST in front, the anon-key exposure
-doesn't apply. But gbrain still fails the check on missing RLS, because:
+doesn't apply. Doctor looks for an exposure signal before it fails the check:
+the PostgREST role names (`anon`, `authenticated`, `authenticator`,
+`service_role`) in `pg_roles`, or a Supabase database URL. With neither, a
+table without RLS is a `warn`:
 
-- The framing is "RLS on all public tables" is a gbrain security invariant,
-  not a Supabase-specific workaround.
-- The `ALTER TABLE ... ENABLE RLS` fix is harmless on any Postgres: it only
-  constrains non-bypass roles, which gbrain doesn't use.
-- If you ever put PostgREST or a similar tool in front later, the guard is
-  already in place.
+```
+rls: warn — 1 table(s) WITHOUT Row Level Security: local_notes. No PostgREST
+exposure detected (...), so this is a warning: enable RLS before putting
+PostgREST or a similar API in front of the public schema. Fix: ALTER TABLE ...
+```
 
-If this framing doesn't fit your deployment, file an issue with the specifics
-so we can decide whether a self-hosted-exempt mode is justified.
+The fix is still worth running: `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` is
+harmless on any Postgres (it only constrains non-bypass roles, which gbrain
+doesn't use), and the guard is in place if you add PostgREST later. Once one
+of those roles exists, the same table fails the check.
+
+**Say to your agent:** *"Check whether my brain's database tables are protected
+before I expose it."*

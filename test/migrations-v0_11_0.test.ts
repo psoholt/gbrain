@@ -12,7 +12,7 @@
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync } from 'fs';
-import { join } from 'path';
+import { join, sep, dirname } from 'path';
 import { tmpdir } from 'os';
 
 import { __testing, type PendingHostWorkEntry } from '../src/commands/migrations/v0_11_0.ts';
@@ -28,18 +28,29 @@ const {
 } = __testing;
 
 let tmp: string;
+let gbrainHome: string;
 let origHome: string | undefined;
+let origGbrainHome: string | undefined;
 
+// HOME holds the host-agent scopes ($HOME/.claude, $HOME/.openclaw); the
+// gbrain home is a SEPARATE dir so every test also proves that migration
+// state follows GBRAIN_HOME, never $HOME/.gbrain (#5549).
 beforeEach(() => {
   origHome = process.env.HOME;
+  origGbrainHome = process.env.GBRAIN_HOME;
   tmp = mkdtempSync(join(tmpdir(), 'gbrain-v0_11_0-test-'));
+  gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-v0_11_0-gbrain-home-'));
   process.env.HOME = tmp;
+  process.env.GBRAIN_HOME = gbrainHome;
 });
 
 afterEach(() => {
   if (origHome === undefined) delete process.env.HOME;
   else process.env.HOME = origHome;
+  if (origGbrainHome === undefined) delete process.env.GBRAIN_HOME;
+  else process.env.GBRAIN_HOME = origGbrainHome;
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
+  try { rmSync(gbrainHome, { recursive: true, force: true }); } catch { /* best-effort */ }
 });
 
 function writeAgentsMd(dir: string, body: string) {
@@ -55,8 +66,6 @@ function writeCronJson(dir: string, jobs: unknown[]) {
   writeFileSync(path, JSON.stringify({ jobs }, null, 2) + '\n');
   return path;
 }
-// Re-export dirname so writeCronJson can use it without another import
-const dirname = (p: string) => p.substring(0, p.lastIndexOf('/'));
 
 const DEFAULT_OPTS = {
   yes: true,
@@ -261,6 +270,37 @@ describe('cron manifest rewrite — gbrain builtins only', () => {
   });
 });
 
+describe('GBRAIN_HOME resolution (#5549)', () => {
+  test('pending-host-work.jsonl lands under GBRAIN_HOME, not $HOME/.gbrain', () => {
+    const path = writeCronJson(join(tmp, '.claude'), [
+      { schedule: '0 */30 * * *', kind: 'agentTurn', skill: 'ea-inbox-sweep' },
+    ]);
+    rewriteCronManifest(path, DEFAULT_OPTS);
+
+    const expected = join(gbrainHome, '.gbrain', 'migrations', 'pending-host-work.jsonl');
+    expect(existsSync(expected)).toBe(true);
+    expect(readFileSync(expected, 'utf-8')).toContain('ea-inbox-sweep');
+    expect(existsSync(join(tmp, '.gbrain'))).toBe(false);
+  });
+
+  test('engine detection reads config.json from GBRAIN_HOME', () => {
+    // Only the GBRAIN_HOME brain is PGLite; $HOME/.gbrain says postgres.
+    // A PGLite brain needs --follow on rewritten builtin cron entries.
+    mkdirSync(join(gbrainHome, '.gbrain'), { recursive: true });
+    writeFileSync(join(gbrainHome, '.gbrain', 'config.json'), JSON.stringify({ engine: 'pglite' }));
+    mkdirSync(join(tmp, '.gbrain'), { recursive: true });
+    writeFileSync(join(tmp, '.gbrain', 'config.json'), JSON.stringify({ engine: 'postgres' }));
+
+    const path = writeCronJson(join(tmp, '.claude'), [
+      { schedule: '*/5 * * * *', kind: 'agentTurn', skill: 'sync' },
+    ]);
+    rewriteCronManifest(path, DEFAULT_OPTS);
+
+    const after = JSON.parse(readFileSync(path, 'utf-8'));
+    expect(after.jobs[0].cmd).toContain('--follow');
+  });
+});
+
 describe('findAgentsMdFiles + findCronManifests scoping', () => {
   test('finds AGENTS.md in $HOME/.claude and $HOME/.openclaw scopes', () => {
     mkdirSync(join(tmp, '.claude'), { recursive: true });
@@ -277,13 +317,17 @@ describe('findAgentsMdFiles + findCronManifests scoping', () => {
   test('does NOT walk $PWD unless --host-dir is passed', () => {
     mkdirSync(join(tmp, 'project'), { recursive: true });
     writeFileSync(join(tmp, 'project', 'AGENTS.md'), '# project\n');
+    // findAgentsMdFiles returns join()-built native paths, so a '/project/'
+    // literal matches nothing on win32 and the negative assertion below would
+    // pass vacuously. Only the separator comes from `path`; the directory name
+    // being probed stays hand-written.
     // No --host-dir
     const found = findAgentsMdFiles(DEFAULT_OPTS);
-    expect(found.some(p => p.includes('/project/'))).toBe(false);
+    expect(found.some(p => p.includes(`${sep}project${sep}`))).toBe(false);
 
     // With --host-dir
     const foundWithHostDir = findAgentsMdFiles({ ...DEFAULT_OPTS, hostDir: join(tmp, 'project') });
-    expect(foundWithHostDir.some(p => p.includes('/project/'))).toBe(true);
+    expect(foundWithHostDir.some(p => p.includes(`${sep}project${sep}`))).toBe(true);
   });
 
   test('findCronManifests picks up cron/jobs.json under scoped roots', () => {

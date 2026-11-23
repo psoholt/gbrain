@@ -23,6 +23,8 @@
  *   15. Determinism across 10 calls
  *   16. Self-link guard (D13)
  *   17. Cross-source guard
+ *   17b. Cross-source guard lifts under allowCrossSource
+ *   17c. Own-source same-name twin outranks the cross-source twin
  *   18. Hardcoded type filter (meeting NOT in gazetteer)
  *   19. Min-length + ignore-list interaction
  *   20. Code-block + token interaction
@@ -33,6 +35,8 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   buildGazetteer,
   findMentionedEntities,
+  tokenizeForScan,
+  tokenizeTitle,
   LINKABLE_ENTITY_TYPES,
   type Gazetteer,
   type GazetteerEntry,
@@ -56,18 +60,15 @@ beforeEach(async () => {
 });
 
 // Tiny gazetteer builder for pure-fn cases that don't need engine.
+//
+// Deliberately calls the PRODUCTION `tokenizeTitle` rather than re-declaring
+// the tokenizer. A duplicated copy makes every test here non-discriminating:
+// reverting the source tokenizer would leave the fixture on the new one, so
+// title and body would keep agreeing and the tests would pass either way.
 function gazetteerFromEntries(entries: Omit<GazetteerEntry, 'tokens'>[]): Gazetteer {
-  const TOKEN_RE = /[a-zA-Z0-9]+/g;
-  const tokenize = (s: string): string[] => {
-    TOKEN_RE.lastIndex = 0;
-    const out: string[] = [];
-    let m: RegExpExecArray | null;
-    while ((m = TOKEN_RE.exec(s)) !== null) out.push(m[0].toLowerCase());
-    return out;
-  };
   const g: Gazetteer = new Map();
   for (const raw of entries) {
-    const tokens = tokenize(raw.title);
+    const tokens = tokenizeTitle(raw.title);
     if (tokens.length === 0) continue;
     const key = tokens[0]!;
     const entry: GazetteerEntry = { ...raw, tokens };
@@ -84,6 +85,21 @@ function gazetteerFromEntries(entries: Omit<GazetteerEntry, 'tokens'>[]): Gazett
 // ============================================================
 
 describe('findMentionedEntities — pure cases', () => {
+  test('text inside HTML comments is never a mention: a gbrain fence marker does not link a page titled gbrain (#6740)', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'projects/gbrain', source_id: 'default', title: 'gbrain' },
+      { slug: 'companies/acme', source_id: 'default', title: 'Acme Example' },
+    ]);
+    const body = '## Facts\n<!--- gbrain:facts:begin -->\n| claim |\n<!--- gbrain:facts:end -->\n<!-- Acme Example owns this -->\nNotes.';
+    expect(findMentionedEntities(body, g, { fromSlug: 'notes/n1', fromSourceId: 'default' })).toEqual([]);
+    const prose = '<!-- Acme Example --> We shipped gbrain with Acme Example.';
+    const mentions = findMentionedEntities(prose, g, { fromSlug: 'notes/n1', fromSourceId: 'default' });
+    expect(mentions.map(m => [m.slug, m.offset])).toEqual([
+      ['projects/gbrain', prose.indexOf('gbrain')],
+      ['companies/acme', prose.lastIndexOf('Acme Example')],
+    ]);
+  });
+
   test('1. single-token title match', () => {
     const g = gazetteerFromEntries([
       { slug: 'companies/acme', source_id: 'default', title: 'Acme' },
@@ -245,6 +261,97 @@ describe('findMentionedEntities — pure cases', () => {
     expect(mentions).toEqual([]);
   });
 
+  test('17b. cross-source guard lifts under allowCrossSource — mention carries the entity\'s own source_id', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'companies/acme', source_id: 'team-b', title: 'Acme' },
+    ]);
+    const opts = { fromSlug: 'writing/post-1', fromSourceId: 'team-a' };
+    expect(findMentionedEntities('We met Acme today.', g, opts)).toEqual([]);
+    const mentions = findMentionedEntities('We met Acme today.', g, { ...opts, allowCrossSource: true });
+    expect(mentions).toHaveLength(1);
+    expect(mentions[0]!.slug).toBe('companies/acme');
+    expect(mentions[0]!.source_id).toBe('team-b');
+  });
+
+  test('17c. same-name twin in the scanning page\'s own source outranks the cross-source twin', () => {
+    // Bucket order is length-only, so the foreign twin sits first: without the
+    // own-source preference the guard drops the mention (allowCrossSource off)
+    // or links the foreign page (allowCrossSource on).
+    const g = gazetteerFromEntries([
+      { slug: 'companies/acme', source_id: 'team-b', title: 'Acme' },
+      { slug: 'companies/acme-local', source_id: 'team-a', title: 'Acme' },
+    ]);
+    for (const allowCrossSource of [false, true]) {
+      const mentions = findMentionedEntities('We met Acme today.', g, {
+        fromSlug: 'writing/post-1', fromSourceId: 'team-a', allowCrossSource,
+      });
+      expect(mentions).toHaveLength(1);
+      expect(mentions[0]!.slug).toBe('companies/acme-local');
+      expect(mentions[0]!.source_id).toBe('team-a');
+    }
+  });
+
+  // Slug uniqueness is (source_id, slug): with the cross-source guard lifted,
+  // a foreign page that merely shares the scanning page's slug is a real
+  // target, not a self-link.
+  test('17d. allowCrossSource — foreign namesakes of the scanning page are not self-links', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'entities/shared', source_id: 'team-b', title: 'Beta Entity' },
+      { slug: 'entities/shared', source_id: 'team-c', title: 'Gamma Entity' },
+    ]);
+    const mentions = findMentionedEntities('Beta Entity met Gamma Entity.', g, {
+      fromSlug: 'entities/shared', fromSourceId: 'team-a', allowCrossSource: true,
+    });
+    expect(mentions.map(({ source_id, slug }) => [source_id, slug])).toEqual([
+      ['team-b', 'entities/shared'],
+      ['team-c', 'entities/shared'],
+    ]);
+  });
+
+  // #6158 / #4845: a connector renders its contacts as near-empty person pages in its own source. With
+  // cross_source on, a mention in that source binds to the canonical twin elsewhere, not the stub; with it
+  // off the own-source posture is unchanged; two foreign twins (no same-slug one) keep the stub (honest tie).
+  test('17f. a connector contact stub yields to the one canonical twin under allowCrossSource only', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'people/dana-example', source_id: 'gmail-a', title: 'Dana Example', connector_stub: true },
+      { slug: 'people/dana-example', source_id: 'workspace', title: 'Dana Example' },
+    ]);
+    const opts = { fromSlug: 'emails/2026/08/thread-1', fromSourceId: 'gmail-a' };
+    expect(findMentionedEntities('Call with Dana Example.', g, opts)).toEqual([expect.objectContaining({ slug: 'people/dana-example', source_id: 'gmail-a' })]);
+    expect(findMentionedEntities('Call with Dana Example.', g, { ...opts, allowCrossSource: true }))
+      .toEqual([expect.objectContaining({ slug: 'people/dana-example', source_id: 'workspace' })]);
+    const tie = gazetteerFromEntries([
+      { slug: 'people/dana-example', source_id: 'gmail-a', title: 'Dana Example', connector_stub: true },
+      { slug: 'people/dana-e', source_id: 'workspace', title: 'Dana Example' },
+      { slug: 'people/dana-example-2', source_id: 'notes', title: 'Dana Example' },
+    ]);
+    expect(findMentionedEntities('Call with Dana Example.', tie, { ...opts, allowCrossSource: true }))
+      .toEqual([expect.objectContaining({ slug: 'people/dana-example', source_id: 'gmail-a' })]);
+    // A third source's page mentioning the name binds to the canonical twin, not the stub the bucket sorts first.
+    expect(findMentionedEntities('Call with Dana Example.', g, { fromSlug: 'notes/x', fromSourceId: 'notes', allowCrossSource: true }))
+      .toEqual([expect.objectContaining({ slug: 'people/dana-example', source_id: 'workspace' })]);
+    const stubOnly = gazetteerFromEntries([
+      { slug: 'people/dana-example', source_id: 'gmail-a', title: 'Dana Example', connector_stub: true },
+      { slug: 'people/dana-example', source_id: 'gmail-b', title: 'Dana Example', connector_stub: true },
+    ]);
+    expect(findMentionedEntities('Call with Dana Example.', stubOnly, { ...opts, allowCrossSource: true }))
+      .toEqual([expect.objectContaining({ slug: 'people/dana-example', source_id: 'gmail-a' })]);
+  });
+
+  test('17e. allowCrossSource — first-mention dedup keys on (source_id, slug), not bare slug', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'entities/shared', source_id: 'team-b', title: 'Beta Entity' },
+      { slug: 'entities/shared', source_id: 'team-c', title: 'Gamma Entity' },
+    ]);
+    const mentions = findMentionedEntities('Beta Entity met Gamma Entity.', g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'team-a', allowCrossSource: true,
+    });
+    expect(mentions.map(({ source_id, slug }) => [source_id, slug])).toEqual([
+      ['team-b', 'entities/shared'],
+      ['team-c', 'entities/shared'],
+    ]);
+  });
+
   test('20. code-block + token interaction — body text outside block linked, inside skipped', () => {
     const g = gazetteerFromEntries([
       { slug: 'companies/acme', source_id: 'default', title: 'Acme' },
@@ -256,6 +363,343 @@ describe('findMentionedEntities — pure cases', () => {
     });
     expect(mentions).toHaveLength(1); // first-mention-only cap
     expect(mentions[0]!.slug).toBe('companies/acme');
+  });
+});
+
+// ============================================================
+// CJK — entity extraction tests
+// ============================================================
+
+describe('findMentionedEntities — CJK cases', () => {
+  test('CJK single-name match — "艾例丝" in body → matched', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'people/alice-example', source_id: 'default', title: '艾例丝' },
+    ]);
+    const mentions = findMentionedEntities('我最近读了艾例丝的书。', g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toHaveLength(1);
+    expect(mentions[0]!.slug).toBe('people/alice-example');
+    expect(mentions[0]!.name).toBe('艾例丝');
+  });
+
+  test('CJK multi-name — two different CJK entities in one body', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'people/alice-example', source_id: 'default', title: '艾例丝' },
+      { slug: 'people/bob-example', source_id: 'default', title: '鲍例布' },
+    ]);
+    const mentions = findMentionedEntities('艾例丝和鲍例布都是作家。', g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toHaveLength(2);
+    const slugs = mentions.map(m => m.slug);
+    expect(slugs).toContain('people/alice-example');
+    expect(slugs).toContain('people/bob-example');
+  });
+
+  test('CJK first-mention-only — repeated name → single link', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'people/alice-example', source_id: 'default', title: '艾例丝' },
+    ]);
+    const mentions = findMentionedEntities('艾例丝说过。然后艾例丝又说过。', g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toHaveLength(1);
+  });
+
+  test('CJK self-link guard — entity page mentioning itself is skipped', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'people/alice-example', source_id: 'default', title: '艾例丝' },
+    ]);
+    const mentions = findMentionedEntities('艾例丝是一位投资人。', g, {
+      fromSlug: 'people/alice-example', fromSourceId: 'default',
+    });
+    expect(mentions).toEqual([]);
+  });
+
+  test('CJK cross-source guard — entity in different source skipped', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'people/alice-example', source_id: 'team-b', title: '艾例丝' },
+    ]);
+    const mentions = findMentionedEntities('艾例丝写了这本书。', g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'team-a',
+    });
+    expect(mentions).toEqual([]);
+  });
+
+  test('CJK code-block stripping — CJK name inside ``` is skipped, outside matched', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'people/alice-example', source_id: 'default', title: '艾例丝' },
+    ]);
+    // "艾例丝" only appears inside code block → should be skipped.
+    const body = '```\n艾例丝\n```\n只有代码块里面有。';
+    const mentions = findMentionedEntities(body, g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toHaveLength(0);
+  });
+
+  test('CJK determinism — same output across 10 calls', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'people/alice-example', source_id: 'default', title: '艾例丝' },
+      { slug: 'people/bob-example', source_id: 'default', title: '鲍例布' },
+    ]);
+    const body = '艾例丝和鲍例布。艾例丝再说一次。';
+    const refs = new Set<string>();
+    for (let i = 0; i < 10; i++) {
+      const mentions = findMentionedEntities(body, g, {
+        fromSlug: 'writing/post-1', fromSourceId: 'default',
+      });
+      refs.add(JSON.stringify(mentions));
+    }
+    expect(refs.size).toBe(1);
+  });
+
+  test('CJK mixed body — CJK entity matched in body with ASCII around it', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'people/alice-example', source_id: 'default', title: '艾例丝' },
+      { slug: 'companies/acme', source_id: 'default', title: 'Acme' },
+    ]);
+    const mentions = findMentionedEntities('Acme was founded by 艾例丝 in 2020.', g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toHaveLength(2);
+    const slugs = mentions.map(m => m.slug);
+    expect(slugs).toContain('people/alice-example');
+    expect(slugs).toContain('companies/acme');
+  });
+
+  test('CJK empty gazetteer — no false positives', () => {
+    const g: Gazetteer = new Map();
+    const mentions = findMentionedEntities('艾例丝和鲍例布。', g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toEqual([]);
+  });
+
+  test('CJK empty text → empty result', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'people/alice-example', source_id: 'default', title: '艾例丝' },
+    ]);
+    const mentions = findMentionedEntities('', g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toEqual([]);
+  });
+});
+
+// ============================================================
+// Vietnamese (diacritic Latin) — entity extraction tests
+// ============================================================
+
+// Fictional Vietnamese names only (privacy rule: no real people in fixtures).
+// "Đà Nẵng" is a public city, not a person, and is the canonical đ-diacritic case.
+//
+// Every case below asserts TOKENIZATION, not just the resolved mention. A
+// mention-only assertion does not discriminate: the previous ASCII tokenizer
+// fragmented the gazetteer title and the body symmetrically, so a 5-fragment
+// entry still matched a 5-fragment body run, and `Mention.name` is copied from
+// the untouched `title` column rather than derived from tokens.
+describe('findMentionedEntities — Vietnamese cases', () => {
+  test('VN multi-syllable name matches as a WHOLE (regression: no diacritic fragmentation)', () => {
+    // Discriminating assertion: the ASCII tokenizer produced
+    // ['nguy','n','v','n','c'] for this title.
+    expect(tokenizeTitle('Nguyễn Văn Đức')).toEqual(['nguyễn', 'văn', 'đức']);
+    const body = 'Hôm nay mình học bài của thầy Nguyễn Văn Đức.';
+    expect(tokenizeForScan(body).map(t => t.text)).toContain('nguyễn');
+
+    const g = gazetteerFromEntries([
+      { slug: 'people/nguyen-van-duc', source_id: 'default', title: 'Nguyễn Văn Đức' },
+    ]);
+    const mentions = findMentionedEntities(body, g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toHaveLength(1);
+    expect(mentions[0]!.slug).toBe('people/nguyen-van-duc');
+    expect(mentions[0]!.name).toBe('Nguyễn Văn Đức');
+  });
+
+  test('VN place name with đ/diacritics — "Đà Nẵng" matched', () => {
+    // Discriminating assertion: the ASCII tokenizer produced ['n','ng'],
+    // which is what made this entity match 820 pages instead of 440.
+    expect(tokenizeTitle('Đà Nẵng')).toEqual(['đà', 'nẵng']);
+    const body = 'Gia đình mình chuyển tới Đà Nẵng năm ngoái.';
+    expect(tokenizeForScan(body).map(t => t.text)).toContain('nẵng');
+
+    const g = gazetteerFromEntries([
+      { slug: 'places/da-nang', source_id: 'default', title: 'Đà Nẵng' },
+    ]);
+    const mentions = findMentionedEntities(body, g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toHaveLength(1);
+    expect(mentions[0]!.slug).toBe('places/da-nang');
+    expect(mentions[0]!.name).toBe('Đà Nẵng');
+  });
+
+  test('VN NFD body matches an NFC gazetteer title (and the reverse)', () => {
+    const nfc = 'Nguyễn Văn';
+    const nfd = nfc.normalize('NFD');
+    expect(nfd).not.toBe(nfc);                       // fixture really is decomposed
+    expect(tokenizeTitle(nfd)).toEqual(tokenizeTitle(nfc));
+    expect(tokenizeTitle(nfd)).toEqual(['nguyễn', 'văn']);
+
+    const opts = { fromSlug: 'writing/post-1', fromSourceId: 'default' };
+    const gNfc = gazetteerFromEntries([{ slug: 'people/nvd', source_id: 'default', title: nfc }]);
+    expect(findMentionedEntities(`Thầy ${nfd} nói.`, gNfc, opts)).toHaveLength(1);
+
+    const gNfd = gazetteerFromEntries([{ slug: 'people/nvd', source_id: 'default', title: nfd }]);
+    expect(findMentionedEntities(`Thầy ${nfc} nói.`, gNfd, opts)).toHaveLength(1);
+  });
+
+  test('VN diacritics are significant — "Hồng" title does NOT match diacritic-free "Hong"', () => {
+    // The title must survive tokenization intact for this to mean anything:
+    // under the ASCII tokenizer it became ['l','th','h','ng'] and missed for
+    // the wrong reason.
+    expect(tokenizeTitle('Lê Thị Hồng')).toEqual(['lê', 'thị', 'hồng']);
+    const g = gazetteerFromEntries([
+      { slug: 'people/le-thi-hong', source_id: 'default', title: 'Lê Thị Hồng' },
+    ]);
+    // Body uses the ASCII-typed variant "Le Thi Hong" — tokens differ, no false match.
+    const mentions = findMentionedEntities('Gặp Le Thi Hong hôm qua.', g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toEqual([]);
+  });
+
+  test('VN mixed with ASCII — Vietnamese name + ASCII company in one body', () => {
+    const body = 'Phạm Quốc Bảo hợp tác với Acme.';
+    // Discriminating: the ASCII tokenizer emitted ['ph','m','qu','c','b','o',
+    // 'h','p','t','c','v','i','acme'] here — only the ASCII control survived.
+    expect(tokenizeForScan(body).map(t => t.text))
+      .toEqual(['phạm', 'quốc', 'bảo', 'hợp', 'tác', 'với', 'acme']);
+
+    const g = gazetteerFromEntries([
+      { slug: 'people/pham-quoc-bao', source_id: 'default', title: 'Phạm Quốc Bảo' },
+      { slug: 'companies/acme', source_id: 'default', title: 'Acme' },
+    ]);
+    const mentions = findMentionedEntities(body, g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toHaveLength(2);
+    const slugs = mentions.map(m => m.slug);
+    expect(slugs).toContain('people/pham-quoc-bao');
+    expect(slugs).toContain('companies/acme');
+  });
+
+  test('VN longest-match wins — "Nguyễn Văn Đức" beats a shorter "Nguyễn Văn" entry', () => {
+    // Both entries must share a real first token for maximal-munch to be
+    // exercised at all; under the ASCII tokenizer both keyed on 'nguy'.
+    expect(tokenizeTitle('Nguyễn Văn')).toEqual(['nguyễn', 'văn']);
+    expect(tokenizeTitle('Nguyễn Văn Đức')[0]).toBe('nguyễn');
+    const g = gazetteerFromEntries([
+      { slug: 'people/nguyen-van-duc', source_id: 'default', title: 'Nguyễn Văn Đức' },
+      { slug: 'people/nguyen-van', source_id: 'default', title: 'Nguyễn Văn' },
+    ]);
+    const mentions = findMentionedEntities('Bài giảng của Nguyễn Văn Đức rất hay.', g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toHaveLength(1);
+    expect(mentions[0]!.slug).toBe('people/nguyen-van-duc');
+  });
+
+  test('VN first-mention-only cap — repeated name → single link', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'people/nguyen-van-duc', source_id: 'default', title: 'Nguyễn Văn Đức' },
+    ]);
+    const body = 'Nguyễn Văn Đức nói. Sau đó Nguyễn Văn Đức nói tiếp.';
+    // The cap must be capping a WHOLE-name match, not a fragment run.
+    expect(tokenizeForScan(body).map(t => t.text).slice(0, 3)).toEqual(['nguyễn', 'văn', 'đức']);
+    const mentions = findMentionedEntities(body, g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'default',
+    });
+    expect(mentions).toHaveLength(1);
+  });
+
+  test('VN determinism — identical output across 10 calls', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'people/nguyen-van-duc', source_id: 'default', title: 'Nguyễn Văn Đức' },
+      { slug: 'places/da-nang', source_id: 'default', title: 'Đà Nẵng' },
+    ]);
+    const body = 'Thầy Nguyễn Văn Đức ở Đà Nẵng. Nguyễn Văn Đức lần nữa.';
+    expect(tokenizeForScan(body).map(t => t.text))
+      .toEqual(['thầy', 'nguyễn', 'văn', 'đức', 'ở', 'đà', 'nẵng', 'nguyễn', 'văn', 'đức', 'lần', 'nữa']);
+    const refs = new Set<string>();
+    for (let i = 0; i < 10; i++) {
+      refs.add(JSON.stringify(findMentionedEntities(body, g, {
+        fromSlug: 'writing/post-1', fromSourceId: 'default',
+      })));
+    }
+    expect(refs.size).toBe(1);
+  });
+});
+
+// ============================================================
+// Tokenizer boundaries — non-word glyphs
+// ============================================================
+
+// Guards for the two ways a Unicode tokenizer regresses against the ASCII one
+// it replaces. Both were found in review of the first version of this change,
+// which used /[[\p{L}\p{M}\p{N}]--[CJK]]+/gv: \p{M} let a token consist of
+// combining marks alone, and \p{N} minted tokens the ASCII regex never emitted.
+describe('tokenizer boundaries — marks and non-ASCII numerics', () => {
+  const opts = { fromSlug: 'writing/post-1', fromSourceId: 'default' };
+
+  test('a token can never be combining marks alone (U+FE0F does not become a key)', () => {
+    // VARIATION SELECTOR-16 is \p{Mn} and rides on most emoji. Allowing a
+    // mark-only token made every emoji-prefixed entity title key on a bare
+    // U+FE0F, collapsing them into one mutually-confusable bucket.
+    expect(tokenizeTitle('❤️ Health Notes')).toEqual(['health', 'notes']);
+    expect(tokenizeTitle('⭐️ Budget Notes')).toEqual(['budget', 'notes']);
+    expect(tokenizeForScan('❤️').map(t => t.text)).toEqual([]);
+
+    const g = gazetteerFromEntries([
+      { slug: 'companies/health-notes', source_id: 'default', title: '❤️ Health Notes' },
+      { slug: 'companies/budget-notes', source_id: 'default', title: '⭐️ Budget Notes' },
+    ]);
+    expect([...g.keys()].sort()).toEqual(['budget', 'health']);
+
+    // The plain-text link survives...
+    expect(findMentionedEntities('Plain health notes, no emoji.', g, opts).map(m => m.slug))
+      .toEqual(['companies/health-notes']);
+    // ...and an unrelated emoji in the body does not drag in the other entity.
+    expect(findMentionedEntities('Sprint ⚠️ health notes were fine.', g, opts).map(m => m.slug))
+      .toEqual(['companies/health-notes']);
+  });
+
+  test('non-ASCII numerics do not break strict token adjacency of an ASCII name', () => {
+    // findMentionedEntities requires an entry's tokens to be STRICTLY
+    // ADJACENT in the body, so any glyph that newly tokenizes between the
+    // words of "Acme Corp" silently kills a match that used to work.
+    const g = gazetteerFromEntries([
+      { slug: 'companies/acme-corp', source_id: 'default', title: 'Acme Corp' },
+    ]);
+    for (const body of [
+      'We met Acme Corp today.',    // control
+      'We met Acme¹ Corp today.',   // U+00B9 superscript one (No)
+      'Acme ½ Corp',                // U+00BD vulgar fraction (No)
+      'Acme １ Corp',                // U+FF11 fullwidth digit one (Nd)
+      'Acme ❤️ Corp',          // emoji + VS16 (So + Mn)
+    ]) {
+      expect(findMentionedEntities(body, g, opts)).toHaveLength(1);
+    }
+    // ASCII digits still tokenize exactly as /[a-zA-Z0-9]+/ did.
+    expect(tokenizeForScan('web3 and h2o').map(t => t.text)).toEqual(['web3', 'and', 'h2o']);
+  });
+
+  test('Han Extension A is no longer CJK here — aligned with cjk.ts scope', () => {
+    // Deliberate behaviour change. by-mention's walkers used to carry their
+    // own range copy covering Ext-A (U+3400–4DBF); cjk.ts scopes Ext-A out
+    // repo-wide, and this module now uses CJK_SLUG_CHARS verbatim. Ext-A
+    // therefore tokenizes as a word run instead of per character, and an
+    // Ext-A-only title is one sub-MIN_NAME_LENGTH token rather than N
+    // char-level ones. Search, chunking and slug grammar already ignore
+    // Ext-A, so this removes by-mention as the lone subsystem that disagreed.
+    expect(tokenizeForScan('㐀㐁').map(t => t.text)).toEqual(['㐀㐁']);
+    expect(tokenizeTitle('㐀㐁')).toEqual(['㐀㐁']);
+    // In-scope CJK is untouched: still char-level.
+    expect(tokenizeTitle('艾例丝')).toEqual(['艾', '例', '丝']);
+    expect(tokenizeForScan('艾例丝说').map(t => t.text)).toEqual(['艾', '例', '丝', '说']);
   });
 });
 
@@ -312,6 +756,86 @@ describe('buildGazetteer — engine integration', () => {
     expect(g.get('apple')![0]!.slug).toBe('companies/apple');
   });
 
+  test('#6158: a page carrying google_contact_id builds a connector_stub entry; a hand-written page does not', async () => {
+    await engine.executeRaw(`INSERT INTO sources (id, name, config) VALUES ('gmail-a', 'gmail-a', '{"kind":"google"}'::jsonb) ON CONFLICT (id) DO NOTHING`);
+    await engine.putPage('people/dana-example', { type: 'person', title: 'Dana Example', compiled_truth: 'Profile.', timeline: '', frontmatter: {} });
+    await engine.putPage('people/dana-example', { type: 'person', title: 'Dana Example', compiled_truth: 'Contact: dana@example.com.', timeline: '',
+      frontmatter: { google_contact_id: 'people/c1' } }, { sourceId: 'gmail-a' });
+    const g = await buildGazetteer(engine);
+    const bucket = g.get('dana')!.filter((e) => e.origin === 'title');
+    expect(bucket.find((e) => e.source_id === 'gmail-a')?.connector_stub).toBe(true);
+    expect(bucket.find((e) => e.source_id === 'default')?.connector_stub).toBeUndefined();
+  });
+
+  test('alias entries (v0.46.15, #3801): page_aliases become gazetteer entries', async () => {
+    await engine.putPage('people/saoirse-x', {
+      type: 'person', title: 'Saoirse Example', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.setPageAliases('people/saoirse-x', 'default', ['saoirse']);
+    const g = await buildGazetteer(engine);
+    const bucket = g.get('saoirse');
+    expect(bucket).toBeDefined();
+    expect(bucket!.some((e) => e.slug === 'people/saoirse-x')).toBe(true);
+  });
+
+  test('REGRESSION (v0.46.15): ignore-list rejects ALIAS entries case-insensitively; CK12 title behavior unchanged', async () => {
+    // Title side (unchanged CK12 policy): a real page titled "Apple" stays.
+    await engine.putPage('companies/apple', {
+      type: 'company', title: 'Apple', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    // Alias side (new teeth): an alias "apple" on an unrelated page is
+    // suppressed — aliases are not user-created pages; the cased ignore list
+    // must match the normalized-lowercase alias store.
+    await engine.putPage('people/annie-p', {
+      type: 'person', title: 'Annie P Example', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.setPageAliases('people/annie-p', 'default', ['apple']);
+    const g = await buildGazetteer(engine);
+    const bucket = g.get('apple') ?? [];
+    expect(bucket.some((e) => e.slug === 'companies/apple')).toBe(true); // title entry survives
+    expect(bucket.some((e) => e.slug === 'people/annie-p')).toBe(false); // alias entry rejected
+  });
+
+  test('alias entries: ambiguous alias (two slugs, same source) is skipped', async () => {
+    await engine.putPage('people/sable-one', {
+      type: 'person', title: 'Sable One Example', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.putPage('people/sable-two', {
+      type: 'person', title: 'Sable Two Example', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.setPageAliases('people/sable-one', 'default', ['sable']);
+    await engine.setPageAliases('people/sable-two', 'default', ['sable']);
+    const g = await buildGazetteer(engine);
+    // Title entries ("Sable One Example" etc.) legitimately share the key —
+    // the ALIAS-shaped entries (single-token) must be absent.
+    expect((g.get('sable') ?? []).filter((e) => e.tokens.length === 1)).toHaveLength(0);
+  });
+
+  test('alias entries: alias colliding with an existing page TITLE in the same source is skipped', async () => {
+    await engine.putPage('companies/acme-corp', {
+      type: 'company', title: 'Acme', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.putPage('people/andy-c', {
+      type: 'person', title: 'Andy C Example', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.setPageAliases('people/andy-c', 'default', ['acme']);
+    const g = await buildGazetteer(engine);
+    const bucket = g.get('acme') ?? [];
+    expect(bucket.some((e) => e.slug === 'companies/acme-corp')).toBe(true);
+    expect(bucket.some((e) => e.slug === 'people/andy-c')).toBe(false);
+  });
+
+  test('alias entries: sub-MIN_NAME_LENGTH aliases are skipped', async () => {
+    await engine.putPage('people/jt-example', {
+      type: 'person', title: 'JT Example Person', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.setPageAliases('people/jt-example', 'default', ['jt']);
+    const g = await buildGazetteer(engine);
+    // The multi-token TITLE entry may share the key; the single-token alias
+    // entry ('jt' < MIN_NAME_LENGTH) must be absent.
+    expect((g.get('jt') ?? []).filter((e) => e.tokens.length === 1)).toHaveLength(0);
+  });
+
   test('13. all entity pages soft-deleted → empty gazetteer', async () => {
     await engine.putPage('people/alice', {
       type: 'person', title: 'Alice Example', compiled_truth: 'b', timeline: '', frontmatter: {},
@@ -348,22 +872,60 @@ describe('buildGazetteer — engine integration', () => {
     expect(g.has('box')).toBe(false);
   });
 
-  test('extraIgnore — user-supplied additional ignore tokens', async () => {
+  test('operator levers for a title the CK12 rule keeps: mentions.exclude_slugs (the removed extraIgnore never applied to titles)', async () => {
     await engine.putPage('people/john', {
       type: 'person', title: 'John', compiled_truth: 'b', timeline: '', frontmatter: {},
     });
-    // No companies/john exists, so adding John to extraIgnore should suppress.
     const g1 = await buildGazetteer(engine);
-    expect(g1.has('john')).toBe(true); // baseline: in gazetteer
-    const g2 = await buildGazetteer(engine, { extraIgnore: ['John'] });
-    // But title "John" IS the entity title — existingTitles.has('John') is true.
-    // Per CK12 rule, gazetteer presence wins → John IS still in.
-    expect(g2.has('john')).toBe(true);
+    expect(g1.has('john')).toBe(true); // baseline: a user-created page's title is in the gazetteer
+    await engine.setConfig('mentions.exclude_slugs', 'people/john');
+    try {
+      const g2 = await buildGazetteer(engine);
+      expect(g2.has('john')).toBe(false);
+    } finally {
+      await engine.unsetConfig('mentions.exclude_slugs');
+    }
   });
 
   test('LINKABLE_ENTITY_TYPES exposes the hardcoded contract', () => {
     // Regression: if anyone changes the hardcoded type list, this test
     // forces a deliberate change (and a corresponding test update).
     expect(LINKABLE_ENTITY_TYPES).toEqual(['person', 'company', 'organization', 'entity']);
+  });
+
+  // CJK — engine-backed tests
+  test('CJK entity with 2-char title enters gazetteer with char-level tokens', async () => {
+    await engine.putPage('people/alice-example', {
+      type: 'person', title: '艾例丝', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    const g = await buildGazetteer(engine);
+    // "艾例丝" tokenized as ["艾","例","丝"] → key is "艾"
+    expect(g.has('艾')).toBe(true);
+    const bucket = g.get('艾')!;
+    expect(bucket.length).toBe(1);
+    expect(bucket[0]!.tokens).toEqual(['艾', '例', '丝']);
+    expect(bucket[0]!.slug).toBe('people/alice-example');
+  });
+
+  test('CJK single-char title (cjkCharCount < 2) excluded from gazetteer', async () => {
+    await engine.putPage('people/x', {
+      type: 'person', title: '谢', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    const g = await buildGazetteer(engine);
+    expect(g.size).toBe(0);
+  });
+
+  test('VN person title enters gazetteer keyed on first diacritic-preserving token', async () => {
+    await engine.putPage('people/nguyen-van-duc', {
+      type: 'person', title: 'Nguyễn Văn Đức', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    const g = await buildGazetteer(engine);
+    // "Nguyễn Văn Đức" → ["nguyễn","văn","đức"], keyed on "nguyễn" (NOT fragmented to "nguy").
+    expect(g.has('nguyễn')).toBe(true);
+    const bucket = g.get('nguyễn')!;
+    expect(bucket[0]!.tokens).toEqual(['nguyễn', 'văn', 'đức']);
+    expect(bucket[0]!.slug).toBe('people/nguyen-van-duc');
+    // Regression guard: the old ASCII tokenizer would have keyed on "nguy".
+    expect(g.has('nguy')).toBe(false);
   });
 });

@@ -3,7 +3,7 @@
  *
  * Covers:
  *   - PR #1461's 6 telegram-bracket cases verbatim (REGRESSION pin)
- *   - All 12 built-in patterns hit their test_positive samples
+ *   - All built-in patterns hit their test_positive samples
  *   - Date derivation precedence (D8)
  *   - Pattern priority scoring (D18) — overlap resolution
  *   - Quick-reject fast path (D11)
@@ -11,9 +11,8 @@
  *   - Disabled-builtin honored
  *   - Timezone warning (D19) emitted when frontmatter timezone missing
  *
- * Pure-function tests; no PGLite, no LLM. The LLM polish/fallback
- * tests live in `llm-base.test.ts`, `llm-polish.test.ts`,
- * `llm-fallback.test.ts` (T4).
+ * Pure-function tests; no PGLite, no LLM. The LLM fallback tests
+ * live in `llm-base.test.ts` and `llm-fallback.test.ts` (T4).
  */
 
 import { describe, expect, test } from 'bun:test';
@@ -23,8 +22,12 @@ import {
   applyPattern,
   scorePattern,
   scorePatternFull,
+  createPatternDetector,
 } from '../../src/core/conversation-parser/parse.ts';
-import { BUILTIN_PATTERNS } from '../../src/core/conversation-parser/builtins.ts';
+import {
+  BUILTIN_PATTERNS,
+  validatePatternEntry,
+} from '../../src/core/conversation-parser/builtins.ts';
 import type { Page } from '../../src/core/types.ts';
 
 // Helper to construct a minimal Page for date-derivation tests.
@@ -116,7 +119,7 @@ describe('parseConversation — REGRESSION PR #1461 (telegram-bracket)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// All 12 built-ins must parse their test_positive samples
+// All built-ins must parse their test_positive samples
 // ---------------------------------------------------------------------------
 
 describe('parseConversation — every built-in matches its test_positive sample', () => {
@@ -137,6 +140,35 @@ describe('parseConversation — every built-in matches its test_positive sample'
       expect(r.matched_pattern_id).toBe(entry.id);
     });
   }
+});
+
+test('validatePatternEntry rejects invalid capture indexes', () => {
+  const base = BUILTIN_PATTERNS[0];
+  const aboveRange = {
+    ...base,
+    id: 'invalid-text-capture',
+    captures: { ...base.captures, text_group: 99 },
+  };
+  const zeroSpeaker = {
+    ...base,
+    id: 'invalid-speaker-capture',
+    captures: { ...base.captures, speaker_group: 0 },
+  };
+  const negativeText = {
+    ...base,
+    id: 'negative-text-capture',
+    captures: { ...base.captures, text_group: -1 },
+  };
+
+  expect(() => validatePatternEntry(aboveRange)).toThrow(
+    "captures group 99 but regex only emits",
+  );
+  expect(() => validatePatternEntry(zeroSpeaker)).toThrow(
+    'speaker_group must be an integer >= 1',
+  );
+  expect(() => validatePatternEntry(negativeText)).toThrow(
+    'text_group must be an integer >= 0',
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -244,6 +276,33 @@ describe('parseConversation — disabledBuiltinIds', () => {
 // Multi-line continuation (D5)
 // ---------------------------------------------------------------------------
 
+describe('parseConversation — markdown-heading-turn (gbrain transcript ingest)', () => {
+  test('parses ## User / ## Assistant heading-only turns with continuation body', () => {
+    const body = [
+      '## User',
+      'What is the capital of France?',
+      '## Assistant',
+      'The capital of France is Paris.',
+      'It is also its largest city.',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-08-11' });
+    expect(r.matched_pattern_id).toBe('markdown-heading-turn');
+    expect(r.messages).toHaveLength(2);
+    expect(r.messages[0].speaker).toBe('User');
+    expect(r.messages[0].text).toBe('What is the capital of France?');
+    expect(r.messages[1].speaker).toBe('Assistant');
+    expect(r.messages[1].text).toBe(
+      'The capital of France is Paris.\nIt is also its largest city.',
+    );
+  });
+
+  test('does not mistake an ordinary ## Summary heading for a turn', () => {
+    const body = ['## Summary', 'This is not a speaker turn.'].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-08-11' });
+    expect(r.matched_pattern_id).not.toBe('markdown-heading-turn');
+  });
+});
+
 describe('parseConversation — multi-line continuation (D5)', () => {
   test('iMessage continuation absorbs orphan lines', () => {
     const body = [
@@ -258,6 +317,40 @@ describe('parseConversation — multi-line continuation (D5)', () => {
       'first line\ncontinuation line\nanother continuation',
     );
     expect(r.messages[1].text).toBe('second message');
+  });
+});
+
+describe('parseConversation — iMessage time-only 12h and date headings (#2756)', () => {
+  test('parses the time-only 12-hour iMessage shape', () => {
+    const r = parseConversation('**Alice Example** (9:04 PM): hello', {
+      fallbackDate: '2024-03-15',
+    });
+    expect(r.matched_pattern_id).toBe('bold-paren-time-12h');
+    expect(r.messages).toHaveLength(1);
+    expect(r.messages[0].timestamp).toBe('2024-03-15T21:04:00Z');
+  });
+
+  test('markdown date headings advance the running date without becoming message text', () => {
+    const body = [
+      '## 2024-03-15',
+      '**Alice Example** (9:04 AM): first day',
+      '## 2024-03-16',
+      '**Bob Example** (10:05 PM): second day',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2024-03-01' });
+    expect(r.matched_pattern_id).toBe('bold-paren-time-12h');
+    expect(r.messages.map((m) => m.timestamp)).toEqual([
+      '2024-03-15T09:04:00Z',
+      '2024-03-16T22:05:00Z',
+    ]);
+    expect(r.messages[0].text).toBe('first day');
+  });
+
+  test('date headings do not mutate the caller-provided context', () => {
+    const ctx = { fallbackDate: '2024-03-01', source: 'explicit' as const };
+    const pattern = BUILTIN_PATTERNS.find((p) => p.id === 'bold-paren-time-12h')!;
+    applyPattern('## 2024-03-16\n**Alice** (9:04 AM): hello', pattern, ctx);
+    expect(ctx.fallbackDate).toBe('2024-03-01');
   });
 });
 
@@ -376,7 +469,7 @@ describe('scorePatternFull — full-body scoring (v0.41.18+ Codex P1 #1)', () =>
     const im = BUILTIN_PATTERNS.find((p) => p.id === 'imessage-slack')!;
     expect(scorePatternFull('', im)).toBe(0);
   });
-  test('preamble + 20 matching lines scores 20/(preamble + 20)', () => {
+  test('multi-line format ignores preamble after multiple anchors establish a transcript', () => {
     const im = BUILTIN_PATTERNS.find((p) => p.id === 'imessage-slack')!;
     const preamble = ['## Summary', 'Three sentences.', '> Source: ref', '## Transcript'];
     const matches = Array.from(
@@ -384,8 +477,9 @@ describe('scorePatternFull — full-body scoring (v0.41.18+ Codex P1 #1)', () =>
       (_, i) => `**Garry Tan** (2026-01-29 12:00 PM): message ${i}`,
     );
     const body = [...preamble, ...matches].join('\n');
-    // 24 total non-blank, 20 match → 20/24 ≈ 0.833
-    expect(scorePatternFull(body, im)).toBeCloseTo(20 / 24, 5);
+    // Once two anchors establish a real multi-line transcript, unrelated
+    // preamble/continuation lines no longer dilute the format score.
+    expect(scorePatternFull(body, im)).toBe(1);
   });
   test('preamble-only-no-match scores 0', () => {
     const im = BUILTIN_PATTERNS.find((p) => p.id === 'imessage-slack')!;
@@ -479,6 +573,152 @@ describe('bold-paren-time pattern (Circleback meeting transcripts)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// bold-time-dash pattern (normalized Slack Markdown)
+// ---------------------------------------------------------------------------
+
+describe('bold-time-dash pattern (normalized Slack Markdown)', () => {
+  test('parses anchors, dash variants, and multi-line continuation text', () => {
+    const body = [
+      '# Team channel — 2026-04-09',
+      '**Alice Example** 09:15 — first line',
+      '- detailed bullet one',
+      '- detailed bullet two',
+      '**Summary Bot** 09:18 – second message',
+      '> continuation of second message',
+      '**Bob Example** 10:01 - final message',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-04-09' });
+
+    expect(r.phase).toBe('regex_match');
+    expect(r.matched_pattern_id).toBe('bold-time-dash');
+    expect(r.messages).toHaveLength(3);
+    expect(r.messages[0]).toEqual({
+      speaker: 'Alice Example',
+      timestamp: '2026-04-09T09:15:00Z',
+      text: 'first line\n- detailed bullet one\n- detailed bullet two',
+    });
+    expect(r.messages[1]).toEqual({
+      speaker: 'Summary Bot',
+      timestamp: '2026-04-09T09:18:00Z',
+      text: 'second message\n> continuation of second message',
+    });
+    expect(r.messages[2]).toEqual({
+      speaker: 'Bob Example',
+      timestamp: '2026-04-09T10:01:00Z',
+      text: 'final message',
+    });
+  });
+
+  test('parses one anchor with a long Markdown continuation body', () => {
+    const continuation = Array.from(
+      { length: 30 },
+      (_, index) => `- supporting detail ${index + 1}`,
+    );
+    const body = [
+      '**Alice Example** 09:15 — summary',
+      ...continuation,
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-04-09' });
+
+    expect(r.matched_pattern_id).toBe('bold-time-dash');
+    expect(r.messages).toHaveLength(1);
+    expect(r.messages[0].text.split('\n')).toHaveLength(31);
+    expect(r.messages[0].text.endsWith('- supporting detail 30')).toBe(true);
+  });
+
+  test('does not treat one stray anchor in long prose as a conversation', () => {
+    const before = Array.from(
+      { length: 150 },
+      (_, index) => `Prose paragraph before ${index + 1}.`,
+    );
+    const after = Array.from(
+      { length: 150 },
+      (_, index) => `Prose paragraph after ${index + 1}.`,
+    );
+    const body = [
+      ...before,
+      '**Deadline** 09:15 — quoted schedule entry',
+      ...after,
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-04-09' });
+
+    expect(r.phase).toBe('no_match');
+    expect(r.messages).toEqual([]);
+  });
+
+  test('uses date headings to advance the frontmatter date anchor', () => {
+    const body = [
+      '## 2026-04-09',
+      '**Alice Example** 23:59 — day one',
+      '## 2026-04-10',
+      '**Bob Example** 00:01 — day two',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-04-09' });
+
+    expect(r.matched_pattern_id).toBe('bold-time-dash');
+    expect(r.messages.map((message) => message.timestamp)).toEqual([
+      '2026-04-09T23:59:00Z',
+      '2026-04-10T00:01:00Z',
+    ]);
+  });
+
+  test('uses page date and preserves the time-only timezone policy', () => {
+    const body = '**Alice Example** 09:15 — hello';
+    const withoutTimezone = parseConversation(body, {
+      page: makePage({ date: '2026-04-09' }),
+    });
+    const withTimezone = parseConversation(body, {
+      page: makePage({
+        date: '2026-04-09',
+        timezone: 'America/Los_Angeles',
+      }),
+    });
+
+    expect(withoutTimezone.messages[0].timestamp).toBe(
+      '2026-04-09T09:15:00Z',
+    );
+    expect(withoutTimezone.timezone_warning).toContain('bold-time-dash');
+    // #5430 (W14 P1.9): a declared zone converts the wall-clock time (09:15
+    // PDT is 16:15Z) and suppresses the warning; before, it only suppressed.
+    expect(withTimezone.messages[0].timestamp).toBe('2026-04-09T16:15:00Z');
+    expect(withTimezone.timezone_warning).toBeUndefined();
+  });
+
+  test('does not shadow existing bold transcript formats', () => {
+    const opts = { fallbackDate: '2026-04-09' };
+
+    expect(
+      parseConversation('**Alice Example** (00:00): hello', opts)
+        .matched_pattern_id,
+    ).toBe('bold-paren-time');
+    expect(
+      parseConversation('**Alice Example** (9:15 AM): hello', opts)
+        .matched_pattern_id,
+    ).toBe('bold-paren-time-12h');
+    expect(
+      parseConversation('**Alice Example:** hello', opts).matched_pattern_id,
+    ).toBe('bold-name-no-time');
+    expect(
+      parseConversation(
+        '**Alice Example** (2026-04-09 9:15 AM): hello',
+        opts,
+      ).matched_pattern_id,
+    ).toBe('imessage-slack');
+  });
+
+  test('rejects invalid 24-hour times', () => {
+    const body = [
+      '**Alice Example** 24:00 — invalid hour',
+      '**Bob Example** 09:60 — invalid minute',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-04-09' });
+
+    expect(r.phase).toBe('no_match');
+    expect(r.messages).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // bold-name-no-time pattern (Circleback / Granola / Zoom transcripts with NO
 // per-line timestamp — `**Speaker:** text`). Additive pattern; the colon
 // inside the bold markers + the `(?!\[)` lookahead are what keep it from
@@ -527,6 +767,82 @@ describe('bold-name-no-time pattern (Circleback/Granola/Zoom, no timestamp)', ()
     expect(r.messages).toHaveLength(3);
     // No fallbackDate → epoch default, still anchors at 00:00:00.
     expect(r.messages[0].timestamp).toBe('1970-01-01T00:00:00Z');
+  });
+
+  // gbrain-evals N12-1: a status note with three one-off bold labels is
+  // not a conversation. Full-body density (3/26 ≈ 0.115) clears the floor,
+  // so the gate is structural: three or more turns with no speaker ever
+  // speaking twice is a list of labels, not an exchange.
+  test('REGRESSION (N12-1): a status note with one-off bold labels is no_match', () => {
+    const filler = Array.from({ length: 22 }, (_, i) => `Paragraph ${i + 1}: the team agreed in principle and will review the plan this week.`);
+    const body = ['# Project status', '', '**Status:** green', '**Owner:** Alice Example', '**Next step:** ship the draft', '', ...filler, ''].join('\n');
+    const r = parseConversation(body, { noFallback: true, noPolish: true, page: { frontmatter: { date: '2026-04-01' } } } as any);
+    expect(r.phase).toBe('no_match');
+    expect(r.messages).toEqual([]);
+  });
+
+  // GST-3251: a documented `**Speaker** (YYYY-MM-DD h:mm AM): text` transcript whose
+  // first answer lists `**Label:** text` lines. bold-name-no-time wins the head
+  // pass, the label-list gate rejects it, and the page used to end no_match
+  // (counted as pages_skipped_unparsed) though imessage-slack clears the floor.
+  test('REGRESSION (GST-3251): a gated label list hands over to the transcript format', () => {
+    const body = [
+      '**User** (2024-03-15 9:00 AM): compare the options',
+      '**Assistant** (2024-03-15 9:01 AM): Here they are:',
+      ...['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'].map((x) => `**Option ${x}:** detail ${x}`),
+      '**User** (2024-03-15 9:02 AM): thanks',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2024-03-15' });
+    expect(r.matched_pattern_id).toBe('imessage-slack');
+    expect(r.messages.map((m) => m.speaker)).toEqual(['User', 'Assistant', 'User']);
+    const detector = createPatternDetector();
+    detector.push(body);
+    expect(detector.finish()).toBe('imessage-slack');
+  });
+
+  // GST-3347: a short session whose one long answer leads many lines with bold
+  // text. Every `**` line used to count as a near-miss anchor, so two turns
+  // over 45 bold lines scored 4% and the page ended below the 5% floor.
+  for (const [shape, line] of [['bold headings', (i: number) => `**Step ${i}** do thing ${i}`], ['bold labels', (i: number) => `**Step ${i}:** do thing ${i}`]] as const) {
+    test(`REGRESSION (GST-3347): a two-turn transcript whose answer has 45 lines of ${shape} parses`, () => {
+      const body = [
+        '**User** (2024-03-15 9:00 AM): what is the plan?',
+        '**Assistant** (2024-03-15 9:01 AM): Here it is:',
+        ...Array.from({ length: 45 }, (_, i) => line(i + 1)),
+      ].join('\n');
+      const r = parseConversation(body, { fallbackDate: '2024-03-15' });
+      expect(r.matched_pattern_id).toBe('imessage-slack');
+      expect(r.messages.map((m) => m.speaker)).toEqual(['User', 'Assistant']);
+      expect(r.messages[1]!.text.split('\n')).toHaveLength(46);
+      const detector = createPatternDetector();
+      detector.push(body);
+      expect(detector.finish()).toBe('imessage-slack');
+    });
+  }
+
+  test('GST-3347 control: one stray transcript line in bold-heavy notes stays no_match', () => {
+    const body = ['Notes from the offsite.', '**Alice Example** (2024-03-15 9:00 AM): one quoted line',
+      ...Array.from({ length: 30 }, (_, i) => `**Item ${i}** detail ${i}`), ...Array.from({ length: 30 }, (_, i) => `prose line ${i}`)].join('\n');
+    expect(parseConversation(body, { fallbackDate: '2024-03-15' }).phase).toBe('no_match');
+  });
+
+  test('GST-3251: a no_match names why and the best pattern', () => {
+    const body = ['A', 'B', 'C', 'D'].map((x) => `**Option ${x}:** detail ${x}`).join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-04-01' });
+    expect(r.no_match).toEqual({ reason: 'label_list', pattern_id: 'bold-name-no-time', score: expect.any(Number) });
+    expect(parseConversation('Plain prose only.\nNothing else here.', {}).no_match?.reason).toBe('below_floor');
+  });
+
+  test('N12-1 control: a three-person exchange where someone speaks twice still parses', () => {
+    const body = [
+      '**Alice Example:** shall we start?',
+      '**Bob Example:** ready.',
+      '**Carol Example:** me too.',
+      '**Alice Example:** great, first item.',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-04-01' });
+    expect(r.matched_pattern_id).toBe('bold-name-no-time');
+    expect(r.messages).toHaveLength(4);
   });
 
   // REGRESSION: must NOT shadow bold-paren-time. A `**Name** (00:00): text`
@@ -581,6 +897,308 @@ describe('bold-name-no-time pattern (Circleback/Granola/Zoom, no timestamp)', ()
     }
     const body = lines.join('\n');
     const r = parseConversation(body, { fallbackDate: '2026-05-28' });
+    expect(r.phase).toBe('no_match');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// chatgpt-export-you-chatgpt pattern (ChatGPT web export — `**You:**` /
+// `**ChatGPT:**` anchors with multi-paragraph reply bodies)
+// ---------------------------------------------------------------------------
+
+describe('chatgpt-export-you-chatgpt pattern (ChatGPT export, multi-paragraph turns)', () => {
+  test('parses You/ChatGPT turns and merges multi-paragraph replies into one message', () => {
+    const body = [
+      '**You:** What is the capital of France?',
+      '',
+      '**ChatGPT:** The capital of France is Paris.',
+      '',
+      'Paris is also the most populous city in France and a major European center of finance, diplomacy, and culture.',
+      '',
+      'It is well known for the Eiffel Tower and the Louvre Museum.',
+      '',
+      '**You:** Thanks, that is helpful.',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-05-28' });
+    expect(r.phase).toBe('regex_match');
+    expect(r.matched_pattern_id).toBe('chatgpt-export-you-chatgpt');
+    expect(r.messages).toHaveLength(3);
+    expect(r.messages[0]).toEqual({
+      speaker: 'You',
+      timestamp: '2026-05-28T00:00:00Z',
+      text: 'What is the capital of France?',
+    });
+    expect(r.messages[1].speaker).toBe('ChatGPT');
+    expect(r.messages[1].text).toBe(
+      'The capital of France is Paris.\nParis is also the most populous city in France and a major European center of finance, diplomacy, and culture.\nIt is well known for the Eiffel Tower and the Louvre Museum.',
+    );
+    expect(r.messages[2]).toEqual({
+      speaker: 'You',
+      timestamp: '2026-05-28T00:00:00Z',
+      text: 'Thanks, that is helpful.',
+    });
+  });
+
+  // REGRESSION (the defect this pattern fixes): a page with only 4 real
+  // turns but dozens of ChatGPT reply-body lines scores far below the 0.05
+  // acceptance floor under bold-name-no-time's own multi_line:false /
+  // flat-density scoring (real-world case: a 156-line export with 4 anchor
+  // lines ≈ 2.6% density → no_match, 0 messages extracted).
+  // score_continuations_as_body excludes the non-`**`-prefixed reply lines
+  // from the density denominator entirely, so the identical shape parses
+  // correctly through this pattern instead. 40 reply-paragraph lines per
+  // turn (80 total + 4 anchors = 84 non-blank lines) puts bold-name-no-time
+  // at 4/84 ≈ 0.048 — BELOW the 0.05 floor — proven directly below via
+  // `scorePatternFull` rather than asserted only indirectly through the
+  // overall parse outcome.
+  test('REGRESSION: long multi-paragraph replies no longer starve the density floor', () => {
+    const paragraphs = (n: number) =>
+      Array.from(
+        { length: 40 },
+        (_, i) =>
+          `This is paragraph ${i + 1} of ChatGPT's long-form answer to question ${n}, describing the topic in detail.`,
+      );
+    const lines: string[] = [];
+    for (let turn = 1; turn <= 2; turn++) {
+      lines.push(`**You:** question number ${turn}?`);
+      lines.push('');
+      lines.push(`**ChatGPT:** Here is the answer to question ${turn}.`);
+      lines.push('');
+      lines.push(...paragraphs(turn));
+      lines.push('');
+    }
+    const body = lines.join('\n');
+    const nonBlankLineCount = body
+      .split('\n')
+      .filter((l) => l.trim().length > 0).length;
+    expect(nonBlankLineCount).toBe(84);
+
+    // Prove the defect this pattern fixes actually reproduces here:
+    // bold-name-no-time's own full-body density score on this exact body
+    // falls below SCORING_MIN_ACCEPTANCE (0.05), so without this pattern
+    // the page would be no_match.
+    const boldNameNoTime = BUILTIN_PATTERNS.find(
+      (p) => p.id === 'bold-name-no-time',
+    )!;
+    expect(scorePatternFull(body, boldNameNoTime)).toBeLessThan(0.05);
+
+    const r = parseConversation(body, { fallbackDate: '2026-05-28' });
+    expect(r.phase).toBe('regex_match');
+    expect(r.matched_pattern_id).toBe('chatgpt-export-you-chatgpt');
+    expect(r.messages).toHaveLength(4);
+    expect(r.messages.map((m) => m.speaker)).toEqual([
+      'You',
+      'ChatGPT',
+      'You',
+      'ChatGPT',
+    ]);
+  });
+
+  // REGRESSION: score_continuations_min_distinct_speakers closes a
+  // false-positive class the plain score_continuations_as_body mechanism
+  // would otherwise open. A `**You:**` heading is a plausible label in
+  // ordinary prose ABOUT ChatGPT (unlike bold-time-dash's much more
+  // distinctive bold-name + valid-24h-time + dash anchor). A long prose
+  // document that merely OPENS with one `**You:**` heading — and never
+  // has a matching `**ChatGPT:**` reply — must NOT get the same density
+  // immunity a genuine two-party exchange gets: only 1 distinct speaker
+  // is ever captured, so the gate keeps this pattern on the ordinary flat
+  // density score, and the lone heading among 80+ prose lines drops it
+  // below the acceptance floor exactly like an unrelated stray anchor
+  // would for any other pattern.
+  test('REGRESSION: a solitary You: heading does not get continuation-density immunity', () => {
+    const lines = ['**You:** what should I ask ChatGPT about today?'];
+    for (let i = 0; i < 80; i++) {
+      lines.push(
+        `This is an ordinary prose sentence number ${i} with no further chat structure.`,
+      );
+    }
+    const body = lines.join('\n');
+
+    const entry = BUILTIN_PATTERNS.find(
+      (p) => p.id === 'chatgpt-export-you-chatgpt',
+    )!;
+    expect(scorePatternFull(body, entry)).toBeLessThan(0.05);
+
+    const r = parseConversation(body, { fallbackDate: '2026-05-28' });
+    expect(r.matched_pattern_id).not.toBe('chatgpt-export-you-chatgpt');
+  });
+
+  // REGRESSION: same gate, different shape — repeating only ONE role's
+  // heading (three `**You:**` lines, never `**ChatGPT:**`) still captures
+  // just 1 distinct speaker, so it must not get continuation-density
+  // immunity either. (`anchored >= 2` alone would otherwise qualify this
+  // case under the shared score_continuations_as_body mechanism.)
+  test('REGRESSION: repeating only one role never satisfies the distinct-speaker gate', () => {
+    const lines = [
+      '**You:** first question',
+      '**You:** second question',
+      '**You:** third question',
+    ];
+    for (let i = 0; i < 80; i++) {
+      lines.push(
+        `This is an ordinary prose sentence number ${i} with no ChatGPT reply anywhere.`,
+      );
+    }
+    const body = lines.join('\n');
+
+    const entry = BUILTIN_PATTERNS.find(
+      (p) => p.id === 'chatgpt-export-you-chatgpt',
+    )!;
+    expect(scorePatternFull(body, entry)).toBeLessThan(0.05);
+  });
+
+  // REGRESSION: score_continuations_max_preamble_lines closes the
+  // remaining false-positive class distinct-speaker count alone does not:
+  // ONE genuine `**You:**` / `**ChatGPT:**` pair — both roles present, so
+  // the distinct-speaker gate is satisfied — merely EMBEDDED somewhere deep
+  // inside an otherwise unrelated long document (a tutorial illustrating
+  // ChatGPT usage, a "how I use ChatGPT" article) must not get the same
+  // density immunity a real export gets. The first anchor here lands well
+  // past the 5-line preamble bound, so the pattern falls back to the
+  // ordinary flat density score and stays below the acceptance floor.
+  test('REGRESSION: a You/ChatGPT pair embedded deep in unrelated prose does not get immunity', () => {
+    const lines: string[] = [];
+    for (let i = 0; i < 40; i++) {
+      lines.push(
+        `This is an ordinary prose sentence number ${i} from an article about productivity.`,
+      );
+    }
+    lines.push('**You:** what is a good example prompt?');
+    lines.push('**ChatGPT:** Try asking for a step-by-step plan.');
+    for (let i = 0; i < 40; i++) {
+      lines.push(
+        `This is another ordinary prose sentence number ${i} continuing the article.`,
+      );
+    }
+    const body = lines.join('\n');
+
+    const entry = BUILTIN_PATTERNS.find(
+      (p) => p.id === 'chatgpt-export-you-chatgpt',
+    )!;
+    expect(scorePatternFull(body, entry)).toBeLessThan(0.05);
+
+    const r = parseConversation(body, { fallbackDate: '2026-05-28' });
+    expect(r.matched_pattern_id).not.toBe('chatgpt-export-you-chatgpt');
+  });
+
+  // REGRESSION: pins the exact score_continuations_max_preamble_lines: 5
+  // boundary — the first anchor's index must be <= 5 (the 6th scored line)
+  // to qualify. 5 preamble lines puts the first anchor at index 5 (still
+  // qualifies); 6 preamble lines puts it at index 6 (one past the bound).
+  test('REGRESSION: preamble boundary — index 5 qualifies for immunity, index 6 does not', () => {
+    const entry = BUILTIN_PATTERNS.find(
+      (p) => p.id === 'chatgpt-export-you-chatgpt',
+    )!;
+    const makeBody = (preambleLines: number) => {
+      const lines: string[] = [];
+      for (let i = 0; i < preambleLines; i++) {
+        lines.push(`Preamble line ${i}.`);
+      }
+      lines.push('**You:** question?');
+      lines.push('**ChatGPT:** answer.');
+      return lines.join('\n');
+    };
+
+    const atBoundary = makeBody(5);
+    expect(scorePatternFull(atBoundary, entry)).toBe(1);
+
+    const pastBoundary = makeBody(6);
+    // 6 preamble + 2 anchors = 8 non-blank lines; no immunity, so this is
+    // the ordinary flat density (2 anchors / 8 total), not 1.0.
+    expect(scorePatternFull(pastBoundary, entry)).toBeCloseTo(2 / 8, 5);
+  });
+
+  // REGRESSION: must NOT reopen bold-name-no-time's BROAD-REGEX GUARD.
+  // Reuses the exact F1 notes-page fixture above (3 bold labels clustered
+  // in the head, 80 plain-prose lines) that bold-name-no-time's own
+  // score_full_body guard exists to reject. This pattern's enumerated
+  // (You|ChatGPT) speaker capture cannot match `**Attendees:**` /
+  // `**Date:**` / `**Goal:**` at all, so it must score exactly 0 and the
+  // page must stay no_match regardless of score_continuations_as_body.
+  test('REGRESSION: notes-page bold labels never match the enumerated ChatGPT speakers', () => {
+    const lines = [
+      '**Attendees:** Alice Example, Bob Example, Participant 2',
+      '**Date:** 2026-05-28',
+      '**Goal:** decide on the Q3 roadmap and unblock the vendor migration',
+    ];
+    for (let i = 0; i < 80; i++) {
+      lines.push(
+        `This is an ordinary prose sentence number ${i} describing the meeting in detail.`,
+      );
+    }
+    const body = lines.join('\n');
+
+    const entry = BUILTIN_PATTERNS.find(
+      (p) => p.id === 'chatgpt-export-you-chatgpt',
+    )!;
+    expect(scorePatternFull(body, entry)).toBe(0);
+
+    const r = parseConversation(body, { fallbackDate: '2026-05-28' });
+    expect(r.phase).toBe('no_match');
+    expect(r.matched_pattern_id).not.toBe('chatgpt-export-you-chatgpt');
+  });
+
+  // REGRESSION: does not shadow bold-name-no-time for arbitrary labels —
+  // the enumerated (You|ChatGPT) capture only ever engages on the two
+  // literal ChatGPT-export speaker names.
+  test('REGRESSION: does not shadow bold-name-no-time for non-enumerated speakers', () => {
+    const opts = { fallbackDate: '2026-05-28' };
+    expect(
+      parseConversation('**Alice Example:** hello world', opts)
+        .matched_pattern_id,
+    ).toBe('bold-name-no-time');
+    expect(
+      parseConversation('**Assistant:** hello world', opts).matched_pattern_id,
+    ).toBe('bold-name-no-time');
+    expect(
+      parseConversation('**User:** hello world', opts).matched_pattern_id,
+    ).toBe('bold-name-no-time');
+  });
+
+  // REGRESSION: does not shadow bold-paren-time / telegram-bracket — the
+  // colon must be INSIDE the bold markers and the speaker must be exactly
+  // `You` or `ChatGPT`.
+  test('REGRESSION: does not shadow bold-paren-time or telegram-bracket', () => {
+    const opts = { fallbackDate: '2026-05-28' };
+    expect(
+      parseConversation('**You** (00:00): hello', opts).matched_pattern_id,
+    ).toBe('bold-paren-time');
+    expect(
+      parseConversation('**[18:37] \u{1f464} You:** hello', opts)
+        .matched_pattern_id,
+    ).toBe('telegram-bracket');
+  });
+});
+
+describe('speaker-letter-no-time pattern (raw transcript sidecars)', () => {
+  test('parses plain Speaker A / Speaker B transcripts', () => {
+    const body = [
+      'Speaker A: That is exactly the issue.',
+      'Speaker B: Yeah, I know.',
+      'Speaker A: Let me ask him.',
+      'Speaker B: Sounds good.',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-06-01' });
+    expect(r.phase).toBe('regex_match');
+    expect(r.matched_pattern_id).toBe('speaker-letter-no-time');
+    expect(r.messages).toHaveLength(4);
+    expect(r.messages[0]).toEqual({
+      speaker: 'Speaker A',
+      timestamp: '2026-06-01T00:00:00Z',
+      text: 'That is exactly the issue.',
+    });
+    expect(r.messages[1].speaker).toBe('Speaker B');
+    expect(r.messages[3].text).toBe('Sounds good.');
+  });
+
+  test('does not parse ordinary prose labels as transcript lines', () => {
+    const body = [
+      'Owner: Elliot',
+      'Decision: Ship the parser fix',
+      'Next step: rerun extraction',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-06-01' });
     expect(r.phase).toBe('no_match');
   });
 });
@@ -711,5 +1329,147 @@ describe('parseConversation — full-body fallback', () => {
     // Post-fix: no_match because 1/301 < 0.05 acceptance floor.
     expect(r.phase).toBe('no_match');
     expect(r.messages).toHaveLength(0);
+  });
+});
+
+describe('unrecognized_headings — folded speaker headings surface (#4136)', () => {
+  const mk = (label: string) =>
+    `## User\n\nWhat is the deploy command?\n\n## ${label}\n\nRun the deploy script from the repo root.\n\n## User\n\nThanks.\n`;
+
+  test('THE repro: ## Claude folds into the previous turn and is REPORTED', () => {
+    const r = parseConversation(mk('Claude'), {});
+    expect(r.phase).toBe('regex_match');
+    expect(r.matched_pattern_id).toBe('markdown-heading-turn');
+    expect(r.messages.length).toBe(2); // the fold itself (unchanged behavior)
+    expect(r.messages.map((m) => m.speaker)).toEqual(['User', 'User']);
+    expect(r.unrecognized_headings).toEqual(['Claude']);
+  });
+
+  test('the OTHER fold site: ## Assistant Bot passes quick_reject, fails regex, is reported', () => {
+    const r = parseConversation(mk('Assistant Bot'), {});
+    expect(r.phase).toBe('regex_match');
+    expect(r.messages.length).toBe(2);
+    expect(r.unrecognized_headings).toEqual(['Assistant Bot']);
+  });
+
+  test('#### User (depth outside the pattern) is reported as a folded heading', () => {
+    const r = parseConversation(mk('Claude').replace('## Claude', '#### User'), {});
+    expect(r.unrecognized_headings).toEqual(['User']);
+  });
+
+  test('a heading dropped BEFORE the first anchor is still reported (content silently discarded)', () => {
+    const body = `## Claude\n\nOrphan reply before any anchor.\n\n## User\n\nQuestion?\n\n## Assistant\n\nAnswer.\n`;
+    const r = parseConversation(body, {});
+    expect(r.phase).toBe('regex_match');
+    expect(r.unrecognized_headings).toEqual(['Claude']);
+  });
+
+  test('NO false positive: a clean User/Assistant transcript leaves the field undefined', () => {
+    const body = `## User\n\nQuestion?\n\n## Assistant\n\nAnswer.\n`;
+    const r = parseConversation(body, {});
+    expect(r.phase).toBe('regex_match');
+    expect(r.messages.length).toBe(2);
+    expect(r.unrecognized_headings).toBeUndefined();
+  });
+
+  test('NO false positive: a heading inside a code fence is not reported (answers paste markdown)', () => {
+    const body = [
+      '## User', '', 'Show me the doc template.', '',
+      '## Assistant', '', '```', '## Claude', '## Summary', '```', 'Done.', '',
+      '## User', '', 'Thanks.',
+    ].join('\n');
+    const r = parseConversation(body, {});
+    expect(r.phase).toBe('regex_match');
+    expect(r.messages.length).toBe(3);
+    expect(r.unrecognized_headings).toBeUndefined();
+  });
+
+  test('long prose headings are not collected (section titles, not lost speakers)', () => {
+    const body = `## User\n\nQ?\n\n## Assistant\n\nA.\n\n## How We Should Think About Deploys Going Forward\n\nnotes\n`;
+    const r = parseConversation(body, {});
+    expect(r.phase).toBe('regex_match');
+    expect(r.unrecognized_headings).toBeUndefined(); // >3 tokens — not speaker-shaped-ish
+  });
+
+  test('ordinary doc headings ARE reported (policy lives in the caller, not here)', () => {
+    const body = `## User\n\nQ?\n\n## Assistant\n\nA.\n\n## Summary\n\nwrap-up notes\n`;
+    const r = parseConversation(body, {});
+    expect(r.unrecognized_headings).toEqual(['Summary']);
+  });
+
+  test('labels dedupe and cap; parse behavior is unchanged by collection', () => {
+    const repeated = Array.from({ length: 30 }, (_, i) => `## Ghost${i}\n\nx.\n`).join('\n');
+    const body = `## User\n\nQ?\n\n## Assistant\n\nA.\n\n${repeated}`;
+    const r = parseConversation(body, {});
+    expect(r.unrecognized_headings!.length).toBeLessThanOrEqual(10);
+  });
+
+  test('applyPattern 3-arg call keeps compiling and behaving identically (back-compat)', () => {
+    const entry = BUILTIN_PATTERNS.find((p) => p.id === 'markdown-heading-turn')!;
+    const messages = applyPattern('## User\nhello\n## Assistant\nhi', entry, {
+      fallbackDate: '2026-01-01',
+      timezone: undefined,
+      source: 'explicit',
+    });
+    expect(messages.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Date-fallback anchoring (#4681 narrow cut): an anchor whose date cannot be
+// reconstructed still opens its own message instead of being dropped and
+// folding its body into the previous speaker.
+// ---------------------------------------------------------------------------
+
+describe('date-fallback anchoring applies to every pattern (#4681)', () => {
+  test('a telegram anchor with an unknown month opens a fallback-dated message instead of folding', () => {
+    // buildIso() returning null used to drop the anchor; on a multi_line
+    // pattern the body then folded into the PREVIOUS speaker while the parse
+    // still returned regex_match (silent misattribution). Reachable on
+    // telegram-text-export with any non-English 3-letter month.
+    const body = [
+      'Alice Doe, [Mar 15, 2024 at 6:37:00 PM]',
+      'hello',
+      'Bob Roe, [Xyz 15, 2024 at 6:38:00 PM]',
+      'bad month',
+      'Alice Doe, [Mar 15, 2024 at 6:39:00 PM]',
+      'bye',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2024-03-15' });
+    expect(r.matched_pattern_id).toBe('telegram-text-export');
+    expect(r.messages).toHaveLength(3);
+    expect(r.messages[0].text).toBe('hello');
+    expect(r.messages[1].speaker).toContain('Bob');
+    expect(r.messages[1].text).toBe('bad month');
+    // Inherits the previous anchor's timestamp (NOT midnight): a midnight
+    // stamp mid-page would open a new too-short segment downstream in
+    // extract-conversation-facts and lose the following message.
+    expect(r.messages[1].timestamp).toBe('2024-03-15T18:37:00Z');
+    expect(r.messages[2].text).toBe('bye');
+    expect(r.date_fallback_count).toBe(1);
+  });
+
+  test('a first-anchor date failure anchors at midnight of the page fallback date', () => {
+    const body = [
+      'Bob Roe, [Xyz 15, 2024 at 6:38:00 PM]',
+      'bad month',
+      'Alice Doe, [Mar 15, 2024 at 6:39:00 PM]',
+      'bye',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2024-03-15' });
+    expect(r.matched_pattern_id).toBe('telegram-text-export');
+    expect(r.messages).toHaveLength(2);
+    expect(r.messages[0].speaker).toContain('Bob');
+    expect(r.messages[0].text).toBe('bad month');
+    expect(r.messages[0].timestamp).toBe('2024-03-15T00:00:00Z');
+    expect(r.date_fallback_count).toBe(1);
+  });
+
+  test('healthy pages carry no date_fallback_count (JSON stays byte-identical)', () => {
+    const body = ['Alice Doe, [Mar 15, 2024 at 6:37:00 PM]', 'hello', 'Bob Roe, [Mar 15, 2024 at 6:38:00 PM]', 'hi'].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2024-03-15' });
+    expect(r.messages).toHaveLength(2);
+    expect(r.date_fallback_count).toBeUndefined();
+    expect('date_fallback_count' in JSON.parse(JSON.stringify(r))).toBe(false);
   });
 });

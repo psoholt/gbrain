@@ -2,64 +2,47 @@ import { describe, test, expect } from 'bun:test';
 import { readFileSync } from 'fs';
 import { isSensitiveConfigKey, redactConfigValue } from '../src/commands/config.ts';
 
-// redactUrl is not exported, so we test it by reading the source and
-// reimplementing the regex to verify the pattern, then test via CLI
+// URL redaction is single-homed in src/core/url-redact.ts (redactPgUrl —
+// drops the whole userinfo, handles BOTH postgres:// and postgresql://);
+// config.ts routes through it via redactConfigValue. The old local redactUrl
+// duplicate (postgresql://-only) is gone by design.
 
-// Extract the redactUrl regex pattern from source
 const configSource = readFileSync(
   new URL('../src/commands/config.ts', import.meta.url),
   'utf-8',
 );
 
-// Reimplemented from source for unit testing
-function redactUrl(url: string): string {
-  return url.replace(
-    /(postgresql:\/\/[^:]+:)([^@]+)(@)/,
-    '$1***$3',
-  );
-}
+describe('redactConfigValue URL redaction (single-homed via redactPgUrl)', () => {
+  test('redacts password in postgresql:// URL (whole userinfo collapses)', () => {
+    const out = redactConfigValue('database_url', 'postgresql://user:secretpass@host:5432/dbname');
+    expect(out).not.toContain('secretpass');
+    expect(out).toContain('***@host:5432/dbname');
+  });
 
-describe('redactUrl', () => {
-  test('redacts password in postgresql:// URL', () => {
-    const url = 'postgresql://user:secretpass@host:5432/dbname';
-    expect(redactUrl(url)).toBe('postgresql://user:***@host:5432/dbname');
+  test('redacts postgres:// scheme too (the old local regex missed it)', () => {
+    const out = redactConfigValue('database_url', 'postgres://user:secretpass@host:5432/dbname');
+    expect(out).not.toContain('secretpass');
+    expect(out).toContain('***@');
   });
 
   test('redacts complex passwords with special chars', () => {
-    const url = 'postgresql://postgres:p@ss!w0rd#123@db.supabase.co:5432/postgres';
-    // The regex is greedy on [^@]+ so it captures up to the LAST @
-    const result = redactUrl(url);
-    expect(result).not.toContain('p@ss');
-    expect(result).toContain('***');
+    const out = redactConfigValue('database_url', 'postgresql://postgres:p@ss!w0rd#123@db.supabase.co:5432/postgres');
+    expect(out).not.toContain('p@ss');
+    expect(out).toContain('***');
   });
 
-  test('returns non-postgresql URLs unchanged', () => {
-    const url = 'https://example.com/api';
-    expect(redactUrl(url)).toBe(url);
-  });
-
-  test('returns plain strings unchanged', () => {
-    expect(redactUrl('hello')).toBe('hello');
-  });
-
-  test('handles URL without password', () => {
-    const url = 'postgresql://user@host:5432/dbname';
-    // No colon after user means regex doesn't match
-    expect(redactUrl(url)).toBe(url);
-  });
-
-  test('handles empty string', () => {
-    expect(redactUrl('')).toBe('');
+  test('non-URL, non-sensitive values pass through unchanged', () => {
+    expect(redactConfigValue('search.mode', 'hello')).toBe('hello');
+    expect(redactConfigValue('search.mode', '')).toBe('');
+    expect(redactConfigValue('some_url', 'https://example.com/api')).toBe('https://example.com/api');
   });
 });
 
 describe('config source correctness', () => {
-  test('redactUrl function exists in config.ts', () => {
-    expect(configSource).toContain('function redactUrl');
-  });
-
-  test('redactUrl uses the correct regex pattern', () => {
-    expect(configSource).toContain('postgresql:\\/\\/');
+  test('the local redactUrl duplicate stays deleted (redaction is single-homed)', () => {
+    expect(configSource).not.toContain('function redactUrl');
+    expect(configSource).toContain("from '../core/url-redact.ts'");
+    expect(configSource).toContain('redactPgUrl');
   });
 });
 
@@ -67,6 +50,7 @@ describe('isSensitiveConfigKey (v0.36.x #892 regression)', () => {
   test('matches common sensitive key shapes', () => {
     expect(isSensitiveConfigKey('openai_api_key')).toBe(true);
     expect(isSensitiveConfigKey('anthropic_api_key')).toBe(true);
+    expect(isSensitiveConfigKey('openrouter_api_key')).toBe(true);
     expect(isSensitiveConfigKey('voyage_api_key')).toBe(true);
     expect(isSensitiveConfigKey('admin_token')).toBe(true);
     expect(isSensitiveConfigKey('database.password')).toBe(true);
@@ -90,15 +74,50 @@ describe('isSensitiveConfigKey (v0.36.x #892 regression)', () => {
   });
 });
 
+describe('isSensitiveConfigKey plurals, acronyms and missing words (#8920)', () => {
+  test('masks plural, acronym and credential-word keys', () => {
+    for (const key of ['github_tokens', 'oauth.tokens', 'client_secrets', 'apiKeys', 'storage.apiKeys', 'passwords', 'db.credentials',
+      'credential', 'smtp.authorization', 'Authorization', 'gpg_passphrase', 'APIKey', 'openaiAPIKey', 'apikey', 'vendor.apikeys']) {
+      expect([key, isSensitiveConfigKey(key)]).toEqual([key, true]);
+    }
+  });
+
+  test('a token or credential count is not a secret', () => {
+    for (const key of ['search.max_tokens', 'max_tokens', 'agent.max_output_tokens', 'dream.synthesize.max_prompt_tokens', 'budget_tokens',
+      'proposals.max_pending_per_credential', 'tokenizer', 'tokenizers', 'keyword_weights', 'passphrased_ok']) {
+      expect([key, isSensitiveConfigKey(key)]).toEqual([key, false]);
+    }
+  });
+});
+
+describe('redactConfigValue strips URL credentials of any scheme (#8920)', () => {
+  test('user:pass@ is removed from non-postgres URLs', () => {
+    const userinfo = (user: string) => [user, 'hunter2'].join(':') + '@';
+    for (const [key, value] of [['redis_url', `redis://${userinfo('user')}cache:6379/0`], ['queue.url', `amqp://${userinfo('guest')}mq.example.com/vhost`],
+      ['mirror', `https://${userinfo('alice-example')}git.example.com/repo.git`], ['mongo_uri', `mongodb+srv://${userinfo('u')}cluster.example.net/db`]]) {
+      const out = redactConfigValue(key!, value!);
+      expect(out).not.toContain('hunter2');
+      expect(out).toContain('***@');
+    }
+  });
+
+  test('a URL without userinfo passes through unchanged', () => {
+    expect(redactConfigValue('some_url', 'https://example.com/a@b')).toBe('https://example.com/a@b');
+    expect(redactConfigValue('mirror', 'https://git.example.com/repo.git')).toBe('https://git.example.com/repo.git');
+  });
+});
+
 describe('redactConfigValue (v0.36.x #892 — set output regression)', () => {
   test('redacts sensitive keys to ***', () => {
     expect(redactConfigValue('openai_api_key', 'sk-test-123')).toBe('***');
+    expect(redactConfigValue('openrouter_api_key', 'sk-or-test-123')).toBe('***');
     expect(redactConfigValue('admin_token', 'eyJhbGciOiJIUzI1NiJ9')).toBe('***');
   });
 
   test('redacts postgresql URL passwords regardless of key', () => {
-    expect(redactConfigValue('database_url', 'postgresql://u:secret@h:5432/d'))
-      .toBe('postgresql://u:***@h:5432/d');
+    const out = redactConfigValue('database_url', 'postgresql://u:secret@h:5432/d');
+    expect(out).not.toContain('secret');
+    expect(out).toBe('postgresql://***@h:5432/d');
   });
 
   test('non-sensitive values pass through unchanged', () => {
@@ -251,5 +270,17 @@ describe('loadConfig — GBRAIN_MAX_MARKUP_RATIO env (v0.42 #1699)', () => {
     await withHomeAndEnv({ GBRAIN_MAX_MARKUP_RATIO: '1.5' }, (cfg) => {
       expect((cfg as { content_sanity?: { max_markup_ratio?: number } }).content_sanity?.max_markup_ratio).toBeUndefined();
     });
+  });
+});
+
+describe('KNOWN_CONFIG_KEYS — documented enable commands must be registered', () => {
+  test('Life Chronicle keys are registered (v0.42.56.0 release notes say `config set auto_chronicle true`)', async () => {
+    const { KNOWN_CONFIG_KEYS, KNOWN_CONFIG_KEY_PREFIXES } = await import('../src/core/config.ts');
+    // The flag the chronicle backstop reads (isAutoChronicleEnabled).
+    expect(KNOWN_CONFIG_KEYS).toContain('auto_chronicle');
+    // The takes bootstrap two-gate consent flag (v0.41.18.0 A12).
+    expect(KNOWN_CONFIG_KEYS).toContain('takes.bootstrap_enabled');
+    // chronicle.tz (chronicleTz) + future chronicle.* knobs.
+    expect(KNOWN_CONFIG_KEY_PREFIXES.some(p => 'chronicle.tz'.startsWith(p))).toBe(true);
   });
 });

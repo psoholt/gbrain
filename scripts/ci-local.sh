@@ -6,17 +6,17 @@
 #
 # Modes:
 #   bash scripts/ci-local.sh              # full local gate: gitleaks + unit + ALL E2E (4-way sharded)
-#   bash scripts/ci-local.sh --diff       # full local gate: gitleaks + unit + selected E2E (4-way sharded)
+#   bash scripts/ci-local.sh --diff       # doc-only diff: gitleaks + doc checks; any other diff: the full gate
 #   bash scripts/ci-local.sh --no-pull    # skip docker compose pull (offline / debug)
 #   bash scripts/ci-local.sh --clean      # nuke named volumes for cold debug
 #   bash scripts/ci-local.sh --no-shard   # debug: run E2E sequentially against postgres-1 only
 #
-# 4-way E2E sharding: 4 pgvector services on host ports 5434-5437. The 36 E2E
-# files split N/4 per shard; shards run in parallel. Within a shard, files run
+# 4-way E2E sharding: 4 pgvector services on host ports 5434-5437. The test/e2e/ file set splits
+# roughly N/4 per shard; shards run in parallel. Within a shard, files run
 # sequentially (TRUNCATE CASCADE no-race property documented in run-e2e.sh).
 # Wall-time on a 16-core host: ~6 min sequential -> ~1.5-2 min sharded.
 #
-# Stronger than PR CI: PR CI runs only Tier 1's 2 files; this runs all 36.
+# Stronger than PR CI: PR CI runs a handful of named files across its tiers; this runs every test/e2e file.
 
 set -euo pipefail
 
@@ -54,35 +54,27 @@ if [ "$CLEAN" = "1" ]; then
   docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>&1 | tail -5 || true
 fi
 
-# Tier 2: --diff fast-path. If the diff is doc-only (or empty), skip the
-# whole heavy gate (postgres + bun install + unit + E2E) and just verify
-# gitleaks on host. Doc-only diffs go from ~25 min to ~5 seconds.
+# --diff: a doc-only diff skips the heavy gate (postgres + bun install + unit
+# + E2E) and runs gitleaks plus the doc checks on the host (seconds instead of
+# ~25 min). Any other diff runs the full gate: E2E narrowing is retired (a
+# typical E2E file imports most of src/, so no diff map ever narrowed).
 if [ "$DIFF" = "1" ]; then
   CLASSIFICATION=$(bun run scripts/select-e2e.ts --classify-only 2>/dev/null || echo "ERR")
-  case "$CLASSIFICATION" in
-    DOC_ONLY)
-      echo "[ci-local] --diff: diff is doc-only — skipping postgres + unit + E2E (Tier 2 fast-path)."
-      echo "[ci-local] Running gitleaks on host as the only gate..."
-      if ! command -v gitleaks >/dev/null 2>&1; then
-        echo "[ci-local] WARN: gitleaks not installed; skipping. brew install gitleaks." >&2
-      else
-        gitleaks dir . --redact --no-banner
-        gitleaks git . --redact --no-banner --log-opts="origin/master..HEAD"
-      fi
-      echo "[ci-local] Doc-only fast-path complete. No code paths exercised."
-      trap - EXIT
-      exit 0
-      ;;
-    EMPTY)
-      echo "[ci-local] --diff: diff is empty (clean branch) — running full gate per fail-closed contract."
-      ;;
-    SRC)
-      echo "[ci-local] --diff: diff touches src/ — running selected E2E + full unit phase."
-      ;;
-    *)
-      echo "[ci-local] WARN: select-e2e.ts --classify-only returned '$CLASSIFICATION' — running full gate." >&2
-      ;;
-  esac
+  if [ "$CLASSIFICATION" = "DOC_ONLY" ]; then
+    echo "[ci-local] --diff: diff is doc-only — skipping postgres + unit + E2E; running gitleaks and the doc checks."
+    if ! command -v gitleaks >/dev/null 2>&1; then
+      echo "[ci-local] ERROR: gitleaks not installed; the required secrets scan cannot run. Install gitleaks and retry." >&2
+      exit 1
+    fi
+    bash scripts/test-gitleaks-config.sh
+    bash scripts/scan-worktree-secrets.sh
+    gitleaks git . --redact --no-banner --log-opts="origin/master..HEAD"
+    bash scripts/ci-doc-checks.sh
+    echo "[ci-local] Doc-only fast-path complete. No code paths exercised."
+    trap - EXIT
+    exit 0
+  fi
+  echo "[ci-local] --diff: E2E narrowing is retired; running the full E2E corpus (see docs/TESTING.md#e2e-selection). Classification: $CLASSIFICATION"
 fi
 
 # Pre-flight: postgres host ports for 4 shards. Defaults to 5434-5437 (avoid
@@ -121,10 +113,11 @@ fi
 #   1. Working-tree files (catch uncommitted secrets sitting in files)
 #   2. Branch commits vs origin/master (catch secrets committed on this branch)
 # Full-history scan is ~4 min on this repo's 3700+ commits; not useful pre-push.
-gitleaks dir . --redact --no-banner
+bash scripts/test-gitleaks-config.sh
+bash scripts/scan-worktree-secrets.sh
 gitleaks git . --redact --no-banner --log-opts="origin/master..HEAD"
 
-# Step 1: pull. Refreshes pgvector + oven/bun:1 (both are `image:` not `build:`).
+# Step 1: pull. Refreshes pgvector + the pinned oven/bun tag (both are `image:` not `build:`).
 if [ "$NO_PULL" = "0" ]; then
   echo "[ci-local] Pulling base images (use --no-pull to skip)..."
   docker compose -f "$COMPOSE_FILE" pull 2>&1 | tail -5
@@ -156,95 +149,62 @@ done
 
 # Step 3: smoke-test run-e2e.sh argv + shard handling.
 echo "[ci-local] Smoke: run-e2e.sh argv + shard..."
-SMOKE_NO_ARGS=$(bash scripts/run-e2e.sh --dry-run-list | wc -l | tr -d ' ')
-EXPECTED_ALL=$(ls test/e2e/*.test.ts | wc -l | tr -d ' ')
-if [ "$SMOKE_NO_ARGS" != "$EXPECTED_ALL" ]; then
-  echo "[ci-local] ERROR: --dry-run-list (no args) printed $SMOKE_NO_ARGS, expected $EXPECTED_ALL" >&2
-  exit 1
-fi
-SMOKE_ONE_ARG=$(bash scripts/run-e2e.sh --dry-run-list test/e2e/sync.test.ts)
-if [ "$SMOKE_ONE_ARG" != "test/e2e/sync.test.ts" ]; then
-  echo "[ci-local] ERROR: --dry-run-list with 1 arg printed '$SMOKE_ONE_ARG'" >&2
-  exit 1
-fi
-SHARD_TOTAL=$(( $(SHARD=1/4 bash scripts/run-e2e.sh --dry-run-list | wc -l) + \
-                $(SHARD=2/4 bash scripts/run-e2e.sh --dry-run-list | wc -l) + \
-                $(SHARD=3/4 bash scripts/run-e2e.sh --dry-run-list | wc -l) + \
-                $(SHARD=4/4 bash scripts/run-e2e.sh --dry-run-list | wc -l) ))
-if [ "$SHARD_TOTAL" != "$EXPECTED_ALL" ]; then
-  echo "[ci-local] ERROR: shards 1-4 covered $SHARD_TOTAL files, expected $EXPECTED_ALL" >&2
-  exit 1
-fi
-echo "[ci-local] Smoke OK ($SMOKE_NO_ARGS files no-arg, 1 single-arg, ${SHARD_TOTAL}=4-shard total)."
+bash scripts/ci-local-e2e-smoke.sh
 
 # Step 4: build the runner-side command.
 # Tier 1: 4-shard parallel UNIT + E2E. Each shard runs ~46 unit files + ~9
 # E2E files against postgres-N. Guards + typecheck run ONCE before fan-out.
 # --no-shard runs the legacy unsharded flow (debug aid).
 if [ "$NO_SHARD" = "1" ]; then
-  if [ "$DIFF" = "1" ]; then
-    RUN_PHASES_CMD='echo "[runner] guards + typecheck"
-bash scripts/check-jsonb-pattern.sh
-bash scripts/check-progress-to-stdout.sh
-bash scripts/check-trailing-newline.sh
-bash scripts/check-wasm-embedded.sh
-bun run typecheck
+  RUN_PHASES_CMD='echo "[runner] guards + typecheck"
+bash scripts/check-bun-test-timeout.sh
+bun run verify
+echo "[runner] serial tests (DATABASE_URL unset)"
+env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun run test:serial
+echo "[runner] slow tests (DATABASE_URL unset)"
+env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun run test:slow
 echo "[runner] unit (unsharded, DATABASE_URL unset)"
 env -u DATABASE_URL bash scripts/run-unit-shard.sh
-echo "[runner] e2e (unsharded, --diff selected)"
-SELECTED=$(bun run scripts/select-e2e.ts)
-if [ -z "$SELECTED" ]; then
-  echo "[runner] selector emitted nothing (doc-only diff); skipping E2E."
-else
-  DATABASE_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \
-  GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer \
-  GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \
-  echo "$SELECTED" | xargs bash scripts/run-e2e.sh
-fi'
-  else
-    RUN_PHASES_CMD='echo "[runner] guards + typecheck"
-bash scripts/check-jsonb-pattern.sh
-bash scripts/check-progress-to-stdout.sh
-bash scripts/check-trailing-newline.sh
-bash scripts/check-wasm-embedded.sh
-bun run typecheck
-echo "[runner] unit (unsharded, DATABASE_URL unset)"
-env -u DATABASE_URL bash scripts/run-unit-shard.sh
+echo "[runner] PgBouncer admin database (gbrain_ci_admin_test on postgres-1)"
+bun scripts/lib/ensure-e2e-database.ts postgresql://postgres:postgres@postgres-1:5432/gbrain_test?sslmode=disable gbrain_ci_admin_test \
+  || { echo "[runner] ERROR: could not create gbrain_ci_admin_test; E2E not started" >&2; exit 1; }
 echo "[runner] e2e (unsharded)"
-DATABASE_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \
-GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer \
-GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \
+DATABASE_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test?sslmode=disable \
+GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer_test?sslmode=disable \
+GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_ci_admin_test?sslmode=disable \
+GBRAIN_PGBOUNCER_E2E_DB=gbrain_test \
+GBRAIN_CI_REQUIRE_PGBOUNCER=1 \
+GBRAIN_TEST_DB=1 \
 bash scripts/run-e2e.sh'
-  fi
 else
   # Tier 1 sharded path. Each shard runs unit+E2E sequentially against its
   # own postgres-N. Shards run in parallel via xargs -P4.
-  if [ "$DIFF" = "1" ]; then
-    DIFF_E2E_PREP='SELECTED=$(bun run scripts/select-e2e.ts)
-if [ -z "$SELECTED" ]; then
-  echo "" > /tmp/e2e-selected.txt
-else
-  echo "$SELECTED" | tr " " "\n" | grep -v "^$" > /tmp/e2e-selected.txt
-fi'
-  else
-    # Empty file -> run-e2e.sh uses default glob (all 36 E2E files).
-    DIFF_E2E_PREP='> /tmp/e2e-selected.txt'
-  fi
   RUN_PHASES_CMD="echo \"[runner] guards + typecheck (run once before sharding)\"
-bash scripts/check-jsonb-pattern.sh
-bash scripts/check-progress-to-stdout.sh
-bash scripts/check-trailing-newline.sh
-bash scripts/check-wasm-embedded.sh
-bun run typecheck
-echo \"[runner] Tier 3: building PGLite snapshot fixture (cached across reruns)\"
-if [ ! -f test/fixtures/pglite-snapshot.tar ] || [ ! -f test/fixtures/pglite-snapshot.version ]; then
-  bun run build:pglite-snapshot
-else
-  echo \"[runner] snapshot fixture exists; engine will validate hash at load time\"
-fi
+bash scripts/check-bun-test-timeout.sh
+bun run verify
+echo \"[runner] serial tests (DATABASE_URL unset)\"
+env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun run test:serial
+echo \"[runner] slow tests (DATABASE_URL unset)\"
+env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun run test:slow
+echo \"[runner] Tier 3: PGLite snapshot fixture (idempotent; rebuilds on hash drift)\"
+# W0 fix-wave (Tier-1 #16): unconditional call — the build script self-
+# short-circuits on a fresh hash and rebuilds STALE snapshots (the old
+# if-missing guard left a stale-but-present snapshot permanently on the
+# warn+slow path). Concurrency-safe via the script's mkdir lock (D5.8).
+bun run build:pglite-snapshot
 export GBRAIN_PGLITE_SNAPSHOT=test/fixtures/pglite-snapshot.tar
-echo \"[runner] resolving E2E file selection (--diff aware)\"
-${DIFF_E2E_PREP}
+# #4479: 4-way shard contention makes subprocess/PGLite tests ~6x slower per
+# file in the container than natively — timeout-class failures that pass on
+# the host. Scale the per-test ceiling for the container lane (overridable).
+export GBRAIN_TEST_TIMEOUT_MULTIPLIER=\${GBRAIN_TEST_TIMEOUT_MULTIPLIER:-6}
+# #6674: E2E files hold administrative sessions on GBRAIN_PGBOUNCER_DIRECT_URL
+# across a file, while run-e2e.sh terminates every other session on its own
+# DATABASE_URL between files. The admin database is therefore no shard's
+# database (shard 1 uses postgres-1/gbrain_test), created once before any
+# shard starts.
+echo \"[runner] PgBouncer admin database (gbrain_ci_admin_test on postgres-1)\"
+bun scripts/lib/ensure-e2e-database.ts postgresql://postgres:postgres@postgres-1:5432/gbrain_test?sslmode=disable gbrain_ci_admin_test \\
+  || { echo \"[runner] ERROR: could not create gbrain_ci_admin_test; shards not started\" >&2; exit 1; }
 mkdir -p /tmp/shard-logs
 echo \"[runner] Tier 1: 4-shard parallel unit + E2E (xargs -P4)\"
 set +e
@@ -260,19 +220,16 @@ printf '%s\\n' 1 2 3 4 | xargs -P4 -I{} sh -c '
     exit \$unit_exit
   fi
   echo \"[shard \${shard}] e2e phase (SHARD=\${shard}/4, DATABASE_URL=postgres-\${shard})\" >> \$log
-  if [ -s /tmp/e2e-selected.txt ]; then
-    SHARD=\${shard}/4 \\
-    DATABASE_URL=postgresql://postgres:postgres@postgres-\${shard}:5432/gbrain_test \\
-    GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer \\
-    GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \\
-    xargs -a /tmp/e2e-selected.txt bash scripts/run-e2e.sh >> \$log 2>&1
-  else
-    SHARD=\${shard}/4 \\
-    DATABASE_URL=postgresql://postgres:postgres@postgres-\${shard}:5432/gbrain_test \\
-    GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer \\
-    GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \\
-    bash scripts/run-e2e.sh >> \$log 2>&1
-  fi
+  # Backend-matrix PgBouncer pass: the one pooler fronts postgres-1, so each
+  # shard gets its own pooled database there (run-e2e.sh creates it).
+  SHARD=\${shard}/4 \\
+  DATABASE_URL=postgresql://postgres:postgres@postgres-\${shard}:5432/gbrain_test?sslmode=disable \\
+  GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer_test?sslmode=disable \\
+  GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_ci_admin_test?sslmode=disable \\
+  GBRAIN_PGBOUNCER_E2E_DB=gbrain_pooled_\${shard}_test \\
+  GBRAIN_CI_REQUIRE_PGBOUNCER=1 \\
+  GBRAIN_TEST_DB=1 \\
+  bash scripts/run-e2e.sh >> \$log 2>&1
   e2e_exit=\$?
   if [ \$e2e_exit -ne 0 ]; then
     echo \"[shard \${shard}] E2E FAILED (exit=\$e2e_exit)\" >> \$log
@@ -282,6 +239,9 @@ printf '%s\\n' 1 2 3 4 | xargs -P4 -I{} sh -c '
 ' _ {}
 shard_xargs_exit=\$?
 set -e
+mkdir -p .context/ci-local-shards
+cp /tmp/shard-logs/shard-*.log .context/ci-local-shards/
+echo \"[runner] Complete shard logs saved to .context/ci-local-shards/\"
 echo \"\"
 echo \"=== SHARD LOGS (last 30 lines each + unit/e2e summaries) ===\"
 for s in 1 2 3 4; do
@@ -309,23 +269,39 @@ fi
 INNER_CMD=$(cat <<'EOF'
 set -euo pipefail
 echo "[runner] bun version: $(bun --version)"
-# oven/bun:1 omits git; many unit tests use mkdtemp + git init for fixtures.
-if ! command -v git >/dev/null 2>&1; then
-  echo "[runner] Installing git (debian apt)..."
+# Test prerequisites may be missing even in a warm runner image: git backs
+# fixture repos, python3 backs security scans and argv recorders, and ps backs
+# live-process / PID-reuse lock checks. psql cleans up connections between E2E
+# files. curl downloads for check:vendor-postgres (vendor/update-postgres.sh);
+# the oven/bun image ships without it (#7765). None are application dependencies.
+if ! command -v git >/dev/null 2>&1 || \
+   ! command -v python3 >/dev/null 2>&1 || \
+   ! command -v ps >/dev/null 2>&1 || \
+   ! command -v psql >/dev/null 2>&1 || \
+   ! command -v cc >/dev/null 2>&1 || \
+   ! command -v jq >/dev/null 2>&1 || \
+   ! command -v curl >/dev/null 2>&1; then
+  echo "[runner] Installing test prerequisites (debian apt)..."
   apt-get update -qq >/dev/null
-  apt-get install -y -qq git ca-certificates >/dev/null
+  apt-get install -y -qq git ca-certificates python3 procps postgresql-client jq curl build-essential >/dev/null
 fi
 # Container runs as root (uid 0) against a host-uid bind-mount; mark repo +
 # any worktree gitdir as safe so `git status` etc. don't refuse.
 git config --global --add safe.directory '*' || true
-if [ ! -d /app/node_modules ] || [ -z "$(ls -A /app/node_modules 2>/dev/null)" ]; then
-  echo "[runner] First run (or --clean): bun install --frozen-lockfile"
-  bun install --frozen-lockfile
-fi
+# #6756: the admin/dist volume starts empty on a fresh checkout; make it the worktree's bytes.
+bash scripts/ci-hydrate-admin-dist.sh /ci-src/admin-dist admin/dist
+# Revalidate even a warm dependency volume against this checkout's lockfile.
+echo "[runner] bun install --frozen-lockfile"
+bun install --frozen-lockfile
+echo "[runner] compiling isolated Linux CLI for executable security checks"
+bun run build
 __RUN_PHASES__
 EOF
 )
-INNER_CMD="${INNER_CMD/__RUN_PHASES__/$RUN_PHASES_CMD}"
+# Concatenate around the marker instead of using replacement expansion:
+# Bash 5.2 expands unquoted '&' in a replacement to the matched marker,
+# corrupting shell redirects such as 2>&1. These slices also work on Bash 3.2.
+INNER_CMD="${INNER_CMD%%__RUN_PHASES__*}${RUN_PHASES_CMD}${INNER_CMD#*__RUN_PHASES__}"
 
 # Conductor / git-worktree support: when `.git` is a file (not a directory),
 # it points at a host gitdir outside the bind-mount. Without remounting that
@@ -350,7 +326,8 @@ if [ -f .git ]; then
 fi
 
 echo "[ci-local] Running checks inside runner container..."
-docker compose -f "$COMPOSE_FILE" run --rm "${EXTRA_MOUNTS[@]:-}" runner bash -c "$INNER_CMD"
+# Bash 3.2 treats an empty array as unset under nounset; preserve zero argv.
+docker compose -f "$COMPOSE_FILE" run --rm ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"} runner bash -c "$INNER_CMD"
 
 echo ""
 echo "[ci-local] All checks passed."

@@ -94,11 +94,12 @@ describe('Bug 8 — max_stalled default bumped in schema files', () => {
   // non-terminal rows via migration v15. These structural assertions track the
   // current schema source state (not historical).
   test('schema-embedded.ts has max_stalled DEFAULT 5', async () => {
-    const source = await Bun.file(new URL('../src/core/schema-embedded.ts', import.meta.url)).text();
+    const source = await Bun.file(new URL('../src/core/schema-embedded.generated.ts', import.meta.url)).text();
     expect(source).toContain('max_stalled      INTEGER     NOT NULL DEFAULT 5');
   });
   test('pglite-schema.ts has max_stalled DEFAULT 5', async () => {
-    const source = await Bun.file(new URL('../src/core/pglite-schema.ts', import.meta.url)).text();
+    // The PGLite bootstrap text lives in the generated template since refactor wave 1 (W2).
+    const source = await Bun.file(new URL('../src/core/pglite-schema.generated.ts', import.meta.url)).text();
     expect(source).toContain('max_stalled      INTEGER     NOT NULL DEFAULT 5');
   });
   test('schema.sql has max_stalled DEFAULT 5', async () => {

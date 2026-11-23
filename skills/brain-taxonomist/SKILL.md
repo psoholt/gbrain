@@ -123,15 +123,23 @@ type is needed and let the schema-pack cathedral handle the proposal flow.
 ## Periodic Drift Detection
 
 ```bash
-# What pages have no type matching the active pack?
+# Which pages have no type matching the active pack? Counts untyped pages AND
+# pages whose type the pack neither declares nor aliases (undeclared_types).
 gbrain schema review-orphans --json
 
-# What's the overall health?
-gbrain doctor --json | jq '.checks[] | select(.name == "schema_pack_consistency")'
+# Per-type audit of the stored corpus (stored_type_undeclared / stored_type_is_alias).
+gbrain schema lint --with-db --json
 ```
 
-When `schema_pack_consistency` warns at >10% untyped, run the EIIRP
-Phase 3 SCHEMA CHECK flow to surface candidate types via `schema detect`.
+Both commands run locally. Over MCP, the `run_doctor` report carries the
+same verdict as its `schema_pack_consistency` check (an undeclared type
+warns with code `page_type_undeclared`).
+
+When undeclared types show up, declare them in the pack
+(`gbrain schema add-type <type> --primitive <p> --prefix <dir/>`) or rewrite
+the pages with a declared type. When more than 10% of a source is untyped,
+run the EIIRP Phase 3 SCHEMA CHECK flow to surface candidate types via
+`schema detect`.
 
 ## Output Format
 
@@ -157,6 +165,13 @@ When the active pack has NO matching type, signal to EIIRP Phase 3
 **Suggested next step:** `gbrain schema detect --source <source_id>` then
 `gbrain schema review-candidates`.
 ```
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain schema show` / `gbrain schema lint` fails because no schema pack is active or the pack is corrupt: report it and route to the schema-author skill; do not guess a directory from memory.
+- A recommendation needs a schema change (`gbrain schema add-type`, `gbrain schema use`): this skill is advisory. Hand it to EIIRP or schema-author with the user's agreement; never mutate the active pack from here.
 
 ## Anti-Patterns
 

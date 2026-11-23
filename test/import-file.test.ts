@@ -1,15 +1,36 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { writeFileSync, mkdirSync, rmSync, symlinkSync, readdirSync, readFileSync, existsSync } from 'fs';
+import { writeFileSync, mkdirSync, rmSync, symlinkSync, readdirSync, readFileSync, existsSync, mkdtempSync } from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import { importFile, importFromContent } from '../src/core/import-file.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { MARKDOWN_CHUNKER_VERSION } from '../src/core/chunkers/recursive.ts';
+import { CODE_FILE_MAX_BYTES, PAGE_MAX_BYTES } from '../src/core/page-size-policy.ts';
 
-const TMP = join(import.meta.dir, '.tmp-import-test');
+const TMP = mkdtempSync(join(tmpdir(), 'gbrain-import-file-test-'));
 
 // Minimal mock engine that tracks calls and supports transaction()
+//
+// Post-write read-back guard: the mock now simulates a real DB by storing pages written
+// via putPage so getPage can read them back. The post-write read-back guard
+// in importFromContent calls getPage after the transaction commits — a mock
+// that always returns null (the pre-fix default) triggers the guard's
+// "page not found after write" path. This is the correct loud-failure
+// behavior for a real desync, but for the existing unit tests we need the
+// mock to behave like a working DB where writes are readable.
+const GUARD_READS: Record<string, (...args: any[]) => unknown> = {
+  readManagedModeRows: () => [{ enabled: false }],
+  getSourceStrictness: () => false,
+  getConfigValues: () => [],
+  readTransactionSettings: (names: string[]) => names.map(() => null),
+  applyTransactionSettings: () => undefined,
+  isFolderRestricted: () => false,
+};
+
 function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
   const calls: { method: string; args: any[] }[] = [];
+  // In-memory page store: slug → page row (simulates a real DB index).
+  const pageStore = new Map<string, { slug: string; content_hash: string; title: string; type: string; frontmatter: Record<string, unknown> }>();
   const track = (method: string) => (...args: any[]) => {
     calls.push({ method, args });
     if (overrides[method]) return overrides[method](...args);
@@ -20,9 +41,58 @@ function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
     get(_, prop: string) {
       if (prop === '_calls') return calls;
       if (prop === 'getTags') return overrides.getTags || (() => Promise.resolve([]));
-      if (prop === 'getPage') return overrides.getPage || (() => Promise.resolve(null));
+      // Like a real engine, the reuse read resolves to a row array (no stored chunks).
+      if (prop === 'getChunkReuseRows') return overrides.getChunkReuseRows || (() => Promise.resolve([]));
+      if (prop === 'getPage') {
+        return async (slug: string, opts?: { sourceId?: string }) => {
+          // If the test provides a custom getPage, call it first (for the
+          // "existing" check at the top of importFromContent). If it returns
+          // a value, use that. If it returns null, fall back to the in-memory
+          // store (for the read-back guard after the write).
+          //
+          // Read-back guard: when the override returns a non-null value,
+          // we still need the read-back to see the page as written by putPage.
+          // The override simulates the "existing page" state; the store has
+          // the post-write state. If the override and the store disagree on
+          // content_hash, the store wins (the write already committed).
+          if (overrides.getPage) {
+            const overrideResult = await overrides.getPage(slug, opts);
+            if (overrideResult) {
+              // If the page was written (store has it), the store's hash
+              // is the post-write hash. Merge: return the override's shape
+              // but with the store's content_hash (the committed value).
+              const stored = pageStore.get(slug);
+              if (stored) {
+                return { ...overrideResult, content_hash: stored.content_hash };
+              }
+              return overrideResult;
+            }
+          }
+          return pageStore.get(slug) ?? null;
+        };
+      }
+      if (prop === 'putPage') {
+        return async (slug: string, page: { content_hash?: string; title?: string; type?: string; frontmatter?: Record<string, unknown> }, _opts?: { sourceId?: string }) => {
+          calls.push({ method: 'putPage', args: [slug, page, _opts] });
+          if (overrides.putPage) overrides.putPage(slug, page, _opts);
+          // Always store the page so getPage can read it back (simulates DB index).
+          pageStore.set(slug, {
+            slug,
+            content_hash: page.content_hash ?? '',
+            title: page.title ?? '',
+            type: page.type ?? '',
+            frontmatter: page.frontmatter ?? {},
+          });
+          return Promise.resolve(undefined);
+        };
+      }
       // transaction: just call the fn with the same engine (no real DB transaction in tests)
       if (prop === 'transaction') return async (fn: (tx: BrainEngine) => Promise<any>) => fn(engine);
+      // Like a real engine, executeRaw always resolves to a row array.
+      // #6482: the strict mode reader needs one well-formed unmanaged row.
+      if (prop === 'executeRaw' && !overrides.executeRaw) return (...args: any[]) => { calls.push({ method: prop, args }); return Promise.resolve(String(args[0]).includes('FROM persistence_brain') ? [{ enabled: false }] : []); };
+      // The import guards read through typed methods; a page-less mock engine answers them like a fresh unmanaged brain.
+      if (!overrides[prop] && prop in GUARD_READS) return (...args: any[]) => { calls.push({ method: prop, args }); return Promise.resolve(GUARD_READS[prop]!(...args)); };
       return track(prop);
     },
   });
@@ -38,6 +108,22 @@ afterAll(() => {
 });
 
 describe('importFile', () => {
+  test('stores code containing NUL bytes without dropping the page', async () => {
+    const filePath = join(TMP, 'nul-fixture.ts');
+    writeFileSync(filePath, "export const nul = '\0';\n");
+
+    const engine = mockEngine();
+    const result = await importFile(engine, filePath, 'src/nul-fixture.ts', { noEmbed: true });
+
+    expect(result.status).toBe('imported');
+    const calls = (engine as any)._calls;
+    const putCall = calls.find((c: any) => c.method === 'putPage');
+    const chunkCall = calls.find((c: any) => c.method === 'upsertChunks');
+    expect(putCall.args[1].compiled_truth).toContain("'\\0'");
+    expect(putCall.args[1].compiled_truth).not.toContain('\0');
+    expect(chunkCall.args[1].every((chunk: { chunk_text: string }) => !chunk.chunk_text.includes('\0'))).toBe(true);
+  });
+
   test('imports a valid markdown file', async () => {
     const filePath = join(TMP, 'test-page.md');
     writeFileSync(filePath, `---
@@ -75,9 +161,26 @@ This is the compiled truth.
     expect(chunkCall).toBeTruthy();
   });
 
-  test('skips files larger than MAX_FILE_SIZE (5MB)', async () => {
+  test('strips a UTF-8 BOM so the heading title is used (#4798)', async () => {
+    // Written as bytes so no editor can silently strip the BOM from a fixture.
+    const filePath = join(TMP, 'bom-note.md');
+    writeFileSync(filePath, Buffer.concat([
+      Buffer.from([0xef, 0xbb, 0xbf]),
+      Buffer.from('# My Real Title\n\nbody text\n'),
+    ]));
+
+    const engine = mockEngine();
+    const result = await importFile(engine, filePath, 'notes/bom-note.md', { noEmbed: true });
+
+    expect(result.status).toBe('imported');
+    const putCall = (engine as any)._calls.find((c: any) => c.method === 'putPage');
+    expect(putCall.args[1].title).toBe('My Real Title');
+    expect(putCall.args[1].compiled_truth).not.toContain('\uFEFF');
+  });
+
+  test('skips files larger than MAX_FILE_SIZE (the 24 MiB page ceiling)', async () => {
     const filePath = join(TMP, 'big-file.md');
-    const bigContent = '---\ntitle: Big\n---\n' + 'x'.repeat(5_100_000);
+    const bigContent = '---\ntitle: Big\n---\n' + 'x'.repeat(PAGE_MAX_BYTES + 100_000);
     writeFileSync(filePath, bigContent);
 
     const engine = mockEngine();
@@ -350,7 +453,7 @@ Content to chunk but not embed.
     // must trigger BEFORE parseMarkdown / chunkText / embedBatch — if it doesn't,
     // an authenticated attacker can force the owner to pay for embedding a
     // multi-megabyte string.
-    const bigContent = '---\ntitle: Big\n---\n' + 'x'.repeat(5_100_000);
+    const bigContent = '---\ntitle: Big\n---\n' + 'x'.repeat(PAGE_MAX_BYTES + 100_000);
 
     const engine = mockEngine();
     const result = await importFromContent(engine, 'big-slug', bigContent, { noEmbed: true });
@@ -363,10 +466,11 @@ Content to chunk but not embed.
   });
 
   test('uses UTF-8 byte length, not JS string length, for the size check', async () => {
-    // 2.6M 4-byte codepoints = ~10.4 MB UTF-8 but only 2.6M JS UTF-16 code units.
+    // 6.5M 4-byte codepoints = 26 MB UTF-8 but only 13M JS UTF-16 code units.
     // A length-based check would let this through; a byteLength check catches it.
     const fourByteChar = '\u{1F600}'; // emoji, 4 bytes in UTF-8
-    const bigContent = fourByteChar.repeat(2_600_000);
+    const bigContent = fourByteChar.repeat(6_500_000);
+    expect(bigContent.length).toBeLessThan(PAGE_MAX_BYTES);
 
     const engine = mockEngine();
     const result = await importFromContent(engine, 'emoji-slug', bigContent, { noEmbed: true });
@@ -379,12 +483,28 @@ Content to chunk but not embed.
   test('accepts in-memory content just under MAX_FILE_SIZE', async () => {
     // Sanity: content exactly at the limit must still import. If this test
     // fails, the guard is off-by-one and will break legitimate large imports.
-    const content = '---\ntitle: Borderline\n---\n' + 'x'.repeat(4_900_000);
+    const head = '---\ntitle: Borderline\n---\n';
+    const sentence = 'Normal prose about acme-example. ';
+    const body = sentence.repeat(Math.floor((PAGE_MAX_BYTES - head.length) / sentence.length));
+    const content = head + body + 'x'.repeat(PAGE_MAX_BYTES - head.length - body.length);
+    expect(Buffer.byteLength(content, 'utf-8')).toBe(PAGE_MAX_BYTES);
 
-    const engine = mockEngine();
+    const engine = mockEngine({ getConfig: (key: string) => Promise.resolve(key === 'pages.segmented_storage' ? 'off' : null) });
     const result = await importFromContent(engine, 'borderline-slug', content, { noEmbed: true });
 
     expect(result.status).toBe('imported');
+  }, 60_000);
+
+  test('a code file keeps the 5 MB code limit while Markdown takes the page ceiling', async () => {
+    const filePath = join(TMP, 'big.ts');
+    writeFileSync(filePath, `export const blob = "${'x'.repeat(CODE_FILE_MAX_BYTES)}";\n`);
+
+    const engine = mockEngine();
+    const result = await importFile(engine, filePath, 'big.ts', { noEmbed: true });
+
+    expect(result.status).toBe('skipped');
+    expect(result.error).toContain('too large');
+    expect((engine as any)._calls.length).toBe(0);
   });
 
   test('assigns sequential chunk_index values', async () => {
@@ -417,6 +537,40 @@ ${longText}
 });
 
 describe('importFile — CJK wave (v0.32.7)', () => {
+  const isVersionStamp = (sql: string) => /^\s*UPDATE\s+pages\s+SET\s+chunker_version\s*=/i.test(sql);
+
+  function mockCompletedIndexEngine(): BrainEngine {
+    let deletionCompleted = false;
+    let replacementCompleted = false;
+    return mockEngine({
+      deleteChunks: async () => {
+        await Promise.resolve();
+        deletionCompleted = true;
+      },
+      upsertChunks: async () => {
+        expect(deletionCompleted).toBe(true);
+        await Promise.resolve();
+        replacementCompleted = true;
+      },
+      executeRaw: async (sql: string) => {
+        if (isVersionStamp(sql)) expect(replacementCompleted).toBe(true);
+        return sql.includes('FROM persistence_brain') ? [{ enabled: false }] : [];
+      },
+    });
+  }
+
+  function expectCompletedIndexVersion(engine: BrainEngine, slug: string): void {
+    const calls = (engine as any)._calls;
+    const putCall = calls.find((c: any) => c.method === 'putPage');
+    expect(putCall.args[1].chunker_version).toBeUndefined();
+    // #5984: a non-empty replacement is sealed by its own upsert (after the insert); an empty one by one stamp.
+    const stamps = calls.filter((c: any) => c.method === 'executeRaw' && isVersionStamp(c.args[0]));
+    const sealedUpserts = calls.filter((c: any) => c.method === 'upsertChunks' && c.args[2]?.sealChunkerVersion !== undefined);
+    expect(stamps.length + sealedUpserts.length).toBe(1);
+    if (stamps.length) expect(stamps[0].args[1]).toEqual([MARKDOWN_CHUNKER_VERSION, 'default', slug]);
+    else expect(sealedUpserts[0].args).toMatchObject([slug, expect.any(Array), { sourceId: 'default', sealChunkerVersion: MARKDOWN_CHUNKER_VERSION }]);
+  }
+
   test('REGRESSION: pure-CJK filename with NO frontmatter slug imports cleanly as CJK slug', async () => {
     // After #115, slugifyPath('小米.md') = '小米' (CJK preserved). The
     // anti-spoof rule is content with no frontmatter slug present.
@@ -428,12 +582,12 @@ title: Xiaomi
 
 Body text.
 `);
-    const engine = mockEngine();
+    const engine = mockCompletedIndexEngine();
     const result = await importFile(engine, filePath, '小米.md', { noEmbed: true });
     expect(result.status).toBe('imported');
     expect(result.slug).toBe('小米');
     const putCall = (engine as any)._calls.find((c: any) => c.method === 'putPage');
-    expect(putCall.args[1].chunker_version).toBe(MARKDOWN_CHUNKER_VERSION);
+    expectCompletedIndexVersion(engine, '小米');
     expect(putCall.args[1].source_path).toBe('小米.md');
   });
 
@@ -470,7 +624,7 @@ just content.
     const result = await importFile(engine, filePath, '🌟🚀.md', { noEmbed: true });
     expect(result.status).toBe('skipped');
     expect(result.error).toContain('no usable slug');
-    expect(result.error).toContain('ASCII / Chinese / Japanese / Korean');
+    expect(result.error).toContain('at least one letter or number (any script)');
     expect((engine as any)._calls.length).toBe(0);
   });
 
@@ -494,7 +648,7 @@ Hijack.
     expect((engine as any)._calls.length).toBe(0);
   });
 
-  test('chunker_version + source_path populated on every import', async () => {
+  test('completed index receives chunker_version and preserves source_path', async () => {
     const filePath = join(TMP, 'cjk-source-path.md');
     writeFileSync(filePath, `---
 type: concept
@@ -503,11 +657,12 @@ title: Has source path
 
 Content.
 `);
-    const engine = mockEngine();
-    await importFile(engine, filePath, 'concepts/cjk-source-path.md', { noEmbed: true });
+    const engine = mockCompletedIndexEngine();
+    const result = await importFile(engine, filePath, 'concepts/cjk-source-path.md', { noEmbed: true });
+    expect(result.status).toBe('imported');
     const putCall = (engine as any)._calls.find((c: any) => c.method === 'putPage');
     expect(putCall).toBeTruthy();
-    expect(putCall.args[1].chunker_version).toBe(MARKDOWN_CHUNKER_VERSION);
+    expectCompletedIndexVersion(engine, 'concepts/cjk-source-path');
     expect(putCall.args[1].source_path).toBe('concepts/cjk-source-path.md');
   });
 });
@@ -706,5 +861,91 @@ body unchanged
     const r2 = await importFromContent(engine2, 'inbox/y', content2, { noEmbed: true });
     shortCircuited = r2.status === 'skipped';
     expect(shortCircuited).toBe(true);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────
+// #1035 — type round-trip preservation
+//
+// put_page → importFromContent → parseMarkdown infers type from the file
+// path when frontmatter omits `type:`, and bare slugs infer 'concept'.
+// Pre-fix, a round-trip put (get_page → edit body → put_page WITHOUT a
+// type: line) silently regressed a curated type to 'concept'. Absence of
+// an explicit frontmatter type on an EXISTING page must preserve the
+// stored type; an explicit type stays an override; new pages still infer.
+// ────────────────────────────────────────────────────────────────
+
+describe('importFromContent type round-trip (#1035)', () => {
+  test('re-put without type: preserves the existing page type', async () => {
+    let putType: string | undefined;
+    const engine = mockEngine({
+      getPage: () => Promise.resolve({
+        slug: 'founder-notes-example',
+        type: 'person',
+        content_hash: 'different-hash',
+        updated_at: new Date(),
+        created_at: new Date(),
+      } as any),
+      putPage: (_slug: string, page: any) => {
+        putType = page.type;
+        return Promise.resolve(null);
+      },
+    });
+    const result = await importFromContent(engine, 'founder-notes-example', [
+      '---',
+      'title: Notes',
+      '---',
+      '',
+      'Edited body, no type in frontmatter.',
+    ].join('\n'), { noEmbed: true });
+    expect(result.status).toBe('imported');
+    expect(putType).toBe('person'); // pre-fix: 'concept' (bare-slug inference default)
+  });
+
+  test('explicit frontmatter type: still overrides the existing type', async () => {
+    let putType: string | undefined;
+    const engine = mockEngine({
+      getPage: () => Promise.resolve({
+        slug: 'founder-notes-example',
+        type: 'person',
+        content_hash: 'different-hash',
+        updated_at: new Date(),
+        created_at: new Date(),
+      } as any),
+      putPage: (_slug: string, page: any) => {
+        putType = page.type;
+        return Promise.resolve(null);
+      },
+    });
+    const result = await importFromContent(engine, 'founder-notes-example', [
+      '---',
+      'type: note',
+      'title: Notes',
+      '---',
+      '',
+      'Explicit type wins.',
+    ].join('\n'), { noEmbed: true });
+    expect(result.status).toBe('imported');
+    expect(putType).toBe('note');
+  });
+
+  test('new page without type: still infers from path', async () => {
+    let putType: string | undefined;
+    const engine = mockEngine({
+      getPage: () => Promise.resolve(null),
+      putPage: (_slug: string, page: any) => {
+        putType = page.type;
+        return Promise.resolve(null);
+      },
+    });
+    const result = await importFromContent(engine, 'people/alice-example', [
+      '---',
+      'title: Alice',
+      '---',
+      '',
+      'A new person page.',
+    ].join('\n'), { noEmbed: true });
+    expect(result.status).toBe('imported');
+    expect(putType).toBe('person'); // /people/ path-prefix inference intact
   });
 });

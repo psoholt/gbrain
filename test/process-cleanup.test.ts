@@ -5,14 +5,16 @@
  *   - registerCleanup adds + returned deregister removes
  *   - triggerCleanupAndExit walks registry via Promise.allSettled
  *   - cleanup callback throw doesn't break other callbacks (allSettled)
- *   - idempotent on double-trigger (second call during cleanup is NO-OP)
+ *   - idempotent on double-trigger (callbacks run once; a later signal or
+ *     EPIPE waits for the running pass before exiting)
  *   - 3s deadline honored (longer callbacks don't block exit)
  *   - deregister-then-release race: no double-fire
  *
  * Signal-handler installation contract is verified by:
  *   - installSignalHandlers() idempotency (this file)
- *   - E2E sync-lock-cleanup-on-sigterm.test.ts (real SIGTERM → real DELETE)
- *   - E2E sync-pipe-sigpipe.test.ts (real EPIPE → real DELETE)
+ *   - E2E test/e2e/sync-lock-recovery.test.ts: real SIGTERM mid-sync →
+ *     real lock-row DELETE, and a real closed output pipe mid-sync →
+ *     broken-pipe cleanup route → real lock-row DELETE
  *
  * NOT covered here: the SIGINT coexistence test (eng-review D9) — moved
  * to E2E because spawning a subprocess and verifying both AbortController
@@ -20,7 +22,9 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import {
+  abortOnCleanupPass,
   registerCleanup,
+  registerSignalOwner,
   triggerCleanupAndExit,
   installSignalHandlers,
   _registeredCleanupCountForTests,
@@ -167,6 +171,33 @@ describe('triggerCleanupAndExit', () => {
   });
 });
 
+describe('abortOnCleanupPass', () => {
+  function swallowExit(): () => void {
+    const real = process.exit;
+    (process as any).exit = () => {};
+    return () => { (process as any).exit = real; };
+  }
+
+  test('aborts its signal when the cleanup pass runs', async () => {
+    const shutdown = abortOnCleanupPass('child-work');
+    expect(shutdown.signal.aborted).toBe(false);
+    const restore = swallowExit();
+    try { await triggerCleanupAndExit(143); } finally { restore(); }
+    expect(shutdown.signal.aborted).toBe(true);
+  });
+
+  test('a released signal is deregistered and stays live through a later cleanup pass', async () => {
+    const shutdown = abortOnCleanupPass('finished-work');
+    expect(_registeredCleanupCountForTests()).toBe(1);
+    shutdown.release();
+    shutdown.release();
+    expect(_registeredCleanupCountForTests()).toBe(0);
+    const restore = swallowExit();
+    try { await triggerCleanupAndExit(143); } finally { restore(); }
+    expect(shutdown.signal.aborted).toBe(false);
+  });
+});
+
 describe('installSignalHandlers', () => {
   test('is idempotent (second call is NO-OP)', () => {
     const beforeListeners = process.listenerCount('SIGTERM');
@@ -197,5 +228,118 @@ describe('installSignalHandlers', () => {
     expect(process.listenerCount('SIGTERM')).toBe(before.sigterm + 1);
     expect(process.listenerCount('SIGHUP')).toBe(before.sighup + 1);
     expect(process.listenerCount('SIGPIPE')).toBe(before.sigpipe + 1);
+  });
+
+  test('later signals and a stdout EPIPE during the cleanup pass wait for it before exiting', async () => {
+    let releaseCleanup!: () => void;
+    let cleanupFinished = false;
+    registerCleanup('lock-row', async () => {
+      await new Promise<void>(resolve => { releaseCleanup = resolve; });
+      cleanupFinished = true;
+    });
+    const exits: Array<{ code: number; cleanupFinished: boolean }> = [];
+    const origExit = process.exit;
+    (process as any).exit = (code?: number) => { exits.push({ code: code ?? 0, cleanupFinished }); };
+    try {
+      installSignalHandlers();
+      process.emit('SIGTERM');
+      process.emit('SIGPIPE');
+      process.stdout.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+      await new Promise(r => setTimeout(r, 20));
+      expect(exits).toEqual([]);
+      releaseCleanup();
+      await new Promise(r => setTimeout(r, 20));
+    } finally {
+      (process as any).exit = origExit;
+    }
+    expect(exits).toEqual([{ code: 143, cleanupFinished: true }, { code: 141, cleanupFinished: true }, { code: 0, cleanupFinished: true }]);
+  });
+
+  test('_resetForTests DETACHES every listener installSignalHandlers attached', () => {
+    // Regression pin for the suite-wide-kill class: a flags-only reset left
+    // a live SIGTERM→exit(143) listener on the shared bun test runner, so a
+    // later synthetic process.emit('SIGTERM') from any test killed the whole
+    // suite. Counts must return to the pre-install BASELINE, not baseline+1.
+    _resetForTests();
+    const before = {
+      sigterm: process.listenerCount('SIGTERM'),
+      sighup: process.listenerCount('SIGHUP'),
+      sigpipe: process.listenerCount('SIGPIPE'),
+      uncaught: process.listenerCount('uncaughtException'),
+      rejection: process.listenerCount('unhandledRejection'),
+      stdoutErr: process.stdout.listenerCount('error'),
+      stderrErr: process.stderr.listenerCount('error'),
+    };
+    installSignalHandlers();
+    expect(process.listenerCount('SIGTERM')).toBe(before.sigterm + 1);
+    _resetForTests();
+    expect(process.listenerCount('SIGTERM')).toBe(before.sigterm);
+    expect(process.listenerCount('SIGHUP')).toBe(before.sighup);
+    expect(process.listenerCount('SIGPIPE')).toBe(before.sigpipe);
+    expect(process.listenerCount('uncaughtException')).toBe(before.uncaught);
+    expect(process.listenerCount('unhandledRejection')).toBe(before.rejection);
+    expect(process.stdout.listenerCount('error')).toBe(before.stdoutErr);
+    expect(process.stderr.listenerCount('error')).toBe(before.stderrErr);
+  });
+});
+
+describe('registerSignalOwner (#5062)', () => {
+  test('an owner receives every termination signal; nothing runs cleanup or exits behind its back', async () => {
+    let cleanupRan = false;
+    registerCleanup('supervisor-lock', async () => { cleanupRan = true; });
+    const seen: string[] = [];
+    registerSignalOwner('supervisor', (signal) => { seen.push(signal); });
+    const exits: number[] = [];
+    const origExit = process.exit;
+    (process as any).exit = (code?: number) => { exits.push(code ?? 0); };
+    try {
+      installSignalHandlers();
+      process.emit('SIGTERM');
+      process.emit('SIGTERM');
+      process.emit('SIGHUP');
+      process.emit('SIGPIPE');
+      process.stdout.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+      await new Promise(r => setTimeout(r, 20));
+    } finally {
+      (process as any).exit = origExit;
+    }
+    expect(seen).toEqual(['SIGTERM', 'SIGTERM', 'SIGHUP', 'SIGPIPE', 'SIGPIPE']);
+    expect(exits).toEqual([]);
+    expect(cleanupRan).toBe(false);
+  });
+
+  test('the owner exits through triggerCleanupAndExit, which still runs the remaining callbacks', async () => {
+    let cleanupRan = false;
+    registerCleanup('other-lock', async () => { cleanupRan = true; });
+    const exits: number[] = [];
+    const origExit = process.exit;
+    (process as any).exit = (code?: number) => { exits.push(code ?? 0); };
+    try {
+      registerSignalOwner('supervisor', () => { void triggerCleanupAndExit(0); });
+      installSignalHandlers();
+      process.emit('SIGTERM');
+      await new Promise(r => setTimeout(r, 20));
+    } finally {
+      (process as any).exit = origExit;
+    }
+    expect(cleanupRan).toBe(true);
+    expect(exits).toEqual([0]);
+  });
+
+  test('after deregistration the generic cleanup-then-exit path is back', async () => {
+    const release = registerSignalOwner('worker', () => { throw new Error('must not be called'); });
+    release();
+    release();
+    const exits: number[] = [];
+    const origExit = process.exit;
+    (process as any).exit = (code?: number) => { exits.push(code ?? 0); };
+    try {
+      installSignalHandlers();
+      process.emit('SIGTERM');
+      await new Promise(r => setTimeout(r, 20));
+    } finally {
+      (process as any).exit = origExit;
+    }
+    expect(exits).toEqual([143]);
   });
 });

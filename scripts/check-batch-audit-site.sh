@@ -14,9 +14,11 @@
 # Usage: scripts/check-batch-audit-site.sh
 # Exit:  0 when every literal matches the enum, 1 otherwise.
 
+# Seam: GBRAIN_GUARD_ROOT (fixture tree root).
+
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+ROOT="${GBRAIN_GUARD_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$ROOT"
 
 RETRY_FILE="src/core/retry.ts"

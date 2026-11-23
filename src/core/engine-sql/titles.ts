@@ -1,0 +1,166 @@
+/**
+ * Page-grain title arm (`BrainEngine.searchTitles`, fix/title-retrieval-arm
+ * D1): one implementation for both engines. The statement builds in
+ * `src/core/search/title-statement.ts` (shared with the plan-proof E2E, the
+ * cjk-search / vector-statement pattern); this module runs it through the
+ * engine's scoped read, with the engine's session settings and the OR
+ * fallback.
+ *
+ * Ranks pages whose title matches the websearch query with the same
+ * page-grain filters the keyword arm applies (type/types/excludeSlugs/date/
+ * source scoping, hard-excludes, visibility), joined to one representative
+ * chunk per output page, with the same AND→OR recall fallback as
+ * searchKeyword. Ordinary long titles are preserved; oversized pasted context
+ * is bounded before websearch FTS.
+ *
+ * Exact-title key (#5889): every title holding a query term once ties on
+ * `ts_rank_cd`, and ties broke by page id, so an identity page titled exactly
+ * like the query fell out of the arm's top rows once ~50 other titles
+ * contained the word; the exact-lookup tier only sees those rows. Both
+ * orderings (the inner `top_pages` LIMIT and the outer projection) now sort
+ * `lower(btrim(title, <space, quotes, NBSP>)) = normalizeAlias(query)` first.
+ * The normalized query is its own bind parameter, so the OR fallback never
+ * rebinds it. The SQL key is a cheap approximation (no internal whitespace
+ * collapse: a regexp measured +37 ms); the tier's JS `normalizeAlias` recheck
+ * stays authoritative, so a mismatch can only miss, never promote.
+ *
+ * Title predicate (title FTS; diagnosis credited to PR #5853 by morven-ai):
+ * remote callers and every OR re-run match the title alone, which used to mean a per-row
+ * `to_tsvector(title)` that no index serves (a scan of every page in scope).
+ * `pages.search_vector` carries the title, and only the title, at weight A
+ * (schema trigger, `reindex-search-vector`, page-state projection), so the
+ * arm matches `search_vector @@ q_a`, where `q_a` is the websearch query
+ * with every lexeme labeled `:A`. That is served by `idx_pages_search`, and
+ * negated or phrase terms are evaluated on title lexemes only, so timeline
+ * text (weight C) never changes which titles they see. Ranking uses the
+ * weight-A slice (`ts_filter(..., '{a}')`). Matching follows the language
+ * `search_vector` was built with; `gbrain reindex-search-vector` rebuilds it
+ * after an FTS language change. A page with a NULL `search_vector` is absent
+ * from the arm (the BEFORE INSERT/UPDATE trigger keeps it non-NULL). Local
+ * callers' strict query still matches and ranks the whole vector (title weight
+ * A dominates). Their any-word retry (the OR re-run) matches the whole vector
+ * too while every matching page fits `titleWholeVectorCandidates()`, and
+ * titles only, like remote callers, when the set does not fit. Unbounded, it
+ * let a date in a question pull every dated timeline into `ts_rank_cd`: 3-5 s
+ * on a large brain (#7135, diagnosed by @veltri-23 in #7136). Titles alone
+ * lost the pages whose timeline names what a reworded question asks about
+ * ("Who is on the payroll at Acme?", GST-2899). The strict attempt ranks at most
+ * `titleWholeVectorCandidates()` matching pages (#7082: a very common word
+ * otherwise read every matching vector until the statement timeout). The whole
+ * vector is the only lexical path to timeline_entries rows no chunk holds, so a
+ * rarer term keeps its exact result; a cut attempt reports
+ * `keyword_candidates_incomplete` and puts the title-only statement's rows
+ * first, so title and exact-title matches never depend on which pages the cut kept.
+ */
+import type { SearchOpts, SearchResult } from '../types.ts';
+import { searchLimitCap } from '../search/eval-pool-depth.ts';
+import { boundWebsearchQuery, buildOrFallbackWebsearchQuery, orFallbackTokens } from '../search/sql-ranking.ts';
+import { buildSearchTitlesStatement, type SearchTitlesDialect } from '../search/title-statement.ts';
+import { RARITY_MAX_TERMS } from '../search/keyword-or-rarity.ts';
+import { holdsIdentifiers, identifierTokens } from '../search/keyword-identifier-probe.ts';
+import { rowToSearchResult } from '../utils.ts';
+import type { ScopedRead } from './brands.ts';
+import type { ScopedReadRunner } from './cjk-search.ts';
+
+/**
+ * `chunkManifest` is the chunkManifestReads probe, run inside each attempt's scoped read after its settings, so the
+ * statement timeout bounds it like the title statement (#6495: a probe outside the transaction waited on a lock with
+ * no bound) and it answers for the role that read runs as. Unset reads the manifest.
+ */
+export type SearchTitlesRunDialect = Omit<SearchTitlesDialect, 'chunkManifest'> & {
+  chunkManifest?: (exec: ScopedRead) => Promise<boolean>;
+  /** Transaction-local settings for every attempt (Postgres: the keyword statement's work_mem, so a common term's bitmap stays exact). */
+  statementSettings?: Readonly<Record<string, string>>;
+};
+
+export async function searchTitles(
+  scoped: ScopedReadRunner,
+  query: string,
+  opts: SearchOpts | undefined,
+  dialect: SearchTitlesRunDialect,
+): Promise<SearchResult[]> {
+  // language/symbolKind are chunk-grain code filters with no page-grain
+  // meaning; a code-scoped query gets no title candidates rather than rows
+  // that silently violate the caller's filter.
+  if (opts?.language || opts?.symbolKind) return [];
+  if (opts?.limit && opts.limit > searchLimitCap()) {
+    console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${searchLimitCap()}`);
+  }
+  type Attempt = { text: string; kind: 'whole' | 'title' | 'complete' };
+  const statementFor = (chunkManifest: boolean, kind: Attempt['kind'] = 'whole') => buildSearchTitlesStatement(query, opts, { ...dialect, chunkManifest, relaxed: kind === 'title', completeOnly: kind === 'complete' });
+  const statement = statementFor(true);
+  /** One scoped read running one statement per attempt, in order; `top` replaces the caller's limit and offset. */
+  const run = (attempts: Attempt[], anyWord: boolean, top?: number) => {
+    const preferIndex = anyWord && dialect.relaxedPrefersIndex && !statement.safeChunks;
+    const settings = {
+      ...(dialect.statementTimeout ? { statement_timeout: dialect.statementTimeout } : {}),
+      ...dialect.statementSettings,
+      ...(preferIndex ? { enable_seqscan: 'off' } : {}),
+    };
+    return scoped(async exec => {
+      const manifest = await dialect.chunkManifest?.(exec) ?? true;
+      const lists = [];
+      for (const a of attempts) lists.push((await exec.unsafe(statementFor(manifest, a.kind).sql, [a.text, statement.params[1], ...(top === undefined ? statement.params.slice(2, 4) : [top, 0]), ...statement.params.slice(4)])).rows);
+      return lists;
+    }, Object.keys(settings).length ? settings : undefined);
+  };
+
+  const strictQuery = statement.params[0] as string;
+  const limit = statement.params[2] as number, offset = statement.params[3] as number;
+  const [rows] = await run([{ text: strictQuery, kind: 'whole' }], false, offset + limit);
+  if (rows.length > 0 && rows[0].candidates_cut === true) {
+    opts?.onKeywordIncomplete?.('candidate_budget');
+    const [titleRows] = await run([{ text: strictQuery, kind: 'title' }], true, offset + limit);
+    const titled = new Set(titleRows.map(r => r.page_id));
+    return [...titleRows, ...rows.filter(r => !titled.has(r.page_id))].slice(offset, offset + limit).map(rowToSearchResult);
+  }
+  if (rows.length > offset) return rows.slice(offset).map(rowToSearchResult);
+  const orQuery = buildOrFallbackWebsearchQuery(strictQuery);
+  if (!orQuery) return [];
+  const terms = orFallbackTokens(strictQuery);
+  const rarity = terms.length <= RARITY_MAX_TERMS && !opts?.offset;
+  const anyWord = boundWebsearchQuery(orQuery);
+  const wordAttempts: Attempt[] = rarity ? terms.map(text => ({ text, kind: 'title' })) : [];
+  // A local caller's retry matches timelines too while every matching page fits the cap; otherwise, and for remote callers, titles alone.
+  let [orRows, ...wordLists] = await run([{ text: anyWord, kind: statement.safeChunks ? 'title' : 'complete' }, ...wordAttempts], true);
+  if (orRows[0]?.candidates_cut === true && !statement.safeChunks) [orRows] = await run([{ text: anyWord, kind: 'title' }], true);
+  const relaxedRows = (rarity ? rankByRarity(orRows, wordLists, limit) : orRows).map(rowToSearchResult);
+  // 2026-09 (#3617 follow-up): relaxed rows are TAGGED so hybrid's fusion can
+  // demote them (SearchResult.keyword_relaxed). #7491: a title holding every
+  // identifier the query names (search/keyword-identifier-probe.ts) is the
+  // identifier probe's match on the title, so it leads untagged.
+  const idents = identifierTokens(query);
+  const named = idents ? relaxedRows.filter(r => holdsIdentifiers(r.title, idents)) : [];
+  return [...named, ...relaxedRows.filter(r => !named.includes(r)).map(r => ({ ...r, keyword_relaxed: true as const }))];
+}
+
+
+/**
+ * #7471: the OR fallback ranks every title holding one query word alike
+ * (ts_rank_cd knows no term rarity) and breaks the tie by page id, so once
+ * thousands of titles held a common word ("Matt"), the one title holding the
+ * rare word (the surname) fell out of the arm. A short query also runs once
+ * per word. A word with fewer rows than the limit is rare, and all of its
+ * titles are known: each weighs 1 / its row count, a title sums the weights
+ * of the rare words it holds, and titles sort by that sum, then in the OR
+ * query's order. A word that fills the limit weighs nothing, so a query with
+ * no rare word keeps the OR query's order exactly.
+ */
+export function rankByRarity<T extends { page_id?: unknown }>(orRows: T[], wordLists: T[][], limit: number): T[] {
+  const weight = new Map<string, number>();
+  const pool = [...orRows];
+  const seen = new Set(orRows.map(row => String(row.page_id)));
+  for (const list of wordLists) {
+    if (list.length === 0 || list.length >= limit) continue;
+    for (const row of list) {
+      const key = String(row.page_id);
+      weight.set(key, (weight.get(key) ?? 0) + 1 / list.length);
+      if (!seen.has(key)) { seen.add(key); pool.push(row); }
+    }
+  }
+  return pool
+    .map((row, i) => ({ row, i, w: weight.get(String(row.page_id)) ?? 0 }))
+    .sort((a, b) => b.w - a.w || a.i - b.i)
+    .slice(0, limit)
+    .map(e => e.row);
+}

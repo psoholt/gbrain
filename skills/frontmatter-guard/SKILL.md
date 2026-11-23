@@ -1,17 +1,21 @@
 ---
 name: frontmatter-guard
-version: 1.0.0
+version: 1.1.0
 description: |
   Validate and auto-repair YAML frontmatter on brain pages. Catches malformed
   pages before they enter the brain (missing closing ---, nested quotes, slug
-  mismatches, null bytes, empty frontmatter, YAML parse failures). Wraps the
-  `gbrain frontmatter` CLI for agent-driven workflows.
+  mismatches, null bytes, empty frontmatter, YAML parse failures), explains
+  files sync holds instead of importing, and drives the previewed
+  `gbrain repair frontmatter` fix. Wraps the `gbrain frontmatter` CLI for
+  agent-driven workflows.
 triggers:
   - "validate frontmatter"
   - "check frontmatter"
   - "fix frontmatter"
   - "frontmatter audit"
   - "brain lint"
+  - "held files"
+  - "sync held a file"
 tools:
   - exec
 mutating: true
@@ -28,6 +32,7 @@ This skill guarantees:
 - Mechanical errors (nested quotes, missing closing `---`, null bytes, slug mismatch) are auto-repairable on demand with `.bak` backups
 - Validation logic is shared with `gbrain doctor`'s `frontmatter_integrity` subcheck — single source of truth
 - Reports per source (gbrain is multi-source since v0.18.0); never silently audits the wrong root
+- Files sync holds are explained from their hold record (code, reason, key, line, fix) and fixed only through a previewed, hash-bound repair the user approved
 
 ## Why This Exists
 
@@ -36,9 +41,51 @@ Brain pages pile up over months. Agents write them with malformed frontmatter:
 - Unstructured YAML in meeting pages (ingestion bugs)
 - Slug mismatches (path renames not propagated)
 - Null bytes (binary corruption from copy-paste accidents)
-- Nested double quotes in titles (`title: "Phil "Nick" Last"`)
+- Nested double quotes in titles (`title: "Alice "Ace" Example"`)
 
 Without a guard, these accumulate silently until `gbrain sync` chokes or search returns garbage. The guard makes the failure visible at audit time and trivially fixable.
+
+## Write brain files safely (do this first)
+
+- Write pages through `put_page` / `capture` (MCP or `gbrain put`). gbrain serializes frontmatter itself, so the file on disk is always valid YAML.
+- A script or agent that writes Markdown files directly must build frontmatter with a YAML serializer (`yaml.dump`, js-yaml `dump`), never by string interpolation. `title: ${title}` breaks as soon as a title contains `: `, `#`, quotes or a newline.
+- Check generated content before writing it, without touching disk:
+
+  ```bash
+  printf '%s' "$content" | gbrain frontmatter validate --stdin --path notes/2026-10-04-digest.md
+  ```
+
+  Exit 1 means fix it first. The default is the strict producer rule: YAML gbrain could still import by quoting a value fails too, because other tools reject it. `--importable` answers the narrower question "would sync hold it?".
+- Never write a key gbrain reads for access or identity (`visibility`, `derived_from`, `slug`, `type`, `id`, `source_id`) from untrusted text.
+- Write no `visibility`, `access`, `confidentiality` or `readable_by` unless the page needs it ([page privacy](../conventions/page-privacy.md)).
+
+## Held files: read them, then fix them
+
+A file sync cannot import without guessing is **held**: the rest of the source still syncs, a new file has no page yet, and an existing page keeps its last good revision and refuses `put_page` until the file is repaired (do not retry the write). Where holds show up: sync output (`Held <path>: <code> … Next: <command>`), `gbrain sources status <id>` (`--json`: `git_holds.items[]`), doctor `git_held_files`, `get_page` `file_held`, and search hits marked `stale`.
+
+Each hold record carries `code`, `reason`, `key`, `line`, `message` (location only, never the value), `fix` (exact argv) and `docs`. Act on `reason`:
+
+| Hold | What to do |
+|------|-----------|
+| `invalid_frontmatter` / `yaml_parse` | Preview `gbrain repair frontmatter --source <id>`; usually `needs_review` with the exact line to fix by hand. |
+| `invalid_frontmatter` / `needs_interpretation` | Preview with `--include-ambiguous`, show the user each per-file diff, apply only what they approve. |
+| `invalid_frontmatter` / `ambiguous_identity_key` or `ambiguous_protected_key`; `visibility_noncanonical`; `readers_noncanonical` | Never guess. Show the user the line; they decide the one value (`visibility` decides who can read the page; page privacy reads only `visibility: private`, lowercase on its own line; page access reads only the key `readable_by`, lowercase with an underscore). |
+| `frontmatter_slug_conflict` | Remove the `slug:` line or move the file; the repair proposes removing it under `--include-ambiguous`. |
+| `file_too_large` | The file is over the fixed page limit (24 MiB for Markdown, 5 MB for code); every page under it is searchable, so never split one that fits. Ask the user to add it to `sync.exclude`, or to split it into files under the limit. A smaller page an MCP transport refused goes by file instead (`docs/guides/memory-boundaries.md#large-page-limits`). |
+| `content_rejected` | The user chose `content_sanity.junk_disposition=reject`; ask before changing it. |
+
+The fix flow (walkthrough with real output: `docs/guides/repair.md#held-files`):
+
+```bash
+gbrain sources status <id>                                  # what is held and why
+gbrain repair frontmatter --source <id>                     # pass 1: safe quoting only; writes nothing
+gbrain repair frontmatter --source <id> --include-ambiguous --diff   # pass 2: every interpretation
+gbrain repair frontmatter --source <id> --include-ambiguous --only <path> --apply --expect <hash> --yes
+```
+
+**Ask the user before** every `--apply` (it rewrites their files) and before any `--include-ambiguous` apply: each interpretation (folding lines into a title, keeping the later duplicate) is a guess only the user can confirm. Show the diff, then apply exactly the previewed hash. Safe-class changes only quote a value exactly as gbrain already reads it, but they still rewrite files, so they need the same agreement.
+
+A source that a broken file blocked before the upgrade recovers on its next sync; to do it now run `gbrain sync --source <id> --no-pull`.
 
 ## Validation classes
 
@@ -89,9 +136,11 @@ When issues are found:
 gbrain frontmatter validate <path> --fix
 ```
 
-`--fix` writes `<file>.bak` for every modified file before mutating. The backup is the safety contract — works whether the brain is a git repo or a plain directory.
+`--fix` backs up every modified file under `~/.gbrain/backups/frontmatter/` before mutating, quotes YAML gbrain reads by quoting (only those lines change), re-validates, and exits 1 when errors remain. Restage fixed files in git (`git add`). `--include-ambiguous` adds interpretations; preview them with `--dry-run` first.
 
 `--dry-run` previews without writing. Use this before applying fixes in batch.
+
+On a managed brain `--fix` in place is refused: use `gbrain repair frontmatter --source <id>` (above), which publishes each repaired file through the coordinated writer.
 
 ### Phase 4: Pre-commit hook (optional)
 
@@ -101,7 +150,7 @@ For brain repos that ARE git repos, install the pre-commit hook to block malform
 gbrain frontmatter install-hook [--source <id>]
 ```
 
-The hook runs `gbrain frontmatter validate` against staged `.md`/`.mdx` files. Bypass with `git commit --no-verify`.
+The hook runs one `gbrain frontmatter validate --staged` process over the staged content of `.md`/`.mdx` files (what will be committed, not the working copy). Bypass with `git commit --no-verify`. Installing writes into the user's repository, so ask first. When doctor `frontmatter_hook` reports an older hook, refresh it with `gbrain frontmatter install-hook --force`.
 
 ## Trigger words
 
@@ -122,9 +171,9 @@ When the user says any of these, route here:
 
 ## Chains with
 
-- `gbrain doctor` — the `frontmatter_integrity` subcheck reports the same counts as `audit`.
+- `gbrain doctor` — the `frontmatter_integrity` subcheck reports the same counts as `audit`; `frontmatter_repairable` counts files `gbrain repair frontmatter` can fix and `git_held_files` lists held files.
 - `skills/maintain/SKILL.md` — broader brain health audit; chain after this skill if other classes of issue are suspected.
-- `skills/lint/SKILL.md` (via `gbrain lint`) — overlapping rules for skill-file lint; the `frontmatter-*` rule names in lint output come from this skill's validation surface.
+- `gbrain lint` — overlapping rules for skill-file lint (a CLI command, not a skill); the `frontmatter-*` rule names in lint output come from this skill's validation surface.
 
 ## Output Format
 
@@ -219,6 +268,15 @@ title: "My "Quoted" Title"
 - **Single quotes** are the default safe choice
 - **Double quotes** only when the value itself contains apostrophes
 
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain frontmatter validate` exits 1: errors were found (that is the result, not a crash). Parse `errors_by_code` and report counts per source.
+- Before a fix pass, state how many files will change and get the user's agreement; the fix writes `.bak` backups, and YAML_PARSE errors are not always auto-repairable.
+- `gbrain sync` holds a file (`invalid_frontmatter`, `frontmatter_slug_conflict`, `file_too_large`, `content_rejected`, `visibility_noncanonical`, `readers_noncanonical`): the sync still succeeded. Read the hold (`gbrain sources status <id>`) and follow "Held files" above.
+- `put_page` refuses a page whose newer file is held: repair the file; retrying the write refuses again.
+
 ## Anti-Patterns
 
 **Don't auto-fix `MISSING_OPEN` or `EMPTY_FRONTMATTER` without user input.** These usually mean a human author started a page and didn't finish — silently inserting `---` markers around an unfinished draft is wrong.
@@ -229,4 +287,4 @@ title: "My "Quoted" Title"
 
 **Don't run `audit` on a brain where sources aren't registered.** The CLI returns "no registered sources to audit" gracefully, but the migration emits a `skipped: no_sources` phase result. Don't paper over this with a manual path-walk; the right fix is to register the source via `gbrain sources add`.
 
-**Don't install the pre-commit hook on non-git brain dirs.** The install-hook command skips them automatically with a one-line note. If you see "skipped — not a git repo" and want validation at write time anyway, use the `audit` command on a cron schedule.
+**Don't install the pre-commit hook on brain dirs outside any git repo.** The install-hook command skips them automatically with a one-line note (a brain that is a subdirectory of a host repo is fine — the hook installs at the host root, scoped to that subdirectory). If you see "skipped, not a git repo" and want validation at write time anyway, use the `audit` command on a cron schedule.

@@ -1,5 +1,6 @@
 import { describe, test, expect } from 'bun:test';
 import { chunkText } from '../../src/core/chunkers/recursive.ts';
+import { cpuMs } from '../helpers/cpu-time.ts';
 
 describe('Recursive Text Chunker', () => {
   test('returns empty array for empty input', () => {
@@ -135,13 +136,11 @@ describe('Recursive Text Chunker', () => {
 });
 
 describe('CJK chunking (v0.32.7)', () => {
-  test('MARKDOWN_CHUNKER_VERSION is 3', async () => {
-    // v0.40.3.0: bumped 2→3 to signal the post-upgrade reembed sweep that
-    // contextual retrieval wrapping is now applied at embed time. Chunk
-    // boundaries themselves are unchanged; the bump forces re-embed for
-    // pages where chunker_version < 3.
+  test('MARKDOWN_CHUNKER_VERSION is 4', async () => {
+    // v4 verifies strict full-body protected-fence sanitation before every
+    // chunk split. Older indexes are unavailable to remote chunk readers.
     const mod = await import('../../src/core/chunkers/recursive.ts');
-    expect(mod.MARKDOWN_CHUNKER_VERSION).toBe(3);
+    expect(mod.MARKDOWN_CHUNKER_VERSION).toBe(4);
   });
 
   test('long pure-Chinese paragraph splits into multiple chunks', () => {
@@ -214,5 +213,17 @@ describe('CJK chunking (v0.32.7)', () => {
     expect(chunks.length).toBeGreaterThan(0);
     // Should have been chunked by word boundaries (English-dominant doc).
     expect(chunks.every(c => /^[\x20-\x7e\s]+$/.test(c.text))).toBe(true);
+  });
+});
+
+describe('large pages: delimiter splitting is linear', () => {
+  test('a 4 MiB single-paragraph page chunks in well under a second per MiB', () => {
+    const sentence = 'Plain prose about acme-example. ';
+    const text = sentence.repeat(Math.floor((4 * 1024 * 1024) / sentence.length));
+    let chunks: ReturnType<typeof chunkText> = [];
+    const used = cpuMs(() => { chunks = chunkText(text); });
+    expect(chunks.length).toBeGreaterThan(1000);
+    expect(chunks.every(c => c.text.length <= 6000)).toBe(true);
+    expect(used).toBeLessThan(3000);
   });
 });

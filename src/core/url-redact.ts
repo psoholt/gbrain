@@ -36,6 +36,55 @@ export function redactPgUrl(url: unknown): string {
 }
 
 /**
+ * Redact credential-bearing URLs of ANY scheme embedded in free text (error
+ * messages, log lines). Greedy userinfo match — `scheme://<anything>@` up to
+ * the last `@` in the same token — so a raw `@` INSIDE a password can't leak
+ * its tail (`p@ssw@rd` redacts whole, at the cost of over-redacting a
+ * hostname that legitimately follows a second `@`, which is the safe
+ * direction for a log line). Text without a `scheme://...@` shape passes
+ * through untouched.
+ *
+ * Examples (scheme genericized so this docstring itself never carries a
+ * credential-shaped span — the tests pin the real postgres shapes):
+ *   redactUrlsInText('connect failed: demo://user:pw@db:5432/x timeout')
+ *     → 'connect failed: demo://***@db:5432/x timeout'
+ *   redactUrlsInText('demo://user:p@ssw@rd@db.example.com/x')
+ *     → 'demo://***@db.example.com/x'
+ */
+export function redactUrlsInText(text: string): string {
+  return (
+    text
+      .replace(/(\w+:\/\/)\S+@/g, '$1***@')
+      // libpq keyword/value form: `password=hunter2 host=db ...` — postgres.js
+      // echoes malformed connection strings verbatim in its error messages.
+      // Quoted values may contain spaces (`password='hunter two'`), so match
+      // quoted forms before the bare-token form.
+      .replace(/\b(password|sslpassword)\s*=\s*('[^']*'|"[^"]*"|\S+)/gi, '$1=***')
+  );
+}
+
+/**
+ * Strip every credential-bearing part (userinfo, query string, fragment) from
+ * URLs of any scheme embedded in free text, keeping scheme, host, port and
+ * path: `demo://user:pw@host.example/mcp?token=x#y` becomes
+ * `demo://host.example/mcp`. For bridge-built diagnostics, where any part of
+ * a remote URL past its path can carry a secret; host results never pass here.
+ */
+export function stripUrlSecrets(text: string): string {
+  return text.replace(/(\w[\w+.-]*:\/\/)([^\s/?#]*@)?([^\s/?#@]*)([^\s?#]*)(?:[?#]\S*)?/g, (_m, scheme: string, _user, host: string, path: string) => `${scheme}${host}${path}`);
+}
+
+/** `stripUrlSecrets` over every string inside a value (objects and arrays recursively); other values pass through. */
+export function stripUrlSecretsDeep<T>(value: T): T {
+  if (typeof value === 'string') return stripUrlSecrets(value) as unknown as T;
+  if (Array.isArray(value)) return value.map(stripUrlSecretsDeep) as unknown as T;
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, stripUrlSecretsDeep(v)])) as T;
+  }
+  return value;
+}
+
+/**
  * Recursively redact any postgresql:// or postgres:// URLs found inside an
  * arbitrary value (string, object, array). Useful when the caller is about
  * to JSON.stringify a structured payload and might have a URL nested

@@ -5,15 +5,17 @@
  * (the canonical test seam — same pattern as `__setEmbedTransportForTests`).
  *
  * Pins:
- *  - Request URL is `${recipe.base_url_default}/models/rerank` — i.e.
- *    `https://api.zeroentropy.dev/v1/models/rerank`, NOT `/v1/v1/…`
+ *  - Request URL is `${recipe.base_url_default}/rerank` — i.e.
+ *    `https://api.voyageai.com/v1/rerank`, NOT `/v1/v1/…`
  *    (CDX1-F2 regression).
  *  - Request body shape: `{model, query, documents, top_n?}`.
- *  - Bearer auth header from `applyResolveAuth` ↔ ZEROENTROPY_API_KEY.
+ *  - Bearer auth header from `applyResolveAuth` ↔ VOYAGE_API_KEY.
  *  - Response parsing: `{results: [{index, relevance_score}]}` →
  *    `RerankResult[]` with `{index, relevanceScore}`.
  *  - Error classification: 401/403 → auth, 429 → rate_limit, 5xx → network,
- *    other 4xx → unknown; AbortError on timeout → timeout.
+ *    other 4xx → unknown, no HTTP response (fetch reject) → unreachable; the
+ *    timeout path is pinned on the real wire in
+ *    test/rerank-failure-reason.serial.test.ts.
  *  - Pre-flight payload guard: body over `max_payload_bytes` throws
  *    payload_too_large BEFORE any HTTP call (no transport invocation).
  *  - Empty documents → empty result, no HTTP call.
@@ -31,10 +33,10 @@ import {
   __setRerankTransportForTests,
 } from '../../src/core/ai/gateway.ts';
 
-function configureZE(model: string = 'zeroentropyai:zerank-2'): void {
+function configureVoyage(model: string = 'voyage:rerank-2.5'): void {
   configureGateway({
     reranker_model: model,
-    env: { ZEROENTROPY_API_KEY: 'sk-test-zerokey' },
+    env: { VOYAGE_API_KEY: 'sk-test-zerokey' },
   });
 }
 
@@ -51,7 +53,7 @@ afterEach(() => {
 });
 
 describe('gateway.rerank() — happy path', () => {
-  beforeEach(() => configureZE());
+  beforeEach(() => configureVoyage());
 
   test('sends the right URL (CDX1-F2 — no /v1/v1/ doubling)', async () => {
     let capturedUrl = '';
@@ -60,7 +62,7 @@ describe('gateway.rerank() — happy path', () => {
       return mockResp({ results: [{ index: 0, relevance_score: 0.9 }] });
     });
     await rerank({ query: 'q', documents: ['d'] });
-    expect(capturedUrl).toBe('https://api.zeroentropy.dev/v1/models/rerank');
+    expect(capturedUrl).toBe('https://api.voyageai.com/v1/rerank');
     expect(capturedUrl).not.toContain('/v1/v1/');
   });
 
@@ -72,24 +74,25 @@ describe('gateway.rerank() — happy path', () => {
     });
     await rerank({ query: 'q', documents: ['d1', 'd2'], topN: 5 });
     expect(captured).toEqual({
-      model: 'zerank-2',
+      model: 'rerank-2.5',
       query: 'q',
       documents: ['d1', 'd2'],
-      top_n: 5,
+      top_k: 5,
     });
   });
 
-  test('omits top_n when not provided', async () => {
+  test('omits top_k when not provided', async () => {
     let captured: any = null;
     __setRerankTransportForTests(async (_url, init) => {
       captured = JSON.parse(init.body as string);
       return mockResp({ results: [{ index: 0, relevance_score: 0.5 }] });
     });
     await rerank({ query: 'q', documents: ['d'] });
+    expect('top_k' in captured).toBe(false);
     expect('top_n' in captured).toBe(false);
   });
 
-  test('uses Bearer auth from ZEROENTROPY_API_KEY', async () => {
+  test('uses Bearer auth from VOYAGE_API_KEY', async () => {
     let authHeader = '';
     __setRerankTransportForTests(async (_url, init) => {
       const headers = new Headers(init.headers as HeadersInit);
@@ -135,8 +138,8 @@ describe('gateway.rerank() — happy path', () => {
       bodyModel = JSON.parse(init.body as string).model;
       return mockResp({ results: [{ index: 0, relevance_score: 0.5 }] });
     });
-    await rerank({ query: 'q', documents: ['d'], model: 'zeroentropyai:zerank-1-small' });
-    expect(bodyModel).toBe('zerank-1-small');
+    await rerank({ query: 'q', documents: ['d'], model: 'voyage:rerank-2.5-lite' });
+    expect(bodyModel).toBe('rerank-2.5-lite');
   });
 
   test('empty documents returns [] without HTTP call', async () => {
@@ -152,7 +155,29 @@ describe('gateway.rerank() — happy path', () => {
 });
 
 describe('gateway.rerank() — error classification', () => {
-  beforeEach(() => configureZE());
+  beforeEach(() => configureVoyage());
+
+  test('missing required reranker API key → RerankError(no_key) before HTTP call (v0.48.2; auth = key present but rejected)', async () => {
+    configureGateway({
+      reranker_model: 'voyage:rerank-2.5',
+      env: {},
+    });
+    let called = false;
+    __setRerankTransportForTests(async () => {
+      called = true;
+      return mockResp({ results: [{ index: 0, relevance_score: 0.5 }] });
+    });
+
+    try {
+      await rerank({ query: 'q', documents: ['d'] });
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(RerankError);
+      expect((err as RerankError).reason).toBe('no_key');
+      expect((err as Error).message).toContain('VOYAGE_API_KEY');
+      expect(called).toBe(false);
+    }
+  });
 
   test('401 → auth', async () => {
     __setRerankTransportForTests(async () => new Response('Unauthorized', { status: 401 }));
@@ -206,7 +231,7 @@ describe('gateway.rerank() — error classification', () => {
     }
   });
 
-  test('network exception (fetch reject) → network', async () => {
+  test('network exception (fetch reject) → unreachable', async () => {
     __setRerankTransportForTests(async () => {
       throw new Error('ECONNREFUSED');
     });
@@ -214,7 +239,7 @@ describe('gateway.rerank() — error classification', () => {
       await rerank({ query: 'q', documents: ['d'] });
       throw new Error('should have thrown');
     } catch (err) {
-      expect((err as RerankError).reason).toBe('network');
+      expect((err as RerankError).reason).toBe('unreachable');
     }
   });
 
@@ -230,7 +255,7 @@ describe('gateway.rerank() — error classification', () => {
 });
 
 describe('gateway.rerank() — payload-too-large pre-flight (no HTTP call)', () => {
-  beforeEach(() => configureZE());
+  beforeEach(() => configureVoyage());
 
   test('body over max_payload_bytes throws payload_too_large WITHOUT transport call', async () => {
     let called = false;
@@ -238,7 +263,7 @@ describe('gateway.rerank() — payload-too-large pre-flight (no HTTP call)', () 
       called = true;
       return mockResp({ results: [] });
     });
-    // ZE's max_payload_bytes is 5MB. 6MB body easily exceeds.
+    // Voyage's max_payload_bytes is 5MB. 6MB body easily exceeds.
     const huge = 'x'.repeat(6 * 1024 * 1024);
     try {
       await rerank({ query: 'q', documents: [huge] });
@@ -266,7 +291,7 @@ describe('gateway.rerank() — payload-too-large pre-flight (no HTTP call)', () 
 
 describe('gateway.rerank() — allowlist enforcement (CDX2-F11)', () => {
   test('rejects model not in recipe touchpoint.models[]', async () => {
-    configureZE();
+    configureVoyage();
     let called = false;
     __setRerankTransportForTests(async () => {
       called = true;
@@ -276,7 +301,7 @@ describe('gateway.rerank() — allowlist enforcement (CDX2-F11)', () => {
       await rerank({
         query: 'q',
         documents: ['d'],
-        model: 'zeroentropyai:zerank-fake-99',
+        model: 'voyage:rerank-fake-99',
       });
       throw new Error('should have thrown');
     } catch (err) {
@@ -286,13 +311,13 @@ describe('gateway.rerank() — allowlist enforcement (CDX2-F11)', () => {
     }
   });
 
-  test('accepts zerank-1 (legacy allowlist member)', async () => {
-    configureZE();
+  test('accepts rerank-3-lite (legacy allowlist member)', async () => {
+    configureVoyage();
     __setRerankTransportForTests(async () => mockResp({ results: [{ index: 0, relevance_score: 1 }] }));
     const out = await rerank({
       query: 'q',
       documents: ['d'],
-      model: 'zeroentropyai:zerank-1',
+      model: 'voyage:rerank-3-lite',
     });
     expect(out.length).toBe(1);
   });
@@ -313,7 +338,7 @@ describe('gateway.rerank() — allowlist enforcement (CDX2-F11)', () => {
 });
 
 describe('gateway.rerank() — guard rails', () => {
-  beforeEach(() => configureZE());
+  beforeEach(() => configureVoyage());
 
   test('empty query throws RerankError(unknown)', async () => {
     try {
@@ -348,17 +373,6 @@ describe('gateway.rerank() — v0.40.6.1 RerankerTouchpoint.path override', () =
     expect(capturedUrl).not.toContain('/v1/v1/');
     expect(capturedUrl).not.toContain('/models/rerank');
   });
-
-  test('falls through to /models/rerank when recipe omits path (ZE regression)', async () => {
-    configureZE();
-    let capturedUrl = '';
-    __setRerankTransportForTests(async (url) => {
-      capturedUrl = url;
-      return mockResp({ results: [{ index: 0, relevance_score: 0.9 }] });
-    });
-    await rerank({ query: 'q', documents: ['d'] });
-    expect(capturedUrl).toBe('https://api.zeroentropy.dev/v1/models/rerank');
-  });
 });
 
 describe('gateway.rerank() — v0.40.6.1 user-provided models (empty allowlist)', () => {
@@ -382,8 +396,8 @@ describe('gateway.rerank() — v0.40.6.1 user-provided models (empty allowlist)'
     // Even when caller overrides via input.model, the resolved recipe still
     // governs the allowlist. Empty allowlist = no restriction.
     configureGateway({
-      reranker_model: 'zeroentropyai:zerank-2',
-      env: { ZEROENTROPY_API_KEY: 'sk-test' },
+      reranker_model: 'voyage:rerank-2.5',
+      env: { VOYAGE_API_KEY: 'sk-test' },
     });
     __setRerankTransportForTests(async () =>
       mockResp({ results: [{ index: 0, relevance_score: 0.6 }] }),
@@ -397,15 +411,157 @@ describe('gateway.rerank() — v0.40.6.1 user-provided models (empty allowlist)'
   });
 });
 
-describe('gateway.rerank() — v0.40.6.1 path regression: zerank-1-small unaffected', () => {
-  test('legacy ZE allowlist members still hit /models/rerank', async () => {
-    configureZE('zeroentropyai:zerank-1-small');
+describe('gateway.rerank() — v0.46.3 Voyage wire dialect', () => {
+  function configureVoyage(model: string = 'voyage:rerank-2.5'): void {
+    configureGateway({
+      reranker_model: model,
+      env: { VOYAGE_API_KEY: 'pa-test-voyagekey' },
+    });
+  }
+
+  test('posts to https://api.voyageai.com/v1/rerank (path override, no /v1/v1)', async () => {
+    configureVoyage();
     let capturedUrl = '';
     __setRerankTransportForTests(async (url) => {
       capturedUrl = url;
-      return mockResp({ results: [{ index: 0, relevance_score: 0.5 }] });
+      return mockResp({ results: [{ index: 0, relevance_score: 0.9 }] });
     });
     await rerank({ query: 'q', documents: ['d'] });
-    expect(capturedUrl.endsWith('/models/rerank')).toBe(true);
+    expect(capturedUrl).toBe('https://api.voyageai.com/v1/rerank');
+  });
+
+  test('request carries top_k (NOT top_n) — the only wire difference', async () => {
+    configureVoyage();
+    let body: any = null;
+    __setRerankTransportForTests(async (_url, init) => {
+      body = JSON.parse(String(init?.body ?? '{}'));
+      return mockResp({ results: [{ index: 0, relevance_score: 0.9 }] });
+    });
+    await rerank({ query: 'q', documents: ['a', 'b'], topN: 1 });
+    expect(body.top_k).toBe(1);
+    expect(body.top_n).toBeUndefined();
+    expect(body.model).toBe('rerank-2.5');
+  });
+
+  test('local dialect sends top_n when top_param is absent', async () => {
+    configureGateway({ reranker_model: 'llama-server-reranker:fixture-reranker', env: {} });
+    let body: any = null;
+    __setRerankTransportForTests(async (_url, init) => {
+      body = JSON.parse(String(init?.body ?? '{}'));
+      return mockResp({ results: [{ index: 0, relevance_score: 0.9 }] });
+    });
+    await rerank({ query: 'q', documents: ['a', 'b'], topN: 1 });
+    expect(body.top_n).toBe(1);
+    expect(body.top_k).toBeUndefined();
+  });
+
+  test("voyage's REST data[] response parses (live-wire shape, 2026-08-15)", async () => {
+    configureVoyage();
+    __setRerankTransportForTests(async () =>
+      mockResp({
+        object: 'list',
+        data: [{ index: 1, relevance_score: 0.8 }, { index: 0, relevance_score: 0.3 }],
+        model: 'rerank-2.5',
+        usage: { total_tokens: 12 },
+      }),
+    );
+    const out = await rerank({ query: 'q', documents: ['a', 'b'] });
+    expect(out).toEqual([
+      { index: 1, relevanceScore: 0.8 },
+      { index: 0, relevanceScore: 0.3 },
+    ]);
+  });
+
+  test('the legacy results[] shape still parses too (local-server dialect)', async () => {
+    configureVoyage();
+    __setRerankTransportForTests(async () =>
+      mockResp({ results: [{ index: 0, relevance_score: 0.9 }] }),
+    );
+    const out = await rerank({ query: 'q', documents: ['a'] });
+    expect(out).toEqual([{ index: 0, relevanceScore: 0.9 }]);
+  });
+
+  test('malformed response (neither results[] nor data[]) → RerankError', async () => {
+    configureVoyage();
+    __setRerankTransportForTests(async () => mockResp({ items: [{ index: 0 }] }));
+    await expect(rerank({ query: 'q', documents: ['a'] })).rejects.toThrow(RerankError);
+  });
+
+  test('missing VOYAGE_API_KEY → RerankError no_key (fail-open skip class)', async () => {
+    resetGateway();
+    configureGateway({ reranker_model: 'voyage:rerank-2.5', env: {} });
+    __setRerankTransportForTests(async () =>
+      mockResp({ results: [{ index: 0, relevance_score: 0.9 }] }),
+    );
+    try {
+      await rerank({ query: 'q', documents: ['a'] });
+      expect.unreachable('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(RerankError);
+      expect((e as RerankError).reason).toBe('no_key');
+      expect((e as Error).message).toContain('VOYAGE_API_KEY');
+    }
+  });
+
+  test('rerank-2.5-lite passes the allowlist', async () => {
+    configureVoyage('voyage:rerank-2.5-lite');
+    let body: any = null;
+    __setRerankTransportForTests(async (_url, init) => {
+      body = JSON.parse(String(init?.body ?? '{}'));
+      return mockResp({ results: [{ index: 0, relevance_score: 0.9 }] });
+    });
+    await rerank({ query: 'q', documents: ['a'] });
+    expect(body.model).toBe('rerank-2.5-lite');
+  });
+
+  // #4938: pre-fix the recipe allowlisted only the rerank-2.5 pair, so
+  // gateway.rerank() threw `Model "rerank-3" is not listed for Voyage AI
+  // reranker` before the request ever reached the transport — an operator
+  // could not opt into Voyage's current generation at all.
+  test('rerank-3 passes the allowlist and reaches the wire (#4938)', async () => {
+    configureVoyage('voyage:rerank-3');
+    let capturedUrl = '';
+    let body: any = null;
+    __setRerankTransportForTests(async (url, init) => {
+      capturedUrl = url;
+      body = JSON.parse(String(init?.body ?? '{}'));
+      return mockResp({
+        object: 'list',
+        data: [{ index: 0, relevance_score: 0.91 }],
+        model: 'rerank-3',
+      });
+    });
+    const out = await rerank({ query: 'q', documents: ['a'], topN: 1 });
+    // Same endpoint + same top-N key as the 2.5 pair: the wire is unchanged.
+    expect(capturedUrl).toBe('https://api.voyageai.com/v1/rerank');
+    expect(body.model).toBe('rerank-3');
+    expect(body.top_k).toBe(1);
+    expect(out).toEqual([{ index: 0, relevanceScore: 0.91 }]);
+  });
+
+  test('rerank-3-lite passes the allowlist (#4938)', async () => {
+    configureVoyage('voyage:rerank-3-lite');
+    let body: any = null;
+    __setRerankTransportForTests(async (_url, init) => {
+      body = JSON.parse(String(init?.body ?? '{}'));
+      return mockResp({ results: [{ index: 0, relevance_score: 0.9 }] });
+    });
+    await rerank({ query: 'q', documents: ['a'] });
+    expect(body.model).toBe('rerank-3-lite');
+  });
+
+  test('the allowlist still rejects an unlisted Voyage reranker (#4938)', async () => {
+    // The fix widens the allowlist; it must not disable it. A typo'd or
+    // retired model still fails locally instead of burning a wire call.
+    configureVoyage('voyage:rerank-9000');
+    let called = false;
+    __setRerankTransportForTests(async () => {
+      called = true;
+      return mockResp({ results: [] });
+    });
+    await expect(rerank({ query: 'q', documents: ['a'] })).rejects.toThrow(
+      /rerank-9000.*not listed/s,
+    );
+    expect(called).toBe(false);
   });
 });

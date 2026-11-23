@@ -16,15 +16,26 @@
  *      wall-clock `now - last_sync_at` (which false-flagged quiet, caught-up
  *      repos as SEVERE). Local callers pass `probeContent: true` and lag
  *      becomes 0 when the source is caught up by COMMIT HASH (HEAD ==
- *      last_commit, untracked ignored, via `isSourceUnchangedSinceSync`).
+ *      last_commit, via `probeSourceGitState`).
  *      Remote callers (federation_health on the HTTP MCP path) read the stored
  *      `newest_content_at` column instead — NO git subprocess on a DB-supplied
  *      local_path (preserves the v0.41.27.0 trust boundary).
+ *
+ * GBRA-133 PR 2b.5: the local probe compares HEAD only (an uncommitted edit
+ *      to a tracked file is not a pending commit), and a source that is behind
+ *      dates its lag from when the commit landed (the reflog entry that moved
+ *      HEAD off last_commit) or from the commit notifier's persisted
+ *      first_due_at, not from the last no-op heartbeat of last_sync_at. Both
+ *      paths raise the lag to first_due_at's age (src/core/sync-pending.ts).
  */
-import { execFileSync } from 'child_process';
+import { execFileSync } from './spawn.ts';
+import { execFileBounded } from './bounded-child-exec.ts';
 import type { BrainEngine } from './engine.ts';
 import { parseSourceConfig, type SourceRow } from './sources-load.ts';
-import { isSourceUnchangedSinceSync } from './git-head.ts';
+import { probeSourceGitState } from './git-head.ts';
+import { resolveHoursEnv } from './env-number.ts';
+import { isSyncDisabledConfig } from './sync-policy.ts';
+import { gitChildEnv } from './git-env.ts';
 
 export interface SourceMetrics {
   source_id: string;
@@ -121,6 +132,7 @@ export function newestCommitMs(localPath: string | null): number | null {
   if (!localPath) return null;
   try {
     const out = execFileSync('git', ['-C', localPath, 'log', '-1', '--format=%ct'], {
+      env: gitChildEnv(),
       encoding: 'utf8',
       timeout: 10_000,
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -148,47 +160,103 @@ export function newestCommitMs(localPath: string | null): number | null {
 export function commitTimeMs(localPath: string | null, sha: string | null): number | null {
   if (!localPath || !sha) return null;
   try {
-    const out = execFileSync('git', ['-C', localPath, 'show', '-s', '--format=%ct', sha], {
+    return parseCommitTime(execFileSync('git', ['-C', localPath, 'show', '-s', '--format=%ct', sha], {
+      env: gitChildEnv(),
       encoding: 'utf8',
       timeout: 10_000,
       stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    if (!out) return null;
-    // `git show -s --format=%ct <sha>` prints only the committer epoch for the
-    // resolved commit; take the first line in case the sha resolves to an
-    // annotated-tag-ish ref that prints extra lines.
-    const first = out.split('\n')[0]?.trim();
-    const ms = Number(first) * 1000;
-    return Number.isFinite(ms) ? ms : null;
+    }));
   } catch {
     return null; // not a git repo / unknown sha / git unavailable / timeout
   }
 }
 
+/** GBRA-133 2b.3: `commitTimeMs` without blocking the event loop (the classic sync's anchor write in a resident). */
+export async function commitTimeMsAsync(localPath: string | null, sha: string | null): Promise<number | null> {
+  if (!localPath || !sha) return null;
+  const r = await execFileBounded('git', ['-C', localPath, 'show', '-s', '--format=%ct', sha], { env: gitChildEnv(), timeout: 10_000 });
+  return r.error ? null : parseCommitTime(r.stdout);
+}
+
+function parseCommitTime(stdout: string): number | null {
+  const out = stdout.trim();
+  if (!out) return null;
+  // `git show -s --format=%ct <sha>` prints only the committer epoch for the
+  // resolved commit; take the first line in case the sha resolves to an
+  // annotated-tag-ish ref that prints extra lines.
+  const first = out.split('\n')[0]?.trim();
+  const ms = Number(first) * 1000;
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Resolve the staleness-ceiling in seconds.
+ *
+ * `GBRAIN_STALENESS_CEILING_HOURS` overrides; otherwise it tracks
+ * `GBRAIN_SYNC_FRESHNESS_FAIL_HOURS` (default 72) so the ceiling and the check
+ * that reads it cannot drift apart by default, while still being separable
+ * during an incident.
+ */
+export function resolveStalenessCeilingSeconds(): number {
+  const base = resolveHoursEnv('GBRAIN_SYNC_FRESHNESS_FAIL_HOURS', 72);
+  return Math.floor(resolveHoursEnv('GBRAIN_STALENESS_CEILING_HOURS', base) * 3600);
+}
+
 /**
  * Commit-relative lag in seconds from a STORED content timestamp (the
- * `newest_content_at` column), for REMOTE consumers that cannot shell out:
+ * `newest_content_at` column), for consumers that cannot shell out:
  *   - `null` when `lastSyncMs` is unknown.
  *   - Negative wall-clock (future `last_sync_at`) is surfaced as-is so upstream
  *     clock-skew detection still fires.
- *   - `0` when the stored content is at or before the last sync (caught up).
+ *   - Caught up (content at or before the last sync) → `0` UNTIL wall-clock
+ *     passes the ceiling, then a monotonic ramp (see below).
  *   - Wall-clock `now - lastSync` when content is newer, or when `contentMs` is
  *     null (no column value / pre-migration) — detection never regresses.
  *
- * Pure. The LOCAL path does NOT use this — it keys off the live commit hash via
- * `isSourceUnchangedSinceSync` (robust against HEAD moving to an old-dated
+ * The core logic is pure; only the DEFAULT `ceilingSeconds` reads env. Callers
+ * that need determinism pass the ceiling explicitly.
+ *
+ * WHY THE RAMP (the 71-day bug):
+ *
+ *   Before, "caught up" returned a hard 0 forever, so a source whose clone had
+ *   vanished reported fresh indefinitely — the wall-clock number was computed on
+ *   the line above and thrown away. But the caught-up branch is not a mistake: it
+ *   exists (see `checkSyncFreshness`'s clone-unavailable path) because a
+ *   container restart wipes `local_path`, and every QUIET source would otherwise
+ *   read stale after a restart. That justification assumed a no-op sync does not
+ *   advance `last_sync_at`, which stopped being true in v0.42.52.0 — a 0-change
+ *   sync now heartbeats the column. So a quiet source that is genuinely being
+ *   checked has a RECENT `last_sync_at` and stays at 0; only a source nobody has
+ *   looked at in a very long time crosses the ceiling.
+ *
+ *   It ramps rather than steps because three consumers read this one value at
+ *   different thresholds: `federation_health` fails at 24h, `sync_freshness`
+ *   warns at 24h / fails at 72h, and `buildSyncStatusReport` buckets at a
+ *   hardcoded 24/72. A step to the ceiling would cross all of them in the same
+ *   instant, firing two checks at once and skipping the warn tier entirely —
+ *   which is the alert-storm shape the caught-up branch was written to prevent.
+ *   `max(0, wallClock - ceiling)` grows continuously, so warn still precedes
+ *   fail and the surfaces escalate in order.
+ *
+ * The LOCAL path does NOT use this — it keys off the live commit hash via
+ * `probeSourceGitState` (robust against HEAD moving to an old-dated
  * commit, which a timestamp comparison would miss).
  */
 export function lagFromContentMs(
   contentMs: number | null,
   lastSyncMs: number | null,
   nowMs: number,
+  ceilingSeconds: number = resolveStalenessCeilingSeconds(),
 ): number | null {
   if (lastSyncMs === null || !Number.isFinite(lastSyncMs)) return null;
   const wallClockSeconds = Math.floor((nowMs - lastSyncMs) / 1000);
   if (wallClockSeconds < 0) return wallClockSeconds; // clock skew passthrough
   if (contentMs !== null && Number.isFinite(contentMs)) {
-    return contentMs <= lastSyncMs ? 0 : wallClockSeconds;
+    // Caught up: 0 while recently checked, then ramp once nobody has looked
+    // for longer than the ceiling.
+    return contentMs <= lastSyncMs
+      ? Math.max(0, wallClockSeconds - ceilingSeconds)
+      : wallClockSeconds;
   }
   return wallClockSeconds; // no stored content signal — wall-clock fallback
 }
@@ -220,8 +288,14 @@ export async function computeAllSourceMetrics(
   // commit-hash probe; the REMOTE federation_health path leaves it off and
   // reads the stored column (no subprocess on a DB-supplied local_path).
   const probeContent = opts?.probeContent === true;
+  // One ceiling for the whole report (hoisted out of the per-source map):
+  // every source gets the same number, and the env read runs once.
+  const stalenessCeilingSeconds = resolveStalenessCeilingSeconds();
+  // GBRA-133 PR 2b.5: the commit notifier's persisted first_due_at dates a pending commit on both paths (no git).
+  const { readFirstDue, readGitPendingEvidence } = await import('./sync-pending.ts');
+  const firstDue = await readFirstDue(engine, sources.map((src) => src.id)).catch(() => new Map<string, { firstDueAt: number | null }>());
 
-  return sources.map((src) => {
+  return Promise.all(sources.map(async (src) => {
     const cfg = parseSourceConfig(src.config);
     const pages = pageCounts.get(src.id) ?? 0;
     const chunkStats = chunkCounts.get(src.id) ?? { total: 0, embedded: 0 };
@@ -232,26 +306,56 @@ export async function computeAllSourceMetrics(
       : Math.round((chunkStats.embedded / chunkStats.total) * 1000) / 10;
 
     const lastMs = src.last_sync_at ? new Date(src.last_sync_at).getTime() : null;
-    // v0.41.32.0: commit-relative lag.
-    //   LOCAL (probeContent): caught up iff HEAD == last_commit AND no tracked
-    //     working-tree changes (untracked ignored) → lag 0; else wall-clock.
-    //     Uses the live commit hash so a HEAD that moved to an old-dated commit
-    //     is correctly NOT caught up. NULL last_commit → not caught up → wall-clock.
-    //   REMOTE (default): read the stored newest_content_at column via
-    //     lagFromContentMs — no git subprocess (v0.41.27.0 trust boundary).
+    const dueMs = firstDue.get(src.id)?.firstDueAt ?? null;
+    // v0.41.32.0: commit-relative lag. TWO implementations, and the split is
+    // load-bearing rather than accidental duplication — see the diagram.
+    //
+    //   computeAllSourceMetrics
+    //         │
+    //         ├─ probeContent: true  ──► probeSourceGitState, HEAD only (git subprocess)
+    //         │                          LOCAL only. Accurate: keys off the live
+    //         │                          commit hash, so a HEAD moved to an
+    //         │                          old-dated commit is correctly NOT caught
+    //         │                          up, and an uncommitted edit is not a
+    //         │                          pending commit. Behind: lag runs from the
+    //         │                          reflog entry that moved HEAD off
+    //         │                          last_commit, else the notifier's
+    //         │                          first_due_at, else wall-clock since the
+    //         │                          last sync. Caller: `gbrain sources status`.
+    //         │
+    //         └─ probeContent: false ──► lagFromContentMs (column read)
+    //                                    REMOTE-SAFE: no subprocess, because a
+    //                                    remote-callable path must never shell
+    //                                    out against a DB-supplied local_path
+    //                                    (v0.41.27.0 trust boundary). That makes
+    //                                    it structurally less accurate than the
+    //                                    probe, which is exactly why it needs the
+    //                                    staleness ceiling to stay honest.
+    //                                    Callers: doctor `federation_health`,
+    //                                    doctor `sync_freshness` (via its own
+    //                                    clone-unavailable branch), and
+    //                                    `buildSyncStatusReport` (gbrain status).
+    //                                    A persisted first_due_at raises it to
+    //                                    the time the commit has been due.
+    //
+    // Do NOT "unify" these behind one flag: collapsing the trust boundary into a
+    // boolean is how a remote caller eventually acquires a subprocess.
     let lagSeconds: number | null;
     if (lastMs === null) {
       lagSeconds = null;
     } else if (probeContent) {
-      const caughtUp = isSourceUnchangedSinceSync(src.local_path, src.last_commit, {
-        requireCleanWorkingTree: 'ignore-untracked',
-      });
-      lagSeconds = caughtUp ? 0 : Math.max(0, Math.floor((now - lastMs) / 1000));
+      const state = probeSourceGitState(src.local_path, src.last_commit);
+      const evidence = state === 'changed' && src.local_path && src.last_commit
+        ? await readGitPendingEvidence(src.local_path, src.last_commit).catch(() => null)
+        : null;
+      const sinceMs = evidence?.departedAt != null ? evidence.departedAt * 1000 : dueMs;
+      lagSeconds = state === 'unchanged' ? 0 : Math.max(0, Math.floor((now - (sinceMs ?? lastMs)) / 1000));
     } else {
       const contentMs = src.newest_content_at
         ? new Date(src.newest_content_at).getTime()
         : null;
-      lagSeconds = lagFromContentMs(contentMs, lastMs, now);
+      lagSeconds = lagFromContentMs(contentMs, lastMs, now, stalenessCeilingSeconds);
+      if (lagSeconds !== null && lagSeconds >= 0 && dueMs !== null) lagSeconds = Math.max(lagSeconds, Math.floor((now - dueMs) / 1000));
     }
 
     return {
@@ -273,7 +377,7 @@ export async function computeAllSourceMetrics(
       priority_label: resolvePriorityLabel(src.id, src.config),
       webhook_configured: typeof cfg.webhook_secret === 'string' && cfg.webhook_secret.length > 0,
     };
-  });
+  }));
 }
 
 async function pageCountsBySource(engine: BrainEngine): Promise<Map<string, number>> {
@@ -289,10 +393,17 @@ async function pageCountsBySource(engine: BrainEngine): Promise<Map<string, numb
 }
 
 async function chunkCountsBySource(engine: BrainEngine): Promise<Map<string, { total: number; embedded: number }>> {
+  // Coverage must count the ACTIVE embedding column: a registry-routed brain
+  // (search_embedding_column != 'embedding') writes vectors elsewhere, and
+  // keying the literal legacy column here read 0% forever — a permanently-red
+  // doctor check recommending no-op remediations. Fail open to legacy.
+  const { quoteIdentifier, resolveActiveEmbeddingColumnFromEngine } = await import('./search/embedding-column.ts');
+  const active = await resolveActiveEmbeddingColumnFromEngine(engine, { fallbackToLegacy: true });
+  const col = quoteIdentifier(active.name);
   const rows = await engine.executeRaw<{ source_id: string; total: number; embedded: number }>(
     `SELECT p.source_id,
             COUNT(*)::int AS total,
-            COUNT(*) FILTER (WHERE c.embedding IS NOT NULL)::int AS embedded
+            COUNT(*) FILTER (WHERE c.${col} IS NOT NULL)::int AS embedded
        FROM content_chunks c
        JOIN pages p ON p.id = c.page_id
       WHERE p.deleted_at IS NULL
@@ -332,4 +443,50 @@ async function jobCountsBySource(engine: BrainEngine): Promise<Map<string, JobSt
   } catch {
     return new Map();
   }
+}
+
+/**
+ * Sync-eligible sources with a local path, for doctor `sync_freshness`,
+ * including the upstream observation sync records (#5255, O-DX-8). Older
+ * brains without those columns (or without `archived`) still load.
+ * `sourceIds` (a remote caller's grant) confines the roster in SQL.
+ */
+export async function loadSyncFreshnessSources(engine: BrainEngine, sourceIds?: string[]) {
+  type FreshnessSourceRow = {
+    id: string;
+    name: string;
+    local_path: string | null;
+    last_sync_at: Date | null;
+    last_commit: string | null;
+    chunker_version: string | null;
+    newest_content_at: Date | null;
+    config: unknown;
+    upstream_checked_at: Date | null;
+    upstream_commit: string | null;
+    upstream_behind: number | null;
+  };
+  const columns = 'id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at, config';
+  const scope = sourceIds ? ' AND id = ANY($1::text[])' : '';
+  const params = sourceIds ? [sourceIds] : undefined;
+  let sources: FreshnessSourceRow[];
+  try {
+    sources = await engine.executeRaw<FreshnessSourceRow>(
+      `SELECT ${columns}, upstream_checked_at, upstream_commit, upstream_behind FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE${scope}`,
+      params,
+    );
+  } catch {
+    const noUpstream = 'NULL AS upstream_checked_at, NULL AS upstream_commit, NULL AS upstream_behind';
+    try {
+      sources = await engine.executeRaw<FreshnessSourceRow>(
+        `SELECT ${columns}, ${noUpstream} FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE${scope}`,
+        params,
+      );
+    } catch {
+      sources = await engine.executeRaw<FreshnessSourceRow>(
+        `SELECT ${columns}, ${noUpstream} FROM sources WHERE local_path IS NOT NULL${scope}`,
+        params,
+      );
+    }
+  }
+  return sources.filter((source) => !isSyncDisabledConfig(source.config));
 }

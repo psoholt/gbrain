@@ -33,16 +33,21 @@
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { spawn, spawnSync } from 'child_process';
+import { freePort } from '../helpers/serve-http.ts';
 import {
   cpSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
   chmodSync,
 } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
+import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import type { EngineConfig } from '../../src/core/types.ts';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
 const BIN_CACHE = join(REPO_ROOT, 'test', '.cache');
@@ -91,14 +96,26 @@ beforeAll(() => {
   // runs with --no-embed below and search/get are keyword-only paths.
   runEnv = { ...process.env, GBRAIN_HOME: tmpHome };
   delete runEnv.VOYAGE_API_KEY;
-  delete runEnv.ZEROENTROPY_API_KEY;
   delete runEnv.OPENAI_API_KEY;
   delete runEnv.ANTHROPIC_API_KEY;
   delete runEnv.GOOGLE_API_KEY;
+  // This file is PGLite-only, but the e2e lane deliberately exports
+  // DATABASE_URL (scripts/run-e2e.sh). An inherited env URL overrides the
+  // fixture's `engine: 'pglite'` config (env > file precedence), silently
+  // rerouting every spawned CLI to the healthy shared Postgres — the
+  // corrupt-WAL case then exits 0 against the wrong engine. Strip all
+  // DB-routing vars so the spawned CLIs honor the PGLite fixture homes.
+  delete runEnv.DATABASE_URL;
+  delete runEnv.GBRAIN_DATABASE_URL;
+  delete runEnv.GBRAIN_PGBOUNCER_URL;
+  delete runEnv.GBRAIN_PGBOUNCER_DIRECT_URL;
 
+  // NOTE: init grew strict flag validation (#2201); `--repo`/`--yes` were
+  // never real init flags (previously silently ignored). The repo is wired
+  // through `sync --repo` below, matching the other e2e suites.
   const initResult = spawnSync(
     SHIM_PATH,
-    ['init', '--pglite', '--repo', repoSourceDir, '--no-embedding', '--yes'],
+    ['init', '--pglite', '--no-embedding', '--non-interactive'],
     {
       cwd: REPO_ROOT,
       env: runEnv,
@@ -113,6 +130,19 @@ beforeAll(() => {
         `STDERR:\n${initResult.stderr}`,
     );
   }
+
+  const sourceResult = spawnSync(
+    SHIM_PATH,
+    ['sources', 'add', 'exit-fixture', '--path', repoSourceDir, '--no-federated'],
+    { cwd: REPO_ROOT, env: runEnv, encoding: 'utf-8', timeout: 60_000 },
+  );
+  if (sourceResult.status !== 0) {
+    throw new Error(
+      `gbrain sources add failed (code=${sourceResult.status}):\n` +
+        `STDOUT:\n${sourceResult.stdout}\nSTDERR:\n${sourceResult.stderr}`,
+    );
+  }
+  runEnv.GBRAIN_SOURCE = 'exit-fixture';
 
   // Sync to import the pages (no-embed: skip the embedding step so
   // the test doesn't need any provider key).
@@ -366,16 +396,6 @@ describe('#2084 — explicit-exit teardown: every swept site exits clean, exit c
     }
   }, 90_000);
 
-  test('ze-switch --dry-run (Site H) exits without hanging, no banner', async () => {
-    const { code, durationMs, stderr } = await runWithTimeout(
-      ['ze-switch', '--dry-run'],
-      30_000,
-    );
-    expect(durationMs).toBeLessThan(30_000);
-    expect(stderr).not.toContain(TEARDOWN_BANNER);
-    expect(code).not.toBeNull();
-  }, 45_000);
-
   test('D11: teardown deadline does NOT cover handler time (slow-handler regression)', async () => {
     // Post-fix the deadline arms at teardown start, so a 500ms deadline cannot
     // touch the handler: results print in full regardless. NOTE the falsification
@@ -409,12 +429,74 @@ describe('#2084 — explicit-exit teardown: every swept site exits clean, exit c
   }, 30_000);
 });
 
+describe('WAL-repair wave — corrupt persistent brain, auto-repair off: owned exit 1 (#2084 class)', () => {
+  test('gbrain status on a torn-WAL brain with GBRAIN_PGLITE_WAL_REPAIR=off exits 1 (not 0, not 99)', async () => {
+    // Fixture (#3922): a REAL persistent PGLite brain — created, probed,
+    // cleanly disconnected — whose WAL segments are then overwritten with
+    // deterministic garbage (Buffer.alloc(size, 0xff), the exact shape
+    // test/pglite-wal-repair.serial.test.ts pins), so PGlite.create aborts
+    // the same way every run. The prior fixture wrote randomBytes into a
+    // fake pg_control + fake WAL segment, which made the abort path
+    // nondeterministic run-to-run. With auto-repair disabled the CLI must
+    // fail LOUDLY through the owned verdict channel: real process exit 1 —
+    // never 0 (silent success over a broken brain), never 99 (Emscripten's
+    // hijacked process.exitCode, the #2084 class).
+    const corruptHome = mkdtempSync(join(tmpdir(), 'gbrain-pglite-corrupt-'));
+    try {
+      const dataDir = join(corruptHome, 'brain.pglite');
+      // GBRAIN_HOME is a parent dir: config lives at <home>/.gbrain/config.json.
+      mkdirSync(join(corruptHome, '.gbrain'), { recursive: true });
+      writeFileSync(
+        join(corruptHome, '.gbrain', 'config.json'),
+        JSON.stringify({ engine: 'pglite', database_path: dataDir }, null, 2) + '\n',
+        'utf-8',
+      );
+
+      // Build the real brain in-process, then shut it down cleanly so the
+      // data dir is layout-valid with a real pg_control + real WAL.
+      const builder = new PGLiteEngine();
+      await builder.connect({ engine: 'pglite', database_path: dataDir } as EngineConfig);
+      await builder.db.exec('CREATE TABLE exit_probe (id int); INSERT INTO exit_probe VALUES (1);');
+      await builder.disconnect();
+
+      // Overwrite EVERY real WAL segment with garbage, keeping its size —
+      // deterministic corruption, no RNG.
+      const segments = readdirSync(join(dataDir, 'pg_wal')).filter((f) =>
+        /^[0-9A-F]{24}$/.test(f),
+      );
+      expect(segments.length).toBeGreaterThan(0);
+      for (const seg of segments) {
+        const p = join(dataDir, 'pg_wal', seg);
+        const size = readFileSync(p).length;
+        writeFileSync(p, Buffer.alloc(size, 0xff));
+      }
+
+      const { code, stdout, stderr, durationMs } = await runWithTimeout(
+        ['status'],
+        30_000,
+        { GBRAIN_HOME: corruptHome, GBRAIN_PGLITE_WAL_REPAIR: 'off' },
+      );
+      if (code !== 1) {
+        throw new Error(
+          `expected exit 1, got ${code}; duration=${durationMs}ms\n` +
+            `STDOUT:\n${stdout}\nSTDERR:\n${stderr}`,
+        );
+      }
+      expect(code).toBe(1);
+      expect(stdout + stderr).toContain('PGLite failed to initialize');
+    } finally {
+      rmSync(corruptHome, { recursive: true, force: true });
+    }
+  }, 180_000);
+});
+
 describe('v0.41.8.0 — daemon survival (regression guard for narrow force-exit)', () => {
   test('gbrain serve --http stays alive past the timeout window', async () => {
-    // Pick a likely-free ephemeral port. We're testing "still alive
+    // A port the kernel reports free (a taken one would also exit early,
+    // and read as this regression). We're testing "still alive
     // 3 seconds after startup" — if the force-exit guard misfired
     // on 'serve', the process would die immediately after binding.
-    const port = 31000 + Math.floor(Math.random() * 1000);
+    const port = await freePort();
     const child = spawn(
       SHIM_PATH,
       ['serve', '--http', '--port', String(port), '--token-ttl', '60'],

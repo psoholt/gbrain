@@ -40,14 +40,21 @@
  */
 
 import * as fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { opError } from '../core/ops/contract.ts';
+import { isWriteReceipt } from '../core/persistence/types.ts';
 import * as path from 'node:path';
 import type { BrainEngine } from '../core/engine.ts';
 import { MinionQueue } from '../core/minions/queue.ts';
 import { waitForCompletion, TimeoutError } from '../core/minions/wait-for-completion.ts';
-import type { MinionJobInput, SubagentHandlerData } from '../core/minions/types.ts';
+import type { MinionJob, MinionJobInput, SubagentHandlerData } from '../core/minions/types.ts';
+import { jobSpendAuthorization, spendSubmitSummary } from '../core/minions/spend-authorization.ts';
 import { operations } from '../core/operations.ts';
 import { loadConfig } from '../core/config.ts';
 import { getCliOptions } from '../core/cli-options.ts';
+import { intFlagValue } from '../cli/flag-values.ts';
+import { consentGateOrExit, engineConsentEnv } from '../core/consent-cli.ts';
+import { neutralizeOutsideText } from '../core/outside-content.ts';
 
 const COST_PER_CHAPTER_OPUS = 0.30;     // rough; depends on chapter length
 const COST_PER_CHAPTER_SONNET = 0.06;
@@ -99,8 +106,11 @@ function parseFlags(args: string[]): BookMirrorFlags {
   const title = parseFlag(args, '--title');
   const author = parseFlag(args, '--author');
   const model = parseFlag(args, '--model') ?? 'claude-opus-4-7';
-  const maxTurnsStr = parseFlag(args, '--max-turns');
-  const timeoutMsStr = parseFlag(args, '--timeout-ms');
+  // #5909 (D4): a present flag needs a positive safe integer (usage error, exit 2), never a parseInt NaN.
+  const positiveInt = (flag: string, example: number) =>
+    hasFlag(args, flag) ? intFlagValue(parseFlag(args, flag), flag, { min: 1, example }) : undefined;
+  const maxTurns = positiveInt('--max-turns', DEFAULT_MAX_TURNS);
+  const timeoutMs = positiveInt('--timeout-ms', 600000);
 
   return {
     chaptersDir,
@@ -109,8 +119,8 @@ function parseFlags(args: string[]): BookMirrorFlags {
     title,
     author,
     model,
-    maxTurns: maxTurnsStr ? parseInt(maxTurnsStr, 10) : DEFAULT_MAX_TURNS,
-    timeoutMs: timeoutMsStr ? parseInt(timeoutMsStr, 10) : undefined,
+    maxTurns: maxTurns ?? DEFAULT_MAX_TURNS,
+    timeoutMs,
     noConfirm: hasFlag(args, '--no-confirm') || hasFlag(args, '--yes'),
     follow: process.stdout.isTTY === true && !hasFlag(args, '--no-follow'),
     dryRun: hasFlag(args, '--dry-run'),
@@ -144,7 +154,8 @@ OPTIONAL
                             right-column quality drops.
   --max-turns <n>           Per-chapter subagent turn budget. Default ${DEFAULT_MAX_TURNS}.
   --timeout-ms <n>          Per-chapter wall-clock timeout.
-  --no-confirm / --yes      Skip the cost-estimate confirmation prompt.
+  --yes / --no-confirm      The user's approval of the printed estimate; without it a
+                            non-interactive run submits nothing and exits 3.
   --no-follow               Submit and exit; don't tail children.
   --dry-run                 Validate inputs + print plan; submit nothing.
 
@@ -217,30 +228,6 @@ function estimateCost(chapters: ChapterEntry[], model: string): number {
   return chapters.length * perChapter;
 }
 
-async function confirmInteractive(estimateUsd: number, chapters: number): Promise<boolean> {
-  if (process.stdin.isTTY !== true) {
-    // Non-TTY: refuse to spend without an explicit --yes / --no-confirm.
-    process.stderr.write(
-      `gbrain book-mirror: refusing to spend ~$${estimateUsd.toFixed(2)} on ${chapters} chapters from a non-TTY context. ` +
-      `Pass --yes to confirm.\n`
-    );
-    return false;
-  }
-  process.stderr.write(
-    `\nThis will spawn ${chapters} subagent jobs at ~$${(estimateUsd / chapters).toFixed(2)} each = ~$${estimateUsd.toFixed(2)} total.\n` +
-    `Continue? [y/N] `
-  );
-  return new Promise(resolve => {
-    process.stdin.setEncoding('utf8');
-    process.stdin.once('data', (chunk) => {
-      const reply = chunk.toString().trim().toLowerCase();
-      resolve(reply === 'y' || reply === 'yes');
-      process.stdin.pause();
-    });
-    process.stdin.resume();
-  });
-}
-
 // ── prompt assembly ────────────────────────────────────────
 
 function buildChapterPrompt(
@@ -257,7 +244,9 @@ function buildChapterPrompt(
 
   return `You are analyzing one chapter of "${bookTitle}"${authorLine} for the user.
 
-Your output is a markdown two-column table where the LEFT column preserves the chapter's actual content (stories, frameworks, statistics, named examples) and the RIGHT column maps each idea to the user's actual life using their words, situations, and patterns from the brain.
+Your output is a two-column HTML table where the LEFT column preserves the chapter's actual content (stories, frameworks, statistics, named examples) and the RIGHT column maps each idea to the user's actual life using their words, situations, and patterns from the brain.
+
+CRITICAL: Use an HTML <table> with valign="top" on EVERY cell — NOT a markdown pipe table. Markdown pipe tables have no way to set vertical alignment, so every renderer except GitHub middle-aligns the rows, which is unreadable when the two columns have different lengths. The HTML <table valign="top"> form top-aligns everywhere (GitHub, PDF, Obsidian).
 
 This is chapter ${chapter.index} of ${totalChapters}.
 
@@ -276,11 +265,12 @@ Return ONLY a single markdown section in this exact shape:
 ### Key Ideas
 [2-4 sentence thesis of the chapter — what the author is actually arguing.]
 
-| What the Author Says | How This Applies to You |
-|---|---|
-| [Detailed paragraph: a section/argument from the chapter, preserving stories, stats, frameworks, named examples. Use \`<br><br>\` for paragraph breaks within the cell.] | [Specific personal connection: name dates, people, exact quotes from the user, real situations. Same \`<br><br>\` for breaks.] |
-| [Next section] | [Next mirror] |
-| [4-10 rows depending on chapter density] |  |
+<table>
+  <tr><th align="left">What the Author Says</th><th align="left">How This Applies to You</th></tr>
+  <tr><td valign="top">[Detailed paragraph: a section/argument from the chapter, preserving stories, stats, frameworks, named examples. Use \`<br><br>\` for paragraph breaks within the cell.]</td><td valign="top">[Specific personal connection: name dates, people, exact quotes from the user, real situations. Same \`<br><br>\` for breaks.]</td></tr>
+  <tr><td valign="top">[Next section]</td><td valign="top">[Next mirror]</td></tr>
+  [4-10 rows depending on chapter density]
+</table>
 \`\`\`
 
 ## RULES
@@ -290,6 +280,7 @@ Return ONLY a single markdown section in this exact shape:
 - 4-10 rows per chapter. If a section honestly doesn't apply, write \`*This section is less directly relevant because [specific reason].*\` Don't force connections.
 - Never generic ("This might apply if you've ever felt..."). Never sycophantic. Never preach.
 - Use \`<br><br>\` for paragraph breaks inside table cells, not literal newlines.
+- EVERY <td> MUST carry valign="top". Never emit a markdown pipe table (| ... | ... |) — always the HTML <table> form above.
 
 You have ${DEFAULT_MAX_TURNS} turns and read-only tools (get_page, search). You CANNOT call put_page — your output is the markdown text in your final message. The CLI assembles all chapters and writes the brain page.
 
@@ -314,7 +305,7 @@ title: "${opts.title} — Personalized"
 type: book-analysis${authorLine}
 date: ${today}
 context: "${contextSummary.replace(/"/g, '\\"')}"
-tags: [book, personalized, two-column]
+tags: [book, personalized, two-column-htmltable-valign-top]
 ---`;
 
   const intro = `# ${opts.title} — Personalized
@@ -329,7 +320,7 @@ This page was generated by \`gbrain book-mirror\`. Each chapter analysis came fr
 
   const failedSection = opts.chapterAnalyses
     .filter(a => a.failed)
-    .map(a => `> Chapter ${a.index}: analysis failed (${a.error ?? 'unknown error'}). Re-run \`gbrain book-mirror\` to retry; idempotent on the same inputs.`)
+    .map(a => `> Chapter ${a.index}: analysis failed (${a.error ?? 'unknown error'}). Retry if you choose: re-run \`gbrain book-mirror\` with the same inputs; a refused chapter's job must be deleted first (\`gbrain jobs delete <id>\`).`)
     .join('\n\n');
 
   const failedHeader = failedSection
@@ -339,13 +330,69 @@ This page was generated by \`gbrain book-mirror\`. Each chapter analysis came fr
   const completed = opts.chapterAnalyses
     .filter(a => !a.failed)
     .sort((a, b) => a.index - b.index)
-    .map(a => a.result.trim())
+    .map(a => neutralizeOutsideText(a.result.trim()))
     .join('\n\n---\n\n');
 
   return `${frontmatter}\n\n${intro}${failedHeader}\n${completed}\n`;
 }
 
+/**
+ * One finished child job as a chapter result. A child that completed with
+ * `stop_reason: 'refusal'` (a provider refusal or output-filter stop) is a
+ * failed chapter, never a completed one: its text is the refusal, not an
+ * analysis.
+ */
+export function chapterAnalysisFromJob(
+  job: Pick<MinionJob, 'status' | 'result'>,
+  childId: number,
+  index: number,
+): { index: number; result: string; failed: boolean; error?: string } {
+  if (job.status !== 'completed' || !job.result || typeof job.result !== 'object') {
+    return { index, result: '', failed: true, error: `job ${childId} status=${job.status}` };
+  }
+  const { result = '', stop_reason } = job.result as { result?: string; stop_reason?: string };
+  if (stop_reason === 'refusal') {
+    return { index, result: '', failed: true, error: `provider refusal or output filter stop (job ${childId} stop_reason=refusal)` };
+  }
+  return { index, result, failed: false };
+}
+
 // ── main entry ─────────────────────────────────────────────
+
+/** Freeze the replacement precondition before chapter providers run. */
+export async function prepareBookMirrorPublication(engine: BrainEngine, slug: string) {
+  const snapshot = await engine.readPageSnapshot(slug, { sourceId: 'default', includeDeleted: true });
+  const requestId = randomUUID();
+  return async (content: string) => {
+    const putPageOp = operations.find(op => op.name === 'put_page');
+    if (!putPageOp) throw new Error('internal: put_page operation not registered');
+    // viaSubagent intentionally omitted: this is the trusted local CLI publication.
+    const receipt = await putPageOp.handler({ engine, config: loadConfig() || { engine: engine.kind },
+      logger: { info: console.log, warn: console.warn, error: console.error }, dryRun: false, remote: false,
+      cliOpts: getCliOptions(), sourceId: 'default' }, {
+      slug, content, request_id: requestId, ...(snapshot ? { expected_revision: snapshot.revision } : {}),
+    });
+    if (!isWriteReceipt(receipt)) {
+      throw opError('storage_error', `Publishing ${slug} returned no durable write receipt, so whether the page was written is unknown.`,
+        `Read the page to see whether it was written; if it is missing or stale, run the same book-mirror command again (completed chapters are reused).`,
+        { why: 'A publication is confirmed only by its write receipt; without one the page may or may not hold the new mirror.',
+          fix: { argv: ['gbrain', 'get', '--source', 'default', '--', slug], consent: [], actor: 'agent', requires_exclusive: false,
+            why: 'Shows the page as stored now, so you can tell whether the publication landed.' } });
+    }
+    if (receipt.state !== 'committed') {
+      const code = ['queued', 'running', 'recovering'].includes(receipt.state) ? 'write_pending' : 'storage_error';
+      const error = opError(code, `Publishing ${slug} is ${receipt.state}; the page may not hold the new mirror yet.`,
+        `Read write request ${requestId} (gbrain write-request -- ${requestId}) and wait for it to settle before repeating publication; a repeat with a new request could write the page twice.`,
+        { why: 'The publication was handed to the brain\'s write path but has not committed; its durable receipt says whether it will.',
+          fix: { argv: ['gbrain', 'write-request', '--', requestId], consent: [], actor: 'agent', requires_exclusive: false,
+            why: 'Reads the publication\'s durable write receipt, read-only.' } });
+      error.writeRequest = receipt;
+      error.writeError = code;
+      throw error;
+    }
+    return receipt;
+  };
+}
 
 export async function runBookMirrorCmd(engine: BrainEngine, args: string[]): Promise<void> {
   const flags = parseFlags(args);
@@ -398,19 +445,33 @@ export async function runBookMirrorCmd(engine: BrainEngine, args: string[]): Pro
     return;
   }
 
-  if (!flags.noConfirm) {
-    const ok = await confirmInteractive(estimateUsd, chapters.length);
-    if (!ok) {
-      process.stderr.write(`gbrain book-mirror: cancelled by user.\n`);
-      process.exit(0);
-    }
-  }
+  // A4: paid fan-out. --yes (or its legacy alias --no-confirm), --max-usd,
+  // tokenmax or a per-run preapproval authorize it; otherwise a TTY prompt
+  // (interaction.readLine: EOF/timeout = decline, never a hang) or exit 3
+  // with the consent payload. Nothing is submitted before consent.
+  const consentArgv = ['gbrain', 'book-mirror', ...args.filter(a => a !== '--yes' && a !== '--no-confirm')];
+  const auth = await consentGateOrExit({
+    command: 'book-mirror', effects: ['paid'], actor: 'agent',
+    what: `Run ${chapters.length} chapter subagent(s) for ${targetSlug}`,
+    why: `Writes a personalized two-column mirror of "${bookTitle}" from the brain's context, one ${flags.model} subagent per chapter.`,
+    risk: `Spends about $${estimateUsd.toFixed(2)} (~$${(estimateUsd / chapters.length).toFixed(2)} per chapter) with the model provider. Subagents are read-only; the result is one new page. Without --max-usd, a model with no known price runs unmetered under the derived or default cap.`,
+    user_message: `Spend about $${estimateUsd.toFixed(2)} to mirror ${chapters.length} chapter(s) of "${bookTitle}" against your brain?`,
+    argv: consentArgv,
+    preview_argv: [...consentArgv, '--dry-run'],
+    est_usd: estimateUsd,
+    args: flags.noConfirm ? [...args, '--yes'] : args,
+  }, { json: false, env: engineConsentEnv(engine) });
+  // One approved total for every chapter subagent (the worker enforces it across the group).
+  const spend = jobSpendAuthorization(auth, { command: 'book-mirror', est_usd: estimateUsd, of: chapters.length, argv: consentArgv });
+
+  const publish = await prepareBookMirrorPublication(engine, targetSlug);
 
   // Submit fan-out: N children, no aggregator. Each child gets read-only
   // tools so the codex HIGH-1 prompt-injection vector is closed at the
   // tool-allowlist layer rather than at allowedSlugPrefixes scope.
   const queue = new MinionQueue(engine);
   const childIds: number[] = [];
+  const children: MinionJob[] = [];
   for (const ch of chapters) {
     const data: SubagentHandlerData = {
       prompt: buildChapterPrompt(ch, chapters.length, bookTitle, flags.author, contextPack),
@@ -431,14 +492,16 @@ export async function runBookMirrorCmd(engine: BrainEngine, args: string[]): Pro
       'subagent',
       data as unknown as Record<string, unknown>,
       submitOpts,
-      { allowProtectedSubmit: true },
+      { allowProtectedSubmit: true, spendAuthorization: spend },
     );
     childIds.push(job.id);
+    children.push(job);
   }
 
   process.stderr.write(
     `submitted: ${childIds.length} subagent jobs (${childIds[0]}..${childIds[childIds.length - 1]})\n`
   );
+  for (const line of spendSubmitSummary(spend, children, consentArgv).lines) process.stderr.write(`${line}\n`);
 
   if (!flags.follow) {
     process.stdout.write(JSON.stringify({ child_ids: childIds, slug: targetSlug }) + '\n');
@@ -460,19 +523,11 @@ export async function runBookMirrorCmd(engine: BrainEngine, args: string[]): Pro
         timeoutMs: flags.timeoutMs ?? 30 * 60 * 1000, // 30 min per child
         pollMs: 1000,
       });
-      if (job.status === 'completed' && job.result && typeof job.result === 'object') {
-        const result = (job.result as { result?: string }).result ?? '';
-        analyses.push({ index: chapterIndex, result, failed: false });
-        process.stderr.write(`  chapter ${chapterIndex}: complete (job ${childId})\n`);
-      } else {
-        analyses.push({
-          index: chapterIndex,
-          result: '',
-          failed: true,
-          error: `job ${childId} status=${job.status}`,
-        });
-        process.stderr.write(`  chapter ${chapterIndex}: FAILED (job ${childId} status=${job.status})\n`);
-      }
+      const analysis = chapterAnalysisFromJob(job, childId, chapterIndex);
+      analyses.push(analysis);
+      process.stderr.write(analysis.failed
+        ? `  chapter ${chapterIndex}: FAILED (${analysis.error})\n`
+        : `  chapter ${chapterIndex}: complete (job ${childId})\n`);
     } catch (e) {
       const msg = e instanceof TimeoutError
         ? `timeout after ${e.elapsedMs}ms`
@@ -502,30 +557,7 @@ export async function runBookMirrorCmd(engine: BrainEngine, args: string[]): Pro
     chapterAnalyses: analyses,
   });
 
-  // Operator-trust put_page — viaSubagent is NOT set, so the namespace
-  // check doesn't fire. The CLI is the trusted writer.
-  const putPageOp = operations.find(op => op.name === 'put_page');
-  if (!putPageOp) {
-    throw new Error('internal: put_page operation not registered');
-  }
-
-  await putPageOp.handler(
-    {
-      engine,
-      config: loadConfig() || { engine: 'postgres' },
-      logger: { info: console.log, warn: console.warn, error: console.error },
-      dryRun: false,
-      remote: false,             // local CLI caller — operator trust path
-      cliOpts: getCliOptions(),
-      sourceId: 'default',       // v0.34 D4: required field; book-mirror is single-source by design
-      // viaSubagent intentionally omitted — operator trust path.
-      // allowedSlugPrefixes intentionally omitted — operator can write anywhere.
-    },
-    {
-      slug: targetSlug,
-      content: assembled,
-    },
-  );
+  await publish(assembled);
 
   process.stderr.write(`\nwrote: ${targetSlug} (${chapters.length} chapter sections, ${assembled.length} bytes)\n`);
   process.stdout.write(JSON.stringify({
@@ -537,7 +569,7 @@ export async function runBookMirrorCmd(engine: BrainEngine, args: string[]): Pro
 
   if (failed > 0) {
     process.stderr.write(
-      `\ngbrain book-mirror: ${failed} chapter(s) failed. The page was written with the completed chapters; run again to retry the failed ones (idempotency keys dedupe successful chapters).\n`
+      `\ngbrain book-mirror: ${failed} chapter(s) failed. The page was written with the completed chapters. Retry if you choose: run again with the same inputs (idempotency keys dedupe successful chapters); a refused chapter's job must be deleted first (gbrain jobs delete <id>).\n`
     );
     process.exit(1);
   }

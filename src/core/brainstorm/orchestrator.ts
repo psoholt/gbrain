@@ -32,8 +32,11 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-import { chat as defaultChat, embedQuery, type ChatResult, type ChatOpts } from '../ai/gateway.ts';
+import { chat as defaultChat, type ChatResult, type ChatOpts } from '../ai/gateway.ts';
+import { embedQueryWithPrefix } from '../search/query-prefix.ts';
+import { embeddingSendBlocked } from '../embedding-disabled.ts';
 import { hybridSearch, hybridSearchCached } from '../search/hybrid.ts';
+import { INTERNAL_BREADTH_SEARCH_OPTS } from '../search/internal-breadth.ts';
 import { fetchFar, type CloseRef, type FarPage } from './domain-bank.ts';
 import { StructuredAgentError } from '../errors.ts';
 import { classifyBrainstormError } from './error-classify.ts';
@@ -46,7 +49,21 @@ import {
   type JudgeConfig,
   type ChatFn,
 } from './judges.ts';
-import { canonicalLookup } from '../model-pricing.ts';
+import {
+  assertJudgeWithinCeiling,
+  ceilingRemedy,
+  chatCostUsd,
+  configuredChatModel,
+  configuredEmbeddingModel,
+  judgeCostUsd,
+  resolveBrainstormCostGate,
+  resolveBrainstormJudgeModel,
+  userCapNoPricingRefusal,
+  type BrainstormCostGate,
+} from './cost-gate.ts';
+import { capNotice } from '../budget/cap-flag.ts';
+import { pricingSetCommand } from '../budget/no-pricing.ts';
+import { peakRateNote, type PricingOverrides } from '../budget/reservation-cost.ts';
 import { ensureWellFormed } from '../text-safe.ts';
 
 // ---------------------------------------------------------------------------
@@ -57,8 +74,10 @@ import { ensureWellFormed } from '../text-safe.ts';
 // module (the only known caller is the test suite).
 // ---------------------------------------------------------------------------
 
-import { BudgetExhausted, BudgetTracker } from '../budget/budget-tracker.ts';
+import { BudgetExhausted, BudgetTracker, loadPricingOverrides } from '../budget/budget-tracker.ts';
 import { withBudgetTracker } from '../ai/gateway.ts';
+import { isInteractive } from '../interaction.ts';
+import { agentBlock } from '../agent-markers.ts';
 import {
   computeRunId,
   loadCheckpoint,
@@ -68,6 +87,7 @@ import {
   type BrainstormCheckpoint,
   type CheckpointCross,
 } from './checkpoint.ts';
+import { resolveOwnerHolder } from '../owner-holder.ts';
 
 export { BudgetExhausted };
 
@@ -139,7 +159,7 @@ export interface BrainstormOptions {
   modelOverride?: string;
   /** Skip the cost-preview TTY grace window. Required for non-interactive callers. */
   skipCostPreview?: boolean;
-  /** When set, force the user holder for calibration profile lookup. Falls back to config (`emotional_weight.user_holder`) then `'garry'`. */
+  /** When set, force the user holder for calibration profile lookup. Falls back to config (`emotional_weight.user_holder`) then `'self'`. */
   holderOverride?: string;
   /** Source scope. */
   sourceId?: string;
@@ -153,13 +173,17 @@ export interface BrainstormOptions {
   /** Stderr sink — defaults to process.stderr.write. Tests pipe into a buffer. */
   stderrWrite?: (s: string) => void;
   /**
-   * Maximum projected cost in USD before the run aborts. Default $5.
+   * Maximum projected cost in USD before the run aborts (`--max-usd`,
+   * legacy `--max-cost`). Undefined = the $5 default; null = `--max-usd off`.
    * The pre-run estimate is compared against this ceiling; if higher, we
    * abort with a paste-ready error (unless `skipCostPreview` is set AND
    * the caller is non-interactive — then we still abort, the ceiling is
-   * a hard limit).
+   * a hard limit). A user cap refuses a run on a model nothing prices; the
+   * default warns and runs it (#5873, see cost-gate.ts).
    */
-  maxCostUsd?: number;
+  maxCostUsd?: number | null;
+  /** The cap flag as the user typed it, for the cap notice. */
+  maxCostFlag?: string;
   /**
    * Hard cap on the domain-bank far set. Default 50. Threaded into
    * `fetchFar` to prevent the "2K prefix" explosion on large brains.
@@ -198,6 +222,13 @@ export interface BrainstormOptions {
    * A5: bypass the 7-day staleness gate when --resume is set.
    */
   forceResume?: boolean;
+  /**
+   * Slug the caller will save the result page under. Recorded in the
+   * checkpoint on the first run and echoed back as `BrainstormResult.idea_slug`
+   * on `--resume`, so the re-scored page overwrites the one the failed run
+   * saved instead of landing under a fresh nonce.
+   */
+  ideaSlug?: string;
 }
 
 /** One idea emitted to the user, with citation transparency (D6). */
@@ -237,12 +268,21 @@ export interface BrainstormResult {
   short_of_target: boolean;
   /** True iff judge phase failed and ideas were saved unscored (D12). */
   judge_failed: boolean;
+  /**
+   * Slug to save this run's page under: the checkpoint's recorded slug when
+   * resuming a run that already saved one, else the caller's `ideaSlug`.
+   */
+  idea_slug?: string;
   /** Cost actuals (codex r2 #10). */
   cost: {
     estimated_usd: number;
     actual_usd: number;
     input_tokens: number;
     output_tokens: number;
+    /** The USD cap the run held, or null when the user turned it off. */
+    cap_usd: number | null;
+    /** `user` for a cap flag (including off), `default` for the $5 default. */
+    cap_source: 'user' | 'default';
   };
 }
 
@@ -251,24 +291,28 @@ export interface BrainstormResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Per-profile cost estimate. brainstorm: ~$0.05-0.15. lsd: ~$0.20-0.40.
- * Real numbers depend on configured model; we anchor on Sonnet pricing.
- * The estimate is informational — operators see actuals printed at run-end.
+ * Per-profile cost estimate. At Sonnet pricing ($3/M in, $15/M out — the
+ * gateway fallback), this formula yields brainstorm ~$0.8 and lsd ~$1.0;
+ * it scales linearly with the configured chat model's pricing (a Haiku 4.5
+ * chat_model at $1/$5 lands exactly 3x lower). Operator `pricing.overrides`
+ * win over the shipped tables and the judge share is priced at the judge
+ * model (#5873). The estimate is informational — operators see actuals
+ * printed at run-end.
  */
-export function estimateCost(profile: BrainstormProfile, model: string): number {
+export function estimateCost(
+  profile: BrainstormProfile,
+  model: string,
+  pricingOverrides?: PricingOverrides,
+  judgeModel: string = model,
+): number {
   const crosses = profile.k_close * profile.m_far;
   const ideas = crosses * profile.ideas_per_cross;
   // Rough per-cross budget: ~3K in, ~1.5K out (prompt + ideas).
   const inTokens = crosses * 3000;
   const outTokens = ideas * 250;
   // Judge: one batch ~ all ideas in, ~200 tokens per scored idea out.
-  const judgeIn = ideas * 350;
-  const judgeOut = ideas * 200;
-
-  const pricing = canonicalLookup(model) ?? { input: 3, output: 15 };
-  const inCost = ((inTokens + judgeIn) / 1_000_000) * pricing.input;
-  const outCost = ((outTokens + judgeOut) / 1_000_000) * pricing.output;
-  return inCost + outCost;
+  return chatCostUsd(model, inTokens, outTokens, pricingOverrides)
+    + judgeCostUsd(judgeModel, ideas, pricingOverrides);
 }
 
 /** Pretty-print a USD cost with 2 decimals + leading dollar. */
@@ -277,25 +321,41 @@ function fmtUsd(n: number): string {
 }
 
 /**
- * Print the cost estimate + 10s TTY grace window. Non-TTY (cron, scripted)
- * auto-proceeds. `--yes` short-circuits via `skipCostPreview: true`.
+ * Print the cost estimate + 10s TTY grace window for a human at a terminal.
+ * Unattended runs (no human: isInteractive() false) proceed under the hard
+ * cap and print an [AGENT] note naming it. `--yes` short-circuits via `skipCostPreview: true`.
  *
  * Returns true iff the user pressed Ctrl-C during the grace window.
  */
 export async function previewCostAndWait(opts: {
   profile: BrainstormProfile;
   model: string;
+  pricingOverrides?: PricingOverrides;
+  /** Model the judge share is priced at; defaults to `model`. */
+  judgeModel?: string;
   skip: boolean;
   stderrWrite: (s: string) => void;
   /** Test seam — override the wait so suites don't hang. */
   graceMs?: number;
+  /** The hard cost ceiling the run proceeds under (printed for unattended runs). */
+  capUsd?: number;
+  /** Test seam — default isInteractive(). */
+  interactive?: boolean;
 }): Promise<{ aborted: boolean; estimate: number }> {
-  const estimate = estimateCost(opts.profile, opts.model);
-  const isTTY = typeof process !== 'undefined' && process.stderr?.isTTY === true;
+  const estimate = estimateCost(opts.profile, opts.model, opts.pricingOverrides, opts.judgeModel);
+  const interactive = opts.interactive ?? isInteractive();
   opts.stderrWrite(
-    `[${opts.profile.label}] estimated cost: ${fmtUsd(estimate)} (${opts.profile.k_close}×${opts.profile.m_far} = ${opts.profile.k_close * opts.profile.m_far} crosses × ${opts.profile.ideas_per_cross} ideas + judge)\n`
+    `[${opts.profile.label}] estimated cost: ${fmtUsd(estimate)}${peakRateNote([opts.model, opts.judgeModel])} (${opts.profile.k_close}×${opts.profile.m_far} = ${opts.profile.k_close * opts.profile.m_far} crosses × ${opts.profile.ideas_per_cross} ideas + judge)\n`
   );
-  if (opts.skip || !isTTY) {
+  if (opts.skip) return { aborted: false, estimate };
+  if (!interactive) {
+    // A4 "no silent flip": unattended runs keep proceeding, under the hard cap, and say so.
+    opts.stderrWrite(agentBlock({
+      why: `${opts.profile.label} runs unattended: about ${fmtUsd(estimate)} of model spend${opts.capUsd !== undefined ? `, hard-capped at ${fmtUsd(opts.capUsd)} (--max-usd)` : ''}.`,
+      consent: 'paid',
+      next: 'run',
+      if_no: 'Tell the user the spend is happening; lower it with --max-usd <usd>.',
+    }));
     return { aborted: false, estimate };
   }
   opts.stderrWrite(`[${opts.profile.label}] Press Ctrl-C within 10s to abort, or wait to proceed...\n`);
@@ -485,9 +545,45 @@ const DEFAULT_PARALLELISM = 4;
  * src/core/errors.ts (the v0.19.0 envelope every new agent-facing
  * surface uses) rather than introducing a new BrainstormError class.
  */
+/** File-config slice the orchestrator reads (see loadConfig in core/config.ts). */
+export interface BrainstormRunConfig {
+  embedding_model?: string;
+  chat_model?: string;
+  emotional_weight?: { user_holder?: string };
+}
+
+/**
+ * Model used for the cost preview + hard cost ceiling. Mirrors what the
+ * gateway will actually run: explicit --model override, else the configured
+ * gateway's chat model (which carries the DB-plane `models.tier.*` /
+ * `models.default` overrides the file config lacks, #5873), else the file
+ * config's chat_model, else the hardcoded gateway fallback. Before this
+ * resolved through config, a non-Sonnet chat_model got its preview priced
+ * against the wrong model. (Takeover of PR #1855 by @starm2010.)
+ */
+export function resolveBrainstormChatModel(
+  config: { chat_model?: string },
+  modelOverride?: string,
+  gatewayChatModel?: string | null,
+): string {
+  return modelOverride ?? gatewayChatModel ?? config.chat_model ?? 'anthropic:claude-sonnet-4-6';
+}
+
+/** Models and cost gate resolved once per run, before the tracker scope opens. */
+interface BrainstormRunPlan {
+  chatModel: string;
+  /** Judge model from --judge-model, `models.brainstorm.judge` or the --model override; undefined runs the gateway default. */
+  judgeModel: string | undefined;
+  gate: BrainstormCostGate;
+}
+
+// Judge-model precedence lives beside the cost gate that prices it, so the
+// brainstorm_health doctor check reads it without this module's imports.
+export { resolveBrainstormJudgeModel };
+
 export async function runBrainstorm(
   engine: BrainEngine,
-  config: { embedding_model?: string; emotional_weight?: { user_holder?: string } },
+  config: BrainstormRunConfig,
   opts: BrainstormOptions
 ): Promise<BrainstormResult> {
   // v0.39.3.0 (Phase 5, CV11+T4): outer try/catch around the orchestrator
@@ -509,7 +605,7 @@ export async function runBrainstorm(
 
 async function runBrainstormImpl(
   engine: BrainEngine,
-  config: { embedding_model?: string; emotional_weight?: { user_holder?: string } },
+  config: BrainstormRunConfig,
   opts: BrainstormOptions,
 ): Promise<BrainstormResult> {
   // v0.39.0.0 T10: install a gateway-layer BudgetTracker scope around the
@@ -520,30 +616,60 @@ async function runBrainstormImpl(
   // estimated call leaks past the ceiling (TX1). BudgetExhausted is NOT
   // SQLSTATE 57014, so the outer classifyBrainstormError lets it pass
   // through with its original shape (which the CLI formatter renders).
-  const _runTracker = new BudgetTracker({
-    label: `brainstorm.${opts.profile?.label ?? 'brainstorm'}`,
-    maxCostUsd: opts.maxCostUsd ?? 5,
+  //
+  // #5873: the cap carries its source. A user cap refuses a run that would
+  // call a model nothing prices, before any work, with the shared no_pricing
+  // guidance; the $5 default is a `default` cap, so the tracker warns and
+  // runs an unpriced model while still metering priced calls. Every price in
+  // the run reads operator `pricing.overrides`.
+  const label = opts.profile?.label ?? 'brainstorm';
+  const stderr = opts.stderrWrite ?? ((s: string) => { process.stderr.write(s); });
+  const pricingOverrides = await loadPricingOverrides(engine);
+  const chatModel = resolveBrainstormChatModel(config, opts.modelOverride, configuredChatModel());
+  const judgeModel = (await resolveBrainstormJudgeModel(engine, opts.judgeModel)) ?? opts.modelOverride;
+  const gate = resolveBrainstormCostGate({
+    maxCostUsd: opts.maxCostUsd,
+    crossModel: chatModel,
+    judgeModel: judgeModel ?? chatModel,
+    pricingOverrides,
   });
-  return withBudgetTracker(_runTracker, () => _runBrainstormInner(engine, config, opts));
+  const refusal = userCapNoPricingRefusal(gate, opts.embedQueryFn ? null : configuredEmbeddingModel(), label);
+  if (refusal) throw refusal;
+  stderr(`[${label}] ${capNotice({ usd: gate.ceilingUsd, source: gate.capSource, flag: opts.maxCostFlag })}\n`);
+  if (gate.capSource === 'default') {
+    for (const { model, role } of gate.unpricedChatModels) {
+      stderr(
+        `[${label}] ${role} model "${model}" has no price: the default ${fmtUsd(gate.ceilingUsd!)} cap cannot meter its calls, ` +
+        `so the estimate, mid-run and pre-judge checks count it at Sonnet rates. To meter its real price, register it: ` +
+        `${pricingSetCommand(model, 'chat')}\n`,
+      );
+    }
+  }
+  const _runTracker = new BudgetTracker({
+    label: `brainstorm.${label}`,
+    ...(gate.ceilingUsd !== null ? { maxCostUsd: gate.ceilingUsd, capSource: gate.capSource } : {}),
+    pricingOverrides,
+  });
+  return withBudgetTracker(_runTracker, () =>
+    _runBrainstormInner(engine, config, opts, { chatModel, judgeModel, gate }));
 }
 
 async function _runBrainstormInner(
   engine: BrainEngine,
-  config: { embedding_model?: string; emotional_weight?: { user_holder?: string } },
+  config: BrainstormRunConfig,
   opts: BrainstormOptions,
+  plan: BrainstormRunPlan,
 ): Promise<BrainstormResult> {
   const profile = opts.profile ?? BRAINSTORM_PROFILE;
   const stderr = opts.stderrWrite ?? ((s: string) => { process.stderr.write(s); });
   const chat = opts.chatFn ?? defaultChat;
-  const embedFn = opts.embedQueryFn ?? embedQuery;
+  const embedFn = opts.embedQueryFn ?? ((q: string) => embedQueryWithPrefix(engine, q));
 
   // ---- Phase 0: cost preview + TTY grace ----
-  const modelStr = opts.modelOverride ?? 'anthropic:claude-sonnet-4-6';
   const { aborted, estimate } = await previewCostAndWait({
-    profile,
-    model: modelStr,
+    profile, model: plan.chatModel, pricingOverrides: plan.gate.pricingOverrides, judgeModel: plan.gate.judgeModel,
     skip: opts.skipCostPreview === true,
-    stderrWrite: stderr,
+    stderrWrite: stderr, capUsd: plan.gate.ceilingUsd ?? undefined,
   });
   if (aborted) {
     throw new Error('brainstorm: aborted before run (Ctrl-C during cost preview window)');
@@ -556,11 +682,11 @@ async function _runBrainstormInner(
   // the wild on a 13K-page brain) because `m_far` got blown out by
   // un-capped prefix sampling. We refuse to start if the *estimate alone*
   // already exceeds the user's ceiling.
-  const maxCostUsd = opts.maxCostUsd ?? 5;
-  if (estimate > maxCostUsd) {
+  const maxCostUsd = plan.gate.ceilingUsd;
+  if (maxCostUsd !== null && estimate > maxCostUsd) {
     throw new BudgetExhausted(
       `${profile.label}: estimated cost ${fmtUsd(estimate)} exceeds --max-cost ${fmtUsd(maxCostUsd)}. ` +
-      `Lower --limit, raise --max-cost, or pass --max-far-set <n> to cap the domain bank.`,
+      `Lower --limit, ${ceilingRemedy(plan.gate)}, or pass --max-far-set <n> to cap the domain bank.`,
       { reason: 'cost', spent: estimate, cap: maxCostUsd },
     );
   }
@@ -568,7 +694,7 @@ async function _runBrainstormInner(
   // ---- Phase 1: question embedding + close-set retrieval ----
   let questionEmbedding: Float32Array | null = null;
   try {
-    questionEmbedding = await embedFn(opts.question);
+    if (!await embeddingSendBlocked(engine)) questionEmbedding = await embedFn(opts.question);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     stderr(`[${profile.label}] WARN: question embedding failed (${msg}); distance scores will be neutral.\n`);
@@ -576,6 +702,7 @@ async function _runBrainstormInner(
 
   // hybridSearch for close-set. Limit to profile.k_close. Source-scoped.
   let closeResults = await hybridSearch(engine, opts.question, {
+    ...INTERNAL_BREADTH_SEARCH_OPTS,
     limit: profile.k_close,
     sourceId: opts.sourceId,
     sourceIds: opts.sourceIds,
@@ -623,7 +750,7 @@ async function _runBrainstormInner(
   }
 
   // ---- Phase 3: calibration context (cold-start fallback) ----
-  const holder = opts.holderOverride ?? config.emotional_weight?.user_holder ?? 'garry';
+  const holder = resolveOwnerHolder({ override: opts.holderOverride, configValue: config.emotional_weight?.user_holder });
   const calibContext = await loadCalibrationContext(engine, {
     holder,
     sourceId: opts.sourceId,
@@ -715,6 +842,7 @@ async function _runBrainstormInner(
     completed_crosses: prevCheckpoint?.completed_crosses.slice() ?? [],
     failed_crosses: prevCheckpoint?.failed_crosses.slice() ?? [],
     judge_done: false,
+    idea_slug: prevCheckpoint?.idea_slug ?? opts.ideaSlug,
   };
   let crossesSinceFlush = 0;
   const flush = (): void => {
@@ -723,7 +851,7 @@ async function _runBrainstormInner(
   };
 
   let totalUsage = { input_tokens: 0, output_tokens: 0 };
-  let crossModel = modelStr;
+  let crossModel = plan.chatModel;
 
   // Parallelize chat calls bounded at DEFAULT_PARALLELISM.
   const rawIdeasByCross = await mapWithConcurrency(crosses, DEFAULT_PARALLELISM, async (cross) => {
@@ -759,11 +887,8 @@ async function _runBrainstormInner(
       crossModel = result.model;
       // Mid-run cost guard: if running spend already exceeds the projected
       // ceiling or the strict-budget multiplier, abort the remaining crosses.
-      const runningPricing = canonicalLookup(result.model) ?? { input: 3, output: 15 };
-      const runningUsd =
-        (totalUsage.input_tokens / 1_000_000) * runningPricing.input +
-        (totalUsage.output_tokens / 1_000_000) * runningPricing.output;
-      if (runningUsd > maxCostUsd) {
+      const runningUsd = chatCostUsd(result.model, totalUsage.input_tokens, totalUsage.output_tokens, plan.gate.pricingOverrides);
+      if (maxCostUsd !== null && runningUsd > maxCostUsd) {
         throw new BudgetExhausted(
           `${profile.label}: running cost ${fmtUsd(runningUsd)} exceeded --max-cost ${fmtUsd(maxCostUsd)} mid-run; aborting remaining crosses`,
           { reason: 'cost', spent: runningUsd, cap: maxCostUsd },
@@ -846,8 +971,9 @@ async function _runBrainstormInner(
       close_slug: i.close_slug,
       far_slug: i.far_slug,
     }));
+    assertJudgeWithinCeiling(plan.gate, crossModel, totalUsage, judgeInput.length, profile.label);
     const judgeResult = await runJudge(profile.judge_config, judgeInput, {
-      modelOverride: opts.judgeModel ?? opts.modelOverride,
+      modelOverride: plan.judgeModel,
       chatFn: opts.chatFn,
       activeBiasTags: activeBiasTags ?? undefined,
       abortSignal: opts.abortSignal,
@@ -864,7 +990,7 @@ async function _runBrainstormInner(
   } catch (err) {
     judgeFailed = true;
     const msg = err instanceof Error ? err.message : String(err);
-    stderr(`[${profile.label}] WARN: judge phase failed (${msg}); saving ideas unscored. Re-run with --retry-judge to score.\n`);
+    stderr(`[${profile.label}] WARN: judge phase failed (${msg}); saving ideas unscored. Re-score with: gbrain ${profile.label} --resume ${runId} (see --list-runs)\n`);
   }
 
   // ---- Phase 5: assemble BrainstormResult ----
@@ -885,16 +1011,25 @@ async function _runBrainstormInner(
   // Cost actuals (codex r2 #10).
   const totalIn = totalUsage.input_tokens + judgeUsage.input_tokens;
   const totalOut = totalUsage.output_tokens + judgeUsage.output_tokens;
-  const pricing = canonicalLookup(crossModel) ?? { input: 3, output: 15 };
-  const actual = (totalIn / 1_000_000) * pricing.input + (totalOut / 1_000_000) * pricing.output;
+  const actual = chatCostUsd(crossModel, totalIn, totalOut, plan.gate.pricingOverrides);
   stderr(`[${profile.label}] actual cost: ${fmtUsd(actual)} (estimated ${fmtUsd(estimate)}) — in=${totalIn} out=${totalOut} tokens\n`);
 
   // TX4: surface --resume hint when any cross failed during this run.
   // The user can re-run with `--resume <run_id>` and we'll retry only
   // the missing crosses (failed_crosses + never-attempted).
+  //
+  // #4766: a judge failure keeps the checkpoint too. The flush above already
+  // persisted every completed cross with judge_done=false, so `--resume` is
+  // the judge-only retry: completed crosses short-circuit from disk and
+  // Phase 4 re-runs. Pre-fix this branch keyed on failed_crosses alone, so
+  // all-crosses-green + judge-failed marked judge_done and unlinked the file.
   if (liveCheckpoint.failed_crosses.length > 0) {
     stderr(
       `[${profile.label}] ${liveCheckpoint.failed_crosses.length} cross(es) failed. Resume with: gbrain ${profile.label} --resume ${runId}\n`,
+    );
+  } else if (judgeFailed) {
+    stderr(
+      `[${profile.label}] Judge failed; ${liveCheckpoint.completed_crosses.length} cross(es) kept in checkpoint ${runId}. Re-score with: gbrain ${profile.label} --resume ${runId}\n`,
     );
   } else {
     // Clean completion — every cross succeeded. Clear the checkpoint so we
@@ -919,11 +1054,14 @@ async function _runBrainstormInner(
     active_bias_tags: activeBiasTags,
     short_of_target: farResult.short_of_target,
     judge_failed: judgeFailed,
+    idea_slug: liveCheckpoint.idea_slug,
     cost: {
       estimated_usd: estimate,
       actual_usd: actual,
       input_tokens: totalIn,
       output_tokens: totalOut,
+      cap_usd: plan.gate.ceilingUsd,
+      cap_source: plan.gate.capSource,
     },
   };
 }
@@ -970,7 +1108,7 @@ export function formatBrainstormMarkdown(
     lines.push(`# ${result.profile_label === 'lsd' ? 'LSD' : 'Brainstorm'}: ${result.question}`);
     lines.push('');
     if (result.judge_failed) {
-      lines.push('> **Judge phase failed mid-run** — ideas below are unscored. Re-run with `--retry-judge` to score.');
+      lines.push('> **Judge phase failed mid-run** — ideas below are unscored. Re-score with `--resume <run_id>` (see `--list-runs`).');
       lines.push('');
     }
     if (result.short_of_target) {

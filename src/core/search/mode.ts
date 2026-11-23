@@ -23,9 +23,36 @@
  * embedding similarity. See `[CDX-4]` in the plan.
  */
 
+import { normalizeChainSlots } from './relational-chain.ts';
 import { createHash } from 'crypto';
 import { CR_MODES, type CRMode } from '../types.ts';
+import { getFtsLanguage } from '../fts-language.ts';
+import { privateFactSources, privateReadableSources, currentCallerAccess } from './private-visibility.ts';
+import { loadConfigSnapshot, type BulkConfigReader } from '../config-snapshot.ts';
+import { pickDecideConfig } from '../ai/decide/config.ts';
 import { getRecipe } from '../ai/recipes/index.ts';
+import { engineRerankerModel } from '../ai/engine-gateway.ts';
+// #3657 seam: the runtime/mode-bundle reranker default has ONE code home
+// (ai/defaults.ts — a leaf module, no SDK loads). The three bundles below
+// resolve through DEFAULT_RERANKER_MODEL (voyage:rerank-3-lite, gbrain-evals #148).
+import { DEFAULT_RERANKER_MODEL } from '../ai/defaults.ts';
+import { normalizeExpansionVariantBudget } from './fusion-lists.ts';
+import { DEFAULT_RELATIONAL_RERANK_PIN, normalizeRelationalRerankPin } from './relational-rerank-pin.ts';
+import { normalizeKeywordArmConfidenceFloor } from './arm-confidence.ts';
+import { normalizeDiversePoolDepth } from './diverse-pool.ts';
+import {
+  DEFAULT_METADATA_BOOST_GATE,
+  normalizeMetadataBoostGate,
+  type MetadataBoostGate,
+} from './metadata-boost-gate.ts';
+import {
+  DEFAULT_RERANK_GATE,
+  DEFAULT_RERANK_GATE_MIN_GAP,
+  normalizeRerankGate,
+  normalizeRerankGateMinGap,
+  type RerankGateMode,
+} from './crag.ts';
+import { DEFAULT_HIGH_COSINE_FLOOR } from './evidence.ts';
 
 /**
  * Look up the `reranker.default_timeout_ms` declared by the resolved
@@ -72,42 +99,72 @@ export interface ModeBundle {
   /** Zero-LLM intent classifier weight adjustments (PR #897). On for everyone. */
   intentWeighting: boolean;
   /**
+   * Keyword-arm AND→OR zero-recall fallback (fix/title-retrieval-arm, D2).
+   * websearch AND semantics at chunk grain mean one non-co-occurring token
+   * zeroes keyword recall; the fallback retries once with OR-of-terms.
+   * On corpora the FTS config can't stem (CJK/agglutinative text under
+   * 'english') the OR retry can match a large fraction of the corpus, and
+   * ts_rank has no IDF to demote common-token hits — the relaxed rows read
+   * as noise in the RRF blend. This knob lets those corpora turn the
+   * fallback off. Default on (the previous hardcoded behavior).
+   */
+  keywordOrFallback: boolean;
+  /**
    * Per-call token budget cap (PR #897). undefined = no-op (tokenmax).
    * 4000 = tight (conservative, fits Haiku context loop).
    * 12000 = balanced (sweet-spot for Sonnet).
    */
   tokenBudget: number | undefined;
   /**
-   * LLM multi-query expansion (Haiku call per search).
-   * Per CLAUDE.md TODOS the corpus eval shows ~97.6% lift relative to no
-   * expansion — barely measurable. Off for conservative/balanced;
-   * on for tokenmax to preserve power-user retrieval ceiling.
+   * LLM multi-query expansion (one chat call per expanded search). The
+   * `query` op's default when a call leaves `expand` unset; `search` and the
+   * memory verbs never expand. Off in every bundle (gbrain-evals GBRA-94).
+   * Override: per-call `expand` → `search.expansion` → bundle.
    */
   expansion: boolean;
   /**
+   * Total RRF weight budget shared by every LLM-expansion variant list (and
+   * any clause-decomposition list) at fusion time; the original query's list
+   * always keeps weight 1. `null` = legacy: every list fuses at weight 1,
+   * byte-identical to the pre-knob path. A number `b` in (0, 4] is split
+   * equally across the VOTING variant lists: `weight_i = b / n_voting_arms`
+   * where n_voting_arms counts the NON-EMPTY variant/clause lists (an empty
+   * list casts no vote and does not dilute the budget — same formula as the
+   * fusion-lists.ts header), so total expansion influence no longer scales
+   * with the nondeterministic variant count. Range/parse contract lives in
+   * ONE place: `normalizeExpansionVariantBudget` (fusion-lists.ts), used by
+   * the config parser AND both per-call seams in hybrid.ts.
+   * Arithmetic: two variants agreeing on a distractor at rank 0 tie
+   * the original's rank-0 vote exactly at `b = 1.0`; legacy with two variants
+   * is ≈ `b = 2.0`; `b = 0.5` subordinates them. Receipt (LongMemEval-S strict
+   * recall_all@5, recorded expansions, reranker off, gbrain-evals 2026-10-04):
+   * legacy-weight expansion 436/470 vs plain hybrid 434/470 (+6/−4, p = 0.75)
+   * — no measured gain. No-op when `expansion` is off.
+   * Override: per-call → `search.expansion_variant_budget` config → bundle.
+   */
+  expansion_variant_budget: number | null;
+  /**
    * Default `limit` for the operation layer (`src/core/operations.ts:1087`).
-   * Note: production `query` op TODAY defaults to 20. Mode bundle becomes
-   * the default ONLY when the caller omits the field — same chain semantics
-   * as model-tier resolution. See `[CDX-1+2+3]` in the plan: the original
-   * "tokenmax preserves Garry's setup" framing is wrong; tokenmax is an
-   * EXPANSION from the implicit current default (limit 20).
+   * Mode bundle becomes the default ONLY when the caller omits the field —
+   * same chain semantics as model-tier resolution. See `[CDX-1+2+3]` in the
+   * plan: the original "tokenmax preserves Garry's setup" framing is wrong;
+   * tokenmax is an EXPANSION from the implicit historical default (limit 20).
+   * (That flat-20 default no longer exists anywhere in `query`: #4360 fixed
+   * the text/hybrid path's cache-hit slice, #4356 Problem 2 fixed the
+   * image-similarity branch. `search_by_image`, a separate op with no mode
+   * param, still hard-defaults to 20 — a different public contract.)
    */
   searchLimit: number;
   /**
-   * v0.35.0.0+ — cross-encoder reranker. Off for conservative/balanced,
-   * on for tokenmax. ZeroEntropy zerank-2 by default; can be overridden
-   * via `search.reranker.model`. Slots between dedup and token-budget
+   * v0.35.0.0+ — cross-encoder reranker. Off for conservative, on for
+   * balanced/tokenmax. Model: `DEFAULT_RERANKER_MODEL` (voyage:rerank-3-lite),
+   * overridable via `search.reranker.model`. Slots between dedup and token-budget
    * enforcement in hybrid.ts; fail-open on any RerankError (audit-logged).
-   * Cost anchor: ~$0.0003/query at tokenmax topNIn=30 × ~400 tokens/chunk
-   * (rounding error vs Opus, meaningful vs Haiku).
+   * Cost anchor: ~$0.0006/query at tokenmax topNIn=50 with rerank-3-lite
+   * (gbrain-evals #148; rounding error vs Opus, meaningful vs Haiku).
    */
   reranker_enabled: boolean;
-  /**
-   * Provider:model for the reranker. Default `'zeroentropyai:zerank-2'`.
-   * Other ZE rerankers (`zerank-1`, `zerank-1-small`) work via the same
-   * recipe; future Cohere/Voyage rerankers drop in as new recipes
-   * declaring `touchpoints.reranker`.
-   */
+
   reranker_model: string;
   /** Candidates to send upstream (default 30). The full result list always
    *  reaches the user — topNIn just caps API spend on the rerank call. */
@@ -149,6 +206,28 @@ export interface ModeBundle {
    * Override: per-call SearchOpts → `search.title_boost` config → bundle.
    */
   title_boost: number | undefined;
+
+  /**
+   * v0.46.15 — cosine floor for evidence's `high_vector_match` (see
+   * evidence.ts DEFAULT_HIGH_COSINE_FLOOR). Config `search.evidence_cosine_floor`.
+   * Labels results and decides the rerank gate's `high_vector_match` grade
+   * (`reranker_gate`), so it is part of knobsHash (`ecf=`, v=31).
+   */
+  evidence_cosine_floor: number | undefined;
+  /**
+   * W3 — confidence-gated reranking (crag.ts `gradePreRerank`). `off` never
+   * grades; `shadow` grades the deduped candidates before the cross-encoder,
+   * stamps `meta.rerank_gate` and still reranks (results identical to `off`).
+   * `off` in every bundle. Override: per-call HybridSearchOpts.rerankGate →
+   * `search.reranker.gate` → bundle. knobsHash part `rrg=`.
+   */
+  reranker_gate: RerankGateMode;
+  /**
+   * W3 — δ: the cosine margin a `high_vector_match` rank-1 needs over the best
+   * candidate from a different page before the gate calls it strong. [0, 1].
+   * Override: `search.reranker.gate_min_gap` → bundle. knobsHash part `rrgg=`.
+   */
+  reranker_gate_min_gap: number;
 
   // v0.36 cross-modal wave knobs (D2 + D3 + D6 + D8 + D13 + LLM-intent).
   // All three mode bundles default these to the same values — cross-modal
@@ -244,9 +323,8 @@ export interface ModeBundle {
   contextual_retrieval_disabled: boolean;
 
   /**
-   * v0.42.3.0 — autocut (score-discontinuity result-sizing). Default OFF for
-   * conservative (no reranker → no trustworthy cliff signal; would no-op
-   * anyway), ON for balanced + tokenmax. When on AND a reranker scored ≥2
+   * autocut (score-discontinuity result-sizing). OFF in every bundle: conservative has no reranker (no cliff
+   * signal); balanced/tokenmax turned it off on the ranker wave's rule R2 receipt (balanced note). When on AND a reranker scored ≥2
    * items, hybridSearch cuts the ranked set at the largest cross-encoder
    * rerank-score gap (instead of returning the full top-K). No-op without a
    * reranker. Override path: per-call SearchOpts.autocut → `search.autocut`
@@ -261,6 +339,19 @@ export interface ModeBundle {
    * run. Override: `search.autocut_jump` config → mode bundle.
    */
   autocut_jump: number;
+
+  autocut_min_top: number;
+  /**
+   * Autocut floor: never trim the returned set below this many results when
+   * candidates exist. Default 1 (the never-empty failsafe — the previous
+   * hardcoded behavior, so nothing changes unless an operator opts in).
+   * Raising it protects "deep but present" answers on score curves without a
+   * dramatic cliff (a reranker whose scores decay smoothly makes the largest
+   * gap a noisy cut signal) — useful when the consumer is an LLM that reads
+   * the whole returned list, where "deep but visible" beats "trimmed away".
+   * Override: `search.autocut_min_keep` config → mode bundle.
+   */
+  autocut_min_keep: number;
   /**
    * v0.43 — relational recall arm. When on, a relational query ("who invested
    * in widget-co", "what connects fund-a and fund-b") resolves its seed
@@ -273,6 +364,118 @@ export interface ModeBundle {
   relationalRetrieval: boolean;
   /** v0.43 — max hops for relational traversal. Default 2, hard-capped at 3. */
   relational_retrieval_depth: number;
+  /**
+   * Ranker wave (R1 receipt) — relational-arm rows bypass reranker DEMOTION.
+   * After the cross-encoder reorders the pool, up to this many relational-arm
+   * rows are re-pinned above the reranked text rows in their fused (RRF)
+   * order (a permutation; one row per page; a row the reranker itself ranked
+   * higher keeps that position). The cross-encoder scores chunk TEXT, and an
+   * edge-derived answer's text need not mention the query's entity, so it
+   * demotes exactly the rows the arm exists to surface: NamedThingBench
+   * relational fixture, balanced default, hit@1 21/39 → 3/39 and hit@3
+   * 27/39 → 5/39 with the reranker on (scripts/r1-namedthing-rerank-ab.ts).
+   * `0` disables (pre-pin ranking); range [0, 10] via the ONE contract
+   * `normalizeRelationalRerankPin` (relational-rerank-pin.ts). No-op for
+   * non-relational queries, when the reranker did not reorder (off / fail-open),
+   * and for image modality. Override: per-call SearchOpts.relationalRerankPin →
+   * `search.relational_rerank_pin` config → bundle. Pinned rows survive
+   * autocut (`relational_pinned` stamp) and are excluded from its cliff math.
+   */
+  relational_rerank_pin: number;
+  /**
+   * Multi-relation planner: questions that chain 2-3 typed relations ("who
+   * founded the companies Alice invested in?") walk typed hop chains
+   * (relational-plan.ts + relational-chain.ts). Also routes keyless `recall`
+   * relational questions through the relational arm. Override: per-call
+   * SearchOpts.relationalPlanner → `search.relational_planner` → bundle.
+   */
+  relational_planner: boolean;
+  /**
+   * Typed one-hop walks read edges stored from either page's side by the
+   * relation's type signature (opt-in; `null` follows `relational_planner`). Override:
+   * per-call SearchOpts.relationalOrientOneHop → `search.relational_orient_onehop`.
+   */
+  relational_orient_onehop: boolean | null;
+  /**
+   * Chain slots: when a multi-hop chain fired, up to this many chain rows
+   * (answers, then their evidence pages) lead page 1. 0 = only the single
+   * page-1 evidence slot. Override: per-call SearchOpts.relationalChainSlots →
+   * `search.relational_chain_slots` (0..10).
+   */
+  relational_chain_slots: number;
+  /**
+   * Session-diverse candidate pool before the reranker (BEAM-1M S1). When N > 0:
+   * every retrieval arm fetches at least N candidates (still capped at
+   * MAX_SEARCH_LIMIT), the deduped pool keeps one row per session (pages
+   * sharing a `sessionPrefix`, otherwise one page), and the reranker reads at
+   * least N candidates, so one session's chunks cannot fill the window the
+   * gold competes for. 0 = off (every bundle). Override:
+   * `search.diverse_pool_depth` (0..100).
+   */
+  diverse_pool_depth: number;
+  /**
+   * Result-time collapse (search/collapse.ts, #4612 #7153 #7154): a same-slug
+   * twin in another source, a redirect stub and copies of one document fold
+   * into the best-ranked row, which lists them in `collapsed`. On in every
+   * bundle. Override: `search.collapse` (boolean).
+   */
+  collapse: boolean;
+  /**
+   * Rank priors after the reranker (search/rank-priors.ts, #7155 #7162
+   * #6058): organization over person when the query names no person, weak
+   * OCR matches, dated over undated rows on 'when' questions. On in every
+   * bundle. Override: `search.rank_priors` (boolean).
+   */
+  rank_priors: boolean;
+  /** #7175: keyword phrase factor (sql-ranking.ts KEYWORD_PHRASE_FACTOR). Off in every bundle (opt-in). Override: `search.keyword_phrase` (boolean). */
+  keyword_phrase: boolean;
+  /** Qualified alias hop (alias-hop.ts): a 3-6 token sub-phrase of the query that is one readable page's alias leads. Off in every bundle (opt-in). Override: `search.qualified_aliases` (boolean). */
+  qualified_aliases: boolean;
+  /** Qualified title boost (intent-weights.ts): a person or company title mentioned inside the query. Off in every bundle (opt-in). Override: `search.title_qualified` (boolean). */
+  title_qualified: boolean;
+  /**
+   * Ranker wave (Phase E2, Cat 13) — arm-confidence-weighted fusion of the
+   * LEXICAL arms (arm-confidence.ts). When the keyword arm's scale-free
+   * confidence `margin_ratio = top / (top + second)` over its returned rows
+   * (1 for a single row, 0 when empty) is BELOW this floor, the keyword AND
+   * title lists fuse at weight 0.5 (k×2 in the old k-only form) — but only
+   * when a text vector arm voted and the query is not relational; never on
+   * the keyword-only fallback paths. `null` = off (byte-identical fusion).
+   * Receipt (Cat 13 conceptual recall, Voyage space voyage-4@1024, reranker
+   * off, autocut off): hybrid nDCG@5 53.0 on the held-out concepts vs bare
+   * vector 60.5 (P@1 48.1 vs 65.2); grep-only 52.2 — the keyword arm's noise
+   * on paraphrase probes drags the fused result below the vector arm.
+   * Every bundle lands at `null`; the Phase E2 receipt decides the flip, with
+   * the floor calibrated as the median `margin_ratio` (read from
+   * `HybridSearchMeta.keyword_arm_confidence` with the knob off) over
+   * tuning-split probes whose keyword top hit is NOT gold. Range `(0, 1]`
+   * via the ONE contract `normalizeKeywordArmConfidenceFloor`. Override:
+   * per-call SearchOpts.keywordArmConfidenceFloor →
+   * `search.keyword_arm_confidence_floor` config (`off` = null) → bundle.
+   */
+  keyword_arm_confidence_floor: number | null;
+  /**
+   * Ranker wave (Phase E3, Cat 13) — post-fusion METADATA boost gate
+   * (metadata-boost-gate.ts). `always` = today's pipeline: backlink, salience,
+   * recency (+ chronicle), graph-signal and alias-resolved boosts run on every
+   * query. `lexical` = those stages run ONLY when a lexical arm voted in fusion
+   * (a strict keyword row, a title-arm row or a relational row reached
+   * composeFusionLists after the relaxed-row demotion); when the vector arm was
+   * the only voter they are skipped and the vector order stands. Untouched
+   * either way: supersede downrank, exact-match boost, title-phrase boost,
+   * compiled-truth boost, cosine re-score, dedup, reranker, autocut.
+   * Receipt (Cat 13 E1 localization, tuning split): gbrain's own vector arm
+   * nDCG@5 60.3 vs live hybrid 50.6; 73/105 gap probes had BOTH lexical arms
+   * empty while hub pages carried backlink / graph-adjacency / recency boosts
+   * of 1.035–1.124x that the gold concept page never carried (0/96); the gate
+   * fixes 73/105 with 0 collateral (tuning 57.3). Every bundle is `lexical`:
+   * the pre-registered Phase E3 held-out receipt passed (gbrain 57.8 nDCG@5 vs
+   * 53.0 before; NamedThingBench, BrainBench and the LongMemEval dev slice
+   * byte-identical). `always` restores the pre-wave pipeline.
+   * Parse contract in ONE place: `normalizeMetadataBoostGate`. Override: per-call
+   * HybridSearchOpts.metadataBoostGate → `search.metadata_boost_gate` config → bundle. knobsHash part `mbg=`.
+   */
+  metadata_boost_gate: MetadataBoostGate;
 }
 
 /**
@@ -288,13 +491,15 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     cache_similarity_threshold: 0.92,
     cache_ttl_seconds: 3600,
     intentWeighting: true,
+    keywordOrFallback: true,
     tokenBudget: 4000,
     expansion: false,
+    expansion_variant_budget: null,
     searchLimit: 10,
     // v0.35.0.0+: reranker off — conservative is cost-sensitive; reranker
     // spend doesn't fit the tier's value prop.
     reranker_enabled: false,
-    reranker_model: 'zeroentropyai:zerank-2',
+    reranker_model: DEFAULT_RERANKER_MODEL,
     reranker_top_n_in: 30,
     reranker_top_n_out: null,
     reranker_timeout_ms: 5000,
@@ -303,6 +508,9 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     floor_ratio: undefined,
     // T2 — title-phrase boost ON by default (correctness fix, cheap + gated).
     title_boost: 1.25,
+    evidence_cosine_floor: 0.8,
+    reranker_gate: DEFAULT_RERANK_GATE,
+    reranker_gate_min_gap: DEFAULT_RERANK_GATE_MIN_GAP,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -325,26 +533,38 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     // matches graph_signals posture). Power users opt in per-call.
     relationalRetrieval: false,
     relational_retrieval_depth: 2,
+    // Ranker wave (R1) — relational rows re-pinned above reranked text rows (0 = off).
+    relational_rerank_pin: DEFAULT_RELATIONAL_RERANK_PIN,
+    // Multi-hop planner: relational retrieval is off in this tier, so the planner is too.
+    relational_planner: false,
+    relational_orient_onehop: false,
+    relational_chain_slots: 10,
+    diverse_pool_depth: 0,
+    collapse: true,
+    rank_priors: true,
+    keyword_phrase: false,
+    qualified_aliases: false,
+    title_qualified: false,
     autocut_jump: 0.2,
+    autocut_min_top: 0.35,
+    autocut_min_keep: 1,
+    // Ranker wave (Phase E2) — keyword-arm confidence floor OFF (null) until the Cat 13 receipt.
+    keyword_arm_confidence_floor: null,
+    // Phase E3 — metadata boost gate `lexical` (flipped on the Cat 13 held-out receipt); `always` restores the pre-wave pipeline.
+    metadata_boost_gate: 'lexical',
   }),
   balanced: Object.freeze({
     cache_enabled: true,
     cache_similarity_threshold: 0.92,
     cache_ttl_seconds: 3600,
     intentWeighting: true,
+    keywordOrFallback: true,
     tokenBudget: 12000,
     expansion: false,
+    expansion_variant_budget: null,
     searchLimit: 25,
-    // v0.36.0.0 (D6): reranker flipped ON for `balanced` mode bundle. The
-    // real-corpus benchmark shows zerank-2 reshuffles 60% of top-1 results
-    // — the headline ZE quality story reaches the 80% of installs that
-    // stay on `balanced`. Per-query rerank cost ~$0.025/M tokens, ~150ms
-    // p50 added latency. Missing ZEROENTROPY_API_KEY is handled via
-    // src/core/search/rerank.ts fail-open contract: log to audit JSONL,
-    // return input order unchanged. Opt out with
-    // `gbrain config set search.reranker.enabled false`.
     reranker_enabled: true,
-    reranker_model: 'zeroentropyai:zerank-2',
+    reranker_model: DEFAULT_RERANKER_MODEL,
     // v0.42.3.0 D4: topNIn = searchLimit (25) so the cross-encoder scores
     // every result the limit slice will return — no unscored tail for autocut
     // to wrongly drop (Codex #2). Was 30; tracking searchLimit is the
@@ -357,6 +577,9 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     floor_ratio: undefined,
     // T2 — title-phrase boost ON by default (correctness fix, cheap + gated).
     title_boost: 1.25,
+    evidence_cosine_floor: 0.8,
+    reranker_gate: DEFAULT_RERANK_GATE,
+    reranker_gate_min_gap: DEFAULT_RERANK_GATE_MIN_GAP,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -377,29 +600,50 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     // per the cost-tier philosophy.
     contextual_retrieval: 'title' as CRMode,
     contextual_retrieval_disabled: false,
-    // v0.42.3.0 — autocut ON (reranker fires; cliff signal is trustworthy).
-    autocut: true,
+    // autocut OFF (ranker wave, rule R2): the post-rerank cliff dropped the second gold session on
+    // multi-part questions (LME recall_all@5 449→379/470; no floor in {0.10..0.80} passed). `search.autocut true` re-enables.
+    autocut: false,
     // v0.43 — relational recall ON (contingent on the no-regression gate;
     // ships default-false everywhere if the gate flags any regression).
     relationalRetrieval: true,
     relational_retrieval_depth: 2,
+    // Ranker wave (R1) — relational rows re-pinned above reranked text rows (0 = off).
+    relational_rerank_pin: DEFAULT_RELATIONAL_RERANK_PIN,
+    // Multi-hop planner ON, one-hop orientation opt-in: docs/eval/decisions/p7-heldout-2026-10-05.
+    relational_planner: true,
+    relational_orient_onehop: false,
+    relational_chain_slots: 10,
+    diverse_pool_depth: 0,
+    collapse: true,
+    rank_priors: true,
+    keyword_phrase: false,
+    qualified_aliases: false,
+    title_qualified: false,
     autocut_jump: 0.2,
+    autocut_min_top: 0.35,
+    autocut_min_keep: 1,
+    // Ranker wave (Phase E2) — keyword-arm confidence floor OFF (null) until the Cat 13 receipt.
+    keyword_arm_confidence_floor: null,
+    // Phase E3 — metadata boost gate `lexical` (flipped on the Cat 13 held-out receipt); `always` restores the pre-wave pipeline.
+    metadata_boost_gate: 'lexical',
   }),
   tokenmax: Object.freeze({
     cache_enabled: true,
     cache_similarity_threshold: 0.92,
     cache_ttl_seconds: 3600,
     intentWeighting: true,
+    keywordOrFallback: true,
     tokenBudget: undefined,
-    expansion: true,
+    expansion: false, // GBRA-94 (2026-10-14): strict recall@10 298 vs 299 with the reranker, `query` p50 2,022 -> 227 ms
+    expansion_variant_budget: null,
     searchLimit: 50,
-    // tokenmax is the high-cost-tolerant tier that already pays for LLM
-    // expansion + 50-result payloads. Reranker is the natural capstone:
+    // tokenmax is the high-cost-tolerant tier that already pays for
+    // 50-result payloads. Reranker is the natural capstone:
     // better ordering of a large candidate set is where rerankers earn
-    // their fee. ~$0.0003/query at this shape; rounding error vs the
+    // their fee. ~$0.0006/query at this shape (rerank-3-lite); rounding error vs the
     // tier's $700/mo @ Opus pairing per CLAUDE.md cost matrix.
     reranker_enabled: true,
-    reranker_model: 'zeroentropyai:zerank-2',
+    reranker_model: DEFAULT_RERANKER_MODEL,
     // v0.42.3.0 D4: topNIn = searchLimit (50) so every returned result is
     // cross-encoder scored — closes the Codex #2 recall gap where autocut
     // would drop the deliberately-preserved un-reranked tail (results 31-50).
@@ -412,6 +656,9 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     floor_ratio: undefined,
     // T2 — title-phrase boost ON by default (correctness fix, cheap + gated).
     title_boost: 1.25,
+    evidence_cosine_floor: 0.8,
+    reranker_gate: DEFAULT_RERANK_GATE,
+    reranker_gate_min_gap: DEFAULT_RERANK_GATE_MIN_GAP,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -429,12 +676,30 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     // 10K-page brain; documented in the post-upgrade cost prompt.
     contextual_retrieval: 'per_chunk_synopsis' as CRMode,
     contextual_retrieval_disabled: false,
-    // v0.42.3.0 — autocut ON.
-    autocut: true,
+    // autocut OFF (ranker wave, rule R2 — see the balanced bundle's note).
+    autocut: false,
     // v0.43 — relational recall ON for tokenmax (max-recall tier).
     relationalRetrieval: true,
     relational_retrieval_depth: 2,
+    // Ranker wave (R1) — relational rows re-pinned above reranked text rows (0 = off).
+    relational_rerank_pin: DEFAULT_RELATIONAL_RERANK_PIN,
+    // Multi-hop planner ON, one-hop orientation opt-in: docs/eval/decisions/p7-heldout-2026-10-05.
+    relational_planner: true,
+    relational_orient_onehop: false,
+    relational_chain_slots: 10,
+    diverse_pool_depth: 0,
+    collapse: true,
+    rank_priors: true,
+    keyword_phrase: false,
+    qualified_aliases: false,
+    title_qualified: false,
     autocut_jump: 0.2,
+    autocut_min_top: 0.35,
+    autocut_min_keep: 1,
+    // Ranker wave (Phase E2) — keyword-arm confidence floor OFF (null) until the Cat 13 receipt.
+    keyword_arm_confidence_floor: null,
+    // Phase E3 — metadata boost gate `lexical` (flipped on the Cat 13 held-out receipt); `always` restores the pre-wave pipeline.
+    metadata_boost_gate: 'lexical',
   }),
 });
 
@@ -454,8 +719,10 @@ export interface SearchKeyOverrides {
   cache_similarity_threshold?: number;
   cache_ttl_seconds?: number;
   intentWeighting?: boolean;
+  keywordOrFallback?: boolean;
   tokenBudget?: number;
   expansion?: boolean;
+  expansion_variant_budget?: number | null;
   searchLimit?: number;
   // v0.35.0.0+ reranker overrides
   reranker_enabled?: boolean;
@@ -470,6 +737,11 @@ export interface SearchKeyOverrides {
   floor_ratio?: number;
   // T2 — title-phrase boost override.
   title_boost?: number;
+  // v0.46.15 — evidence cosine-floor override (knobsHash `ecf=` since v=31).
+  evidence_cosine_floor?: number;
+  // W3 — confidence-gated reranking overrides.
+  reranker_gate?: RerankGateMode;
+  reranker_gate_min_gap?: number;
   // v0.36 cross-modal overrides
   cross_modal_both_text_weight?: number;
   cross_modal_both_image_weight?: number;
@@ -488,7 +760,23 @@ export interface SearchKeyOverrides {
   // v0.43 — relational recall overrides.
   relationalRetrieval?: boolean;
   relational_retrieval_depth?: number;
+  relational_rerank_pin?: number;
+  relational_planner?: boolean;
+  relational_orient_onehop?: boolean | null;
+  relational_chain_slots?: number;
+  diverse_pool_depth?: number;
+  collapse?: boolean;
+  rank_priors?: boolean;
+  keyword_phrase?: boolean;
+  qualified_aliases?: boolean;
+  title_qualified?: boolean;
+  // Ranker wave (Phase E2) — keyword-arm confidence floor override (null = off; (0, 1]).
+  keyword_arm_confidence_floor?: number | null;
+  // Ranker wave (Phase E3) — metadata boost gate override (`always` | `lexical`).
+  metadata_boost_gate?: MetadataBoostGate;
   autocut_jump?: number;
+  autocut_min_top?: number;
+  autocut_min_keep?: number;
 }
 
 /**
@@ -503,8 +791,10 @@ export interface SearchPerCallOpts {
   cache_similarity_threshold?: number;
   cache_ttl_seconds?: number;
   intentWeighting?: boolean;
+  keywordOrFallback?: boolean;
   tokenBudget?: number;
   expansion?: boolean;
+  expansion_variant_budget?: number | null;
   searchLimit?: number;
   // v0.35.0.0+ reranker per-call overrides (same shape as SearchKeyOverrides).
   reranker_enabled?: boolean;
@@ -516,6 +806,11 @@ export interface SearchPerCallOpts {
   floor_ratio?: number;
   // T2 — title-phrase boost per-call override.
   title_boost?: number;
+  // v0.46.15 — evidence cosine-floor per-call override.
+  evidence_cosine_floor?: number;
+  // W3 — confidence-gated reranking per-call override (RERANK_GATE_MODES).
+  reranker_gate?: RerankGateMode;
+  reranker_gate_min_gap?: number;
   // v0.36 cross-modal per-call overrides
   cross_modal_both_text_weight?: number;
   cross_modal_both_image_weight?: number;
@@ -535,9 +830,26 @@ export interface SearchPerCallOpts {
   // numeric per-call knob threaded through the bundle.
   autocut?: boolean;
   autocut_jump?: number;
+  autocut_min_top?: number;
+  autocut_min_keep?: number;
   // v0.43 — relational recall per-call overrides.
   relationalRetrieval?: boolean;
   relational_retrieval_depth?: number;
+  // Ranker wave — relational rerank pin per-call override (0 = off; [0, 10]).
+  relational_rerank_pin?: number;
+  relational_planner?: boolean;
+  relational_orient_onehop?: boolean | null;
+  relational_chain_slots?: number;
+  diverse_pool_depth?: number;
+  collapse?: boolean;
+  rank_priors?: boolean;
+  keyword_phrase?: boolean;
+  qualified_aliases?: boolean;
+  title_qualified?: boolean;
+  // Ranker wave (Phase E2) — keyword-arm confidence floor per-call override (null = off; (0, 1]).
+  keyword_arm_confidence_floor?: number | null;
+  // Ranker wave (Phase E3) — metadata boost gate per-call override (`always` | `lexical`).
+  metadata_boost_gate?: MetadataBoostGate;
 }
 
 /**
@@ -559,6 +871,12 @@ export interface ResolveSearchModeInput {
   overrides?: SearchKeyOverrides;
   /** Per-call opts (SearchOpts / HybridSearchOpts). */
   perCall?: SearchPerCallOpts;
+  /** Raw `search.source_boosts` (read in the same snapshot; see source-boost.ts). */
+  sourceBoosts?: string;
+  /** Raw `search.alias_token_hop` (read in the same snapshot; #5428, opt-in). */
+  aliasTokenHop?: string;
+  /** decide.* keys from the same snapshot; absent when none are set (System One all-off fast path). */
+  decide?: Record<string, string>;
 }
 
 export interface ResolvedSearchKnobs extends ModeBundle {
@@ -583,13 +901,7 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     return bundle[key];
   };
 
-  // v0.40.6.1: `reranker_timeout_ms` resolution slots the resolved recipe's
-  // touchpoint default between override and bundle, so local rerankers
-  // (llama.cpp serving Qwen3-Reranker / self-hosted ZE on CPU) inherit
-  // their cold-start headroom without forcing users to discover the
-  // `search.reranker.timeout_ms` config key.
-  // Precedence: per-call > config override > recipe.touchpoints.reranker.default_timeout_ms > mode bundle.
-  const resolvedRerankerModel = pick('reranker_model');
+  const resolvedRerankerModel = pc.reranker_model ?? ov.reranker_model ?? engineRerankerModel() ?? bundle.reranker_model;
   const pickRerankerTimeoutMs = (): number => {
     if (pc.reranker_timeout_ms !== undefined) return pc.reranker_timeout_ms;
     if (ov.reranker_timeout_ms !== undefined) return ov.reranker_timeout_ms;
@@ -603,8 +915,10 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     cache_similarity_threshold: pick('cache_similarity_threshold'),
     cache_ttl_seconds: pick('cache_ttl_seconds'),
     intentWeighting: pick('intentWeighting'),
+    keywordOrFallback: pick('keywordOrFallback'),
     tokenBudget: pick('tokenBudget'),
     expansion: pick('expansion'),
+    expansion_variant_budget: pick('expansion_variant_budget'),
     searchLimit: pick('searchLimit'),
     reranker_enabled: pick('reranker_enabled'),
     reranker_model: resolvedRerankerModel,
@@ -614,6 +928,9 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     // v0.35.6.0 — floor-ratio resolved via the same pick chain.
     floor_ratio: pick('floor_ratio'),
     title_boost: pick('title_boost'),
+    evidence_cosine_floor: pick('evidence_cosine_floor'),
+    reranker_gate: pick('reranker_gate'),
+    reranker_gate_min_gap: pick('reranker_gate_min_gap'),
     // v0.36 cross-modal knobs
     cross_modal_both_text_weight: pick('cross_modal_both_text_weight'),
     cross_modal_both_image_weight: pick('cross_modal_both_image_weight'),
@@ -630,9 +947,23 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     // v0.42.3.0 — autocut resolved via the same pick chain.
     autocut: pick('autocut'),
     autocut_jump: pick('autocut_jump'),
+    autocut_min_top: pick('autocut_min_top'),
+    autocut_min_keep: pick('autocut_min_keep'),
     // v0.43 — relational recall resolved via the same pick chain.
     relationalRetrieval: pick('relationalRetrieval'),
     relational_retrieval_depth: pick('relational_retrieval_depth'),
+    relational_rerank_pin: pick('relational_rerank_pin'),
+    relational_planner: pick('relational_planner'),
+    relational_orient_onehop: pick('relational_orient_onehop'),
+    relational_chain_slots: pick('relational_chain_slots'),
+    diverse_pool_depth: pick('diverse_pool_depth'),
+    collapse: pick('collapse'),
+    rank_priors: pick('rank_priors'),
+    keyword_phrase: pick('keyword_phrase'),
+    qualified_aliases: pick('qualified_aliases'),
+    title_qualified: pick('title_qualified'),
+    keyword_arm_confidence_floor: pick('keyword_arm_confidence_floor'),
+    metadata_boost_gate: pick('metadata_boost_gate'),
     resolved_mode,
     mode_valid: valid,
   };
@@ -664,7 +995,7 @@ export function attributeKnob<K extends keyof ModeBundle>(
     return { knob, value: resolved[knob], source: 'per-call', source_detail: 'SearchOpts' };
   }
   if (ov[knob] !== undefined) {
-    return { knob, value: resolved[knob], source: 'override', source_detail: `config: search.${knob}` };
+    return { knob, value: resolved[knob], source: 'override', source_detail: `config: ${KNOB_CONFIG_KEY[knob]}` };
   }
   if (resolved.mode_valid) {
     return { knob, value: resolved[knob], source: 'mode', source_detail: `mode: ${resolved.resolved_mode}` };
@@ -681,73 +1012,7 @@ export function attributeKnob<K extends keyof ModeBundle>(
  * reorder or add a knob without bumping a constant — a hash collision would
  * mean stale cache rows silently reading the wrong shape.
  */
-// v0.35.0.0+ bump 1→2: reranker fields participate in the cache key so a
-// tokenmax-with-reranker write can't be served to a reranker-off lookup.
-// v0.35.6.0   bump 2→3: floor_ratio participates so a floor-on write can't
-// be served to a floor-off lookup (cross-floor contamination, codex T1).
-// CDX2-F13 convention: under a version bump, additions are APPEND-ONLY at
-// the end of `parts[]` — reordering existing fields would silently rebuild
-// the hash for every existing row.
-//
-// CDX2-F12 mid-deploy duplicate-row note: because `cacheRowId()` (in
-// src/core/search/query-cache.ts) includes knobsHash, a v=2 process and a
-// v=3 process writing the same `(source_id, query_text)` produce DISTINCT
-// row IDs. Expect a temporary hit-rate dip + cache-row doubling for hot
-// queries during a rolling deploy. Clears naturally within
-// `cache.ttl_seconds` (default 3600s). The CHANGELOG note covers this.
-//
-// v0.36 wave: cross-modal knobs ALSO participate in v=3 hash (D2 cache
-// contamination fix — a text-mode cache hit cannot silently serve an
-// image-mode caller). v0.35.6.0's floor_ratio bump and v0.36's cross-modal
-// extensions both land under v=3, with cross-modal fields appended after
-// the floor_ratio entry (CDX2-F13 append-only convention).
-//
-// v0.40.4 bump 3→4: graph_signals participates in the cache key. A
-// graph-on write must NOT be served to a graph-off lookup (ranking
-// shifts when adjacency / cross-source / session-demote stamps move
-// results). v0.39 T21 (master) also added schema_pack identity fields
-// under v=4.
-//
-// v0.40.3.0 bump 4→5: contextual_retrieval and contextual_retrieval_disabled
-// added under v=5 (per D8 sequencing — first to land claimed v=4; the
-// contextual-retrieval wave rebased to v=5). Mid-deploy hit-rate dip is
-// expected — clears within cache.ttl_seconds (3600s default).
-//
-// v0.42 bump 5→6: alias_resolved_boost (T19, plan D6) adds a new post-fusion
-// stage. Results whose slug is a canonical_slug in slug_aliases get a
-// 1.05x multiplier. Cached pre-v0.42 entries don't reflect the boost so
-// must invalidate. Same one-time miss-spike pattern as prior bumps;
-// fills within cache.ttl_seconds (3600s default).
-//
-// T2 bump 6→7: title_boost (retrieval-maxpool incident) adds a post-fusion
-// stage that multiplies title-phrase-matching results. A title-boost-on write
-// must NOT be served to a title-boost-off lookup (ranking shifts). Same
-// one-time miss-spike pattern; fills within cache.ttl_seconds.
-//
-// v0.42.3.0 bump 7→8: autocut (score-discontinuity result-sizing) adds `ac`
-// + `acj` parts. Default-ON in reranked modes trims the returned set, so an
-// autocut-on write must NOT be served to an autocut-off lookup. ONE-TIME
-// global cache cold-miss on upgrade — EVERY query_cache row invalidates,
-// including conservative/no-reranker calls where autocut is a no-op (the hash
-// is global, not per-mode). Refills within cache.ttl_seconds (3600s default).
-//
-// bump 8→9 (issue #1777): `archive/` moved from DEFAULT_HARD_EXCLUDES to a 0.5
-// source-boost demote. The source-boost / hard-exclude policy is NOT part of the
-// knobs hash, so without a version bump cached rows would keep returning the old
-// archive-excluded result set for up to cache.ttl_seconds. Bumping forces the fix
-// to take effect immediately (one-time global cache cold-miss on upgrade; refills
-// within cache.ttl_seconds). Same cache-key-contamination convention as the
-// autocut / title_boost / graph_signals bumps above.
-//
-// bump 10→11 (#1400 input_type fix): asymmetric embedding models (zembed-1
-// hosted or local, Voyage v3+) had their query-side input_type stripped by
-// the AI SDK before the wire, so every cached row's key embedding AND result
-// set were computed with document-side query vectors. The fix changes what
-// embedQuery() produces for those providers; pre-fix rows must not be served
-// to post-fix lookups. Same one-time global cold-miss pattern as the bumps
-// above (the hash is global, not per-provider); refills within
-// cache.ttl_seconds (3600s default).
-export const KNOBS_HASH_VERSION = 11;
+export const KNOBS_HASH_VERSION = 31;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -761,6 +1026,13 @@ export const KNOBS_HASH_VERSION = 11;
  * don't know the column produce a stable hash for the default case.
  */
 export interface KnobsHashContext {
+  /**
+   * #5691: the brain's `embedding_query_prefix`. The query embedding the
+   * cache keys on is computed from prefix + query, so a row written under one
+   * prefix must never serve another. Empty/undefined adds no key part, so
+   * rows written without a prefix keep their key.
+   */
+  queryPrefix?: string;
   /** Resolved column name, e.g. 'embedding', 'embedding_voyage'. */
   embeddingColumn?: string;
   /** Resolved provider:model, e.g. 'voyage:voyage-3-large'. */
@@ -776,6 +1048,75 @@ export interface KnobsHashContext {
    */
   schemaPack?: string;
   schemaPackVersion?: string;
+  /**
+   * v=12 (#2825): the RESOLVED effective hard-exclude prefix list — the same
+   * value resolveHardExcludes() produces at query-build time (defaults ∪
+   * GBRAIN_SEARCH_EXCLUDE ∪ per-call exclude_slug_prefixes, minus
+   * include_slug_prefixes). Folded (sorted, so input order is irrelevant)
+   * into the hash so a cache row written under one exclude policy can never
+   * be served to a lookup under another. Undefined falls back to the literal
+   * 'none' for legacy callers that don't thread excludes.
+   */
+  hardExcludes?: string[];
+  /**
+   * v=27 (2026-08 fix wave, E5b): the RESOLVED adaptive-return gate for this
+   * call — params + the query's resolved intent class (classifier-
+   * deterministic, computed pre-lookup by hybridSearchCached). Enabled folds
+   * all five parts; disabled/absent hashes like legacy rows. See the ar=/ari=
+   * comment in knobsHash for the cross-intent contamination rationale.
+   */
+  adaptiveReturn?: {
+    enabled: boolean;
+    entityMax: number;
+    otherMax: number;
+    minKeep: number;
+    intent: string;
+  };
+  /**
+   * v=16 (#3515): the EFFECTIVE detail level for this call — per-call
+   * SearchOpts.detail, or the auto-detected level when the caller didn't
+   * specify (hybridSearchCached threads `opts.detail ?? autoDetectDetail(query)`,
+   * matching what bare hybridSearch resolves). detail gates dedup,
+   * chunk-source filtering, and the compiled_truth boost, so a detail=low
+   * write must never be served to a detail=medium lookup. Lives in ctx (not
+   * ResolvedSearchKnobs) because it's per-call, not a mode knob — same path
+   * as col=/prov=. Undefined falls back to 'medium' (the documented default).
+   */
+  detail?: 'low' | 'medium' | 'high';
+  /**
+   * v=23 (#4352 follow-up): the private-visibility posture for this call.
+   * `excludePrivate=true` (the default for every remote MCP caller) filters
+   * `visibility: private` pages out of every recall arm, so the result set
+   * differs from a trusted private-included run. Lives in ctx (not
+   * ResolvedSearchKnobs) because it's per-call trust posture, not a mode
+   * knob — same path as detail/hardExcludes. Undefined hashes like `false`
+   * (private included), matching enforcement's strict `=== true` semantics.
+   */
+  excludePrivate?: boolean;
+  /**
+   * v=24 (#4415, wave-g): the EFFECTIVE salience/recency boost modes for
+   * this call — per-call SearchOpts, or the classifier's auto-suggestion
+   * when the caller didn't specify (hybridSearchCached resolves them with
+   * the same chain bare hybridSearch uses). Both reorder the post-fusion
+   * result set, so a 'strong' write must never serve an 'off' lookup.
+   * Undefined falls back to 'off' (the classifier's default for unmatched
+   * queries) so legacy callers hash stably.
+   */
+  salience?: 'off' | 'on' | 'strong';
+  recency?: 'off' | 'on' | 'strong';
+  /**
+   * v=24 (#4415, wave-g): fingerprint of the applied `search.intent_patterns`
+   * config (query-intent.ts intentPatternFingerprint — 'none' when unset).
+   * The patterns change classification (intent weights + auto salience/
+   * recency/detail) and therefore results; folding the fingerprint makes a
+   * config edit invalidate immediately instead of after the TTL. Threaded
+   * through ctx (not read process-globally like fts=) because the applied
+   * config is PER ENGINE (wave-g) — a process-global read would key one
+   * brain's rows under another brain's patterns in a multi-engine process.
+   */
+  intentPatterns?: string;
+  /** System One decide knobs (search/decide-stage.ts decideKnobsPart); absent when every slot is off. */
+  decide?: string;
 }
 
 export function knobsHash(
@@ -855,6 +1196,10 @@ export function knobsHash(
     // etc.) so a partial-knobs caller (tests passing a minimal literal) can't
     // crash the hash. Typed callers always carry the field.
     `acj=${(knobs.autocut_jump ?? 0.2).toFixed(2)}`,
+    // v=18 addition (v0.46.15 #1863, append-only): weak-top floor. A floored
+    // write (full cluster kept on a weak top) must not be served to an
+    // unfloored lookup and vice versa — the kept set differs.
+    `acm=${(knobs.autocut_min_top ?? 0.35).toFixed(2)}`,
     // v=10 additions (v0.43, append-only): relational recall arm. A
     // relational-on write (edge-seeded result set) must NOT be served to a
     // relational-off lookup — same contamination class as graph_signals. The
@@ -863,7 +1208,142 @@ export function knobsHash(
     // test/model-pricing.test.ts-style drift guards and the mode tests.
     `rel=${knobs.relationalRetrieval ? 1 : 0}`,
     `reld=${knobs.relational_retrieval_depth ?? 2}`,
+    // v=12 addition (#2825, append-only): resolved hard-exclude prefixes.
+    // Before this, resolveHardExcludes() only ran at DB-query build time
+    // (cache miss), so cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs
+    // across processes. Sorted copy so ['a/','b/'] and ['b/','a/'] hash
+    // identically; undefined falls back to 'none' for legacy callers.
+    `hx=${ctx?.hardExcludes ? [...ctx.hardExcludes].sort().join(',') : 'none'}`,
+    // v=15 addition (append-only): the resolved FTS configuration name. Read
+    // from getFtsLanguage() rather than threaded through KnobsHashContext on
+    // purpose — the language is a process-global env read with no per-call
+    // dimension, and the `prov=` bump note above records what threading costs:
+    // a ctx field only isolates callers that pass it, so legacy callers keep
+    // hashing the fallback literal on both sides of a switch. Reading it here
+    // covers every knobsHash() caller, present and future. getFtsLanguage()
+    // memoizes and validates against /^[a-z][a-z0-9_]*$/, so this stays a
+    // cheap, bounded string.
+    `fts=${getFtsLanguage()}`,
+    // v=16 addition (#3515, append-only): effective detail level. detail
+    // gates dedup, chunk-source filtering, and the compiled_truth boost, so
+    // a low write (compiled-truth-only set) must never be served to a
+    // medium/high lookup. Undefined falls back to 'medium' (the default).
+    `det=${ctx?.detail ?? 'medium'}`,
+    // v=19 addition (#3621, append-only): autocut minKeep floor. Changing the
+    // floor changes how many rows survive the cut, so a write under one floor
+    // must not serve a lookup under another — same contamination class as
+    // ac=/acj=. Token is `ack=`, not the PR's original `acm=`: master's
+    // weak-top floor (v=18) already owns `acm=`. `?? 1` mirrors the defensive
+    // read of acj= above for partial-knobs callers.
+    `ack=${Math.max(1, Math.floor(knobs.autocut_min_keep ?? 1))}`,
+    // v=23 addition (#4352 follow-up, append-only): private-visibility
+    // posture. A private-included (trusted) write must never serve a
+    // private-excluding (remote-default) lookup and vice versa. Replaces
+    // #4352's wholesale skipCache bypass, which disabled the semantic cache
+    // for every remote MCP caller (excludePrivate=true is their default).
+    // Strict `=== true` mirrors the enforcement predicate so undefined and
+    // false (both private-included) hash identically.
+    `xp=${ctx?.excludePrivate === true ? 1 : 0}`,
+    // v=25 addition (#3617, append-only): keyword AND→OR fallback knob. A
+    // fallback-on write (OR-relaxed rows blended in) must not be served
+    // to a fallback-off lookup — the zero-strict-recall result sets are
+    // disjoint (relaxed rows vs empty keyword arm). `?? true` mirrors the
+    // module's defensive read of other knobs for partial-knobs callers.
+    `kof=${(knobs.keywordOrFallback ?? true) ? 1 : 0}`,
+    // v=26 additions (#4415, wave-g, append-only): effective salience/
+    // recency boost modes + applied intent-pattern config fingerprint. A
+    // salience/recency-boosted (reordered) write must never serve a lookup
+    // under different modes, and a `search.intent_patterns` edit changes
+    // classification → results, so it must change the key. 'off'/'none'
+    // fallbacks keep legacy callers stable.
+    `sal=${ctx?.salience ?? 'off'}`,
+    `rec=${ctx?.recency ?? 'off'}`,
+    `ipat=${ctx?.intentPatterns ?? 'none'}`,
+    // v=27 ALSO covers a same-knobs behavioral change shipped in the same
+    // release (#3617 follow-up): OR-relaxed keyword/title rows no longer
+    // vote in RRF when the vector arm is non-empty, so a pre-fix cache row
+    // (relaxed junk fused in) must not serve post-fix lookups — the version
+    // bump invalidates them wholesale (one-bump-per-wave rule).
+    // v=27 additions (2026-08 fix wave, E5b + outside-voice F11, append-only):
+    // adaptive-return gate params + the query's resolved intent class. An
+    // adaptive-on write (intent-capped result set) must never serve an
+    // adaptive-off lookup or a different cap config — and because the
+    // semantic cache admits SIMILAR queries, an entity-intent row (cap 2)
+    // must never serve a concept-intent lookup (cap 6) either; folding the
+    // resolved intent class closes that channel (same-query lookups are
+    // classifier-deterministic; near-duplicate queries with a different
+    // class simply miss). Residual, documented: a future classifier change
+    // reclassifies queries and silently re-keys — acceptable, cache-only.
+    // Gate-off calls hash identically to legacy rows ('0'/'none' fallbacks).
+    `ar=${ctx?.adaptiveReturn?.enabled ? 1 : 0}`,
+    `arem=${ctx?.adaptiveReturn?.enabled ? ctx.adaptiveReturn.entityMax : 'none'}`,
+    `arom=${ctx?.adaptiveReturn?.enabled ? ctx.adaptiveReturn.otherMax : 'none'}`,
+    `armk=${ctx?.adaptiveReturn?.enabled ? ctx.adaptiveReturn.minKeep : 'none'}`,
+    `ari=${ctx?.adaptiveReturn?.enabled ? ctx.adaptiveReturn.intent : 'none'}`,
+    // v=29 addition (ranker wave, append-only): expansion variant budget.
+    // Weighted-RRF fusion of variant lists changes the fused order for
+    // identical knobs, so a budget write must never serve a legacy lookup.
+    // `== null` (not `=== null`) keeps a partial-knobs literal hashing as legacy.
+    `evb=${knobs.expansion_variant_budget == null ? 'legacy' : knobs.expansion_variant_budget.toFixed(3)}`,
+    // v=29 addition (ranker wave, append-only): relational rerank pin. The
+    // pin permutes the post-rerank pool (relational rows to the top), so a
+    // pin-3 write must never serve a pin-0 lookup. A partial-knobs literal
+    // without the field hashes as the bundle default.
+    `rrp=${knobs.relational_rerank_pin ?? DEFAULT_RELATIONAL_RERANK_PIN}`,
+    // v=29 addition (ranker wave Phase E2, append-only): keyword-arm
+    // confidence floor. A weak-arm down-weight reorders the fused page, so a
+    // floor write must never serve a floor-off lookup. `== null` keeps a
+    // partial-knobs literal (and the all-null bundles) hashing as `off`.
+    `kacf=${knobs.keyword_arm_confidence_floor == null ? 'off' : knobs.keyword_arm_confidence_floor.toFixed(3)}`,
+    // v=29 addition (ranker wave Phase E3, append-only): metadata boost gate.
+    // `lexical` skips the metadata boosts on vector-only-voter queries and
+    // re-orders the fused page, so a `lexical` write must never serve an
+    // `always` lookup. A partial-knobs literal hashes as `always` — the deliberate pre-wave hash identity, NOT the bundle default (`lexical`).
+    `mbg=${knobs.metadata_boost_gate ?? DEFAULT_METADATA_BOOST_GATE}`,
+    // v=31 additions (W3 confidence-gated reranking, append-only): the gate,
+    // its δ and the evidence cosine floor. The gate's grade rides the stored
+    // meta, and δ and the floor decide that grade, so rows written under one
+    // setting must not serve another. The floor was label-only before this
+    // block and stayed out of the hash.
+    // Partial-knobs literals hash as the bundle defaults.
+    `rrg=${knobs.reranker_gate ?? DEFAULT_RERANK_GATE}`,
+    `rrgg=${(knobs.reranker_gate_min_gap ?? DEFAULT_RERANK_GATE_MIN_GAP).toFixed(3)}`,
+    `ecf=${(knobs.evidence_cosine_floor ?? DEFAULT_HIGH_COSINE_FLOOR).toFixed(3)}`,
+    // System One (append-only, emitted only when a decide slot is not off, so
+    // the all-off key is unchanged and needs no version bump).
+    ...(ctx?.decide ? [`dec=${ctx.decide}`] : []),
+    // Multi-hop planner (append-only, emitted only when on, so every
+    // planner-off key is unchanged and needs no version bump).
+    ...(knobs.relational_planner ? ['rp=1'] : []),
+    ...(knobs.relational_orient_onehop ?? knobs.relational_planner ? ['ro=1'] : []),
+    ...(knobs.relational_planner && knobs.relational_chain_slots ? [`rcs=${knobs.relational_chain_slots}`] : []),
+    // Session-diverse pool (append-only, emitted only when on, so every off key is unchanged).
+    ...(knobs.diverse_pool_depth ? [`dpd=${knobs.diverse_pool_depth}`] : []),
+    // Collapse and rank priors (append-only, emitted only when turned off).
+    ...(knobs.collapse === false ? ['col=0'] : []),
+    ...(knobs.rank_priors === false ? ['rpr=0'] : []),
+    ...(knobs.keyword_phrase === true ? ['kph=1'] : []),
+    ...(knobs.qualified_aliases === true ? ['qa=1'] : []),
+    ...(knobs.title_qualified === true ? ['tq=1'] : []),
   ];
+  // #5691 (append-only, no version bump): only a non-empty query prefix adds
+  // a part, so every row written without one keeps its key.
+  if (ctx?.queryPrefix) parts.push(`qp=${createHash('sha256').update(ctx.queryPrefix).digest('hex').slice(0, 16)}`);
+  // GBRA-156 (append-only, no bump): a read granted private pages keys on its sorted private-readable
+  // set (read here so every knobsHash() caller is covered); an empty set adds no part and keeps the key. GBRA-575: xpf= likewise, its private-fact sources.
+  const privateReadable = ctx?.excludePrivate === true ? privateReadableSources() : [];
+  for (const [key, ids] of [['xpr', privateReadable], ['xpf', privateFactSources()]] as const) if (ids.length) parts.push(`${key}=${[...ids].sort().join(',')}`);
+  // GBRA-218 (append-only, no bump): a read under the read policy keys on its member identity (sorted at
+  // record time) and on a privacy relaxation (operator or, GST-2059, owner); an unbound, unrelaxed read adds no part.
+  if (ctx?.excludePrivate === true) {
+    const access = currentCallerAccess();
+    if (access.identity.length) parts.push(`xid=${createHash('sha256').update(access.identity.join(',')).digest('hex').slice(0, 16)}`);
+    if (access.audienceIdentities.length) parts.push(`xau=${createHash('sha256').update(JSON.stringify(access.audienceIdentities)).digest('hex').slice(0, 16)}`);
+    if (!access.hidePrivate) parts.push('xhp=0');
+    if (access.lineage) parts.push(!access.owner ? 'xol=3' : access.ownerReadsRestricted ? 'xol=2' : 'xol=1');
+    if (access.labelledOnly) parts.push('xlo=1');
+    if (access.audienceKindMembers.length) parts.push(`xak=${createHash('sha256').update(access.audienceKindMembers.join(',')).digest('hex').slice(0, 16)}`);
+  }
   const h = createHash('sha256');
   h.update(parts.join('|'));
   return h.digest('hex').slice(0, 16);
@@ -901,6 +1381,10 @@ export function loadOverridesFromConfig(
   if (iw !== undefined) {
     out.intentWeighting = iw === '1' || iw.toLowerCase() === 'true';
   }
+  const kof = get('search.keywordOrFallback');
+  if (kof !== undefined) {
+    out.keywordOrFallback = kof === '1' || kof.toLowerCase() === 'true';
+  }
   const tb = get('search.tokenBudget');
   if (tb !== undefined) {
     const n = parseInt(tb, 10);
@@ -909,6 +1393,16 @@ export function loadOverridesFromConfig(
   const ex = get('search.expansion');
   if (ex !== undefined) {
     out.expansion = ex === '1' || ex.toLowerCase() === 'true';
+  }
+  // `search.expansion_variant_budget`: the literal `legacy`/`null` pins the
+  // pre-knob weighting (null); a number in (0, 4] is the shared variant
+  // budget. Out-of-range/non-numeric falls through to the bundle (mirrors
+  // autocut_jump). ONE range contract with the per-call seams in hybrid.ts:
+  // normalizeExpansionVariantBudget (fusion-lists.ts).
+  const evb = get('search.expansion_variant_budget');
+  if (evb !== undefined) {
+    const n = normalizeExpansionVariantBudget(evb);
+    if (n !== undefined) out.expansion_variant_budget = n;
   }
   const sl = get('search.searchLimit');
   if (sl !== undefined) {
@@ -967,6 +1461,21 @@ export function loadOverridesFromConfig(
     const n = parseFloat(tib);
     if (Number.isFinite(n) && n >= 1.0 && n <= 5.0) out.title_boost = n;
   }
+
+  // v0.46.15 — evidence cosine floor. [0, 1] sanity-bounded. Part of
+  // knobsHash since v=31: it also decides the rerank gate's grade.
+  const ecf = get('search.evidence_cosine_floor');
+  if (ecf !== undefined) {
+    const n = parseFloat(ecf);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) out.evidence_cosine_floor = n;
+  }
+
+  // W3 — confidence-gated reranking. One parse contract each (crag.ts);
+  // anything unrecognized falls through to the bundle.
+  const rrg = normalizeRerankGate(get('search.reranker.gate'));
+  if (rrg !== undefined) out.reranker_gate = rrg;
+  const rrgg = normalizeRerankGateMinGap(get('search.reranker.gate_min_gap'));
+  if (rrgg !== undefined) out.reranker_gate_min_gap = rrgg;
 
   // v0.36 cross-modal overrides (D3 registry)
   const cmbt = get('search.cross_modal.both_mode_text_weight');
@@ -1029,6 +1538,21 @@ export function loadOverridesFromConfig(
     const n = parseFloat(acj);
     if (Number.isFinite(n) && n > 0 && n <= 1) out.autocut_jump = n;
   }
+  // v0.46.15 (#1863) — weak-top floor. [0, 1]; 0 disables the floor.
+  const acm = get('search.autocut_min_top');
+  if (acm !== undefined) {
+    const n = parseFloat(acm);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) out.autocut_min_top = n;
+  }
+
+  // `search.autocut_min_keep` floors the cut (integer ≥ 1; 1 = the previous
+  // hardcoded failsafe). Out-of-range/non-numeric falls through to the bundle
+  // — mirrors autocutFromConfig's validation in autocut.ts.
+  const ack = get('search.autocut_min_keep');
+  if (ack !== undefined) {
+    const n = parseInt(ack, 10);
+    if (Number.isFinite(n) && n >= 1) out.autocut_min_keep = n;
+  }
 
   // v0.43 — relational recall arm.
   const rel = get('search.relational_retrieval');
@@ -1040,50 +1564,119 @@ export function loadOverridesFromConfig(
     const n = parseInt(reld, 10);
     if (Number.isFinite(n) && n >= 1 && n <= 3) out.relational_retrieval_depth = n;
   }
+  // Ranker wave — relational rerank pin: `off`/`0` disables, a non-negative
+  // integer <= 10 is the pinned-row cap; anything else falls through to the
+  // bundle. ONE range contract with the per-call seams in hybrid.ts:
+  // normalizeRelationalRerankPin (relational-rerank-pin.ts).
+  const rrp = get('search.relational_rerank_pin');
+  if (rrp !== undefined) {
+    const n = normalizeRelationalRerankPin(rrp);
+    if (n !== undefined) out.relational_rerank_pin = n;
+  }
+  // Multi-hop planner + one-hop orientation (booleans; anything else falls through).
+  const rp = parseBoolKnob(get('search.relational_planner'));
+  if (rp !== undefined) out.relational_planner = rp;
+  const roh = parseBoolKnob(get('search.relational_orient_onehop'));
+  if (roh !== undefined) out.relational_orient_onehop = roh;
+  const rcs = normalizeChainSlots(get('search.relational_chain_slots'));
+  if (rcs !== undefined) out.relational_chain_slots = rcs;
+  const dpd = normalizeDiversePoolDepth(get('search.diverse_pool_depth'));
+  if (dpd !== undefined) out.diverse_pool_depth = dpd;
+  const col = parseBoolKnob(get('search.collapse'));
+  if (col !== undefined) out.collapse = col;
+  const rpr = parseBoolKnob(get('search.rank_priors'));
+  if (rpr !== undefined) out.rank_priors = rpr;
+  const kph = parseBoolKnob(get('search.keyword_phrase'));
+  if (kph !== undefined) out.keyword_phrase = kph;
+  const qa = parseBoolKnob(get('search.qualified_aliases'));
+  if (qa !== undefined) out.qualified_aliases = qa;
+  const tq = parseBoolKnob(get('search.title_qualified'));
+  if (tq !== undefined) out.title_qualified = tq;
+  // Ranker wave (Phase E2) — keyword-arm confidence floor: the literal
+  // `off`/`null` pins the knob off (null); a number in (0, 1] is the floor;
+  // anything else falls through to the bundle. ONE range contract with the
+  // per-call seams in hybrid.ts: normalizeKeywordArmConfidenceFloor
+  // (arm-confidence.ts).
+  const kacf = get('search.keyword_arm_confidence_floor');
+  if (kacf !== undefined) {
+    const n = normalizeKeywordArmConfidenceFloor(kacf);
+    if (n !== undefined) out.keyword_arm_confidence_floor = n;
+  }
+  // Ranker wave (Phase E3) — metadata boost gate: the literals `always` /
+  // `lexical` (any case); anything else falls through to the bundle. ONE
+  // parse contract with the per-call seams in hybrid.ts:
+  // normalizeMetadataBoostGate (metadata-boost-gate.ts).
+  const mbg = get('search.metadata_boost_gate');
+  if (mbg !== undefined) {
+    const g = normalizeMetadataBoostGate(mbg);
+    if (g !== undefined) out.metadata_boost_gate = g;
+  }
 
   return out;
 }
 
+/**
+ * knob → the config key `loadOverridesFromConfig` reads it from (#4605). The
+ * Record type forces a row per ModeBundle knob. `attributeKnob` prints these
+ * (the dashboard's copy-pasteable `config set` target — knob name and key
+ * spelling differ for 14 of them); SEARCH_MODE_CONFIG_KEYS derives from it;
+ * KNOWN_CONFIG_KEYS (config.ts, kept import-light) mirrors it by hand, pinned
+ * equal by test/config-search-registry.test.ts.
+ */
+export const KNOB_CONFIG_KEY: Readonly<Record<keyof ModeBundle, string>> = Object.freeze({
+  cache_enabled: 'search.cache.enabled',
+  cache_similarity_threshold: 'search.cache.similarity_threshold',
+  cache_ttl_seconds: 'search.cache.ttl_seconds',
+  intentWeighting: 'search.intentWeighting',
+  keywordOrFallback: 'search.keywordOrFallback',
+  tokenBudget: 'search.tokenBudget',
+  expansion: 'search.expansion',
+  expansion_variant_budget: 'search.expansion_variant_budget',
+  searchLimit: 'search.searchLimit',
+  reranker_enabled: 'search.reranker.enabled',
+  reranker_model: 'search.reranker.model',
+  reranker_top_n_in: 'search.reranker.top_n_in',
+  reranker_top_n_out: 'search.reranker.top_n_out',
+  reranker_timeout_ms: 'search.reranker.timeout_ms',
+  floor_ratio: 'search.floor_ratio',
+  title_boost: 'search.title_boost',
+  evidence_cosine_floor: 'search.evidence_cosine_floor',
+  reranker_gate: 'search.reranker.gate',
+  reranker_gate_min_gap: 'search.reranker.gate_min_gap',
+  cross_modal_both_text_weight: 'search.cross_modal.both_mode_text_weight',
+  cross_modal_both_image_weight: 'search.cross_modal.both_mode_image_weight',
+  image_query_text_refinement_weight: 'search.image_query.text_refinement_weight',
+  image_query_image_refinement_weight: 'search.image_query.image_refinement_weight',
+  unified_multimodal: 'search.unified_multimodal',
+  unified_multimodal_only: 'search.unified_multimodal_only',
+  cross_modal_llm_intent: 'search.cross_modal.llm_intent',
+  graph_signals: 'search.graph_signals',
+  // Per-mode default lives in the bundle; these let power users override at
+  // the per-key level without flipping the global mode.
+  contextual_retrieval: 'search.contextual_retrieval',
+  contextual_retrieval_disabled: 'search.contextual_retrieval_disabled',
+  autocut: 'search.autocut',
+  autocut_jump: 'search.autocut_jump',
+  autocut_min_top: 'search.autocut_min_top',
+  autocut_min_keep: 'search.autocut_min_keep',
+  relationalRetrieval: 'search.relational_retrieval',
+  relational_retrieval_depth: 'search.relational_retrieval_depth',
+  relational_rerank_pin: 'search.relational_rerank_pin',
+  relational_planner: 'search.relational_planner',
+  relational_orient_onehop: 'search.relational_orient_onehop',
+  relational_chain_slots: 'search.relational_chain_slots',
+  diverse_pool_depth: 'search.diverse_pool_depth',
+  collapse: 'search.collapse',
+  rank_priors: 'search.rank_priors',
+  keyword_phrase: 'search.keyword_phrase',
+  qualified_aliases: 'search.qualified_aliases',
+  title_qualified: 'search.title_qualified',
+  keyword_arm_confidence_floor: 'search.keyword_arm_confidence_floor',
+  metadata_boost_gate: 'search.metadata_boost_gate',
+});
+
 /** The full list of config keys this module reads. Used by `gbrain search modes --reset`. */
-export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
-  'search.cache.enabled',
-  'search.cache.similarity_threshold',
-  'search.cache.ttl_seconds',
-  'search.intentWeighting',
-  'search.tokenBudget',
-  'search.expansion',
-  'search.searchLimit',
-  // v0.35.0.0+ reranker keys
-  'search.reranker.enabled',
-  'search.reranker.model',
-  'search.reranker.top_n_in',
-  'search.reranker.top_n_out',
-  'search.reranker.timeout_ms',
-  // v0.35.6.0 — floor-ratio gate
-  'search.floor_ratio',
-  'search.title_boost',
-  // v0.36 cross-modal keys (D3)
-  'search.cross_modal.both_mode_text_weight',
-  'search.cross_modal.both_mode_image_weight',
-  'search.image_query.text_refinement_weight',
-  'search.image_query.image_refinement_weight',
-  'search.unified_multimodal',
-  'search.unified_multimodal_only',
-  'search.cross_modal.llm_intent',
-  // v0.40.4 graph signals
-  'search.graph_signals',
-  // v0.40.3.0 contextual retrieval — tier override + soft kill switch.
-  // Per-mode default lives in the bundle; this key lets power users
-  // override at the per-key level without flipping the global mode.
-  'search.contextual_retrieval',
-  'search.contextual_retrieval_disabled',
-  // v0.42.3.0 autocut
-  'search.autocut',
-  // v0.43 relational recall
-  'search.relational_retrieval',
-  'search.relational_retrieval_depth',
-  'search.autocut_jump',
-]);
+export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze(Object.values(KNOB_CONFIG_KEY));
 
 /**
  * The mode-selection config key itself. Separated from SEARCH_MODE_CONFIG_KEYS
@@ -1091,23 +1684,36 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
  * the operator's mode choice.
  */
 export const SEARCH_MODE_KEY = 'search.mode';
+/** Per-brain source-boost map, read alongside the mode keys (not a bundle knob). */
+export const SOURCE_BOOSTS_KEY = 'search.source_boosts';
+/** Opt-in single-token alias hop (#5428), read alongside the mode keys. */
+export const ALIAS_TOKEN_HOP_KEY = 'search.alias_token_hop';
 
 /**
  * Load the live mode config (mode + per-key overrides) from the brain engine.
- * Runs ONE round-trip per knob currently — the BrainEngine.getConfig interface
- * is single-key. A future v0.34 batch loader can collapse this. Volume is
- * small (~8 keys); call site is once per search.
+ * This reads SEARCH_MODE_KEY plus every SEARCH_MODE_CONFIG_KEYS entry, and it
+ * runs once per direct `hybridSearch` call. (#4359, fixed) On the cached path
+ * it also runs exactly once — `hybridSearchCached` loads the snapshot to
+ * resolve its own cache-key knobs, then threads that SAME snapshot into the
+ * inner `hybridSearch` call (the INTERNAL `HybridSearchOpts._searchModeInput`
+ * field in hybrid.ts) instead of letting it load a second, independent one.
+ * One key per round trip is free on PGLite and is most of the pre-retrieval
+ * wall clock on a hosted Postgres (dozens of pooler-slot grabs per query), so
+ * read the whole config table once and answer every key from that snapshot.
+ * See config-snapshot.ts.
  *
  * Errors are swallowed and fall through to mode-bundle defaults. The cache
- * config table predates v0.32.3 and may not exist on very old brains, so
- * silent fallback is the right shape.
+ * config table predates v0.32.3 and may not exist on very old brains, and an
+ * engine from outside this repo may lack the bulk read; in both cases every
+ * key falls back to a per-key getConfig(), same as before.
  */
 export async function loadSearchModeConfig(
-  engine: { getConfig(key: string): Promise<string | null> },
+  engine: BulkConfigReader,
 ): Promise<ResolveSearchModeInput> {
+  const snapshot = await loadConfigSnapshot(engine);
   const safeGet = async (k: string): Promise<string | undefined> => {
     try {
-      const v = await engine.getConfig(k);
+      const v = snapshot ? snapshot[k] : await engine.getConfig(k);
       // getConfig's contract is string | null, but guard against engines that
       // return non-string junk (e.g. arrays/booleans). A non-string value is
       // treated as "not set" so it falls through to the mode-bundle default,
@@ -1119,8 +1725,10 @@ export async function loadSearchModeConfig(
     }
   };
 
-  const [mode, ...overrideValues] = await Promise.all([
+  const [mode, sourceBoosts, aliasTokenHop, ...overrideValues] = await Promise.all([
     safeGet(SEARCH_MODE_KEY),
+    safeGet(SOURCE_BOOSTS_KEY),
+    safeGet(ALIAS_TOKEN_HOP_KEY),
     ...SEARCH_MODE_CONFIG_KEYS.map(safeGet),
   ]);
 
@@ -1129,9 +1737,21 @@ export async function loadSearchModeConfig(
     if (overrideValues[i] !== undefined) configMap[key] = overrideValues[i];
   });
 
+  const decide = pickDecideConfig(snapshot);
   return {
     mode,
     overrides: loadOverridesFromConfig(configMap),
+    ...(sourceBoosts !== undefined ? { sourceBoosts } : {}),
+    ...(aliasTokenHop !== undefined ? { aliasTokenHop } : {}),
+    ...(decide ? { decide } : {}),
   };
 }
 
+/** `true`/`1`/`on` → true, `false`/`0`/`off` → false, anything else (or unset) → undefined. */
+export function parseBoolKnob(v: string | undefined): boolean | undefined {
+  if (v === undefined) return undefined;
+  const l = v.trim().toLowerCase();
+  if (l === 'true' || l === '1' || l === 'on') return true;
+  if (l === 'false' || l === '0' || l === 'off') return false;
+  return undefined;
+}

@@ -39,6 +39,7 @@ const EXPECTED_EXPORTS: ExpectedExport[] = [
   { subpath: 'gbrain/operations', canary: ['operations', 'OperationError'] },
   { subpath: 'gbrain/minions', canary: [] }, // barrel module; re-exports many names
   { subpath: 'gbrain/engine-factory', canary: [] }, // factory exports a default creator
+  { subpath: 'gbrain/engine-open', canary: ['openEngine', 'DEFAULT_EMBEDDED_POOL_MAX'] },
   { subpath: 'gbrain/pglite-engine', canary: ['PGLiteEngine'] },
   { subpath: 'gbrain/link-extraction', canary: ['extractEntityRefs', 'extractPageLinks'] },
   { subpath: 'gbrain/import-file', canary: ['importFromContent'] },
@@ -49,10 +50,23 @@ const EXPECTED_EXPORTS: ExpectedExport[] = [
   { subpath: 'gbrain/backoff', canary: [] },
   { subpath: 'gbrain/search/hybrid', canary: ['hybridSearch', 'rrfFusion'] },
   { subpath: 'gbrain/search/expansion', canary: ['expandQuery'] },
+  { subpath: 'gbrain/search/evidence-delivery', canary: ['assembleEvidenceForHits', 'evidenceFingerprint', 'deliverEvidence'] },
+  { subpath: 'gbrain/eval/longmemeval/reader', canary: ['resolveReaderConfig', 'buildReaderRequest', 'readerConfigHash'] },
+  { subpath: 'gbrain/think', canary: ['runThink', 'stripGapsSection'] },
   { subpath: 'gbrain/ai/gateway', canary: ['configureGateway', 'embed'] },
+  { subpath: 'gbrain/ai/invocation-guard', canary: ['withAIInvocationGuard', 'invokeAI', 'sdkInvocationUsage'] },
+  { subpath: 'gbrain/core/model-pricing', canary: ['canonicalLookup', 'CANONICAL_PRICING'] },
   { subpath: 'gbrain/extract', canary: [] },
   { subpath: 'gbrain/ingestion', canary: ['INGESTION_SOURCE_API_VERSION', 'validateIngestionEvent', 'computeContentHash'] },
   { subpath: 'gbrain/ingestion/test-harness', canary: ['IngestionTestHarness', 'expectEvent'] },
+  { subpath: 'gbrain/core/guardrails', canary: ['registerGuardrailProvider', 'runGuardrails', 'loadGuardrailProvidersFromEnv'] },
+  // 2026-08 fix wave (audit skillopt-cats-11): the surface gbrain-evals
+  // cat30–33 consume, replacing physical node_modules deep imports.
+  { subpath: 'gbrain/core/skillopt', canary: ['runSkillOpt', 'scoreSkillOnTasks', 'loadHeldOut'] },
+  // GBRA-377: the engine-free skill resolver library (docs/guides/skill-resolver.md#library).
+  { subpath: 'gbrain/skill-resolver', canary: ['resolveSkills', 'buildSkillIndex', 'ResolverError'] },
+  { subpath: 'gbrain/pglite-lock', canary: ['peekLock'] },
+  { subpath: 'gbrain/version', canary: ['VERSION'] },
   { subpath: 'gbrain/src/*', canary: [] }, // Energee fork: wildcard for deep src/ imports
 ];
 
@@ -69,7 +83,12 @@ describe('public exports — package.json exports map', () => {
     // Adding new exports: increment this + add to EXPECTED_EXPORTS below.
     // Removing exports: see CLAUDE.md "Removing any of these is a
     // breaking change going forward" — bump minor and update this count.
-    expect(count).toBe(21);
+    // 23→24 (2026-08 fix wave): ./core/skillopt (audit skillopt-cats-11).
+    // 28→29: ./version (gbrain-evals reads the installed version directly).
+    // 29→30: ./engine-open (experimental openEngine(settings), GBRA-283 Wave B1).
+    // 30→31: ./skill-resolver (the engine-free skill resolver, GBRA-377).
+    // Fork: +1 for ./src/* wildcard (psoholt/gbrain).
+    expect(count).toBe(32);
   });
 
   test('EXPECTED_EXPORTS list matches the exports map exactly (no drift)', () => {
@@ -109,4 +128,18 @@ describe('public exports — every subpath resolves via package name', () => {
       });
     }
   }
+});
+
+describe('public exports — gbrain/version', () => {
+  test('VERSION is the package version and importing it boots nothing', async () => {
+    const repoRoot = resolve(import.meta.dir, '..');
+    const pkgVersion = (await import('../package.json')).default.version;
+    const proc = Bun.spawnSync(
+      [process.execPath, '-e', "const m = await import('gbrain/version'); process.stdout.write(JSON.stringify(Object.keys(m)) + ' ' + m.VERSION);"],
+      { cwd: repoRoot, env: { PATH: process.env.PATH ?? '/usr/bin:/bin' }, stdout: 'pipe', stderr: 'pipe' },
+    );
+    expect(proc.stderr.toString()).toBe('');
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stdout.toString()).toBe(`["VERSION"] ${pkgVersion}`);
+  });
 });

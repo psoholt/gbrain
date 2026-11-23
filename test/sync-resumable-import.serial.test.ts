@@ -154,12 +154,13 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
     for (let i = 0; i < 30; i++) files[`p${i}.md`] = pageMd(`P${i}`);
     const c1 = commitPages(repoPath, files, 'thirty pages');
 
-    // Abort once the checkpoint shows at least one banked path.
+    // Abort once the checkpoint shows at least one banked path, while the import loop still runs (all 30 banked means the
+    // loop is done, and an abort then lands in the bookmark window, which this test does not cover).
     const ac = new AbortController();
     const fp = syncFingerprint({ lastCommit: c0 });
     const poll = setInterval(() => {
       loadOpCheckpoint(engine, { op: 'sync', fingerprint: fp })
-        .then((paths) => { if (paths.length >= 1 && !ac.signal.aborted) ac.abort(); })
+        .then((paths) => { if (paths.length >= 1 && paths.length < 30 && !ac.signal.aborted) ac.abort(); })
         .catch(() => {});
     }, 1);
     const aborted = await performSync(engine, { repoPath, noPull: true, noEmbed: true, signal: ac.signal });
@@ -203,15 +204,18 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
     // Run 1: drains C0..C1 only, advances to the PIN (C1), not live HEAD (C2).
     const r1 = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
     expect(r1.status).toBe('synced');
+    expect(r1.toCommit).toBe(c1);
+    expect(r1.toCommit).not.toBe(c2);
     expect(await engine.getPage('notes/x')).not.toBeNull();
     expect(await engine.getPage('notes/y')).toBeNull(); // past the pin, not yet
-    expect(await lastCommitConfig()).toBe(c1);
+    expect(await lastCommitConfig()).toBe(r1.toCommit);
 
     // Run 2: now anchored at C1, diff C1..C2 picks up y.
     const r2 = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
     expect(r2.status).toBe('synced');
+    expect(r2.toCommit).toBe(c2);
     expect(await engine.getPage('notes/y')).not.toBeNull();
-    expect(await lastCommitConfig()).toBe(c2);
+    expect(await lastCommitConfig()).toBe(r2.toCommit);
   }, 60_000);
 
   // ── D. Rewrite of the pin → discard checkpoint, re-pin to HEAD ─────────────
@@ -271,7 +275,10 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
     );
     execSync('git add -A && git commit -m "good + bad"', { cwd: repoPath, stdio: 'pipe' });
 
+    // #5988: content refusals are held by default; sync.holds=fail keeps the fail-closed gate this test exercises.
+    await engine.setConfig('sync.holds', 'fail');
     const res = await performSync(engine, { repoPath, sourceId: sid, noPull: true, noEmbed: true });
+    await engine.setConfig('sync.holds', 'hold');
     expect(res.status).toBe('blocked_by_failures');
 
     // Codex #2: blocked path writes neither last_commit NOR last_sync_at.

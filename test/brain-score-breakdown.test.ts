@@ -10,6 +10,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { doctorSource } from './helpers/doctor-source.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
 let engine: PGLiteEngine;
@@ -121,7 +122,7 @@ describe('Bug 11 — orphan_pages is "no inbound links"', () => {
 
 describe('Bug 11 — doctor renders brain_score breakdown', () => {
   test('doctor source contains brain_score breakdown rendering', async () => {
-    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    const source = doctorSource();
     expect(source).toContain('brain_score');
     expect(source).toContain('embed_coverage_score');
     expect(source).toContain('link_density_score');
@@ -141,5 +142,51 @@ describe('Bug 11 — BrainHealth type shape', () => {
     expect(typesSource).toContain('no_dead_links_score: number');
     // The stale "(0-10)" comment must be corrected to 0-100.
     expect(typesSource).toContain('0-100');
+  });
+});
+
+describe('linkable scope — archive pages do not drag the score', () => {
+  test('islanded raw/ and daily/ pages are excluded from the orphan component', async () => {
+    // Curated, connected pages.
+    await engine.putPage('people/alice-example', { type: 'person', title: 'Alice', compiled_truth: 'x', frontmatter: {} });
+    await engine.putPage('companies/acme-example', { type: 'company', title: 'Acme', compiled_truth: 'x', frontmatter: {} });
+    const { rows: ids } = await (engine as any).db.query(
+      `SELECT id, slug FROM pages ORDER BY slug`,
+    );
+    const bySlug = Object.fromEntries(ids.map((r: any) => [r.slug, r.id]));
+    await (engine as any).db.query(
+      `INSERT INTO links (from_page_id, to_page_id, link_type) VALUES ($1, $2, 'works_at')`,
+      [bySlug['people/alice-example'], bySlug['companies/acme-example']],
+    );
+    // Archive + daily-log pages: no links, no timeline — by design.
+    await engine.putPage('raw/whatsapp/2025-01/log-page', { type: 'note', title: 'raw log', compiled_truth: 'x', frontmatter: {} });
+    await engine.putPage('deals/acme-seed/raw/transcript', { type: 'note', title: 'raw t', compiled_truth: 'x', frontmatter: {} });
+    await engine.putPage('daily/calendar/2025/2025-01-01', { type: 'note', title: 'day', compiled_truth: 'x', frontmatter: {} });
+
+    const h = await engine.getHealth();
+    // The three archive/log pages are outside the linkable scope...
+    expect(h.linkable_page_count).toBe(2);
+    // ...so none of them is an orphan, and the connected pair keeps 15/15.
+    expect(h.orphan_pages).toBe(0);
+    expect(h.no_orphans_score).toBe(15);
+  });
+
+  test('timeline coverage is measured over linkable pages only', async () => {
+    await engine.putPage('people/alice-example', { type: 'person', title: 'Alice', compiled_truth: 'x', frontmatter: {} });
+    await engine.addTimelineEntry('people/alice-example', { date: '2025-01-01', source: 'note', summary: 'joined' });
+    // A raw archive page without timeline must not dilute coverage.
+    await engine.putPage('raw/whatsapp/2025-01/log-page', { type: 'note', title: 'raw log', compiled_truth: 'x', frontmatter: {} });
+
+    const h = await engine.getHealth();
+    expect(h.linkable_page_count).toBe(1);
+    expect(h.timeline_coverage_score).toBe(15); // 1/1 linkable pages covered
+  });
+
+  test('an islanded curated page still counts as an orphan', async () => {
+    await engine.putPage('people/forgotten-example', { type: 'person', title: 'F', compiled_truth: 'x', frontmatter: {} });
+    const h = await engine.getHealth();
+    expect(h.orphan_pages).toBe(1);
+    expect(h.linkable_page_count).toBe(1);
+    expect(h.no_orphans_score).toBe(0);
   });
 });

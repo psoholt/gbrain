@@ -20,7 +20,7 @@ import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 let engine: PGLiteEngine;
 
 beforeAll(async () => {
-  // v0.41.5.0+: DEFAULT_EMBEDDING_DIMENSIONS is 1280 (ZE Matryoshka). unitVec()
+  // v0.41.5.0+: DEFAULT_EMBEDDING_DIMENSIONS is 1024 (Voyage Matryoshka). unitVec()
   // below inserts 1536-dim vectors into facts.embedding. Without pinning, a
   // fresh CI environment (no prior gateway configure) sizes the column at
   // vector(1280) and the inserts throw "expected 1280 dimensions, not 1536"
@@ -146,6 +146,23 @@ describe('find_trajectory MCP op — visibility filter (R6 / D-CDX-1)', () => {
     const remote = await op.handler(mkCtx({ remote: true  }), { entity_slug: 'optraj-vis' }) as any;
     expect(remote.points.length).toBe(1);
     expect(remote.points[0].value).toBe(99999);
+  });
+
+  test('FAIL-CLOSED cast bypass: a context missing `remote` is world-only (F7b)', async () => {
+    await insertTyped({ entity_slug: 'optraj-vis-bypass', metric: 'mrr', value: 50000, visibility: 'private', valid_from: new Date('2026-01-15') });
+    await insertTyped({ entity_slug: 'optraj-vis-bypass', metric: 'mrr', value: 99999, visibility: 'world',   valid_from: new Date('2026-04-12') });
+
+    const op = operationsByName['find_trajectory'];
+    // Simulate the type bypass this fix closes: a widened context (Partial<>
+    // cast) whose `remote` was never threaded. If the ops-layer coercion ever
+    // regresses to `ctx.remote === true`, this context becomes an explicit
+    // remote: false and reads the private row — the exact leak class F7b
+    // closed for whoami. It must degrade to world-only instead.
+    const ctx = mkCtx();
+    delete (ctx as any).remote;
+    const result = await op.handler(ctx, { entity_slug: 'optraj-vis-bypass' }) as any;
+    expect(result.points.length).toBe(1);
+    expect(result.points[0].value).toBe(99999);
   });
 });
 

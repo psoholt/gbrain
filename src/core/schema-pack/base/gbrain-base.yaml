@@ -12,8 +12,8 @@
 #
 # Determinism: codegen output is sorted lex-stable per primitive and per
 # field. Re-running `bun scripts/generate-gbrain-base.ts` must produce
-# byte-identical output. CI-pinned via
-# test/regressions/gbrain-base-codegen-determinism.test.ts.
+# byte-identical output; `bun scripts/generate-gbrain-base.ts --check`
+# reports drift.
 #
 # Aliases: empty by default. v0.38 ships gbrain-base with NO alias graph
 # edges so existing search behavior is unchanged. Users opt into alias
@@ -205,6 +205,17 @@ page_types:
     extractable: true
     expert_routing: false
 
+  # imessage source kind: one private, owner-only page per chat per day. Not
+  # extractable: atom extraction never sends other people's messages to a
+  # model on its own (facts follow the connector's own extraction setting).
+  - name: imessage
+    primitive: temporal
+    path_prefixes:
+      - imessage/
+    aliases: []
+    extractable: false
+    expert_routing: false
+
   - name: calendar-event
     primitive: temporal
     path_prefixes:
@@ -262,6 +273,27 @@ page_types:
     extractable: false
     expert_routing: false
 
+  # v0.42.x — Life Chronicle (#2390). `event` = timeline atom
+  # (when·where·who·what) backlinking to a depth page; `diary` = timestamped
+  # first-person interiority. Both `temporal` (events through time, not entity
+  # surfaces). `extractable: false`: events are already the atomic form, and
+  # diary interiority is NEVER mined into the facts table (privacy/consent).
+  - name: event
+    primitive: temporal
+    path_prefixes:
+      - life/events/
+    aliases: []
+    extractable: false
+    expert_routing: false
+
+  - name: diary
+    primitive: temporal
+    path_prefixes:
+      - life/diary/
+    aliases: []
+    extractable: false
+    expert_routing: false
+
   # Types with no path prefix (set explicitly via frontmatter).
   - name: code
     primitive: media
@@ -278,6 +310,26 @@ page_types:
     expert_routing: false
 
   - name: synthesis
+    primitive: annotation
+    path_prefixes: []
+    aliases: []
+    extractable: false
+    expert_routing: false
+
+  # Quotable facts page (GST-2731): one dated line per fact, with where it came
+  # from (me/facts, company/facts); agents quote only its dated lines, and
+  # doctor's facts_undated_lines names a line with no date. Set via frontmatter only.
+  - name: facts
+    primitive: annotation
+    path_prefixes: []
+    aliases: []
+    extractable: false
+    expert_routing: false
+
+  # Pinned question page (C4): the question and the owner's notes; the answer
+  # lives in pinned_questions. Owner-private and never evidence. Set via
+  # frontmatter only, so an existing questions/ folder keeps its own types.
+  - name: question
     primitive: annotation
     path_prefixes: []
     aliases: []
@@ -315,18 +367,22 @@ link_types:
   - name: founded
     inference:
       regex: \b(founded|founder of|co-?founded|started)\b
+      ner_only: true
 
   - name: invested_in
     inference:
       regex: \b(invested in|backed|seeded|funded|wrote a check)\b
+      ner_only: true
 
   - name: advises
     inference:
       regex: \b(advises|advisor|advising|advisor to)\b
+      ner_only: true
 
   - name: works_at
     inference:
       regex: \b(works? at|employed by|works? for|joined|hired by|ceo of|cto of|cmo of)\b
+      ner_only: true
 
   - name: yc_partner
 

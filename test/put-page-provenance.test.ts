@@ -26,10 +26,18 @@ import { describe, test, expect, beforeAll, beforeEach, afterAll } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operations } from '../src/core/operations.ts';
 import type { OperationContext } from '../src/core/operations.ts';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { withEnv } from './helpers/with-env.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { OperationError } from '../src/core/operations.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 
-const putPageOp = operations.find((o) => o.name === 'put_page')!;
+const home = mkdtempSync(join(tmpdir(), 'gbrain-provenance-'));
+const put = operations.find((o) => o.name === 'put_page')!;
+const putPageOp = { ...put, handler: (ctx: OperationContext, p: Record<string, unknown>) => withEnv({ GBRAIN_HOME: home }, () => put.handler(ctx, p)) };
 
 let engine: PGLiteEngine;
 
@@ -63,22 +71,22 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  await disposePersistenceConsumer(engine);
   await engine.disconnect();
+  rmSync(home, { recursive: true, force: true });
   __setEmbedTransportForTests(null);
   resetGateway();
 });
 
 beforeEach(async () => {
-  // Wipe pages so each test starts from a known empty state. We use
-  // executeRaw rather than a TRUNCATE-by-name sweep because this file
-  // only touches one table.
-  await engine.executeRaw('DELETE FROM pages', []);
+  await disposePersistenceConsumer(engine);
+  await resetPgliteState(engine);
 });
 
 function makeCtx(opts: Partial<OperationContext> = {}): OperationContext {
   return {
     engine,
-    config: { engine: 'pglite' as const },
+    config: { engine: 'pglite' as const, embedding_disabled: true },
     logger: {
       info: () => { /* noop */ },
       warn: () => { /* noop */ },
@@ -181,7 +189,7 @@ describe('put_page provenance — CV6 spoofing guard (ctx.remote !== false)', ()
     // v0.26.9 F7b discipline: anything that isn't strictly `false` is remote.
     const ctx: OperationContext = {
       engine,
-      config: { engine: 'pglite' as const },
+      config: { engine: 'pglite' as const, embedding_disabled: true },
       logger: { info: () => {}, warn: () => {}, error: () => {} },
       dryRun: false,
       // remote: explicitly undefined to exercise the fail-closed path
@@ -218,6 +226,7 @@ describe('put_page provenance — CV12 COALESCE-preserve UPDATE', () => {
     await putPageOp.handler(ctx, {
       slug: 'wiki/p3a-preserve',
       content: '---\ntype: note\ntitle: V2\n---\n\nedited body',
+      expected_revision: (await engine.readPageSnapshot('wiki/p3a-preserve', { sourceId: 'default' }))!.revision,
     });
     const second = await readProvenance('wiki/p3a-preserve');
     // CV12: provenance preserved — first-write wins
@@ -241,6 +250,7 @@ describe('put_page provenance — CV12 COALESCE-preserve UPDATE', () => {
     await putPageOp.handler(ctx, {
       slug: 'wiki/p3a-reingest',
       content: '---\ntype: note\ntitle: V2\n---\n\nbody',
+      expected_revision: (await engine.readPageSnapshot('wiki/p3a-reingest', { sourceId: 'default' }))!.revision,
       source_kind: 'file-watcher', // explicit re-ingest under different kind
       source_uri: 'file:///watched/path.md',
       ingested_via: 'file-watcher',
@@ -267,6 +277,7 @@ describe('put_page provenance — CV12 COALESCE-preserve UPDATE', () => {
     await putPageOp.handler(remoteCtx, {
       slug: 'wiki/p3a-local-then-remote',
       content: '---\ntype: note\ntitle: V2\n---\n\nremote edit',
+      expected_revision: (await engine.readPageSnapshot('wiki/p3a-local-then-remote', { sourceId: 'default' }))!.revision,
     });
 
     // Remote second write is itself a provenance write (server-stamped),
@@ -278,6 +289,23 @@ describe('put_page provenance — CV12 COALESCE-preserve UPDATE', () => {
     // the second write IS an ingestion, it gets to record itself.
     const prov = await readProvenance('wiki/p3a-local-then-remote');
     expect(prov.source_kind).toBe('mcp:put_page');
+  });
+
+  test('a remote timeline entry, tag or link keeps the page provenance and ignores supplied stamps (#8667)', async () => {
+    const run = (name: string, ctx: OperationContext, p: Record<string, unknown>) =>
+      withEnv({ GBRAIN_HOME: home }, () => operations.find((o) => o.name === name)!.handler(ctx, p));
+    const slug = 'wiki/p3a-local-then-remote-meta';
+    await putPageOp.handler(makeCtx({ remote: false }), {
+      slug, content: '---\ntype: note\ntitle: V1\n---\n\nbody', source_kind: 'capture-cli', source_uri: 'file:///tmp/v1.md', ingested_via: 'put_page',
+    });
+    const before = await readProvenance(slug);
+    expect(before.source_kind).toBe('capture-cli');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await run('add_timeline_entry', makeCtx({ remote: true }), { slug, date: '2026-11-01', summary: 'Kickoff with acme-example' });
+    await run('add_tag', makeCtx({ remote: true }), { slug, tag: 'follow-up', source_kind: 'spoofed', ingested_via: 'spoofed' });
+    await putPageOp.handler(makeCtx({ remote: false }), { slug: 'wiki/p3a-link-target', content: '---\ntype: note\ntitle: Target\n---\n\nbody' });
+    await run('add_link', makeCtx({ remote: true }), { from: slug, to: 'wiki/p3a-link-target', link_type: 'mentions' });
+    expect(await readProvenance(slug)).toEqual(before);
   });
 });
 
@@ -327,7 +355,7 @@ describe('put_page provenance — T2 subagent namespace regression', () => {
   test('subagent missing subagentId fails-closed regardless of provenance params', async () => {
     const ctx: OperationContext = {
       engine,
-      config: { engine: 'pglite' as const },
+      config: { engine: 'pglite' as const, embedding_disabled: true },
       logger: { info: () => {}, warn: () => {}, error: () => {} },
       dryRun: false,
       remote: true,

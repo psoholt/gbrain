@@ -12,6 +12,7 @@ import * as os from 'node:os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { parseMarkdown } from '../src/core/markdown.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
 import {
   runPhantomRedirectPass,
@@ -248,7 +249,7 @@ describe('tryRedirectPhantom (single phantom orchestration)', () => {
       );
       await putPage('alice', phantomBody);
       writeMd(brainDir, 'alice', phantomBody);
-      writeMd(brainDir, 'people/alice-example', '# alice-example\n');
+      writeMd(brainDir, 'people/alice-example', '# alice-example\n\n## Facts\n\n');
 
       const phantom = await engine.getPage('alice', { sourceId: 'default' });
       expect(phantom).not.toBeNull();
@@ -580,25 +581,54 @@ describe('runExtractFacts — phantom-redirect integration', () => {
     });
   });
 
-  test('round 2 P1: legacy-row guard fires BEFORE phantom-redirect pass', async () => {
+  test('round 2 P1 (#6650): the legacy-row guard holds only the phantom that owns legacy rows', async () => {
     await withTempDirs(async ({ brainDir }) => {
-      // Seed a legacy v0.31 fact row (row_num NULL, entity_slug NOT NULL).
-      // `source` is NOT NULL in the schema; the v0.31 path always set it.
+      // #2763: the guard only gates on rows the v0_32_2 Phase B backfill
+      // could actually fence, which requires the source's local_path — set
+      // it (the migrated v0.31 brain shape) so the legacy row keeps gating.
       await engine.executeRaw(
-        `INSERT INTO facts (source_id, entity_slug, fact, kind, valid_from, source)
-         VALUES ('default', 'people/legacy', 'Legacy claim', 'fact', '2020-01-01'::date, 'legacy-import')`,
+        `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+        [brainDir],
       );
-      // Seed a phantom that SHOULD have been redirected if the guard didn't fire
-      await putPage('people/alice-example', '# alice-example\n', { type: 'person' });
-      writeMd(brainDir, 'people/alice-example', '# alice-example\n');
-      await putPage('alice', STUB_BODY);
-      writeMd(brainDir, 'alice', STUB_BODY);
+      try {
+        // Seed a legacy v0.31 fact row (row_num NULL, entity_slug NOT NULL).
+        // `source` is NOT NULL in the schema; the v0.31 path always set it.
+        // #2484: the guard only gates on rows whose entity_slug resolves to a
+        // LIVE page, so seed the backing page too. #5299: the phase fences a
+        // row whose canonical file exists, so the page has no file here and the
+        // row stays unfenced, which is what gates.
+        await putPage('people/legacy', '# legacy\n', { type: 'person' });
+        await engine.executeRaw(
+          `INSERT INTO facts (source_id, entity_slug, fact, kind, valid_from, source)
+           VALUES ('default', 'people/legacy', 'Legacy claim', 'fact', '2020-01-01'::date, 'legacy-import')`,
+        );
+        // Seed a phantom that SHOULD have been redirected if the guard didn't fire
+        await putPage('people/alice-example', '# alice-example\n', { type: 'person' });
+        writeMd(brainDir, 'people/alice-example', '# alice-example\n');
+        await putPage('alice', STUB_BODY);
+        writeMd(brainDir, 'alice', STUB_BODY);
 
-      const result = await runExtractFacts(engine, { sourceId: 'default', brainDir });
-      expect(result.guardTriggered).toBe(true);
-      expect(result.phantomsRedirected).toBe(0);
-      // Phantom .md still on disk (pass skipped)
-      expect(mdExists(brainDir, 'alice')).toBe(true);
+        // #6650: a phantom that owns a legacy row would strand it, so it is held.
+        await putPage('bob', STUB_BODY);
+        writeMd(brainDir, 'bob', STUB_BODY);
+        await putPage('people/bob-example', '# bob-example\n', { type: 'person' });
+        writeMd(brainDir, 'people/bob-example', '# bob-example\n');
+        await engine.executeRaw(
+          `INSERT INTO facts (source_id, entity_slug, fact, kind, valid_from, source)
+           VALUES ('default', 'bob', '   ', 'fact', '2020-01-01'::date, 'legacy-import')`,
+        );
+
+        const result = await runExtractFacts(engine, { sourceId: 'default', brainDir });
+        expect(result.guardTriggered).toBe(true);
+        // A legacy row on another page no longer stops the pass for the source (#6650).
+        expect(result.phantomsRedirected).toBe(1);
+        expect(mdExists(brainDir, 'alice')).toBe(false);
+        // The phantom that owns a legacy row is held: its file and row stay.
+        expect(mdExists(brainDir, 'bob')).toBe(true);
+        expect(await engine.executeRaw(`SELECT 1 FROM facts WHERE entity_slug = 'bob' AND row_num IS NULL AND expired_at IS NULL`)).toHaveLength(1);
+      } finally {
+        await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+      }
     });
   });
 
@@ -697,40 +727,31 @@ describe('runPhantomRedirectPass (per-cycle pass)', () => {
 
 // ─── Lock retry semantics (C4) ─────────────────────────────────────
 
-describe('lock contention (C4)', () => {
-  test('lock_busy when another holder has it → pass skipped, audit entry, retries next cycle', async () => {
+describe('lock contention (C4) — per-source sync lock (v0.40 D16)', () => {
+  // A held lock makes acquireLockWithRetry loop until its 30s budget or the
+  // caller's abort; the short abort keeps the busy case fast.
+  async function holdLock(id: string): Promise<void> {
+    await engine.executeRaw(
+      `INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at)
+       VALUES ($1, 9999, 'other-host', now(), now() + interval '1 hour')`,
+      [id],
+    );
+  }
+
+  test('same-source sync lock held → pass skipped as lock_busy', async () => {
     await withTempDirs(async ({ brainDir }) => {
-      // Manually claim the gbrain-sync lock with a future TTL
-      await engine.executeRaw(
-        `INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at)
-         VALUES ('gbrain-sync', 9999, 'other-host', now(), now() + interval '1 hour')`,
-      );
+      await holdLock('gbrain-sync:src-b');
+      const result = await runPhantomRedirectPass(engine, brainDir, 'src-b', false, AbortSignal.timeout(200));
+      expect(result.lock_busy).toBe(true);
+    });
+  });
 
-      // Need a phantom + canonical or scanned would be 0 regardless
-      await putPage('people/alice-example', '# alice-example\n', { type: 'person' });
-      writeMd(brainDir, 'people/alice-example', '# alice-example\n');
-      await putPage('alice', STUB_BODY);
-      writeMd(brainDir, 'alice', STUB_BODY);
-
-      // Reduce retry window so the test finishes quickly. The handler's
-      // 30s default would slow the suite. We don't expose a knob, but the
-      // 30s+1s-backoff loop ends in ~30 retries; since we want this to be
-      // an honest assertion let's run with a short manual lock and then
-      // release it mid-loop... actually simpler: assert lock_busy after
-      // the full retry window (slow). For a fast test, we'll instead
-      // assert via withEnv shortcut: set the env var to abbreviate, but
-      // since the handler has hardcoded 30s, the cleanest fast assertion
-      // is to release the lock right away then re-acquire AFTER the pass
-      // proves the timeout path. Instead we'll just verify the lock IS
-      // held externally; the lock_busy result is asserted in a slow
-      // companion test if needed.
-      const lockBefore = await engine.executeRaw<{ holder_pid: number }>(
-        `SELECT holder_pid FROM gbrain_cycle_locks WHERE id='gbrain-sync'`,
-      );
-      expect(lockBefore[0].holder_pid).toBe(9999);
-
-      // Cleanup
-      await engine.executeRaw(`DELETE FROM gbrain_cycle_locks WHERE id='gbrain-sync'`);
+  test('bare and default-source sync locks held → another source still runs', async () => {
+    await withTempDirs(async ({ brainDir }) => {
+      await holdLock('gbrain-sync');
+      await holdLock('gbrain-sync:default');
+      const result = await runPhantomRedirectPass(engine, brainDir, 'src-b', false, AbortSignal.timeout(200));
+      expect(result.lock_busy).toBe(false);
     });
   });
 });
@@ -761,6 +782,82 @@ describe('phantom-audit module', () => {
       const { logPhantomEvent } = await import('../src/core/facts/phantom-audit.ts');
       // Should not throw — failure is logged to stderr
       expect(() => logPhantomEvent({ outcome: 'redirected', source_id: 'default' })).not.toThrow();
+    });
+  });
+});
+
+// ─── wave review: #4756 placement rule holds for the phantom-redirect writer ──
+describe('tryRedirectPhantom — fence placement above the timeline sentinel (#4756)', () => {
+  test('a canonical with a `---` + `## Timeline` sentinel and no fence gets `## Facts` ABOVE it, not at EOF', async () => {
+    await withTempDirs(async ({ brainDir }) => {
+      // The recommended page template: prose, then the legacy bare `---`
+      // sentinel followed by `## Timeline`. splitBody() files everything
+      // below the sentinel into page.timeline, where extract_facts refuses
+      // to reconcile a fence (FACTS_FENCE_BELOW_SENTINEL) — a blind EOF
+      // append froze the redirected rows permanently.
+      const canonicalBody = `# alice-example\n\nAlice runs acme-example.\n\n---\n\n## Timeline\n\n- 2026-01-01: Founded Acme\n`;
+      const split = parseMarkdown(canonicalBody, 'people/alice-example.md');
+      await engine.putPage('people/alice-example', { title: 'people/alice-example', type: 'person' as never, compiled_truth: split.compiled_truth, timeline: split.timeline, frontmatter: {} });
+      writeMd(brainDir, 'people/alice-example', canonicalBody);
+
+      const phantomBody = FACT_FENCE(
+        `| 1 | Founded Acme | fact | 1.0 | world | high | 2017-01-01 |  | linkedin |  |`,
+      );
+      await putPage('alice', phantomBody);
+      writeMd(brainDir, 'alice', phantomBody);
+
+      const phantom = await engine.getPage('alice', { sourceId: 'default' });
+      const result = await tryRedirectPhantom(engine, phantom!, 'default', brainDir, false);
+      expect(result.outcome).toBe('redirected');
+
+      const canonicalMd = readMd(brainDir, 'people/alice-example');
+      expect(canonicalMd).toContain('Founded Acme');
+      const factsAt = canonicalMd.indexOf('## Facts');
+      const sentinelAt = canonicalMd.indexOf('\n---\n');
+      expect(factsAt).toBeGreaterThan(-1);
+      expect(sentinelAt).toBeGreaterThan(-1);
+      expect(factsAt).toBeLessThan(sentinelAt);
+      // Prose above the fence survives; the timeline section is still last.
+      expect(canonicalMd.indexOf('Alice runs acme-example.')).toBeLessThan(factsAt);
+      expect(canonicalMd.indexOf('## Timeline')).toBeGreaterThan(canonicalMd.indexOf('gbrain:facts:end'));
+    });
+  });
+});
+
+describe('tryRedirectPhantom — content outside compiled_truth is residue', () => {
+  test('a page whose content lives in the timeline is not a phantom and survives', async () => {
+    await withTempDirs(async ({ brainDir }) => {
+      await putPage('people/alice-example', '# Alice Example\n\nCanonical person page.\n', { type: 'person' });
+      await engine.putPage('alice', {
+        title: 'alice',
+        type: 'person',
+        compiled_truth: '# alice\n',
+        timeline: '## Timeline\n\n- **2026-03-01** | Met alice at the acme-example offsite; TIMELINE-MARKER.\n',
+        frontmatter: {},
+      });
+      writeMd(brainDir, 'alice', '# alice\n\n<!-- timeline -->\n\n## Timeline\n\n- **2026-03-01** | TIMELINE-MARKER\n');
+
+      const phantom = await engine.getPage('alice', { sourceId: 'default' });
+      const result = await tryRedirectPhantom(engine, phantom!, 'default', brainDir, false);
+
+      expect(result.outcome).toBe('not_phantom');
+      const after = await engine.getPage('alice', { sourceId: 'default' });
+      expect(after?.timeline).toContain('TIMELINE-MARKER');
+      expect(mdExists(brainDir, 'alice')).toBe(true);
+    });
+  });
+
+  test('custom frontmatter is residue; title/type/tags alone are not', async () => {
+    await withTempDirs(async ({ brainDir }) => {
+      await putPage('people/alice-example', '# Alice Example\n\nCanonical person page.\n', { type: 'person' });
+      await putPage('alice', STUB_BODY, { frontmatter: { email_hint: 'alice@acme-example.test' } });
+      writeMd(brainDir, 'alice', `---\nemail_hint: alice@acme-example.test\n---\n${STUB_BODY}`);
+      const withCustom = await engine.getPage('alice', { sourceId: 'default' });
+      expect((await tryRedirectPhantom(engine, withCustom!, 'default', brainDir, false)).outcome).toBe('not_phantom');
+
+      await putPage('alice', STUB_BODY, { frontmatter: { title: 'alice', type: 'person', tags: [] } });
+      const plain = await engine.getPage('alice', { sourceId: 'default' });
+      expect((await tryRedirectPhantom(engine, plain!, 'default', brainDir, true)).outcome).toBe('redirected');
     });
   });
 });

@@ -10,12 +10,28 @@ export const groq: Recipe = {
   name: 'Groq',
   tier: 'openai-compat',
   implementation: 'openai-compatible',
+  // No shipped rate for these yet: they warn and run under a default cap; a
+  // user cap refuses them until `gbrain pricing set` registers one (X1 guard).
+  unpriced_models: [
+    'llama-3.1-8b-instant',
+    'llama-3.3-70b-versatile',
+    'gpt-oss-20b',
+    'gpt-oss-120b',
+  ],
   base_url_default: 'https://api.groq.com/openai/v1',
   auth_env: {
     required: ['GROQ_API_KEY'],
     setup_url: 'https://console.groq.com/keys',
   },
   touchpoints: {
+    // Same OpenAI-compatible endpoint as chat; declared so an explicit
+    // `expansion_model: groq:...` resolves instead of silently dropping
+    // expansion (#1135). 8b-instant is the natural expansion pick (cheap,
+    // fast, no tool-calling needed for multi-query rewrites).
+    expansion: {
+      models: ['llama-3.1-8b-instant', 'llama-3.3-70b-versatile'],
+      price_last_verified: '2026-04-20',
+    },
     chat: {
       models: [
         'llama-3.3-70b-versatile',

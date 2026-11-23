@@ -1,6 +1,11 @@
 import { createHash } from 'crypto';
 import type { BrainEngine } from './engine.ts';
 import { withRetry, BULK_RETRY_OPTS, RetryAbortError } from './retry.ts';
+import { FENCE_REPAIR_ATTEMPT_OP } from './fence-repair/attempts.ts';
+import { FENCE_CANDIDATE_OP, FENCE_SCAN_OP } from './fence-repair/census-store.ts';
+import { FENCE_UNCOMMITTED_OP } from './fence-repair/uncommitted.ts';
+import { SYNC_PASS_ROW_OPS } from './persistence/sync-pass-row.ts';
+import { SYNC_DELETE_TOMBSTONE_OP } from './persistence/sync-delete-tombstones.ts';
 
 /** Max paths per append-INSERT round-trip; bounds the param-array size. */
 const APPEND_CHUNK = 1000;
@@ -484,7 +489,19 @@ export function syncFingerprint(p: { sourceId?: string; lastCommit: string }): s
 /**
  * Cycle's purge phase calls this to drop stale checkpoints. 7-day TTL is
  * deliberately generous — any reasonable long-running op finishes inside
- * that window, and the row is cheap (few KB).
+ * that window, and the row is cheap (few KB). Durable state is exempt: Git
+ * sync holds, their summary while it counts any, retry requests, sync
+ * import provenance, the blocked-cursor conversion log, and the #6188 fence
+ * census (candidates and scan cursors), paid fence-repair attempt claims
+ * and memos, uncommitted legacy fence-repair notices, and the #6712 managed
+ * sync pass row, deletion markers, withheld mass-delete record and cost
+ * reservations (`SYNC_PASS_ROW_OPS`) of a live source incarnation leave only
+ * on resolution (or with the incarnation), and connector hold-retry requests and stuck-recovery
+ * resolution audit entries never expire (#5988, #6650); a managed purge's
+ * tombstone failure records and parks (#6741, purge-parks.ts) leave only with
+ * their tombstone, its purge or a rearm; an open #6729 rename-identity downgrade
+ * record stays until its pair is settled or its old page is restored or purged, and a #7130 managed sync
+ * deletion record while its tombstone (same page id and deleted_at) exists.
  */
 export async function purgeStaleCheckpoints(
   engine: BrainEngine,
@@ -498,6 +515,36 @@ export async function purgeStaleCheckpoints(
       `WITH deleted AS (
          DELETE FROM op_checkpoints
          WHERE updated_at < now() - ($1 || ' days')::interval
+           AND op NOT IN ('managed-atoms','managed-atoms-generation','managed-connector','managed-connector-retry','managed-connector-state','managed-connector-migration')
+           AND op<>'connector-hold-retry'
+           AND op<>'connector-db-cursor'
+           AND op<>'stuck-recovery-resolution'
+           AND op<>'sync-admission'
+           AND NOT (op='${SYNC_DELETE_TOMBSTONE_OP}' AND EXISTS (
+             SELECT 1 FROM pages p WHERE p.id::text=op_checkpoints.fingerprint AND p.deleted_at=(op_checkpoints.completed_keys->0->>'deleted_at')::timestamptz))
+           AND op<>'purge-deleted-park'
+           AND op<>'derived-origin-park'
+           AND op<>'owed-page-purge'
+           AND NOT (op='sync-identity-downgrade' AND completed_keys->0->>'disposition' IS NULL AND EXISTS (
+             SELECT 1 FROM pages p WHERE p.id::text=op_checkpoints.fingerprint AND p.deleted_at=(op_checkpoints.completed_keys->0->>'old_deleted_at')::timestamptz))
+           AND NOT (op IN ('sync-hold','sync-hold-retry','sync-import-provenance','plain-directory-agreed','sync-hold-summary','sync-conversions','${FENCE_CANDIDATE_OP}','${FENCE_SCAN_OP}','${FENCE_REPAIR_ATTEMPT_OP}','${FENCE_UNCOMMITTED_OP}',${SYNC_PASS_ROW_OPS.map(op => `'${op}'`).join(',')})
+             AND NOT (op='sync-hold-summary' AND COALESCE((completed_keys->0->>'count')::int,0)=0)
+             AND EXISTS (SELECT 1 FROM sources s WHERE s.id=op_checkpoints.completed_keys->0->>'source_id'
+               AND s.incarnation::text=op_checkpoints.completed_keys->0->>'incarnation'))
+           AND NOT (op='managed-sync' AND (COALESCE(completed_keys->0->>'done','false')<>'true' OR EXISTS (
+             SELECT 1 FROM op_checkpoints f WHERE f.op='managed-sync-failure' AND f.fingerprint=op_checkpoints.fingerprint)))
+           AND op<>'managed-sync-failure'
+           AND NOT (op='managed-sync-manifest' AND EXISTS (
+             SELECT 1 FROM op_checkpoints c WHERE c.op='managed-sync'
+               AND c.completed_keys->0->>'runId'=op_checkpoints.fingerprint
+               AND COALESCE(c.completed_keys->0->>'done','false')<>'true'))
+           AND NOT EXISTS (
+             SELECT 1 FROM source_ingestion_receipts r,
+               LATERAL jsonb_array_elements(r.checkpoint_refs) ref
+             WHERE r.outcome = 'incomplete'
+               AND ref->>'op' = op_checkpoints.op
+               AND ref->>'fingerprint' = op_checkpoints.fingerprint
+           )
          RETURNING 1
        )
        SELECT count(*)::text AS count FROM deleted`,

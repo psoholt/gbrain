@@ -11,11 +11,14 @@ import {
   runRegexBounded,
   PageRegexBudget,
   RegexInputTooLargeError,
+  RegexCatastrophicPatternError,
   MAX_REGEX_INPUT_CHARS,
 } from '../src/core/schema-pack/redos-guard.ts';
 import { inferLinkTypeFromPack } from '../src/core/schema-pack/link-inference.ts';
 import { linkRegexCatastrophicBacktrack } from '../src/core/schema-pack/lint-rules.ts';
 import type { SchemaPackManifest } from '../src/core/schema-pack/manifest-v1.ts';
+import { surfaceFileSource, surfaceSource } from './helpers/source-surface.ts';
+import { cpuMs } from './helpers/cpu-time.ts';
 
 describe('#1569 input-length cap', () => {
   test('runRegexBounded throws RegexInputTooLargeError over the cap', () => {
@@ -42,11 +45,55 @@ describe('#1569 input-length cap', () => {
       link_types: [{ name: 'founded', inference: { regex: '(a+)+$' } }],
     } as unknown as Pick<SchemaPackManifest, 'link_types'>;
     const huge = 'a'.repeat(MAX_REGEX_INPUT_CHARS + 100) + '!';
-    const t0 = Date.now();
-    const result = inferLinkTypeFromPack(pack, 'company', huge);
+    let result!: ReturnType<typeof inferLinkTypeFromPack>;
+    const ms = cpuMs(() => { result = inferLinkTypeFromPack(pack, 'company', huge); });
     // Skipped via the cap → no match, and fast (no catastrophic backtrack).
     expect(result).toBeNull();
-    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(ms).toBeLessThan(2_000);
+  });
+});
+
+describe('megawave vm-watchdog removal (bootstrap-verify freeze)', () => {
+  // Bun's `vm.runInContext(..., { timeout })` watchdog wedges the event loop
+  // in processes that also host PGLite WASM: after some dozens of watchdog
+  // runs, all JS timers stop firing and the next in-flight PGLite query
+  // promise never resolves (repro: the bootstrap-verify corpus test hanging
+  // at 240s once #3190 wired pack regex inference into put_page). The guard
+  // must never route through node:vm again; bounding is structural (input
+  // cap + catastrophic-shape refusal + per-page budget).
+  test('redos-guard does not import node:vm (freeze regression pin)', () => {
+    // Import absence is the load-bearing check: without the import, no code
+    // path can reach runInContext. (The header comment intentionally KEEPS
+    // the historical vm references as the record of why it was removed.)
+    const src = readFileSync(join(import.meta.dir, '..', 'src', 'core', 'schema-pack', 'redos-guard.ts'), 'utf-8');
+    expect(src).not.toMatch(/from ['"]node:vm['"]/);
+    expect(src).not.toMatch(/require\(['"]node:vm['"]\)/);
+    expect(src).not.toMatch(/from ['"]vm['"]/);
+  });
+
+  test('runRegexBounded refuses nested-quantifier patterns before executing', () => {
+    expect(() => runRegexBounded('(a+)+$', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!')).toThrow(RegexCatastrophicPatternError);
+  });
+
+  test('PageRegexBudget.runBounded degrades (null) on catastrophic pattern, counts budget', () => {
+    const budget = new PageRegexBudget();
+    expect(budget.runBounded('verb', '(\\w+)+$', 'some ordinary context sentence')).toBeNull();
+    expect(budget.getCumulativeMs()).toBeGreaterThan(0);
+  });
+
+  test('benign first-party-shaped patterns still match (plain exec path)', () => {
+    const m = runRegexBounded('\\b(founded|founder of|co-?founded|started)\\b', 'alice founded acme');
+    expect(m).not.toBeNull();
+  });
+
+  test('inferLinkTypeFromPack degrades a catastrophic pack regex to null (no hang)', () => {
+    const pack = {
+      link_types: [{ name: 'evil', inference: { regex: '(a+)+$' } }],
+    } as unknown as Pick<SchemaPackManifest, 'link_types'>;
+    let result!: ReturnType<typeof inferLinkTypeFromPack>;
+    const ms = cpuMs(() => { result = inferLinkTypeFromPack(pack, 'company', 'a'.repeat(64) + '!'); });
+    expect(result).toBeNull();
+    expect(ms).toBeLessThan(1_000);
   });
 });
 
@@ -78,7 +125,10 @@ describe('#1569 star-height lint rule', () => {
 });
 
 describe('#1569 --no-schema-pack + heartbeat wiring (structural)', () => {
-  const SYNC = readFileSync(join(import.meta.dir, '..', 'src', 'commands', 'sync.ts'), 'utf-8');
+  // A10: containment pins read the whole sync surface; the ordering pin names
+  // the single file that holds the import loop.
+  const SYNC = surfaceSource('sync');
+  const SYNC_IMPORTS = surfaceFileSource('sync', 'src/commands/sync/imports.ts');
 
   test('SyncOpts carries noSchemaPack and it gates loadActivePack', () => {
     expect(SYNC).toContain('noSchemaPack?: boolean');
@@ -87,8 +137,8 @@ describe('#1569 --no-schema-pack + heartbeat wiring (structural)', () => {
   });
 
   test('begin heartbeat fires before importFile (GBRAIN_SYNC_TRACE)', () => {
-    const beginIdx = SYNC.indexOf('begin import:');
-    const importIdx = SYNC.indexOf('importFile(eng, filePath, path');
+    const beginIdx = SYNC_IMPORTS.indexOf('begin import:');
+    const importIdx = SYNC_IMPORTS.indexOf('importFile(eng, filePath, path');
     expect(beginIdx).toBeGreaterThan(0);
     expect(importIdx).toBeGreaterThan(0);
     expect(beginIdx).toBeLessThan(importIdx);

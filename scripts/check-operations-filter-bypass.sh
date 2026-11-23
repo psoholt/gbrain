@@ -34,22 +34,51 @@
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+# Self-test seam: GBRAIN_GUARD_ROOT points at a fixture tree with its own src/.
+ROOT="${GBRAIN_GUARD_ROOT:-$ROOT}"
 cd "$ROOT"
 
 # Files allowed to import `operations` directly. Each entry must be
 # accompanied by a one-line rationale (the comment on the same line).
 ALLOWED=(
-  "src/cli.ts"                                  # local CLI; user owns the machine, no trust boundary
+  "src/core/grants/profiles.ts"                 # snapshots eligible remote ops with !op.localOnly; grant validation never exposes local-only operations
+  "src/core/bootstrap/harness.ts"              # trusted owner provisioning; filters localOnly and scopes before minting explicit follow operation snapshots
+  "src/core/token-mint.ts"                     # trusted token creation validates explicit snapshots against public scope-compatible operations
+  "src/core/grants/legacy-token.ts"             # trusted local rescope-token; validates and refreshes snapshots against !op.localOnly scope-compatible operations
+  "src/core/shared-skills/tool-access.ts"       # skill usability intersects locality, scopes, snapshots, source fences, surface and publication gates
+  "src/mcp/skill-resources.ts"                  # resources map only catalog reads through equivalent scope/snapshot/surface/gate checks and shared dispatch
+  "src/core/harness/capabilities.ts"            # introspection applies !op.localOnly plus effective surface, scope, fence, snapshot and publish-gate filters
+  "src/cli/main.ts"                             # local CLI dispatcher (loaded by src/cli.ts); user owns the machine, no trust boundary
   "src/mcp/dispatch.ts"                         # shared dispatch; sets ctx.remote from caller, handlers self-gate
   "src/mcp/server.ts"                           # stdio MCP; local-trusted (binary on user's box)
   "src/mcp/http-transport.ts"                   # superseded by serve-http.ts; kept for back-compat tests
   "src/mcp/tool-defs.ts"                        # pure helper; takes ops as parameter, never exposes them
   "src/core/minions/tools/brain-allowlist.ts"   # subagent registry; has its own opt-in allowlist (separate from localOnly)
   "src/commands/capture.ts"                     # local CLI tool; not network-exposed
+  "src/commands/recall.ts"                      # local CLI delegates forget through the frozen operation before acquiring an engine
+  "src/commands/forget-purge.ts"                # local CLI runs the cliOnly purge_fact op as the trusted owner (remote: false) or over the 0600 owner socket
+  "src/commands/pages-purges.ts"                # local CLI runs the cliOnly list_page_purges / unpurge_page ops as the trusted owner (remote: false)
+  "src/commands/takes-mutation.ts"              # local CLI adapter; trusted execution or authenticated persistence IPC only
+  "src/core/persistence/administration.ts"      # trusted-admin grant diagnostics; does not expose an operation transport
+  "src/core/persistence/provider.ts"            # authenticated local registrations; shared dispatch enforces localOnly and the immutable trust lane
   "src/commands/enrich.ts"                       # local CLI tool; calls put_page handler with remote=false, not network-exposed
+  "src/commands/import-calls.ts"                 # local CLI import --calls; calls the put_page handler with remote=false, not network-exposed
+  "src/core/extract-takes-from-pages.ts"          # local CLI extraction calls put_page with remote=false; it does not expose operations to a transport
   "src/commands/book-mirror.ts"                 # local CLI tool; not network-exposed
+  "src/commands/edge-proposals.ts"              # local CLI review of edge proposals; calls trusted handlers with remote=false, not network-exposed
+  "src/core/cycle/edge-contradictions.ts"       # dream phase appends closure lines via add_timeline_entry with remote=false; never exposes operations
   "src/commands/tools-json.ts"                  # gbrain --tools-json introspection; full op list IS the purpose
+  "src/mcp/publish-gates.ts"                    # reads op.publishGateKey/name only to compute gate-DISABLED sets and the gate key set; never lists/exposes ops
+  "src/mcp/tool-catalog.ts"                     # docs/TOOL_CATALOG.md renderer; filters !op.localOnly at the boundary; never a transport surface
   "src/commands/serve-http.ts"                  # MUST APPLY .filter(op => !op.localOnly) — verified by grep below
+  "src/core/ops/request-tools.ts"               # visibleOpsForCaller loads the assembled list lazily (verbs.ts house pattern) and applies (isLocal || !op.localOnly) + surface + gate filtering
+  # The four below predate the widened specifier regex (they import via
+  # '../operations.ts', invisible to the old 'core/operations.ts' pattern) —
+  # all internal consumers, none a transport surface:
+  "src/core/advisor/collect-mcp-client-fit.ts"  # advisor collector; uses op.localOnly names to SCORE client fit, never serves the list
+  "src/core/bootstrap/verify.ts"                # bootstrap wiring verifier; finds ops by name to probe local wiring, remote=false context
+  "src/core/skillopt/rollout.ts"                # skillopt internals; iterates op metadata for rollout planning, not exposed
+  "src/core/skillopt/write-capture.ts"          # skillopt internals; iterates op params for capture schema, not exposed
 )
 
 # Pattern: any import that brings the `operations` VALUE in from core/operations.ts.
@@ -63,14 +92,18 @@ ALLOWED=(
 # inside the destructured clause OR a namespace import (`* as X`); type-only
 # imports of sibling exports like `sourceScopeOpts` / `OperationContext` are
 # left alone (those don't expose the op list to a transport surface).
-PATTERN='import[[:space:]]+(\*[[:space:]]+as[[:space:]]+[a-zA-Z_$][a-zA-Z0-9_$]*|\{[^}]*\boperations\b[^}]*\})[[:space:]]+from[[:space:]]*['\''"][^'\''"]*core/operations\.ts['\''"]'
+# Specifier: `core/operations.ts` from outside src/core, `../operations.ts`
+# from inside (the ops/ module dir sits one level down post-peel), and the
+# dynamic `import('...operations.ts')` house pattern — all three reach the
+# assembled op list.
+PATTERN='(import[[:space:]]+(\*[[:space:]]+as[[:space:]]+[a-zA-Z_$][a-zA-Z0-9_$]*|\{[^}]*\boperations\b[^}]*\})[[:space:]]+from[[:space:]]*['\''"][^'\''"]*(core/operations|\.\./operations)\.ts['\''"]|\{[^}]*\boperations\b[^}]*\}[[:space:]]*=[[:space:]]*await[[:space:]]+import\(['\''"][^'\''"]*operations\.ts['\''"]\))'
 
 # Collect files that import `operations`. Use a while-loop over grep output
 # instead of `mapfile` to stay compatible with macOS's default bash 3.2.
 FOUND_FILES=""
 while IFS= read -r f; do
   [ -n "$f" ] && FOUND_FILES="$FOUND_FILES$f"$'\n'
-done < <(grep -rlE --include='*.ts' "$PATTERN" src/ 2>/dev/null | sort -u || true)
+done < <(grep -rlE --include='*.ts' "$PATTERN" src 2>/dev/null | sort -u || true)
 
 FAIL=0
 
@@ -93,13 +126,21 @@ while IFS= read -r file; do
   fi
 done <<< "$FOUND_FILES"
 
-# Check 2: serve-http.ts MUST contain the canonical filter expression near
-# its operations import. Without the filter, the entire HTTP MCP surface
-# leaks localOnly ops.
-SERVE_HTTP="src/commands/serve-http.ts"
-if [ -f "$SERVE_HTTP" ]; then
-  if ! grep -qE 'operations\.filter\(\s*op\s*=>\s*!op\.localOnly\s*\)' "$SERVE_HTTP"; then
-    echo "FAIL: $SERVE_HTTP no longer contains the canonical"
+# Check 2: the HTTP MCP surface MUST contain the canonical filter expression
+# near its operations import. Without the filter, the entire HTTP MCP surface
+# leaks localOnly ops. Refactor wave 1 moves the /mcp handler from
+# serve-http.ts into serve-http-mcp.ts, so the filter may live in either file
+# (a containment check over that two-file surface); a new serve-http-*.ts
+# module that imports operations must still pass check 1's ALLOWED list.
+SERVE_HTTP_SURFACE=()
+for f in src/commands/serve-http.ts src/commands/serve-http-mcp.ts; do
+  [ -f "$f" ] && SERVE_HTTP_SURFACE+=("$f")
+done
+if [ "${#SERVE_HTTP_SURFACE[@]}" -gt 0 ]; then
+  # grep the files directly: `cat | grep -q` under pipefail fails with
+  # SIGPIPE whenever grep exits on an early match.
+  if ! grep -qE 'operations\.filter\(\s*op\s*=>\s*!op\.localOnly\s*\)' "${SERVE_HTTP_SURFACE[@]}"; then
+    echo "FAIL: ${SERVE_HTTP_SURFACE[*]} no longer contain the canonical"
     echo "      operations.filter(op => !op.localOnly) expression. The HTTP MCP"
     echo "      surface depends on this filter to enforce localOnly. Restore"
     echo "      the filter or refactor the trust boundary explicitly."

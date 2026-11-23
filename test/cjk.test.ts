@@ -8,6 +8,9 @@ import {
   CJK_SENTENCE_DELIMITERS,
   CJK_CLAUSE_DELIMITERS,
   escapeLikePattern,
+  splitCJKQueryTerms,
+  stripKoreanParticle,
+  cjkMatchTerms,
 } from '../src/core/cjk.ts';
 
 describe('hasCJK', () => {
@@ -126,5 +129,78 @@ describe('escapeLikePattern', () => {
   });
   test('no-op on CJK', () => {
     expect(escapeLikePattern('测试')).toBe('测试');
+  });
+});
+
+describe('splitCJKQueryTerms', () => {
+  test('splits query by whitespace into terms', () => {
+    expect(splitCJKQueryTerms('김대리 미팅')).toEqual(['김대리', '미팅']);
+    expect(splitCJKQueryTerms('미팅 김대리')).toEqual(['미팅', '김대리']);
+  });
+
+  test('deduplicates terms while preserving original order', () => {
+    expect(splitCJKQueryTerms('김대리 미팅 김대리')).toEqual(['김대리', '미팅']);
+    expect(splitCJKQueryTerms('미팅 김대리 미팅')).toEqual(['미팅', '김대리']);
+    expect(splitCJKQueryTerms('a b a c b')).toEqual(['a', 'b', 'c']);
+  });
+
+  test('handles consecutive whitespace, tabs, and newlines', () => {
+    expect(splitCJKQueryTerms('김대리   미팅 \t\n 2026')).toEqual(['김대리', '미팅', '2026']);
+    expect(splitCJKQueryTerms('  \t  주간   보고서  \n ')).toEqual(['주간', '보고서']);
+  });
+
+  test('returns single term for single-word queries', () => {
+    expect(splitCJKQueryTerms('김대리')).toEqual(['김대리']);
+    expect(splitCJKQueryTerms(' 한글 ')).toEqual(['한글']);
+  });
+
+  test('returns empty array on empty or whitespace-only input', () => {
+    expect(splitCJKQueryTerms('')).toEqual([]);
+    expect(splitCJKQueryTerms('   ')).toEqual([]);
+    expect(splitCJKQueryTerms('\t\n\r ')).toEqual([]);
+  });
+
+  test('handles mixed CJK and alphanumeric queries', () => {
+    expect(splitCJKQueryTerms('한국어 日本語 中文 English 123')).toEqual([
+      '한국어',
+      '日本語',
+      '中文',
+      'English',
+      '123',
+    ]);
+  });
+});
+
+
+describe('stripKoreanParticle (#6666)', () => {
+  test('strips the longest trailing particle', () => {
+    expect(stripKoreanParticle('혈당에서')).toBe('혈당');
+    expect(stripKoreanParticle('검진을')).toBe('검진');
+    expect(stripKoreanParticle('병원으로')).toBe('병원');
+    expect(stripKoreanParticle('진료실에서')).toBe('진료실');
+    expect(stripKoreanParticle('결과에서는')).toBe('결과');
+  });
+
+  test('keeps a word that only ends in a particle syllable', () => {
+    expect(stripKoreanParticle('회의')).toBe('회의');
+    expect(stripKoreanParticle('결과')).toBe('결과');
+    expect(stripKoreanParticle('도로')).toBe('도로');
+    expect(stripKoreanParticle('에서')).toBe('에서');
+    expect(stripKoreanParticle('는')).toBe('는');
+  });
+
+  test('leaves Chinese, Japanese and ASCII terms alone', () => {
+    expect(stripKoreanParticle('席位')).toBe('席位');
+    expect(stripKoreanParticle('東京で')).toBe('東京で');
+    expect(stripKoreanParticle('LDL')).toBe('LDL');
+    expect(stripKoreanParticle('LDL수치가')).toBe('LDL수치');
+  });
+});
+
+describe('cjkMatchTerms (#6666)', () => {
+  test('stems each term and drops duplicates in order', () => {
+    expect(cjkMatchTerms('혈당에서 검진을')).toEqual(['혈당', '검진']);
+    expect(cjkMatchTerms('혈당 혈당에서 수치')).toEqual(['혈당', '수치']);
+    expect(cjkMatchTerms('席位 升级')).toEqual(['席位', '升级']);
   });
 });

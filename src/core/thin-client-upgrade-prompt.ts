@@ -12,7 +12,7 @@
  *   the original command on the stale in-memory binary.
  * - D2 — Exclusive non-blocking advisory lock around the prompt; loser no-ops.
  * - D5 — Re-read `gbrain --version` post-upgrade to verify the binary actually
- *   advanced. `gbrain upgrade` returns 0 even on bun/clawhub catch-and-print
+ *   advanced. `gbrain upgrade` returns 0 even on bun catch-and-print
  *   paths and on the `binary` install ("not yet implemented").
  * - D6 — Gate on both stdin AND stdout TTY; prompt writes to stderr.
  * - D7 — When `bannerSuppressed()` is true, emit nothing about upgrades.
@@ -21,8 +21,8 @@
 
 import { existsSync, readFileSync, writeFileSync, renameSync, openSync, closeSync, unlinkSync, statSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
-import { execSync, execFileSync } from 'child_process';
-import { compareVersions } from '../commands/migrations/index.ts';
+import { execSync, execFileSync } from './spawn.ts';
+import { compareVersions } from './migration-ledger.ts';
 import { gbrainPath } from './config.ts';
 import type { GBrainConfig } from './config.ts';
 import { promptLineStderr } from './cli-util.ts';
@@ -320,17 +320,6 @@ let _upgradeRunner: UpgradeRunner = defaultRunUpgrade;
 
 export function _setUpgradeRunnerForTest(fn: UpgradeRunner | null): void {
   _upgradeRunner = fn ?? defaultRunUpgrade;
-}
-
-// ============================================================================
-// Test escape: clear in-process state file path memo (none today, but matches
-// the _clearIdentityCacheForTest pattern for future-proofing).
-// ============================================================================
-
-export function _clearPromptStateForTest(): void {
-  // No in-process state to clear today; the file lives on disk and tests use
-  // GBRAIN_HOME tempdirs for isolation. This stub exists for symmetry with
-  // _clearIdentityCacheForTest in src/cli.ts so future caching can hook here.
 }
 
 // ============================================================================

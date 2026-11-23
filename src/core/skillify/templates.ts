@@ -4,6 +4,8 @@
  * Pure-string generators. No I/O here; the caller writes files.
  */
 
+import { yamlScalar } from '../frontmatter-inference.ts';
+
 /**
  * SKILLIFY_STUB sentinel (D-CX-9). Every scaffolded script body
  * carries this marker until an implementer replaces it. `gbrain
@@ -31,16 +33,16 @@ export interface ScaffoldVars {
 export function skillMdTemplate(v: ScaffoldVars): string {
   const triggerLines =
     v.triggers.length > 0
-      ? v.triggers.map(t => `  - "${t.replace(/"/g, '\\"')}"`).join('\n')
+      ? v.triggers.map(t => `  - ${JSON.stringify(t)}`).join('\n')
       : '  - "TBD-trigger — replace with phrases users actually type"';
   const writesToLines =
-    v.writesTo.length > 0 ? v.writesTo.map(d => `  - ${d}`).join('\n') : '';
+    v.writesTo.length > 0 ? v.writesTo.map(d => `  - ${yamlScalar(d)}`).join('\n') : '';
 
   const lines: string[] = [
     '---',
-    `name: ${v.name}`,
+    `name: ${yamlScalar(v.name)}`,
     'version: 0.1.0',
-    `description: ${v.description}`,
+    `description: ${yamlScalar(v.description)}`,
     'triggers:',
     triggerLines,
   ];

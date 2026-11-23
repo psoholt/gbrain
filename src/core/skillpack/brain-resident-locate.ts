@@ -22,12 +22,17 @@ import { loadAllSources } from '../sources-load.ts';
 import { loadSkillpackManifest } from './manifest-v1.ts';
 import { loadState, findEntry } from './state.ts';
 import { MAX_SKILL_MD_BYTES } from '../skill-catalog.ts';
+import type { Action } from '../agent-output.ts';
 import type { BrainEngine } from '../engine.ts';
-import { OperationError, type OperationContext } from '../operations.ts';
+import { opError, type OperationContext } from '../operations.ts';
 import { sourceScopeOpts } from '../operations.ts';
+import { hostFix, readFix } from '../ops/op-fix.ts';
+import { relativeEscapesRoot } from '../path-confine.ts';
 
 export interface ResidentPackSkill {
-  slug: string;
+  /** Skill name, as get_skill takes it. Never `slug`: page slugs and skill
+   * names are different things, and readers treat every slug as a page. */
+  name: string;
   description: string;
 }
 
@@ -147,7 +152,7 @@ export async function loadResidentPacksForServer(ctx: OperationContext): Promise
         active_schema_pack: active,
         schema_pack_match: wantSchema === null ? null : wantSchema === active,
         skills: manifest.skills.map((s) => ({
-          slug: s.replace(/^skills\//, ''),
+          name: s.replace(/^skills\//, ''),
           description: readSkillDescription(localPath, s),
         })),
         scaffold_spec: remoteUrl && remoteUrl.length > 0 ? remoteUrl : null,
@@ -161,10 +166,14 @@ export async function loadResidentPacksForServer(ctx: OperationContext): Promise
   return { packs };
 }
 
+function listPacksFix(why: string): Action {
+  return readFix(why, { argv: ['gbrain', 'brain-skillpack'], mcp: { tool: 'list_brain_skillpack', arguments: {} } });
+}
+
 export interface ResidentSkillDetail {
   source_id: string;
   pack_name: string;
-  slug: string;
+  name: string;
   description: string;
   /** Full SKILL.md body (size-capped). */
   body: string;
@@ -172,7 +181,7 @@ export interface ResidentSkillDetail {
 
 /**
  * Fetch one brain-resident skill's SKILL.md body from a specific source, for
- * `get_skill` when a `source_id` is supplied (disambiguates a slug that exists
+ * `get_skill` when a `source_id` is supplied (disambiguates a skill name that exists
  * on more than one source). Same confinement as skill-catalog: realpath +
  * relative-contained to the pack root, regular file named SKILL.md, size-capped.
  *
@@ -182,43 +191,54 @@ export interface ResidentSkillDetail {
 export async function getResidentSkillDetail(
   ctx: OperationContext,
   sourceId: string,
-  slug: string,
+  name: string,
 ): Promise<ResidentSkillDetail> {
-  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) {
-    throw new OperationError('invalid_params', `Invalid skill slug: ${JSON.stringify(slug)}`);
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) {
+    throw opError('invalid_params', `Invalid skill name: ${JSON.stringify(name)}`,
+      'Pass the skill name exactly as list_brain_skillpack returns it: lowercase letters, digits, and hyphens, at most 64 characters.',
+      { fix: listPacksFix('Lists every brain-resident pack with its source id and skill names.') });
   }
   // Respect source scoping: a scoped caller can only reach its own sources.
   const scope = sourceScopeOpts(ctx);
-  if (scope.sourceIds && !scope.sourceIds.includes(sourceId)) {
-    throw new OperationError('not_found', `Source not in scope: ${sourceId}`);
-  }
-  if (scope.sourceId && scope.sourceId !== sourceId) {
-    throw new OperationError('not_found', `Source not in scope: ${sourceId}`);
+  if ((scope.sourceIds && !scope.sourceIds.includes(sourceId)) || (scope.sourceId && scope.sourceId !== sourceId)) {
+    throw opError('not_found', `Source not in scope: ${sourceId}`,
+      `This connection cannot read source ${sourceId}. List the packs it can see and use one of their source ids.`,
+      { fix: listPacksFix('Lists only the brain-resident packs on sources this connection may read.') });
   }
 
   let sources;
   try {
     sources = await loadAllSources(ctx.engine);
   } catch {
-    throw new OperationError('storage_error', 'Could not enumerate sources.');
+    throw opError('storage_error', 'Could not enumerate sources.',
+      'The brain could not read its sources table; this is a server-side storage failure, not a caller mistake. Run the doctor check on the brain host; if it repeats, report it to the user.',
+      { fix: hostFix(ctx, ['gbrain', 'doctor', '--json'], 'Checks the brain\'s database connection and schema.') });
   }
   const src = sources.find((s) => s.id === sourceId);
   if (!src || !src.local_path) {
-    throw new OperationError('not_found', `Source ${sourceId} has no local path.`);
+    throw opError('not_found', `Source ${sourceId} has no local path.`,
+      `Source ${sourceId} is not registered or has no local checkout on the brain host, so it ships no brain-resident pack here. List the packs this brain does ship.`,
+      { fix: listPacksFix('Lists the sources that ship a brain-resident pack.') });
   }
   const packRoot = src.local_path;
   let manifest;
   try {
     manifest = loadSkillpackManifest(packRoot);
   } catch {
-    throw new OperationError('not_found', `Source ${sourceId} has no valid skillpack.`);
+    throw opError('not_found', `Source ${sourceId} has no valid skillpack.`,
+      `Source ${sourceId}'s skillpack.json is missing or invalid, so its pack cannot load. List the packs that do load; tell the user if they expected this source to ship one.`,
+      { fix: listPacksFix('Lists the brain-resident packs that load successfully.') });
   }
   if (manifest.brain_resident !== true) {
-    throw new OperationError('not_found', `Source ${sourceId} does not ship a brain-resident pack.`);
+    throw opError('not_found', `Source ${sourceId} does not ship a brain-resident pack.`,
+      `Source ${sourceId}'s skillpack is not marked brain_resident, so it is not served here. List the packs this brain does serve.`,
+      { fix: listPacksFix('Lists the sources that ship a brain-resident pack.') });
   }
-  const skillDir = `skills/${slug}`;
+  const skillDir = `skills/${name}`;
   if (!manifest.skills.includes(skillDir)) {
-    throw new OperationError('not_found', `Skill "${slug}" not in pack ${manifest.name}.`);
+    throw opError('not_found', `Skill "${name}" not in pack ${manifest.name}.`,
+      `Pack ${manifest.name} on source ${sourceId} has no skill ${name}. List its skills and pass one of the names it returns.`,
+      { fix: listPacksFix(`Lists pack ${manifest.name}'s skill names.`) });
   }
 
   // Confinement: realpath the resolved SKILL.md and require it stays under the
@@ -230,23 +250,29 @@ export async function getResidentSkillDetail(
     realRoot = realpathSync(packRoot);
     realFile = realpathSync(skillMd);
   } catch {
-    throw new OperationError('not_found', `SKILL.md missing for ${slug} in ${sourceId}.`);
+    throw opError('not_found', `SKILL.md missing for ${name} in ${sourceId}.`,
+      `Pack ${manifest.name} lists skill ${name}, but its SKILL.md is missing on the brain host. Tell the user the pack is incomplete so its maintainer can add the file.`);
   }
   const rel = relative(realRoot, realFile);
-  if (rel.startsWith('..') || resolve(realRoot, rel) !== realFile) {
-    throw new OperationError('storage_error', 'Skill path escaped the pack root.');
+  if (relativeEscapesRoot(rel) || resolve(realRoot, rel) !== realFile) { // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- rel comes from relative() of two realpaths; resolve only re-joins it to confirm containment, no file is opened here
+    throw opError('storage_error', 'Skill path escaped the pack root.',
+      `Skill ${name} in source ${sourceId} resolves outside its pack root (a symlink or '..'), so it was refused. Do not retry; tell the user so the pack's maintainer replaces it with a regular file inside the pack.`);
   }
   const st = statSync(realFile);
-  if (!st.isFile()) throw new OperationError('storage_error', 'Resolved skill path is not a file.');
+  if (!st.isFile()) {
+    throw opError('storage_error', 'Resolved skill path is not a file.',
+      `Skill ${name}'s SKILL.md in source ${sourceId} is not a regular file. Tell the user so the pack's maintainer can fix the pack.`);
+  }
   if (st.size > MAX_SKILL_MD_BYTES) {
-    throw new OperationError('storage_error', `SKILL.md exceeds ${MAX_SKILL_MD_BYTES} bytes.`);
+    throw opError('storage_error', `SKILL.md exceeds ${MAX_SKILL_MD_BYTES} bytes.`,
+      `Skill ${name}'s SKILL.md in source ${sourceId} is larger than the ${MAX_SKILL_MD_BYTES}-byte limit and cannot be served. Tell the user so the pack's maintainer can shorten it.`);
   }
 
   const body = readFileSync(realFile, 'utf-8');
   return {
     source_id: sourceId,
     pack_name: manifest.name,
-    slug,
+    name,
     description: readSkillDescription(packRoot, skillDir),
     body,
   };

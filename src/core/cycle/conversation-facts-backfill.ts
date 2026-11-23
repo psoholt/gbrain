@@ -7,10 +7,10 @@
  *
  * Architecture (per CEO + eng review + Codex outside voice):
  *
- *   - Per-source iteration HERE. PHASE_SCOPE='source' is taxonomy-only
- *     (cycle.ts:131 documents this); no runtime fanout exists yet. The
- *     wrapper enumerates `listSources(engine)` and loops over per-source
- *     core invocations directly.
+ *   - Per-source iteration HERE. The outer cycle scheduler now uses
+ *     PHASE_SCOPE for fanout admission, while this legacy wrapper still
+ *     enumerates `listSources(engine)` and loops over per-source core
+ *     invocations directly.
  *
  *   - Brain-wide BudgetTracker created ONCE per phase tick and passed
  *     into every per-source invocation via `opts.budgetTracker`. The
@@ -36,27 +36,47 @@
  *   cycle.conversation_facts_backfill.max_total_cost_usd   (5.00)
  *   cycle.conversation_facts_backfill.max_walltime_min     (20)
  *   cycle.conversation_facts_backfill.max_total_walltime_min (30)
- *   cycle.conversation_facts_backfill.types                (["conversation","meeting","slack","email"])
+ *   cycle.conversation_facts_backfill.types                (all of ALLOWED_TYPES — src/core/facts/conversation-types.ts)
+ *   cycle.conversation_facts_backfill.exclude_sources      (none: a JSON array or comma list of source ids the phase skips, #7043)
  *
  * `.types` is the single source of truth for "enabled types" — the CLI
  * default reads from the same key (Eng-v2 A2).
  */
 
 import type { BrainEngine } from '../engine.ts';
-import { BudgetTracker, BudgetExhausted } from '../budget/budget-tracker.ts';
+import {
+  BudgetTracker,
+  BudgetExhausted,
+  loadPricingOverrides,
+} from '../budget/budget-tracker.ts';
 import { withBudgetTracker } from '../ai/gateway.ts';
 import { listSources } from '../sources-ops.ts';
 import {
   runExtractConversationFactsCore,
-  ALLOWED_TYPES,
-  type AllowedType,
+  emptyExtractConversationFactsResult,
+  isAbortError,
   type ExtractConversationFactsResult,
 } from '../../commands/extract-conversation-facts.ts';
+// The type allowlist comes straight from the canonical leaf module (same
+// binding extract-conversation-facts.ts re-exports) so this phase is part of
+// the drift-guarded set in test/conversation-facts-type-allowlist-drift.test.ts.
+import { ALLOWED_TYPES, type AllowedType } from '../facts/conversation-types.ts';
+import { conversationFactsCostCap } from '../facts/conversation-budget.ts';
+import { noPricingMessage } from '../budget/no-pricing.ts';
+import { OperationError } from '../ops/contract.ts';
 
 /** Per-phase wrapper opts. */
 export interface ConversationFactsBackfillPhaseOpts {
   dryRun?: boolean;
   signal?: AbortSignal;
+  /**
+   * issue #2860 — `gbrain dream --phase conversation_facts_backfill --once`.
+   * Bypasses the `cycle.conversation_facts_backfill.enabled` gate for THIS
+   * call only; never reads or writes config. Per-source + brain-wide cost/
+   * walltime caps still apply — the override lifts the on/off switch, not
+   * the spend guards.
+   */
+  once?: boolean;
 }
 
 /** Phase return shape (matches PhaseResult contract from cycle.ts). */
@@ -70,13 +90,16 @@ export interface ConversationFactsBackfillPhaseResult {
 
 const CFG_PREFIX = 'cycle.conversation_facts_backfill';
 
-interface ResolvedConfig {
+export interface ResolvedConfig {
   enabled: boolean;
   maxCostUsd: number;          // per source per cycle
   maxTotalCostUsd: number;     // brain-wide per cycle
+  explicitCostCap: boolean;
   maxWalltimeMin: number;      // per source per cycle
   maxTotalWalltimeMin: number; // brain-wide per cycle
   types: AllowedType[];
+  /** #7043: source ids the phase never extracts (`exclude_sources`, default none). */
+  excludeSources: string[];
   /**
    * v0.41.15.0 (D9 in cycle context): in-process worker count per
    * per-source invocation. Default 1 — cycle is opt-in per CLAUDE.md,
@@ -86,9 +109,10 @@ interface ResolvedConfig {
   workers: number;
 }
 
-async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
+/** The backfill's resolved config (switch, caps, types); doctor reads the same values. */
+export async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
   const get = (k: string) => engine.getConfig(`${CFG_PREFIX}.${k}`);
-  const [enabled, maxCost, maxTotalCost, maxWall, maxTotalWall, typesRaw, workersRaw] =
+  const [enabled, maxCost, maxTotalCost, maxWall, maxTotalWall, typesRaw, workersRaw, excludeRaw] =
     await Promise.all([
       get('enabled'),
       get('max_cost_usd'),
@@ -97,6 +121,7 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
       get('max_total_walltime_min'),
       get('types'),
       get('workers'),
+      get('exclude_sources'),
     ]);
 
   // Truthy-string parse mirrors isFactsExtractionEnabled.
@@ -110,6 +135,10 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
     if (raw == null) return fallback;
     const n = parseFloat(raw);
     return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+  const parseCostOrDefault = (raw: string | null, fallback: number): number => {
+    const n = raw == null ? NaN : parseFloat(raw);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
   };
 
   let types: AllowedType[] = [...ALLOWED_TYPES];
@@ -139,8 +168,10 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
 
   return {
     enabled: enabledFlag,
-    maxCostUsd: parseFloatOrDefault(maxCost, 1.0),
-    maxTotalCostUsd: parseFloatOrDefault(maxTotalCost, 5.0),
+    excludeSources: parseSourceList(excludeRaw),
+    maxCostUsd: parseCostOrDefault(maxCost, 1.0),
+    maxTotalCostUsd: parseCostOrDefault(maxTotalCost, 5.0),
+    explicitCostCap: maxCost !== null || maxTotalCost !== null,
     maxWalltimeMin: parseFloatOrDefault(maxWall, 20),
     maxTotalWalltimeMin: parseFloatOrDefault(maxTotalWall, 30),
     types,
@@ -153,148 +184,246 @@ export async function runPhaseConversationFactsBackfill(
   opts: ConversationFactsBackfillPhaseOpts = {},
 ): Promise<ConversationFactsBackfillPhaseResult> {
   const cfg = await loadCfg(engine);
+  const pricingOverrides = await loadPricingOverrides(engine);
 
   if (!cfg.enabled) {
-    return {
-      phase: 'conversation_facts_backfill',
-      status: 'skipped',
-      duration_ms: 0,
-      summary: 'cycle.conversation_facts_backfill.enabled=false (default OFF)',
-      details: {
-        reason: 'disabled',
-        enable_hint:
-          'gbrain config set cycle.conversation_facts_backfill.enabled true',
-      },
-    };
+    if (!opts.once) {
+      return {
+        phase: 'conversation_facts_backfill',
+        status: 'skipped',
+        duration_ms: 0,
+        summary: 'cycle.conversation_facts_backfill.enabled=false (default OFF)',
+        details: {
+          reason: 'disabled',
+          enable_hint:
+            'gbrain config set cycle.conversation_facts_backfill.enabled true',
+        },
+      };
+    }
+    process.stderr.write(
+      '[dream] --once: cycle.conversation_facts_backfill.enabled is false but ' +
+      '--phase conversation_facts_backfill --once forces this run (config untouched)\n',
+    );
   }
 
   const startedAt = Date.now();
+  const costCap = await conversationFactsCostCap(engine, cfg.maxTotalCostUsd, cfg.explicitCostCap, pricingOverrides);
   const maxTotalWalltimeMs = cfg.maxTotalWalltimeMin * 60_000;
+  const maxWalltimeMs = cfg.maxWalltimeMin * 60_000;
 
-  const sources = await listSources(engine);
+  const { withoutGuestSources } = await import('../guests/derived.ts');
+  const listed = await withoutGuestSources(engine, 'conversation_facts_backfill', await listSources(engine), src => src.id);
+  const excluded = listed.filter(src => cfg.excludeSources.includes(src.id)).map(src => src.id);
+  const sources = listed.filter(src => !excluded.includes(src.id));
   if (sources.length === 0) {
     return {
       phase: 'conversation_facts_backfill',
       status: 'ok',
       duration_ms: Date.now() - startedAt,
-      summary: 'no sources to process',
-      details: { sources_count: 0 },
+      summary: excluded.length ? `no sources to process (${excluded.length} excluded by ${CFG_PREFIX}.exclude_sources)` : 'no sources to process',
+      details: { sources_count: 0, ...(excluded.length ? { sources_excluded: excluded } : {}) },
     };
   }
 
-  // Brain-wide tracker — created ONCE, scoped to brain-wide cap. Passed
-  // explicitly into every per-source core invocation via opts.budgetTracker
-  // so the core doesn't wrap (which would REPLACE).
-  const brainTracker = new BudgetTracker({
-    maxCostUsd: cfg.maxTotalCostUsd,
-    label: 'conversation_facts_backfill:brain-wide',
-  });
-
-  const perSourceResults: Record<string, ExtractConversationFactsResult & { error?: string }> = {};
+  type PerSourceRecord = ExtractConversationFactsResult & {
+    error?: string;
+    walltime_exhausted?: boolean;
+  };
+  const perSourceResults: Record<string, PerSourceRecord> = {};
   let skippedByBrainWideCap = 0;
   let skippedByBrainWideWalltime = 0;
+  let sourcesBudgetExhausted = 0;
+  let sourcesWalltimeExhausted = 0;
+  const sourcesNotOwned: string[] = [];
   let totalSpent = 0;
 
+  const zeroResult = emptyExtractConversationFactsResult;
+
+  // #3627: the per-source caps (max_cost_usd / max_walltime_min) were parsed
+  // but never enforced — one runaway source could eat the whole brain-wide
+  // budget while every later source starved. Each source now runs under its
+  // OWN tracker capped at min(per-source cap, brain-wide remainder) with the
+  // tracker's runtime cap as the LLM-boundary walltime check, PLUS an
+  // AbortController deadline threaded as the core's signal (the core already
+  // aborts at page/pool boundaries). Per-source exhaustion records and
+  // CONTINUES to the next source; only the brain-wide caps break the loop.
   try {
-    // Single withBudgetTracker scope wraps the entire loop so the
-    // brain-wide tracker counts EVERY gateway call inside any per-source
-    // invocation. The core uses opts.budgetTracker as-is (no nested wrap),
-    // so the AsyncLocalStorage scope established here remains active.
-    await withBudgetTracker(brainTracker, async () => {
-      for (const src of sources) {
-        if (opts.signal?.aborted) throw new Error('aborted');
+    for (let i = 0; i < sources.length; i++) {
+      const src = sources[i];
+      if (opts.signal?.aborted) throw new Error('aborted');
 
-        // Brain-wide walltime check.
-        if (Date.now() - startedAt > maxTotalWalltimeMs) {
-          skippedByBrainWideWalltime++;
-          continue;
-        }
+      // Brain-wide walltime check.
+      const remainingWallMs = maxTotalWalltimeMs - (Date.now() - startedAt);
+      if (remainingWallMs <= 0) {
+        skippedByBrainWideWalltime++;
+        continue;
+      }
 
-        try {
-          const result = await runExtractConversationFactsCore(engine, {
+      // Brain-wide cost check (sum of per-source tracker spends).
+      const remainingCostUsd = costCap === undefined ? Infinity : costCap - totalSpent;
+      if (remainingCostUsd <= 0) {
+        skippedByBrainWideCap = sources.length - i;
+        break;
+      }
+
+      const perSourceWallMs = Math.min(maxWalltimeMs, remainingWallMs);
+      const perSourceCapUsd = costCap === undefined ? undefined : Math.min(cfg.maxCostUsd, remainingCostUsd);
+      const tracker = new BudgetTracker({
+        maxCostUsd: perSourceCapUsd,
+        maxRuntimeMs: perSourceWallMs,
+        label: `conversation_facts_backfill:${src.id}`,
+        pricingOverrides,
+      });
+
+      // Per-source deadline signal. The tracker's maxRuntimeMs fires at LLM
+      // call boundaries (core catches BudgetExhausted and returns a partial
+      // result + receipt); the AbortController is the backstop for stretches
+      // with no LLM call. An outer abort forwards so shutdown still works.
+      const controller = new AbortController();
+      let walltimeFired = false;
+      const timer = setTimeout(() => {
+        walltimeFired = true;
+        controller.abort(new Error(
+          `conversation_facts_backfill: per-source walltime cap (${cfg.maxWalltimeMin}min) hit for ${src.id}`,
+        ));
+      }, perSourceWallMs);
+      const onOuterAbort = () => controller.abort();
+      opts.signal?.addEventListener('abort', onOuterAbort, { once: true });
+
+      let interrupted: ExtractConversationFactsResult | null = null;
+      const committed = () => interrupted ?? zeroResult();
+      try {
+        const result = await withBudgetTracker(tracker, () =>
+          runExtractConversationFactsCore(engine, {
             sourceId: src.id,
             types: cfg.types,
             dryRun: opts.dryRun,
-            // Pass brain-wide tracker so core skips its own auto-wrap.
-            budgetTracker: brainTracker,
+            // Per-source tracker so core skips its own auto-wrap.
+            budgetTracker: tracker,
             // v0.41.15.0 (D9 cycle context): cycle config controls
             // per-source worker count. Default 1 — opt-in concurrency
             // for cycle paths.
             workers: cfg.workers,
-          }, opts.signal);
-          perSourceResults[src.id] = result;
-          if (result.budget_exhausted) {
-            // Brain-wide cap hit. Remaining sources skipped.
-            skippedByBrainWideCap = Math.max(
-              0,
-              sources.length - Object.keys(perSourceResults).length,
-            );
-            break;
-          }
-        } catch (err) {
-          if (err instanceof BudgetExhausted) {
-            skippedByBrainWideCap = Math.max(
-              0,
-              sources.length - Object.keys(perSourceResults).length,
-            );
-            break;
-          }
+            onInterrupted: partial => { interrupted = partial; },
+          }, controller.signal),
+        );
+        perSourceResults[src.id] = result;
+        // #3627: per-source exhaustion (cost or the tracker's runtime cap)
+        // is recorded and the loop CONTINUES — the next source gets its own
+        // fresh budget. Only the brain-wide checks at the loop top break.
+        if (result.budget_exhausted) sourcesBudgetExhausted++;
+      } catch (err) {
+        if (opts.signal?.aborted) throw err; // real caller abort propagates
+        if (walltimeFired) {
+          // Our own per-source deadline aborted the core mid-run: record +
+          // continue with the next source.
+          sourcesWalltimeExhausted++;
+          perSourceResults[src.id] = {
+            ...committed(),
+            walltime_exhausted: true,
+            error: 'walltime_exhausted',
+          };
+        } else if (err instanceof BudgetExhausted) {
+          // Escaped the core's own catch — same per-source posture.
+          sourcesBudgetExhausted++;
+          perSourceResults[src.id] = {
+            ...committed(),
+            budget_exhausted: true,
+            budget_reason: err.reason,
+            budget_model: err.modelId,
+            ...(err.pricing ? { budget_pricing: err.pricing } : {}),
+            error: err.message,
+          };
+        } else if (isAbortError(err)) {
+          // #4052 wave abort-honesty fix: an abort that is neither our own
+          // per-source deadline (walltimeFired) nor a flagged caller signal
+          // is still cycle-runner control flow — propagate it rather than
+          // downgrading it to a per-source failure record.
+          throw err;
+        } else if (err instanceof OperationError && err.code === 'owner_unavailable') {
+          sourcesNotOwned.push(src.id); // its owner host extracts it (as fence_repair skips); reported, not a failure
+          perSourceResults[src.id] = zeroResult();
+        } else {
           // Per-source failure: record + continue with next source.
           perSourceResults[src.id] = {
-            pages_considered: 0,
-            pages_processed: 0,
-            pages_skipped: 0,
-            pages_skipped_too_large: 0,
-            pages_skipped_disappeared: 0,
-            // v0.41.15.0 (D6 + D11): new counters from the per-page lock
-            // + delete-orphans-first replay safety.
-            pages_lock_skipped: 0,
-            orphan_facts_cleaned: 0,
-            segments_processed: 0,
-            facts_extracted: 0,
-            facts_inserted: 0,
+            ...committed(),
+            pages_failed: committed().pages_failed + 1,
             error: (err as Error).message,
           };
         }
+      } finally {
+        clearTimeout(timer);
+        opts.signal?.removeEventListener('abort', onOuterAbort);
+        totalSpent += tracker.totalSpent;
       }
-    });
-  } catch (err) {
-    if (err instanceof BudgetExhausted) {
-      // Brain-wide cap hit during last source.
-    } else if ((err as Error).message === 'aborted' || opts.signal?.aborted) {
-      // Propagate abort.
-      throw err;
-    } else {
-      // Unexpected error.
-      return {
-        phase: 'conversation_facts_backfill',
-        status: 'fail',
-        duration_ms: Date.now() - startedAt,
-        summary: `brain-wide loop failed: ${(err as Error).message}`,
-        details: { error: (err as Error).message, perSourceResults },
-      };
     }
+  } catch (err) {
+    if (isAbortError(err) || opts.signal?.aborted) {
+      // Abort is control flow owned by the cycle runner; never downgrade it
+      // into a per-source warning or phase failure result. isAbortError also
+      // matches the loop-top `throw new Error('aborted')`.
+      throw err;
+    }
+    // Unexpected error.
+    return {
+      phase: 'conversation_facts_backfill',
+      status: 'fail',
+      duration_ms: Date.now() - startedAt,
+      summary: `brain-wide loop failed: ${(err as Error).message}`,
+      details: { error: (err as Error).message, perSourceResults },
+    };
   }
-
-  totalSpent = brainTracker.totalSpent;
 
   // Aggregate.
   const totals = {
     pages_processed: 0,
     pages_skipped: 0,
+    pages_skipped_unparsed: 0,
+    pages_skipped_type_mismatch: 0,
+    pages_skipped_insufficient_turns: 0,
+    pages_skipped_since: 0,
+    pages_skipped_completed: 0,
+    pages_skipped_non_extractable: 0,
+    pages_marked_non_extractable: 0,
+    pages_skipped_unrecognized_speaker: 0,
+    pages_failed: 0,
+    windows_declined: 0,
     facts_inserted: 0,
+    pages_pending: 0,
+    fallback_slugify_count: 0,
+    resolution_errors: 0,
     sources_processed: 0,
   };
-  for (const r of Object.values(perSourceResults)) {
-    if (!r.error) totals.sources_processed++;
+  for (const [id, r] of Object.entries(perSourceResults)) {
+    if (!r.error && !sourcesNotOwned.includes(id)) totals.sources_processed++;
     totals.pages_processed += r.pages_processed;
     totals.pages_skipped += r.pages_skipped;
+    totals.pages_skipped_unparsed += r.pages_skipped_unparsed;
+    totals.pages_skipped_type_mismatch += r.pages_skipped_type_mismatch;
+    totals.pages_skipped_insufficient_turns += r.pages_skipped_insufficient_turns;
+    totals.pages_skipped_since += r.pages_skipped_since;
+    totals.pages_skipped_completed += r.pages_skipped_completed;
+    totals.pages_skipped_non_extractable += r.pages_skipped_non_extractable;
+    totals.pages_marked_non_extractable += r.pages_marked_non_extractable;
+    totals.pages_skipped_unrecognized_speaker += r.pages_skipped_unrecognized_speaker;
+    totals.pages_failed += r.pages_failed;
+    totals.windows_declined += r.windows_declined ?? 0;
     totals.facts_inserted += r.facts_inserted;
+    totals.pages_pending += r.pages_pending ?? 0;
+    totals.fallback_slugify_count += r.fallback_slugify_count;
+    totals.resolution_errors += r.resolution_errors;
   }
 
-  const anyError = Object.values(perSourceResults).some((r) => r.error);
+  const anyError = Object.values(perSourceResults).some(
+    (r) => r.error || r.pages_failed > 0 || r.budget_reason === 'no_pricing',
+  );
   const status = anyError ? 'warn' : 'ok';
-  const summary = `${totals.facts_inserted} facts inserted across ${totals.sources_processed}/${sources.length} sources, ~$${totalSpent.toFixed(4)} spent`;
+  const noPricing = [...new Map(Object.values(perSourceResults)
+    .flatMap((r) => r.budget_pricing ? [[r.budget_pricing.model, r.budget_pricing] as const] : [])).values()];
+  const summary = `${totals.facts_inserted} facts inserted across ${totals.sources_processed}/${sources.length} sources, ~$${totalSpent.toFixed(4)} spent` +
+    (totals.pages_pending ? `. ${totals.pages_pending} page(s) accepted and still publishing; their facts commit after this run and are not counted here` : '') +
+    noPricing.map((g) => `. ${noPricingMessage(g)}`).join('') + notOwnedNote(sourcesNotOwned)
+    + (excluded.length ? `. Skipped ${excluded.length} source(s) listed in ${CFG_PREFIX}.exclude_sources (${excluded.join(', ')})` : '');
 
   return {
     phase: 'conversation_facts_backfill',
@@ -306,14 +435,51 @@ export async function runPhaseConversationFactsBackfill(
       sources_processed: totals.sources_processed,
       pages_processed: totals.pages_processed,
       pages_skipped: totals.pages_skipped,
+      pages_skipped_unparsed: totals.pages_skipped_unparsed,
+      pages_skipped_type_mismatch: totals.pages_skipped_type_mismatch,
+      pages_skipped_insufficient_turns: totals.pages_skipped_insufficient_turns,
+      pages_skipped_since: totals.pages_skipped_since,
+      pages_skipped_completed: totals.pages_skipped_completed,
+      pages_skipped_non_extractable: totals.pages_skipped_non_extractable,
+      pages_marked_non_extractable: totals.pages_marked_non_extractable,
+      pages_skipped_unrecognized_speaker: totals.pages_skipped_unrecognized_speaker,
+      pages_failed: totals.pages_failed,
+      windows_declined: totals.windows_declined,
       facts_inserted: totals.facts_inserted,
+      pages_pending: totals.pages_pending,
+      fallback_slugify_count: totals.fallback_slugify_count,
+      resolution_errors: totals.resolution_errors,
       spent_usd: totalSpent,
       skipped_by_brain_wide_cap: skippedByBrainWideCap,
       skipped_by_brain_wide_walltime: skippedByBrainWideWalltime,
+      // #3627: per-source cap enforcement observability.
+      sources_budget_exhausted: sourcesBudgetExhausted,
+      sources_walltime_exhausted: sourcesWalltimeExhausted,
+      sources_skipped_not_owner: sourcesNotOwned,
+      sources_excluded: excluded,
+      no_pricing: noPricing,
       types: cfg.types,
+      max_cost_usd: cfg.maxCostUsd,
+      cost_cap_enforced: costCap !== undefined,
+      max_walltime_min: cfg.maxWalltimeMin,
       max_total_cost_usd: cfg.maxTotalCostUsd,
       max_total_walltime_min: cfg.maxTotalWalltimeMin,
       per_source: perSourceResults,
     },
   };
+}
+
+/** `exclude_sources`: a JSON array of source ids or a comma-separated list; anything else excludes nothing. */
+function parseSourceList(raw: string | null): string[] {
+  if (!raw?.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.filter((id): id is string => typeof id === 'string' && id.trim() !== '').map(id => id.trim());
+    if (typeof parsed !== 'string') return [];
+  } catch { /* a comma-separated list */ }
+  return raw.split(',').map(id => id.trim()).filter(Boolean);
+}
+
+function notOwnedNote(ids: string[]): string {
+  return ids.length ? `. Skipped ${ids.length} managed source(s) this host does not own (${ids.join(', ')}); run the phase on their owner host` : '';
 }

@@ -1,32 +1,32 @@
 # Skillpacks as scaffolding, not amber
 
-GBrain v0.33 reshapes `gbrain skillpack` from a package manager into a
-scaffold + reference library. This guide explains the model and the
-workflow.
+`gbrain skillpack` is a scaffold + reference library, not a package
+manager. This guide explains the model and the workflow.
 
-## Why we changed it
+## Why it works this way
 
-Pre-v0.33 (the "amber" model):
-
-- `gbrain skillpack install <name>` copied bundled skills into your
-  workspace AND wrote a managed-block fence into your `RESOLVER.md` /
-  `AGENTS.md` with a `cumulative-slugs="..."` receipt.
-- Subsequent installs hash-checked every file and refused to overwrite
-  local edits unless you passed `--overwrite-local`.
-- `gbrain skillpack uninstall` had its own data-loss safeguards (D8
-  receipt gate + D11 content-hash pre-scan) and rebuilt the fence.
-
-It worked, but it treated personal-AI skills like vendor packages.
-Users couldn't cleanly fork a skill without the next install fighting
-them. Every release re-litigated the same managed block. The test
-surface alone for the managed block was ~1000 lines.
+A package-manager model (an `install` that copies skills into your
+workspace AND writes a managed-block fence into your `RESOLVER.md` /
+`AGENTS.md`, hash-checks every file on the next install, and refuses to
+overwrite local edits) treats personal-AI skills like vendor packages.
+You can't cleanly fork a skill without the next install fighting you, and
+every release re-litigates the same managed block.
 
 Skills aren't vendor packages. They're first-class code in your agent
 repo. You scaffold once, you own them, you fork and edit freely. When
 gbrain ships a new version, you ask "what changed?" — the agent reads
 the diff and decides what (if anything) to integrate.
 
-## The five commands
+## The core workflow commands
+
+The five commands below are the scaffold-and-own workflow. The full
+`gbrain skillpack` surface is larger (`list`, `diff`, `check`, `search`,
+`info`, `registry`, `doctor`, `init`, `pack`, `endorse`, …) — run
+`gbrain skillpack --help` for the always-current list. One worth calling
+out here: **`gbrain skillpack init-brain-pack <name>`** scaffolds a
+*brain-resident* pack inside a brain/source repo (`brain_resident: true`
+plus a machine-parseable README) that connecting harnesses discover on
+`gbrain sources add`.
 
 ### `gbrain skillpack scaffold <name> [--workspace PATH]`
 
@@ -76,16 +76,98 @@ gbrain skillpack reference book-mirror
 
 `reference <name> --apply-clean-hunks` is the auto-apply path. It
 parses the diff between gbrain's bundle and your local copy, applies
-every hunk whose pre-change context matches uniquely. **Two-way merge
-limitation**: without scaffold-time base tracking (intentionally
-out-of-scope for v0.33), this cannot distinguish "gbrain changed X"
-from "you changed X." Applied hunks align everything to gbrain. Use
-`--dry-run` first to preview, or run plain `reference` to inspect the
-diff before letting auto-apply touch anything.
+every hunk whose pre-change context matches uniquely. **It is a
+destructive two-way apply**: it compares only your copy and gbrain's
+current bundle, so it cannot tell "gbrain changed X" from "you changed
+X," and applied hunks align everything to gbrain. Preview with
+`--dry-run` first, or run plain `reference` and merge by hand. For
+skills you never edited, `--update-untouched` (below) is the safe path.
+
+### Updating installed skills
+
+`gbrain skillpack reference <name>|--all --update-untouched [--dry-run] [--json] [--no-diff] [--accept-historical] [--fail-on-skipped]`
+replaces whole skills you never edited with gbrain's current version.
+It never prompts; `--dry-run` is the preview.
+
+- **Base.** `scaffold` (including `--harness` installs, `sync` and the
+  openclaw lane) and every update record the sha256 of each skill file
+  gbrain installed in `~/.gbrain/skillpack-state.json`, per skills root and
+  skill. That recorded base always wins.
+- **Per skill, all or nothing.** A skill's closure is its `SKILL.md`,
+  references, scripts and any shared dependency it lacks. It updates only
+  when every closure file is unchanged, absent, or still equal to its base,
+  and the skill is not pinned. A file that differs from its base is
+  `local_edits` even when it equals a past release.
+- **Installs from before bases were recorded.** A file with no base that
+  equals a released version (listed in `skills/skills.lock.history.json`)
+  is shown separately and needs `--accept-historical`.
+- **Skip reasons:** `local_edits`, `pinned` (`gbrain skillpack pin <skill>`,
+  undo with `unpin`), `no_history`, `historical_only`,
+  `history_unverified` (the history file failed its hash in
+  `skills.lock.json`, so no whole-file update runs) and `unsafe_target` (a
+  symlink or a path outside the skills root). A skipped skill prints its
+  diff: your copy against gbrain's, at most 200 lines per file, with
+  secret-looking values redacted.
+- **Commit protocol.** The closure is staged and checked first, a journal
+  of intent and a backup of each replaced file go to
+  `~/.gbrain/skillpack-backups/<id>/`, each file is rehashed right before
+  its rename, and conformance, the trigger check and the resolver check run
+  on the updated skill. A late change, a crash or a failed check rolls back
+  only the files that still hold the update's bytes. A crash shows up as
+  `skillpack_update_incomplete` in `gbrain doctor` and on the next run.
+- **Restore.** `gbrain skillpack restore <id>` puts back what an update
+  replaced and removes what it added. It refuses a file you changed since
+  the update unless you name it with `--skip <file>`, and running it again
+  is a no-op. `restore --list` lists backups; they are kept 30 days or the
+  newest 10.
+- **Exit codes:** 0 when nothing failed (skips are in the summary and
+  JSON), 1 only with `--fail-on-skipped` when something was skipped, 2 when
+  a skill failed (the files touched and the restore command are printed).
+- **Locks.** The command takes the workspace writer lock
+  (`.gbrain-skillpack.lock` beside the skills dir), then the shared lock on
+  the state file, in that order.
+- **No repository needed.** The state file and backups are files under
+  `GBRAIN_HOME`, so this works the same on a repo-less brain.
+- **Upgrades only announce.** `gbrain upgrade` writes no skill files; its
+  behavior notice names the preview command.
+- **Not covered:** paired source files outside the skills root (reported,
+  never written), shared dependencies you already have (only missing ones
+  are added), harness destination installs (`reference --harness <h>`
+  stays the lens there), and skills shared through a brain. Those update by
+  publishing a revision with `put_skill`; skillpack file-copy commands are
+  not a way around publication. See
+  [shared brain skills](shared-brain-skills.md#update-a-shared-skill).
+
+| You want to | Run |
+|---|---|
+| Read what changed upstream | `gbrain skillpack reference <name>` (or `--all`) |
+| Take upstream on skills you never edited | `gbrain skillpack reference --all --update-untouched --dry-run`, then without `--dry-run` |
+| Keep an edited or deliberately old skill as it is | `gbrain skillpack pin <name>` |
+| Update a skill you edited | read `gbrain skillpack reference <name>` and merge by hand; `--apply-clean-hunks` is a destructive two-way apply (preview with `--dry-run`) |
+| Find which skills need work | `gbrain skillpack health` |
+| Improve a skill's quality against a benchmark | `gbrain skillopt <name>` |
+| Undo an update | `gbrain skillpack restore <id>` (`--list` to find it) |
+
+### `gbrain skillpack health [<skill>] [--skills-dir PATH] [--json] [--strict]`
+
+Read-only. For the active skills folder (the harness or workspace skills
+dir, else the bundled skills) it reports each skill's bytes against its
+budget, growth past 10% over its last diet, description size, missing
+frontmatter triggers, and every `gbrain` command, flag or tool the skill
+shows that this gbrain does not have. Each finding carries what was
+observed, what was expected, the edit or command that fixes it (for an
+unedited copy of a bundled skill, `gbrain skillpack reference <skill>`
+first) and a verify command. A folder with no skills manifest or
+`skills.lock.json` is checked only for copies of gbrain's bundled skills,
+so other agents' skills are never reported. It reads files only, so it
+works the same on a brain with no git repository.
+
+`gbrain doctor` runs it as `skill_health` (it warns only on drift),
+`gbrain maintain` and `gbrain skillpack-check` print its one-line summary.
 
 ### `gbrain skillpack migrate-fence [--workspace PATH] [--dry-run]`
 
-One-shot conversion for workspaces on the pre-v0.33 managed-block
+One-shot conversion for workspaces still on the legacy managed-block
 model. Strips the `<!-- gbrain:skillpack:begin -->` / `end -->`
 markers and the manifest receipt comment from your resolver file.
 
@@ -131,7 +213,9 @@ into gbrain so other clients can scaffold it. Default behavior:
   `~/.gbrain/harvest-private-patterns.txt` plus built-in defaults
   (canonical private fork name, common email regex, Slack channel pattern). Any
   match → rollback (delete the harvested files) and exit non-zero.
-- `openclaw.plugin.json` updated with the new slug, sorted.
+- `openclaw.plugin.json` updated with the new slug, sorted. Harvest must preserve
+  the top-level OpenClaw-native plugin fields (`id`, `configSchema`, `contracts`)
+  because OpenClaw validates those before it can install the package.
 - `--no-lint` bypasses the linter (after a manual editorial scrub).
 
 Use the `skillpack-harvest` skill (its companion editorial workflow)
@@ -139,7 +223,7 @@ to walk the genericization checklist before running the CLI.
 
 ## How agents discover scaffolded skills
 
-Routing under the new model lives entirely in each skill's frontmatter:
+Routing lives entirely in each skill's frontmatter:
 
 ```yaml
 ---
@@ -155,12 +239,11 @@ Your agent's job at runtime is to walk `skills/*/SKILL.md`, parse the
 frontmatter, and match the user's intent against every skill's
 `triggers:` array. When a match scores high enough, invoke that skill.
 
-This replaces the v0.32 model where `gbrain skillpack install` wrote
-table rows into your `RESOLVER.md`. Rows are gone (or, for users
-migrating from the old model, preserved transitionally by
-`migrate-fence` until they run `scrub-legacy-fence-rows`).
+gbrain writes no routing rows into your `RESOLVER.md`. A workspace that
+still carries a managed-block fence keeps its rows through `migrate-fence`
+until it runs `scrub-legacy-fence-rows`.
 
-If you're a downstream agent author updating to this model:
+If you're a downstream agent author adopting this model:
 
 1. On startup, scan `skills/*/SKILL.md` for frontmatter.
 2. Build an in-memory routing table from each skill's `triggers:`
@@ -171,7 +254,7 @@ If you're a downstream agent author updating to this model:
 
 ## Removing a scaffolded skill
 
-There's no `gbrain skillpack uninstall` command in v0.33. The files
+There's no `gbrain skillpack uninstall` command. The files
 in your `skills/<slug>/` are first-class members of your repo —
 delete them like any other code:
 
@@ -190,19 +273,125 @@ rm skills/_output-rules.md
 
 You own the files. There's no manifest to update, no fence to rebuild.
 
+## Moved skills
+
+Some bundled skills are moving out of gbrain to another skill catalog. Which
+ones is listed in `skills/moved-skills.json`. Until a move is announced,
+gbrain keeps shipping those skills and the commands below behave as they
+always have, with one exception: `gbrain check-resolvable` and `gbrain
+doctor` already accept a `RESOLVER.md` row (or `manifest.json` entry) for
+one of those skills that your skills folder lacks when another catalog
+provides it: a skill catalog built with `gbrain skills index build`, or a
+folder of that name in a directory configured under
+`skills.resolver.per_harness.<harness>.dirs`.
+
+Once a move is announced (in a stable release's upgrade notice and release
+notes), gbrain keeps its own copy of each moved skill for at least 14 days
+and two stable releases, and tells you where the skill went:
+
+- `gbrain skillpack scaffold <name>` (and `--all`, `--harness`) still copies
+  gbrain's copy, then prints where the skill moved and the command that
+  installs it from there.
+- `gbrain skillpack reference <name>` (and `--harness`) prints the same
+  notice.
+- `gbrain skillpack status` marks the skill `moved` next to its
+  new / drifted / current state, and lists moved skills under each harness
+  bridge, stub pointers included.
+- `gbrain skillpack reference --update-untouched` stops updating a moved
+  skill (it is skipped with the reason `moved`); `pin` and `unpin` say it
+  moved.
+- `gbrain bundled-skill <name>` serves gbrain's copy while it ships one, with
+  the notice on stderr; after the copy is removed it prints the notice and
+  exits 0.
+- `gbrain check-resolvable` and `gbrain doctor` report a row for a moved
+  skill that nothing here provides as moved (a warning with the notice)
+  rather than as a broken row.
+
+A copy you already scaffolded stays in your `skills/` folder; it is yours.
+
+**Say to your agent:** *"Which of my skills moved out of gbrain, and where do I get them now?"*
+
+## The harness bridge: `scaffold --harness`
+
+Workspace scaffolds serve agent repos. The HARNESS lane installs a
+persona-curated set of bundled skills into a coding harness's **native
+skill-discovery location** instead:
+
+```bash
+gbrain skillpack scaffold --harness claude-code            # coding-agent persona → the user-scope skills dir
+gbrain skillpack scaffold --harness claude-code --persona daily-driver
+gbrain skillpack scaffold --harness claude-code --skill query --skill ingest
+gbrain skillpack scaffold --harness openclaw               # workspace delegation, brain-first core (--all: full bundle)
+gbrain skillpack reference --harness claude-code           # stub-aware three-way diff lens
+gbrain skillpack remove --harness claude-code --skill query
+```
+
+- **Personas** live in `skills/plugin-lanes.json#personas` (one recorded
+  reason per skill, validated against the plugin lane — lane-excluded skills
+  like `testing` are refused with their recorded reason). `--persona all`
+  (shorthand `--all`) installs the full lane. The same personas power the
+  `gbrain-coding` / `gbrain-daily` marketplace plugin variants.
+- **Never overwrites**: existing files are skipped and counted; the diff
+  lens (`reference --harness`) splits `differs` into **local_edit** (your
+  change — keep it) vs **upstream_drift** (gbrain moved —
+  `--apply-clean-hunks` aligns), using the install-time hash ledger at
+  `~/.gbrain/skillpack-bridge-state.json`. A shared file with no
+  install-time hash in the ledger reports **unknown** provenance and is
+  never auto-applied — patch by hand, or remove and re-scaffold.
+- **`remove --harness`** deletes ONLY files the bridge wrote (the ledger) —
+  never your own files. Shared convention files stay on disk even after the
+  last skill is removed; once no owned skill is left at that destination,
+  the v0.53.0 shared-skills migration no longer counts them as legacy
+  copies. Workspace scaffolds have no `uninstall` at all; they stay
+  user-owned outright.
+- **`--stub`** installs cold-pull pointer SKILL.md files whose body fetches
+  the real instructions via the gbrain MCP `get_skill` op. Preflight-gated:
+  it refuses unless `mcp.publish_skills` is on and every slug is servable
+  from the skills dir the server would resolve. Stub mode targets
+  full-surface local/HTTP MCP setups — the marketplace plugin lanes serve
+  the starter surface, where `get_skill` is not exposed; stub bodies tell
+  agents to ask the operator for a wider serve surface (`request_tools`
+  self-widening never exceeds the operator's ceiling, and stdio servers
+  cannot persist a per-client surface at all). Shared convention files AND
+  sibling aux files ship even in stub mode — skill bodies reference both,
+  and `get_skill` serves only the SKILL.md body itself.
+- **Targets**: `claude-code` has a verified user-scope skills dir (project
+  scope via `--scope project`); `openclaw` delegates to the workspace
+  scaffold; `codex` / `opencode` require an explicit `--dest` until their
+  native locations get observation runs (the plugin lane already serves
+  both). `reference --harness` and `remove --harness` accept the same
+  `--dest` / `--scope` / `--workspace` targeting as `scaffold --harness`.
+- **Coexistence**: the same skill names may also load from the gbrain
+  marketplace plugin snapshot — duplicate names coexist in one session;
+  prefer one lane per machine.
+- **Known limitation**: skill bodies that reference shared deps
+  repo-relatively (`skills/conventions/...`) keep those literal paths in a
+  copied layout — same limitation as the plugin tree; sibling-relative
+  references (`../conventions/...`) work because shared deps land as
+  siblings. Skill bodies are never rewritten.
+
 ## When to use which command (quick decision tree)
 
 - **New host repo, want a gbrain skill** → `scaffold`
+- **Give a coding harness the curated skill set (user-scope, no
+  marketplace)** → `scaffold --harness <h>`
+- **Shipping a pack from inside a brain/source repo** → `init-brain-pack`
 - **gbrain shipped a new version, want to see what's changed**
-  → `reference` (read-only) or `reference --apply-clean-hunks` (auto)
-- **Upgrading from v0.32 or earlier** → `migrate-fence` (one-shot)
+  → `reference` (read-only), `reference --all --update-untouched` for
+  skills you never edited, or a hand merge for edited ones (see
+  [Updating installed skills](#updating-installed-skills));
+  for harness installs → `reference --harness <h>`
+- **Find skills that grew too big or show commands this gbrain doesn't
+  have** → `health` (read-only)
+- **Upgrading from the legacy managed-block model** → `migrate-fence` (one-shot)
 - **Cleanup after `migrate-fence`** → `scrub-legacy-fence-rows`
 - **Lift your fork's skill back into gbrain** → `harvest` + the
   `skillpack-harvest` editorial skill
+- **Undo a harness install** → `remove --harness <h>` (ledger-owned files only)
 
 ## What about `install` and `uninstall`?
 
-Both are removed in v0.33. Running either prints an error pointing at
-the replacement command. No deprecated alias — this is a clean break.
-If you have existing scripts referencing the old names, update them
-once and move on.
+Neither exists. Running either prints an error pointing at the
+replacement command; there is no alias. Scripts that reference those
+names need `scaffold` (or plain file deletion) instead. (The harness lane's `remove --harness` is a different
+contract: it deletes only machine-ledgered bridge files, never yours.)

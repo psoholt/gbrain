@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { runEvalGate } from '../src/commands/eval-gate.ts';
+import { expectFunnelSuggestions } from './helpers/agent-envelope.ts';
 import {
   BASELINE_FILE_SCHEMA_VERSION,
   DEFAULT_THRESHOLDS,
@@ -121,6 +122,11 @@ function withExitCapture<T>(fn: () => Promise<T>): Promise<{ exitCode: number | 
 }
 
 describe('eval gate: usage errors', () => {
+  test('every usage() refusal names its own next step', () => {
+    expectFunnelSuggestions('src/commands/eval-gate.ts', 'usage', 7);
+  });
+
+
   test('no flags → exit 2 with usage error', async () => {
     const out = await withExitCapture(() => runEvalGate(engine, []));
     expect(out.exitCode).toBe(2);
@@ -136,6 +142,52 @@ describe('eval gate: usage errors', () => {
   test('--qrels file missing → exit 2', async () => {
     const out = await withExitCapture(() =>
       runEvalGate(engine, ['--qrels', '/tmp/does-not-exist-12345.json']),
+    );
+    expect(out.exitCode).toBe(2);
+  });
+});
+
+describe('eval gate: embedder flag validation', () => {
+  // The hermetic-canary embedder option accepts exactly one value and only
+  // composes with the correctness (qrels) gate. A regression that silently
+  // accepts a bad value would fall through to the keyed gateway path and
+  // defeat the hermetic guarantee.
+  const REAL_QRELS = 'test/fixtures/eval-baselines/qrels-search.json';
+
+  test('unsupported embedder value → exit 2', async () => {
+    const out = await withExitCapture(() =>
+      runEvalGate(engine, ['--embedder', 'semantic', '--qrels', REAL_QRELS]),
+    );
+    expect(out.exitCode).toBe(2);
+  });
+
+  test('deterministic embedder combined with the baseline gate → exit 2', async () => {
+    const out = await withExitCapture(() =>
+      runEvalGate(engine, [
+        '--embedder', 'deterministic',
+        '--baseline', '/tmp/does-not-exist-12345.ndjson',
+        '--qrels', REAL_QRELS,
+      ]),
+    );
+    expect(out.exitCode).toBe(2);
+  });
+
+  test('deterministic embedder without a qrels file → exit 2', async () => {
+    const out = await withExitCapture(() =>
+      runEvalGate(engine, ['--embedder', 'deterministic']),
+    );
+    expect(out.exitCode).toBe(2);
+  });
+
+  test('deterministic embedder with a malformed qrels file → exit 2', async () => {
+    const { mkdtempSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'gate-embedder-'));
+    const bad = join(dir, 'malformed.json');
+    writeFileSync(bad, '{"not_queries": []}');
+    const out = await withExitCapture(() =>
+      runEvalGate(engine, ['--embedder', 'deterministic', '--qrels', bad]),
     );
     expect(out.exitCode).toBe(2);
   });

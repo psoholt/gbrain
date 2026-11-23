@@ -18,8 +18,10 @@
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from 'fs';
+import { doctorSource } from './helpers/doctor-source.ts';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { surfaceFileSource, surfaceSource } from './helpers/source-surface.ts';
 
 // Point HOME at a tmpdir so we don't stomp the real ~/.gbrain/sync-failures.jsonl
 let tmpHome: string;
@@ -135,7 +137,7 @@ describe('Bug 9 — sync-failures JSONL helpers', () => {
 
 describe('Bug 9 — doctor surfaces sync failures', () => {
   test('doctor source contains sync_failures check', async () => {
-    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    const source = doctorSource();
     expect(source).toContain('sync_failures');
     expect(source).toContain('unacknowledgedSyncFailures');
     expect(source).toContain("'gbrain sync --skip-failed'");
@@ -146,7 +148,7 @@ describe('Bug 9 — doctor surfaces sync failures', () => {
   // they can never drift. The remote surface must no longer hand-roll an
   // `acknowledged_at` count (the old field-split that caused drift).
   test('both doctor surfaces use the shared decideSyncFailureSeverity', async () => {
-    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    const source = doctorSource();
     const occurrences = source.split('decideSyncFailureSeverity').length - 1;
     expect(occurrences).toBeGreaterThanOrEqual(2); // local + remote
     // remote no longer counts `!entry.acknowledged_at` by hand.
@@ -156,7 +158,7 @@ describe('Bug 9 — doctor surfaces sync failures', () => {
 
 describe('Bug 9 — sync.ts CLI flag wiring', () => {
   test('runSync parses --skip-failed and --retry-failed flags', async () => {
-    const source = await Bun.file(new URL('../src/commands/sync.ts', import.meta.url)).text();
+    const source = surfaceSource('sync');
     expect(source).toContain("args.includes('--skip-failed')");
     expect(source).toContain("args.includes('--retry-failed')");
     expect(source).toContain('skipFailed');
@@ -172,7 +174,7 @@ describe('Bug 9 — sync.ts CLI flag wiring', () => {
     // runSync so the flag means "ack whatever is currently flagged".
     // v0.42.42.0 (#2139, D13C): the pre-ack is now scoped PER SOURCE — `--all`
     // acks every source, single-source acks only its own.
-    const source = await Bun.file(new URL('../src/commands/sync.ts', import.meta.url)).text();
+    const source = surfaceFileSource('sync', 'src/commands/sync/run.ts');
     expect(source).toMatch(/if \(skipFailed\) \{[\s\S]*?syncAll \? acknowledgeFailures\(\) : acknowledgeFailures\(sourceId\)/);
   });
 
@@ -193,14 +195,14 @@ describe('Bug 9 — sync.ts CLI flag wiring', () => {
   });
 
   test('performSync gates the bookmark through the shared failure ledger', async () => {
-    const source = await Bun.file(new URL('../src/commands/sync.ts', import.meta.url)).text();
+    const source = surfaceSource('sync');
     // issue #1939: the gate is now the shared applySyncFailureGate orchestrator.
     expect(source).toContain('applySyncFailureGate');
     expect(source).toContain('blocked_by_failures');
   });
 
   test('performFullSync routes failures through the same shared gate', async () => {
-    const source = await Bun.file(new URL('../src/commands/sync.ts', import.meta.url)).text();
+    const source = surfaceSource('sync');
     expect(source).toContain('result.failures');
     expect(source).toContain('applySyncFailureGate');
   });
@@ -240,6 +242,22 @@ describe('classifyErrorCode — error message to code mapping', () => {
   test('classifies NULL_BYTES', async () => {
     const { classifyErrorCode } = await import('../src/core/sync.ts');
     expect(classifyErrorCode('invalid UTF-8: null byte at position 3770')).toBe('NULL_BYTES');
+  });
+
+  test('classifies RENAME_RECONCILE from the #3056 sentinel message (was UNKNOWN — #3479 review)', async () => {
+    const { classifyErrorCode, renameReconcileErrorMessage } = await import('../src/core/sync.ts');
+    expect(classifyErrorCode(
+      renameReconcileErrorMessage('people/carol.md', 'people/carol', 'permission denied for table pages'),
+    )).toBe('RENAME_RECONCILE');
+    // Envelope-stable: the wrapped cause must not steal the classification —
+    // the same sentinel class should not surface as STATEMENT_TIMEOUT one
+    // run and DB_DUPLICATE_KEY the next just because the cause text varies.
+    expect(classifyErrorCode(
+      renameReconcileErrorMessage('people/carol.md', 'people/carol', 'canceling statement due to statement timeout'),
+    )).toBe('RENAME_RECONCILE');
+    expect(classifyErrorCode(
+      renameReconcileErrorMessage('people/carol.md', undefined, 'duplicate key value violates unique constraint "pages_source_id_slug_key"'),
+    )).toBe('RENAME_RECONCILE');
   });
 
   test('classifies INVALID_UTF8', async () => {
@@ -527,9 +545,9 @@ describe('v0.41.6.0 D2 — embedding error classification', () => {
     expect(classifyErrorCode('Voyage AI embedding requires VOYAGE_API_KEY.')).toBe('EMBEDDING_NO_CREDS');
   });
 
-  test('EMBEDDING_NO_CREDS matches ZeroEntropy openai-compat shape', async () => {
+  test('EMBEDDING_NO_CREDS matches Voyage openai-compat shape', async () => {
     const { classifyErrorCode } = await import('../src/core/sync.ts');
-    expect(classifyErrorCode('ZeroEntropy embedding requires ZEROENTROPY_API_KEY.')).toBe('EMBEDDING_NO_CREDS');
+    expect(classifyErrorCode('Voyage embedding requires VOYAGE_API_KEY.')).toBe('EMBEDDING_NO_CREDS');
   });
 
   test('EMBEDDING_NO_CREDS matches DeepSeek openai-compat shape', async () => {
@@ -611,5 +629,55 @@ describe('v0.41.6.0 D2 — embedding error classification', () => {
   test('UNKNOWN still fires when no pattern matches', async () => {
     const { classifyErrorCode } = await import('../src/core/sync.ts');
     expect(classifyErrorCode('some random unmatched error message')).toBe('UNKNOWN');
+  });
+});
+
+// ─── #4543 — blocked_by_failures names the failing files + validate hint ───
+//
+// The v0.46.28.0 fix (#4496) made a status:'error' import result BLOCK the
+// bookmark instead of checkpointing it as done — but the blocked message only
+// showed code COUNTS (`YAML_PARSE: 1`), never WHICH file failed, and gave no
+// pointer to the tool that pinpoints the YAML issue. Operators had to open
+// sync-failures.jsonl by hand.
+describe('#4543 blocked output names failing files', () => {
+  test('formatFailedFileList names files with codes and skips sentinels', async () => {
+    const { formatFailedFileList } = await import('../src/core/sync.ts');
+    const out = formatFailedFileList([
+      { path: 'notes/bad.md', error: 'YAML parse failed: bad block mapping' },
+      { path: '<head>', error: 'history rewrite' },
+    ]);
+    expect(out).toContain('notes/bad.md');
+    expect(out).toContain('YAML_PARSE');
+    expect(out).not.toContain('<head>');
+  });
+
+  test('formatFailedFileList caps the list and counts the overflow', async () => {
+    const { formatFailedFileList } = await import('../src/core/sync.ts');
+    const many = Array.from({ length: 15 }, (_, i) => ({
+      path: `notes/f${String(i).padStart(2, '0')}.md`,
+      error: 'YAML parse failed',
+    }));
+    const out = formatFailedFileList(many, 10);
+    expect(out).toContain('notes/f09.md');
+    expect(out).not.toContain('notes/f10.md');
+    expect(out).toContain('and 5 more');
+  });
+
+  test('formatFailedFileList scrubs control characters from paths', async () => {
+    const { formatFailedFileList } = await import('../src/core/sync.ts');
+    const out = formatFailedFileList([
+      { path: 'notes/evil\x1b[2Jname.md', error: 'YAML parse failed' },
+    ]);
+    expect(out).not.toContain('\x1b');
+    expect(out).toContain('�');
+  });
+
+  test('both blocked gates name the files and hint at frontmatter validate', async () => {
+    const source = surfaceSource('sync');
+    // Incremental gate names files from failedFiles; full gate from result.failures.
+    expect(source).toContain('formatFailedFileList(failedFiles)');
+    expect(source).toContain('formatFailedFileList(result.failures)');
+    // The actionable hint rides along in the blocked copy.
+    expect(source).toContain("gbrain frontmatter validate <path>");
   });
 });

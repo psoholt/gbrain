@@ -45,6 +45,12 @@ import {
 export interface EnrichThinPhaseOpts {
   dryRun?: boolean;
   signal?: AbortSignal;
+  /**
+   * issue #2860 — `gbrain dream --phase enrich_thin --once`. Bypasses the
+   * `cycle.enrich_thin.enabled` gate for THIS call only; never reads or
+   * writes config. Per-source + brain-wide cost/walltime caps still apply.
+   */
+  once?: boolean;
 }
 
 export interface EnrichThinPhaseResult {
@@ -95,6 +101,18 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
     const n = parseFloat(raw);
     return Number.isFinite(n) && n > 0 ? n : fallback;
   };
+  // #2504 — cost knobs accept 'off'/'unlimited'/'none' (the same spellings
+  // `gbrain enrich --max-usd` takes) → Infinity sentinel. Per-source 'off'
+  // leaves the brain-wide total governing; both 'off' reaches runEnrichCore
+  // as Infinity, which it maps to an uncapped tracker. parseFloat('off') used
+  // to silently become the default cap — the operator's opt-out was ignored.
+  const parseCostOrDefault = (raw: string | null, fallback: number): number => {
+    if (raw != null && ['off', 'unlimited', 'none'].includes(raw.trim().toLowerCase())) {
+      return Infinity;
+    }
+    const n = raw == null ? NaN : parseFloat(raw);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+  };
   const parseIntOrDefault = (raw: string | null, fallback: number): number => {
     if (raw == null) return fallback;
     const n = parseInt(raw, 10);
@@ -121,8 +139,8 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
 
   return {
     enabled: enabledFlag,
-    maxCostUsd: parseFloatOrDefault(maxCost, 1.0),
-    maxTotalCostUsd: parseFloatOrDefault(maxTotalCost, 5.0),
+    maxCostUsd: parseCostOrDefault(maxCost, 1.0),
+    maxTotalCostUsd: parseCostOrDefault(maxTotalCost, 5.0),
     maxTotalWalltimeMin: parseFloatOrDefault(maxTotalWall, 30),
     maxPagesPerTick: parseIntOrDefault(maxPages, 3),
     types,
@@ -139,16 +157,22 @@ export async function runPhaseEnrichThin(
   const cfg = await loadCfg(engine);
 
   if (!cfg.enabled) {
-    return {
-      phase: 'enrich_thin',
-      status: 'skipped',
-      duration_ms: 0,
-      summary: 'cycle.enrich_thin.enabled=false (default OFF)',
-      details: {
-        reason: 'disabled',
-        enable_hint: 'gbrain config set cycle.enrich_thin.enabled true',
-      },
-    };
+    if (!opts.once) {
+      return {
+        phase: 'enrich_thin',
+        status: 'skipped',
+        duration_ms: 0,
+        summary: 'cycle.enrich_thin.enabled=false (default OFF)',
+        details: {
+          reason: 'disabled',
+          enable_hint: 'gbrain config set cycle.enrich_thin.enabled true',
+        },
+      };
+    }
+    process.stderr.write(
+      '[dream] --once: cycle.enrich_thin.enabled is false but ' +
+      '--phase enrich_thin --once forces this run (config untouched)\n',
+    );
   }
 
   const startedAt = Date.now();
@@ -166,7 +190,8 @@ export async function runPhaseEnrichThin(
   }
 
   const maxTotalWalltimeMs = cfg.maxTotalWalltimeMin * 60_000;
-  const sources = await listSources(engine);
+  const { withoutGuestSources } = await import('../guests/derived.ts');
+  const sources = await withoutGuestSources(engine, 'enrich_thin', await listSources(engine), src => src.id);
   if (sources.length === 0) {
     return {
       phase: 'enrich_thin',
@@ -254,8 +279,10 @@ export async function runPhaseEnrichThin(
       pages_skipped_insufficient: totals.skipped_insufficient,
       spent_usd: totalSpent,
       skipped_by_brain_wide_walltime: skippedByBrainWideWalltime,
-      max_cost_usd: cfg.maxCostUsd,
-      max_total_cost_usd: cfg.maxTotalCostUsd,
+      // #2504 — Infinity would JSON-serialize to null; report the 'off'
+      // spelling the operator configured instead.
+      max_cost_usd: Number.isFinite(cfg.maxCostUsd) ? cfg.maxCostUsd : 'off',
+      max_total_cost_usd: Number.isFinite(cfg.maxTotalCostUsd) ? cfg.maxTotalCostUsd : 'off',
       max_pages_per_tick: cfg.maxPagesPerTick,
       types: cfg.types,
       order: cfg.order,

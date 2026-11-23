@@ -10,10 +10,12 @@ on:
     branches: [master]
     paths:
       - '.github/workflows/**'
+      - '.github/actionlint.yaml'
   pull_request:
     branches: [master]
     paths:
       - '.github/workflows/**'
+      - '.github/actionlint.yaml'
   workflow_dispatch:
 
 permissions:
@@ -25,8 +27,15 @@ concurrency:
 
 jobs:
   actionlint:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-      - uses: rhysd/actionlint@393031adb9afb225ee52ae2ccd7a5af5525e03e8  # v1.7.11
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
+        continue-on-error: true
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
+      - uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca  # v1.7.12

@@ -12,10 +12,35 @@
  * install AND every doctor consistency check.
  */
 
-// v0.36.0 chose ZeroEntropy as the system default after evals showed
-// 11/20 wins vs OpenAI (6) and Voyage (4) on real-corpus benchmarks.
-// 1280 is the closest analog to legacy OpenAI 1536d while staying on
-// the high-recall section of ZE's Matryoshka curve. Valid ZE Matryoshka
-// steps: {2560, 1280, 640, 320, 160, 80, 40} — see ai/dims.ts.
-export const DEFAULT_EMBEDDING_MODEL = 'zeroentropyai:zembed-1';
-export const DEFAULT_EMBEDDING_DIMENSIONS = 1280;
+export const DEFAULT_EMBEDDING_MODEL = 'voyage:voyage-4';
+export const DEFAULT_EMBEDDING_DIMENSIONS = 1024;
+export const NEW_INSTALL_DEFAULT_EMBEDDING_MODEL = DEFAULT_EMBEDDING_MODEL;
+export const NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS = DEFAULT_EMBEDDING_DIMENSIONS;
+export const DEFAULT_RERANKER_MODEL = 'voyage:rerank-3-lite';
+export const NEW_INSTALL_DEFAULT_RERANKER_MODEL = DEFAULT_RERANKER_MODEL;
+
+export function renderCanonicalMigrationCommands(opts: { colDims?: number | null } = {}): {
+  /** Live run (agents append --yes themselves after consent). */
+  recommended: string;
+  /** Cost preview — what every warning surface should print first. */
+  recommendedDryRun: string;
+  /** Keep-width alternative (no schema rebuild), when the width allows it. */
+  openaiAlternative: string | null;
+  /** Rebuild explanation when the recommended target changes the width. */
+  note: string | null;
+} {
+  const base = `gbrain migrate embeddings --to ${NEW_INSTALL_DEFAULT_EMBEDDING_MODEL} --dim ${NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS}`;
+  const colDims = opts.colDims ?? null;
+  const openaiAlternative = colDims !== null && colDims <= 1536
+    ? `gbrain migrate embeddings --to openai:text-embedding-3-small --dim ${colDims} --dry-run`
+    : null;
+  const note = colDims !== null && colDims !== NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS
+    ? `(--dim ${NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS} rebuilds the ${colDims}d index — Voyage's valid widths are 256/512/1024/2048${openaiAlternative ? `; the OpenAI alternative keeps this brain's ${colDims}d width` : ''}.)`
+    : null;
+  return {
+    recommended: base,
+    recommendedDryRun: `${base} --dry-run`,
+    openaiAlternative,
+    note,
+  };
+}

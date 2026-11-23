@@ -11,7 +11,9 @@ import {
   loadAllSources,
   fetchSource,
   parseSourceConfig,
+  normalizeSourceConfig,
   isSourceFederated,
+  sourceLocalPathSkipWarning,
 } from '../src/core/sources-load.ts';
 
 let engine: PGLiteEngine;
@@ -120,6 +122,68 @@ describe('parseSourceConfig', () => {
   test('returns empty object on malformed JSON string', () => {
     expect(parseSourceConfig('{')).toEqual({});
   });
+
+  test('#2829: unwraps an accidental multi-layer nested string (self-heal read path)', () => {
+    const wrapped = JSON.stringify(JSON.stringify({ federated: true }));
+    expect(parseSourceConfig(wrapped)).toEqual({ federated: true });
+  });
+
+  test('recovers ordered object fragments from a historical JSONB array', () => {
+    expect(parseSourceConfig([
+      '{"remote_url":"https://example.invalid/repo"}',
+      { federated: true },
+      { tracked_branch: 'main' },
+    ])).toEqual({
+      remote_url: 'https://example.invalid/repo',
+      federated: true,
+      tracked_branch: 'main',
+    });
+  });
+});
+
+describe('normalizeSourceConfig (#2829)', () => {
+  test('passes a plain object through unchanged', () => {
+    expect(normalizeSourceConfig({ federated: true, webhook_secret: 'x' })).toEqual({
+      federated: true,
+      webhook_secret: 'x',
+    });
+  });
+
+  test('unwraps a single JSON-string layer', () => {
+    expect(normalizeSourceConfig('{"federated":true}')).toEqual({ federated: true });
+  });
+
+  test('unwraps a 5-layer nested JSON string back to the object', () => {
+    let v: unknown = { federated: true, tracked_branch: 'main' };
+    for (let i = 0; i < 5; i++) v = JSON.stringify(v); // 5 stringify passes = 5 layers
+    expect(normalizeSourceConfig(v)).toEqual({ federated: true, tracked_branch: 'main' });
+  });
+
+  test('non-object garbage resolves to {}', () => {
+    expect(normalizeSourceConfig('not json')).toEqual({});
+    expect(normalizeSourceConfig('42')).toEqual({}); // parses to a number
+    expect(normalizeSourceConfig('"just a string"')).toEqual({});
+    expect(normalizeSourceConfig(null)).toEqual({});
+    expect(normalizeSourceConfig(undefined)).toEqual({});
+    expect(normalizeSourceConfig(['a', 'b'])).toEqual({}); // array is not a plain object
+    expect(normalizeSourceConfig(JSON.stringify(['a']))).toEqual({});
+  });
+
+  test('normalizes a historical config-fragment array without dropping valid keys', () => {
+    expect(normalizeSourceConfig([
+      JSON.stringify(JSON.stringify({ remote_url: 'https://example.invalid/repo' })),
+      { federated: false },
+    ])).toEqual({
+      remote_url: 'https://example.invalid/repo',
+      federated: false,
+    });
+  });
+
+  test('respects the unwrap bound instead of spinning forever', () => {
+    let v: unknown = { federated: true };
+    for (let i = 0; i < 12; i++) v = JSON.stringify(v); // 12 layers, past the bound of 10
+    expect(normalizeSourceConfig(v)).toEqual({}); // gives up to {} once the bound is hit
+  });
 });
 
 describe('isSourceFederated', () => {
@@ -130,5 +194,58 @@ describe('isSourceFederated', () => {
     expect(isSourceFederated({ federated: 1 })).toBe(false);
     expect(isSourceFederated({})).toBe(false);
     expect(isSourceFederated(null)).toBe(false);
+    expect(isSourceFederated(['{"remote_url":"x"}', { federated: true }])).toBe(true);
+  });
+});
+
+describe('sourceLocalPathSkipWarning', () => {
+  test('keeps existing absolute checkouts dispatchable', () => {
+    expect(sourceLocalPathSkipWarning('present', '/repos/brain', (p) => p === '/repos/brain')).toBeNull();
+  });
+
+  test('skips relative local_path rows before consulting the filesystem', () => {
+    const asked: string[] = [];
+    const warn = sourceLocalPathSkipWarning('legacy', 'notes/brain', (p) => {
+      asked.push(p);
+      return true;
+    });
+    expect(asked).toEqual([]);
+    expect(warn).toContain("source 'legacy'");
+    expect(warn).toContain('relative local_path');
+    // /ship coverage audit (GBRA-207, #7630).
+    // Value: protects=the skip names the fix that works (sources set-path <id> <absolute-directory>), never "run gbrain sync once to self-heal";
+    //   fails_when=the advice reverts to the pre-#7630 sync self-heal, which now refuses sync_anchor_relative; why_new=no test read the advice
+    //   (only "relative local_path" and "cannot be resolved from a daemon"); seam=none; no_claim=none beyond protects
+    expect(warn).toContain("gbrain sources set-path legacy <absolute-directory>");
+    expect(warn).not.toContain('self-heal');
+  });
+
+  test('skips absolute paths missing from this machine', () => {
+    const warn = sourceLocalPathSkipWarning('foreign', '/missing/brain', () => false);
+    expect(warn).toContain("source 'foreign'");
+    expect(warn).toContain('/missing/brain');
+    expect(warn).toContain('does not exist on this machine');
+  });
+
+  test('allows missing managed remote clones to reach sync recovery', () => {
+    expect(
+      sourceLocalPathSkipWarning(
+        'managed',
+        '/missing/managed',
+        () => false,
+        { remote_url: 'https://github.com/example/repo', managed_clone: true },
+      ),
+    ).toBeNull();
+  });
+
+  test('still skips missing unowned remote-url paths', () => {
+    const warn = sourceLocalPathSkipWarning(
+      'foreign',
+      '/Users/other/repo',
+      () => false,
+      { remote_url: 'https://github.com/example/repo' },
+    );
+    expect(warn).toContain("source 'foreign'");
+    expect(warn).toContain('does not exist on this machine');
   });
 });

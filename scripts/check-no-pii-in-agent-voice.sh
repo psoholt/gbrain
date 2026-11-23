@@ -12,14 +12,16 @@
 #
 # Exit 0 on no matches; exit 1 on any match. Wired into `bun run verify`.
 #
-# Test fixtures under recipes/agent-voice/tests/fixtures/scrub-{dirty,clean}.txt are
-# the deliberate dirty inputs used by test/check-no-pii.test.ts. They contain the
-# token FORBIDDEN_PLACEHOLDER_NAME_1 (NOT real names) and the test sets
-# AGENT_VOICE_PII_BLOCKLIST=FORBIDDEN_PLACEHOLDER_NAME_1 to verify the mechanism.
+# recipes/agent-voice/tests/fixtures/scrub-{dirty,clean}.txt are skipped (they
+# carry the placeholder token FORBIDDEN_PLACEHOLDER_NAME_1, never real names).
+# The guard's own known-bad/known-good trees live under
+# test/fixtures/guards/check-no-pii-in-agent-voice.sh/ (scripts/guard-self-test.sh).
+#
+# Seam: GBRAIN_GUARD_ROOT (fixture tree root).
 
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+ROOT="${GBRAIN_GUARD_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$ROOT"
 
 SCAN_PATHS=(
@@ -108,6 +110,9 @@ fi
 if [ "$FAILED" -ne 0 ]; then
   echo
   echo "FAIL: agent-voice privacy guard found leaks. Scrub before commit."
+  echo "Why: the agent-voice recipe is copied into operators' agent repos and is public; contact details, tokens and private paths must not ship in it."
+  echo "Fix: replace each match above with a placeholder (alice-example, 555-0100, /path/to/workspace), then re-run: bun run check:no-pii-agent-voice"
+  echo "Docs: recipes/agent-voice/code/lib/personas/private-name-blocklist.json"
   exit 1
 fi
 

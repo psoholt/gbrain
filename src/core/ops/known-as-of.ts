@@ -1,0 +1,192 @@
+/**
+ * W2 page-at-time on the op surface: `get_page {known_as_of}` and
+ * `get_versions {known_as_of, diff}` (docs/designs/BELIEF_LEDGER.md section
+ * 10). Recorded time, read from the belief ledger's publication events
+ * (`belief/page-at-time.ts`); `as_of` elsewhere is valid time.
+ */
+import type { OperationContext, ParamDef } from './contract.ts';
+import { opError } from './contract.ts';
+import { opTransport, readFix } from './op-fix.ts';
+import { assertExplicitSourceLive, federatedSearchScope, pageNotFoundError, parseSourceIdParam, readHolders } from './context.ts';
+import { inlineBodyBytes } from './get-page-body.ts';
+import { historyQuarantine, pageTrustForRead, type QuarantinedView } from './get-page-projection.ts';
+import { parseKnownAsOf, readPageAtTime, remoteMayRead, type PageAtTime, type PageInterval } from '../belief/page-at-time.ts';
+import { sanitizeRemoteBody } from '../remote-body.ts';
+import { heldRowsForCaller } from '../eligibility/fence-overlay.ts';
+import { callerIsOwner, callerReadersAllow, ownerFenceView, privatePagesFilterForCaller, remoteReadFloorSql, resolveExcludePrivatePages } from '../search/private-visibility.ts';
+import { unifiedDiff } from '../skillpack/diff-text.ts';
+import { fenceTranscriptText, quotesStored } from '../search/transcript-quote.ts';
+
+export const KNOWN_AS_OF_PARAM: ParamDef = { type: 'string', fullSurfaceOnly: true,
+  description: 'Recorded time: the page as this brain had recorded it at this ISO 8601 instant (2026-10-01T12:00:00Z), from the belief ledger. Not as_of, which is valid time (a date).' };
+export const VERSIONS_DIFF_PARAM: ParamDef = { type: 'boolean', actsWhenTrue: true, fullSurfaceOnly: true, description: 'With known_as_of: each version also carries a unified diff from the version before it.' };
+
+/** get_page parameters that select a body window, a fuzzy match or an edit view, none of which a historical read serves: a recorded-time read sets them aside and names them (GST-2214: GPT-6.1 Sol fills every one). */
+const GET_PAGE_UNSUPPORTED = ['fuzzy', 'include_content', 'content_only', 'include_timeline_entries', 'grammar_diagnostics',
+  'lines', 'bytes', 'around_chunk_id', 'context_lines', 'cursor', 'max_bytes', 'view', 'outline_from', 'section', 'grep', 'context'] as const;
+
+/** The get_page arguments a recorded-time read serves; the refusal's fix keeps only these. */
+const GET_PAGE_AS_OF_ARGS = ['slug', 'known_as_of', 'source_id', 'include_deleted', 'min_trust', 'body'];
+
+/**
+ * R94 (GST-3252): the page rule the brain owner's current-time get_page applies, which its recorded-time read applies
+ * too, private editions included. Null for the local CLI and for every other remote caller, who keep the ledger's
+ * world-only rule (remoteMayRead).
+ */
+async function ownerPageRule(ctx: OperationContext): Promise<string | null> {
+  if (ctx.remote === false || !callerIsOwner()) return null;
+  return await resolveExcludePrivatePages(ctx.engine, ctx.remote) ? privatePagesFilterForCaller('p') : 'TRUE';
+}
+
+/**
+ * The one source a recorded-time read targets: the explicit or ambient source, else the only granted source whose
+ * ledger names the slug. A remote caller's search counts only world-visible events of a page it can see now, and
+ * finding none across several sources is `page_not_found`, so which source is picked never reveals a private page.
+ */
+async function targetSource(ctx: OperationContext, p: Record<string, unknown>, op: string, owner: string | null): Promise<string> {
+  const sourceIdParam = parseSourceIdParam(p.source_id, op, { allowAll: true });
+  const scope = federatedSearchScope(ctx, sourceIdParam);
+  await assertExplicitSourceLive(ctx, sourceIdParam);
+  if (scope.sourceId) return scope.sourceId;
+  const visible = ctx.remote === false ? '' : owner ? `AND EXISTS (SELECT 1 FROM pages p WHERE p.source_id = e.source_id AND p.slug = e.slug
+      AND p.deleted_at IS NULL AND ${owner})` : `AND e.visibility = 'world' AND EXISTS (SELECT 1 FROM pages p WHERE p.source_id = e.source_id AND p.slug = e.slug
+      AND p.deleted_at IS NULL AND ${remoteReadFloorSql('p')})`;
+  const rows = await ctx.engine.executeRaw<{ source_id: string }>(`SELECT DISTINCT e.source_id FROM belief_events e
+    JOIN sources s ON s.id = e.source_id AND s.incarnation = e.source_incarnation
+    WHERE e.slug = $1 AND e.subject_kind = 'page' AND ($2::text[] IS NULL OR e.source_id = ANY($2::text[])) ${visible} ORDER BY e.source_id`, [p.slug, scope.sourceIds ?? null]);
+  if (rows.length === 1) return rows[0]!.source_id;
+  if (rows.length > 1) {
+    throw opError('invalid_params', `${op}: ${String(p.slug)} has recorded history in several sources (${rows.map(r => r.source_id).join(', ')}).`, 'Pass source_id to name one.');
+  }
+  if (scope.sourceIds?.length === 1) return scope.sourceIds[0]!;
+  if (ctx.remote !== false) throw pageNotFoundError(ctx, String(p.slug), { includeDeleted: p.include_deleted === true });
+  return 'default';
+}
+
+const PAGE_REFUSALS = new Set(['coverage_from', 'coverage_gap', 'known_as_of_unproven']);
+
+/** Reads the page as recorded; a remote caller that cannot see the page now gets `page_not_found` instead of a coverage or proof refusal about it. */
+async function readAsCaller(ctx: OperationContext, q: Parameters<typeof readPageAtTime>[1], includeDeleted: boolean, owner: string | null): Promise<PageAtTime> {
+  try {
+    return await readPageAtTime(ctx.engine, q);
+  } catch (error) {
+    if (ctx.remote === false || !PAGE_REFUSALS.has(String((error as { code?: unknown }).code))) throw error;
+    const [row] = await ctx.engine.executeRaw<{ visible: boolean }>(`SELECT ${owner ?? remoteReadFloorSql('p')} AS visible FROM pages p
+      WHERE p.source_id = $1 AND p.slug = $2 AND p.deleted_at IS NULL`, [q.sourceId, q.slug]);
+    if (row?.visible === true) throw error;
+    throw pageNotFoundError(ctx, q.slug, { includeDeleted, sourceIdParam: q.sourceId });
+  }
+}
+
+type GatedInterval = PageInterval & { quarantined?: QuarantinedView; live?: { sourceId: string; slug: string }; ownerRead?: boolean };
+
+/**
+ * Readable intervals: a remote caller sees an interval only under the ledger's visibility rule and the page's current
+ * trust floor. #6259: when the page is quarantined now, or was in the interval, the interval keeps no body, as the
+ * current read keeps none (the same view and notice as get_page). GST-2891: each carries the live page's source and slug,
+ * where its held rows are looked up (a rename moves a page's facts to its new slug). GST-3252 (R94): the owner also reads
+ * an interval of the live page's own lifetime when its current-time read shows that page and the edition's own readers
+ * admit it, as get_page as_of judges a stored edition (an edition whose frontmatter was not loaded must have been world).
+ * An earlier lifetime at the slug keeps the world-only rule, since the live page's quarantine and held rows are not its.
+ */
+async function readable(ctx: OperationContext, read: PageAtTime, intervals: PageInterval[], minTrust: unknown, owner: string | null): Promise<GatedInterval[]> {
+  if (ctx.remote === false) return intervals;
+  if (read.page_id == null || !(await pageTrustForRead(ctx, { id: read.page_id }, minTrust))) return [];
+  const [live] = await ctx.engine.executeRaw<{ slug: string; source_id: string; frontmatter: Record<string, unknown>; owner_reads: boolean }>(
+    `SELECT p.slug, p.source_id, p.frontmatter, (p.deleted_at IS NULL AND ${owner ?? 'FALSE'}) AS owner_reads FROM pages p WHERE p.id = $1`, [read.page_id]);
+  if (!live) return [];
+  const ownerLifetime = live.owner_reads === true ? read.current?.lifetime : undefined;
+  const quarantine = historyQuarantine(ctx, live);
+  const out: GatedInterval[] = [];
+  for (const i of intervals) {
+    const ownerSees = ownerLifetime !== undefined && i.lifetime === ownerLifetime && (i.page ? callerReadersAllow(i.page.frontmatter, i.slug) : i.event.visibility === 'world');
+    if (!ownerSees && !(await remoteMayRead(ctx.engine, read.page_id, i))) continue;
+    const view = quarantine(i.page?.frontmatter);
+    const held = { sourceId: live.source_id, slug: live.slug };
+    out.push(view?.body_omitted && i.page
+      ? { ...i, live: held, ownerRead: ownerSees, body: 'unavailable', page: { ...i.page, compiled_truth: null, timeline: null, body_bytes: 0 }, quarantined: view }
+      : { ...i, live: held, ownerRead: ownerSees });
+  }
+  return out;
+}
+
+async function intervalView(ctx: OperationContext, sourceId: string, i: GatedInterval, opts: { body: boolean; inlineMax: number }) {
+  const meta = { slug: i.slug, revision: i.revision, deleted: i.deleted, recorded_at: i.event.recorded_at, visible_at: i.event.visible_at, until: i.until,
+    source_time: i.event.source_time, event: i.event.type, event_id: i.event.id, origin: i.event.origin, body: i.body,
+    ...(i.body_reason ? { body_reason: i.body_reason } : {}), ...(i.version_id != null ? { version_id: i.version_id } : {}),
+    ...(i.page ? { title: i.page.title, type: i.page.type, tags: i.page.tags, frontmatter: i.page.frontmatter } : {}), ...(i.quarantined ? { quarantined: i.quarantined } : {}) };
+  if (!opts.body || !i.page || i.quarantined?.body_omitted) return meta;
+  const bytes = i.page.body_bytes ?? 0;
+  if (i.body === 'segmented' || bytes > opts.inlineMax) {
+    return { ...meta, body_ref: { total_bytes: bytes } };
+  }
+  const omitRows = await heldRowsForCaller(ctx.engine, ctx.remote, { ...(i.live ?? { sourceId, slug: i.slug }), compiled_truth: i.page.compiled_truth ?? '', timeline: i.page.timeline });
+  const clean = (s: string | null) => s == null ? null : ctx.remote === false ? s : sanitizeRemoteBody(s, { includeWithdrawn: true, keepMaterializedMarkers: true, omitRows, owner: i.ownerRead ? ownerFenceView(readHolders(ctx)) : undefined });
+  // #8042: a third-party page as recorded reaches an untrusted reader quoted, as get_page's current body does.
+  const quote = quotesInterval(ctx, i);
+  const fence = (s: string | null) => s && quote ? fenceTranscriptText(s, i.slug) : s;
+  return { ...meta, compiled_truth: fence(clean(i.page.compiled_truth)), timeline: fence(clean(i.page.timeline)), ...(quote ? { quoted: 'transcript' } : {}) };
+}
+
+/** GST-687: an interval below the owner's tier (the live page's, or the version's snapshot; none reads as unknown) reaches an untrusted reader quoted too. */
+const quotesInterval = (ctx: OperationContext, i: PageInterval) => ctx.remote !== false && quotesStored(i.page?.type, i.page?.trust_tier);
+
+function ledgerView(read: PageAtTime) {
+  return { known_as_of: read.known_as_of, source_id: read.source_id, certified: read.certified, uncertified_reason: read.uncertified_reason, coverage_from: read.coverage_cut };
+}
+
+/** `get_page {known_as_of}`: the page at the slug as recorded at the instant, with the interval it was in and whether the ledger certifies it. */
+export async function getPageKnownAsOf(ctx: OperationContext, p: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const at = parseKnownAsOf(p.known_as_of);
+  const badBody = p.body !== undefined && p.body !== 'auto' && p.body !== 'full' && p.body !== 'none';
+  const drop = [...(p.include_quarantined === true ? ['include_quarantined'] : []), ...(badBody ? ['body'] : [])];
+  if (drop.length) {
+    const name = (k: string) => opTransport(ctx) === 'cli' ? `--${k.replace(/_/g, '-')}` : `\`${k}\``;
+    const kept = Object.fromEntries(GET_PAGE_AS_OF_ARGS.filter(k => p[k] !== undefined && !drop.includes(k)).map(k => [k, p[k]]));
+    throw opError('invalid_params', `get_page: known_as_of does not combine with ${drop.map(k => k === 'body' ? `body: ${String(p.body)}` : k).join(' or ')}.`,
+      `Drop ${drop.map(name).join(', ')} to read the page as recorded at known_as_of, or drop ${name('known_as_of')} for the current page. A recorded-time read takes only ${GET_PAGE_AS_OF_ARGS.slice(2).map(name).join(', ')} (auto, full or none).`,
+      { fix: readFix('The same call without the arguments a recorded-time read does not serve.',
+        { argv: ['gbrain', 'get', ...Object.entries(kept).filter(([k]) => k !== 'slug').flatMap(([k, v]) => v === true ? [`--${k.replace(/_/g, '-')}`] : v === false ? [] : [`--${k.replace(/_/g, '-')}`, String(v)]), '--', String(p.slug)],
+          mcp: { tool: 'get_page', arguments: kept } }) });
+  }
+  const slug = String(p.slug);
+  const owner = await ownerPageRule(ctx);
+  const sourceId = await targetSource(ctx, p, 'get_page', owner);
+  const read = await readAsCaller(ctx, { sourceId, slug, at }, p.include_deleted === true, owner);
+  const current = read.current && (await readable(ctx, read, [read.current], p.min_trust, owner))[0];
+  if (!current || (current.deleted && p.include_deleted !== true)) throw pageNotFoundError(ctx, slug, { includeDeleted: p.include_deleted === true, sourceIdParam: sourceId });
+  const ignored = GET_PAGE_UNSUPPORTED.filter(k => p[k] !== undefined && p[k] !== false);
+  return { ...await intervalView(ctx, sourceId, current, { body: p.body !== 'none', inlineMax: await inlineBodyBytes(ctx) }), ...ledgerView(read),
+    ...(ignored.length ? { set_aside: { ignored, note: `Read the whole page as recorded at known_as_of; ignored ${ignored.length > 1 ? `${ignored.slice(0, -1).join(', ')} and ${ignored[ignored.length - 1]}` : ignored[0]}, which read the current page. Drop known_as_of to read a window or view of the current page.` } } : {}) };
+}
+
+/** `get_versions {known_as_of}`: the page's validity intervals known at the instant, newest first; `diff` adds each one's change from the one before it. */
+export async function getVersionsKnownAsOf(ctx: OperationContext, p: Record<string, unknown>, limit: number): Promise<Record<string, unknown>> {
+  const at = parseKnownAsOf(p.known_as_of);
+  const slug = String(p.slug);
+  const owner = await ownerPageRule(ctx);
+  const sourceId = await targetSource(ctx, p, 'get_versions', owner);
+  const wantBody = p.include_body === true;
+  const read = await readAsCaller(ctx, { sourceId, slug, at, history: true, withBodies: wantBody || p.diff === true ? true : owner !== null ? 'frontmatter' : false }, true, owner);
+  const intervals = await readable(ctx, read, read.intervals, p.min_trust, owner);
+  if (!intervals.length) throw pageNotFoundError(ctx, slug, { includeDeleted: true, sourceIdParam: sourceId });
+  const inlineMax = await inlineBodyBytes(ctx);
+  const views = await Promise.all(intervals.map(async (i, n) => {
+    const view: Record<string, unknown> = await intervalView(ctx, sourceId, i, { body: wantBody, inlineMax });
+    if (p.diff !== true) return view;
+    const prev = intervals.slice(0, n).reverse().find(x => x.lifetime === i.lifetime);
+    const text = (x: GatedInterval | undefined) => x?.page && x.body !== 'segmented' && !x.quarantined?.body_omitted ? `${x.page.compiled_truth ?? ''}${x.page.timeline ? `\n${x.page.timeline}` : ''}` : null;
+    const [a, b] = [prev ? text(prev) : '', text(i)];
+    const held = (x: GatedInterval | undefined, t: string) => x ? heldRowsForCaller(ctx.engine, ctx.remote, { ...(x.live ?? { sourceId, slug: x.slug }), compiled_truth: t }) : undefined;
+    const fence = (x: GatedInterval | undefined) => x?.ownerRead ? ownerFenceView(readHolders(ctx)) : undefined;
+    const diff = a == null || b == null ? null : unifiedDiff(ctx.remote === false ? a : sanitizeRemoteBody(a, { omitRows: await held(prev, a), owner: fence(prev) }),
+      ctx.remote === false ? b : sanitizeRemoteBody(b, { omitRows: await held(i, b), owner: fence(i) }),
+      { oldPath: prev ? `${slug}@${prev.event.recorded_at}` : '/dev/null', newPath: `${slug}@${i.event.recorded_at}` });
+    const quote = diff !== null && (quotesInterval(ctx, i) || (prev !== undefined && quotesInterval(ctx, prev)));
+    view.diff = quote ? fenceTranscriptText(diff, i.slug) : diff;
+    if (quote) view.quoted = 'transcript';
+    return view;
+  }));
+  const newest = views.reverse();
+  return { slug, ...ledgerView(read), truncated: newest.length > limit, versions: newest.slice(0, limit) };
+}

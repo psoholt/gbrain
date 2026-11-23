@@ -49,6 +49,10 @@ describe('precisionAtK', () => {
     expect(precisionAtK(['a', 'b'], relevant, 10)).toBeCloseTo(2 / 10);
   });
 
+  test('duplicate chunks count as one page while the denominator remains k', () => {
+    expect(precisionAtK(['a', 'a'], new Set(['a']), 2)).toBe(0.5);
+  });
+
   test('empty hits → 0', () => {
     expect(precisionAtK([], new Set(['a']), 5)).toBe(0);
   });
@@ -86,6 +90,11 @@ describe('recallAtK', () => {
     const relevant = new Set(['a', 'b']);
     // 'b' is at rank 5, beyond k=3
     expect(recallAtK(['a', 'x', 'y', 'z', 'b'], relevant, 3)).toBeCloseTo(1 / 2);
+  });
+
+  test('deduplicates before the cutoff and cannot count one relevant page twice', () => {
+    expect(recallAtK(['a', 'a'], new Set(['a']), 2)).toBe(1);
+    expect(recallAtK(['x', 'x', 'a'], new Set(['a']), 2)).toBe(1);
   });
 
   test('empty hits → 0', () => {
@@ -130,6 +139,10 @@ describe('mrr', () => {
     // 'b' is rank 2, 'c' is rank 3 — MRR should use 'b' at rank 2
     expect(mrr(['x', 'b', 'c'], new Set(['b', 'c']))).toBeCloseTo(0.5);
   });
+
+  test('duplicate non-relevant chunks do not consume page-level ranks', () => {
+    expect(mrr(['x', 'x', 'a'], new Set(['a']))).toBeCloseTo(0.5);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -146,6 +159,10 @@ describe('ndcgAtK', () => {
   test('single relevant doc at rank 1 → 1.0', () => {
     const grades = new Map([['a', 1]]);
     expect(ndcgAtK(['a', 'x', 'y'], grades, 5)).toBeCloseTo(1.0);
+  });
+
+  test('a repeated relevant page receives gain once and remains bounded at 1', () => {
+    expect(ndcgAtK(['a', 'a'], new Map([['a', 1]]), 2)).toBe(1);
   });
 
   test('single relevant doc at rank 2 → less than 1', () => {
@@ -240,5 +257,129 @@ describe('parseQrels', () => {
 
   test('throws on unrecognized format', () => {
     expect(() => parseQrels(JSON.stringify({ foo: 'bar' }))).toThrow();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// parseQrels — #4608: validate/normalize BEFORE any billed search
+// ─────────────────────────────────────────────────────────────────
+
+describe('parseQrels (#4608) — gate-shape aliases + per-entry validation', () => {
+  test("gate legacy shape (relevant_slugs + first_relevant_slug) parses; keys map onto 'relevant'", () => {
+    // The exact shape of gbrain's own committed gate fixture — pre-fix this
+    // crashed inside buildGradesMap AFTER a live search+rerank was billed.
+    const input = JSON.stringify({
+      schema_version: 1,
+      queries: [
+        {
+          query_id: 'q1',
+          query: 'how does the sprocket subsystem handle retries',
+          relevant_slugs: ['topic/page-a', 'topic/page-b'],
+          first_relevant_slug: 'topic/page-a',
+        },
+      ],
+    });
+    const result = parseQrels(input);
+    expect(result).toHaveLength(1);
+    expect(result[0].relevant).toEqual(['topic/page-a', 'topic/page-b']);
+  });
+
+  test('gate legacy shape in a bare-array wrapper parses too', () => {
+    const input = JSON.stringify([
+      { query: 'q', relevant_slugs: ['topic/page-a'] },
+    ]);
+    expect(parseQrels(input)[0].relevant).toEqual(['topic/page-a']);
+  });
+
+  test('first_relevant_slug outside relevant_slugs is folded into the gold set', () => {
+    const input = JSON.stringify([
+      { query: 'q', relevant_slugs: ['topic/page-b'], first_relevant_slug: 'topic/page-a' },
+    ]);
+    expect(parseQrels(input)[0].relevant).toEqual(['topic/page-b', 'topic/page-a']);
+  });
+
+  test('the committed gate fixture itself parses (both --qrels commands accept one file)', () => {
+    const result = parseQrels('test/fixtures/eval-baselines/qrels-search.json');
+    expect(result.length).toBeGreaterThan(0);
+    for (const q of result) {
+      expect(typeof q.query).toBe('string');
+      expect(q.relevant.length).toBeGreaterThan(0);
+    }
+  });
+
+  test('federated {source_id, slug} gold is rejected BY NAME (not four zeros at exit 0)', () => {
+    const input = JSON.stringify({
+      schema_version: 1,
+      queries: [
+        { query: 'q', relevant: [{ source_id: 'vault-a', slug: 'topic/page-a' }] },
+      ],
+    });
+    expect(() => parseQrels(input)).toThrow(/gbrain eval gate/);
+    expect(() => parseQrels(input)).toThrow(/entry 0/);
+  });
+
+  test('missing relevant throws with the entry index (validation precedes any query)', () => {
+    const input = JSON.stringify([
+      { query: 'fine', relevant: ['a'] },
+      { query: 'broken' },
+    ]);
+    expect(() => parseQrels(input)).toThrow(/entry 1/);
+    expect(() => parseQrels(input)).toThrow(/"relevant"/);
+  });
+
+  test('missing/empty query throws with the entry index', () => {
+    expect(() => parseQrels(JSON.stringify([{ relevant: ['a'] }]))).toThrow(/entry 0/);
+    expect(() => parseQrels(JSON.stringify([{ query: '   ', relevant: ['a'] }]))).toThrow(/entry 0/);
+  });
+
+  test('empty gold set + non-object entries + malformed grades are named errors', () => {
+    expect(() => parseQrels(JSON.stringify([{ query: 'q', relevant: [] }]))).toThrow(/at least one gold slug/);
+    expect(() => parseQrels(JSON.stringify(['not-an-entry']))).toThrow(/entry 0/);
+    expect(() => parseQrels(JSON.stringify([{ query: 'q', relevant: ['a'], grades: ['x'] }]))).toThrow(/"grades"/);
+    expect(() => parseQrels(JSON.stringify([{ query: 'q', relevant: [42] }]))).toThrow(/slug strings/);
+  });
+
+  test("'relevant' wins over 'relevant_slugs' when both are present (alias is a fallback, not a merge)", () => {
+    const input = JSON.stringify([
+      { query: 'q', relevant: ['topic/page-a'], relevant_slugs: ['topic/page-z'] },
+    ]);
+    expect(parseQrels(input)[0].relevant).toEqual(['topic/page-a']);
+  });
+
+  test('a non-array relevant_slugs names the key in the error (not a bare missing-relevant message)', () => {
+    const input = JSON.stringify([{ query: 'q', relevant_slugs: 'topic/page-a' }]);
+    expect(() => parseQrels(input)).toThrow(/relevant_slugs/);
+    expect(() => parseQrels(input)).toThrow(/non-array/);
+    expect(() => parseQrels(input)).toThrow(/entry 0/);
+  });
+
+  test('id is kept only when it is a string', () => {
+    const parsed = parseQrels(JSON.stringify([
+      { id: 'q-1', query: 'q', relevant: ['a'] },
+      { id: 7, query: 'q2', relevant: ['b'] },
+      { query: 'q3', relevant: ['c'] },
+    ]));
+    expect(parsed[0].id).toBe('q-1');
+    expect('id' in parsed[1]).toBe(false);
+    expect('id' in parsed[2]).toBe(false);
+  });
+
+  test('grades: null throws a named error mentioning grades (null is not an absent key)', () => {
+    const input = JSON.stringify([{ query: 'q', relevant: ['a'], grades: null }]);
+    expect(() => parseQrels(input)).toThrow(/"grades"/);
+    expect(() => parseQrels(input)).toThrow(/entry 0/);
+  });
+
+  test('non-finite grade VALUES are named errors with the entry index (pre-billing)', () => {
+    // A string/null grade survives JSON.parse and the object-shape check;
+    // pre-fix it was cast blindly (grades as Record<string, number>) and
+    // produced NaN nDCG AFTER the paid searches had already run.
+    const stringGrade = JSON.stringify([{ query: 'q', relevant: ['a'], grades: { a: 'high' } }]);
+    expect(() => parseQrels(stringGrade)).toThrow(/entry 0/);
+    expect(() => parseQrels(stringGrade)).toThrow(/finite number/);
+    // null is representable in JSON and coerces to NaN through Math.log paths.
+    expect(() => parseQrels(JSON.stringify([{ query: 'q', relevant: ['a'], grades: { a: null } }]))).toThrow(/finite number/);
+    // Valid finite numeric grades still pass untouched.
+    expect(parseQrels(JSON.stringify([{ query: 'q', relevant: ['a'], grades: { a: 2.5 } }]))[0].grades).toEqual({ a: 2.5 });
   });
 });

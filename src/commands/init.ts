@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execSync } from '../core/spawn.ts';
 import { readdirSync, lstatSync, existsSync, copyFileSync, mkdirSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -10,8 +10,30 @@ import { saveConfig, loadConfig, loadConfigFileOnly, toEngineConfig, gbrainPath,
 import { createEngine } from '../core/engine-factory.ts';
 import { discoverOAuth, mintClientCredentialsToken, smokeTestMcp } from '../core/remote-mcp-probe.ts';
 import { runInitEmbedCheck } from '../core/init-embed-check.ts';
+import { PgliteBusyError } from '../core/pglite-lock.ts';
+import { inspectRemoteInitState, preserveConversionConfig, readInitConfigState, printInAgentReady } from '../core/agent-install/init-state.ts';
+import { isNewContentDatabase, setupSharedBrainContent, type SharedContentOptions } from '../core/shared-skills/setup.ts';
+import { resolveSourceId } from '../core/source-resolver.ts';
+import type { BrainEngine } from '../core/engine.ts';
+import { readPrimaryEmbeddingStores, readStoredEmbeddingIdentity } from '../core/stored-embedding-identity.ts';
+import { deferInitJsonError, flushInitJsonResult, initJsonError, setInitJsonResult, writeDeferredInitJsonError } from './init-json.ts';
+import { deferredEmbeddingHint, firstRunBundle, firstRunJson, harnessRegistrationCommand } from './init-first-run.ts';
+import { keptEmbeddingIdentity, keptEmbeddingNotice, recordInitEmbedding } from './init-embedding-plane.ts';
+import { writeCliNotices } from '../core/interop-notices.ts';
+import { exitCodeForCode } from '../core/error-catalogue.ts';
+import { promptLineStderr } from '../core/interaction.ts';
+import type { SearchMode as SearchModeName } from '../core/search/mode.ts';
+import type { McpSurface } from '../mcp/surface.ts';
 
+/** D2: `--json` writes exactly one document, after whichever branch ran (see init-json.ts). */
 export async function runInit(args: string[]) {
+  const fresh = !existsSync(configPath());
+  await runInitBranches(args);
+  if (fresh && existsSync(configPath())) (await import('../core/funnel.ts')).recordFunnelEvent('clean_install');
+  if (args.includes('--json')) await flushInitJsonResult();
+}
+
+async function runInitBranches(args: string[]) {
   // Help guard: cli.ts only routes --help to printOpHelp() for shared-op
   // commands; CLI_ONLY commands (init, embed, etc.) fall through to their
   // handler with --help in argv. Without this guard, `gbrain init --help`
@@ -26,6 +48,10 @@ export async function runInit(args: string[]) {
     return;
   }
 
+  validateInitFlags(args);
+  registrationSurface = (await import('../mcp/surface.ts')).parseSurfaceFlag(args) ?? undefined;
+  searchModeChoice = (await import('./init-mode-picker.ts')).searchModeChoiceFromArgs(args, failInitFlag);
+
   const isSupabase = args.includes('--supabase');
   const isPGLite = args.includes('--pglite');
   const isMcpOnly = args.includes('--mcp-only');
@@ -33,12 +59,22 @@ export async function runInit(args: string[]) {
   const isNonInteractive = args.includes('--non-interactive');
   const isMigrateOnly = args.includes('--migrate-only');
   const jsonOutput = args.includes('--json');
+  const fileState = readInitConfigState(jsonOutput, jsonOutput ? message => process.exit(initJsonError({ status: 'error', reason: 'invalid_existing_config', message },
+    'config_error', message, `Repair or move ${configPath()} aside, then re-run gbrain init.`)) : undefined);
   const urlIndex = args.indexOf('--url');
   const manualUrl = urlIndex !== -1 ? args[urlIndex + 1] : null;
   const keyIndex = args.indexOf('--key');
   const apiKey = keyIndex !== -1 ? args[keyIndex + 1] : null;
   const pathIndex = args.indexOf('--path');
   const customPath = pathIndex !== -1 ? args[pathIndex + 1] : null;
+  const contentRootIndex = args.indexOf('--content-root');
+  if (args.includes('--git') && args.includes('--no-git')) failInitFlag('Choose --git or --no-git, not both.', jsonOutput);
+  if (args.includes('--db-only') && (contentRootIndex !== -1 || args.includes('--git'))) failInitFlag('--db-only cannot be combined with --content-root or --git.', jsonOutput);
+  const content: SharedContentOptions = {
+    ...(contentRootIndex !== -1 ? { root: args[contentRootIndex + 1] } : {}),
+    dbOnly: args.includes('--db-only'), git: args.includes('--git') ? 'init' : 'none',
+    fresh: fileState.kind === 'absent',
+  };
   // v0.42 (T17): pack selection on fresh installs. New brains default to
   // gbrain-base-v2 (the 15-type canonical taxonomy); --schema-pack
   // gbrain-base opts back to the legacy 24-type pack for users who don't
@@ -47,7 +83,7 @@ export async function runInit(args: string[]) {
   const schemaPackIdx = args.indexOf('--schema-pack');
   const schemaPack = schemaPackIdx !== -1 && args[schemaPackIdx + 1]
     ? args[schemaPackIdx + 1]
-    : 'gbrain-base-v2';
+    : (fileState.kind === 'present' ? fileState.config.schema_pack : undefined) ?? 'gbrain-base-v2';
 
   // Multi-topology v1: thin-client init. Skips local engine entirely; writes
   // remote_mcp config that the CLI dispatch guard reads to refuse DB-bound ops.
@@ -58,23 +94,21 @@ export async function runInit(args: string[]) {
   // Re-run guard (A8): if thin-client config is already present, refuse to
   // create a local engine without --force. Catches the scripted-setup-loop
   // friction (running setup-gbrain repeatedly on a thin-client machine).
-  const existing = loadConfig();
+  const existing = loadConfigFileOnly();
   if (isThinClient(existing) && !isForce && !isMigrateOnly) {
     const url = existing!.remote_mcp!.mcp_url;
     const msg = `Thin-client config already present at ${configPath()} (remote_mcp.mcp_url=${url}).\n` +
       `Re-init would create a local engine and conflict with the remote MCP setup.\n` +
       `Use --force to overwrite, or \`gbrain init --mcp-only --force\` to refresh thin-client config.`;
-    if (jsonOutput) {
-      console.log(JSON.stringify({ status: 'error', reason: 'thin_client_config_present', mcp_url: url, message: msg }));
-    } else {
-      console.error(msg);
-    }
+    if (jsonOutput) process.exit(initJsonError({ status: 'error', reason: 'thin_client_config_present', mcp_url: url, message: msg }, 'config_error', msg,
+      'Pass --force to overwrite, or run `gbrain init --mcp-only --force` to refresh the thin-client config.'));
+    console.error(msg);
     process.exit(1);
   }
 
   // Schema-only path: apply initSchema against the already-configured engine
   // without ever calling saveConfig. Used by apply-migrations, the stopgap
-  // script, and the postinstall hook. Bare `gbrain init` defaults to PGLite
+  // script, and older releases' postinstall hook. Bare `gbrain init` defaults to PGLite
   // and overwrites any existing Postgres config — we must never take that
   // branch from a migration orchestrator.
   //
@@ -109,8 +143,60 @@ export async function runInit(args: string[]) {
     nonInteractive: isNonInteractive,
   });
 
+  // db-availability loop (5a): Postgres-first ladder for agent-harness
+  // installs. Explicit opt-in flag — the zero-config `gbrain init` default
+  // stays PGLite (owner decision; the preference lives in the plugin lane).
+  if (args.includes('--prefer-postgres')) {
+    const { runPreferPostgresLadder } = await import('./init-prefer-postgres.ts');
+    return runPreferPostgresLadder({
+      jsonOutput,
+      apiKey,
+      customPath,
+      aiOpts,
+      schemaPack,
+      skipEmbedCheck,
+      content,
+      allowDocker: args.includes('--allow-docker'),
+      allowCreateDb: args.includes('--allow-create-db'),
+      localPostgres: args.includes('--local-postgres'),
+    });
+  }
+
+  // #3753: a --force re-init with NO explicit engine choice preserves the
+  // configured engine — the D5 persisted-config-wins rule extended to the
+  // engine field. Pre-fix, the PGLite default branch below swallowed a
+  // postgres config: following the deferred-setup hint verbatim
+  // (`gbrain init --force --embedding-model ...`) silently rewrote
+  // config.json to engine=pglite, orphaning the postgres data behind a
+  // config that no longer pointed at it. Switching engines stays available
+  // by saying so (--pglite / --supabase / --url). loadConfigFileOnly, NOT
+  // loadConfig: a transient env DATABASE_URL must not count as a configured
+  // engine here (CDX2-7); the env plane keeps its existing precedence in
+  // the non-interactive branch below.
+  let preservedPostgresUrl: string | null = null;
+  if (isForce && !isPGLite && !isSupabase && !manualUrl) {
+    const fileCfg = loadConfigFileOnly();
+    if (fileCfg?.engine === 'postgres' && fileCfg.database_url) {
+      preservedPostgresUrl = fileCfg.database_url;
+      console.error('[init] Existing postgres engine preserved (pass --pglite to switch engines).');
+    }
+  }
+
+  // --non-interactive with no engine flag keeps the brain the config file already names (PGLite or Postgres) instead
+  // of demanding --url; an env DATABASE_URL keeps its precedence in the non-interactive branch below.
+  const keptCfg = isNonInteractive && !isPGLite && !isSupabase && !manualUrl && !args.includes('--prefer-postgres') && !isThinClient(existing) ? existing : null;
+  let keptPglitePath: string | null = null;
+  let keptPostgresUrl: string | null = null;
+  const keptEngine = keptCfg?.engine;
+  switch (keptEngine) {
+    case undefined: break; // no config: the routing below is unchanged
+    case 'pglite': if (!effectiveEnvDatabaseUrl()) keptPglitePath = keptCfg?.database_path ?? gbrainPath('brain.pglite'); break;
+    case 'postgres': keptPostgresUrl = keptCfg?.database_url ?? null; break;
+    default: { const unknownEngine: never = keptEngine; void unknownEngine; }
+  }
+
   // Explicit PGLite mode
-  if (isPGLite || (!isSupabase && !manualUrl && !isNonInteractive)) {
+  if (!preservedPostgresUrl && (isPGLite || (!isSupabase && !manualUrl && (!isNonInteractive || keptPglitePath !== null)))) {
     // Smart detection: scan for .md files unless --pglite flag forces it
     if (!isPGLite && !isSupabase) {
       const fileCount = countMarkdownFiles(process.cwd());
@@ -125,7 +211,7 @@ export async function runInit(args: string[]) {
       }
     }
 
-    return initPGLite({ jsonOutput, apiKey, customPath, aiOpts, schemaPack, skipEmbedCheck });
+    return initPGLite({ jsonOutput, apiKey, customPath: customPath ?? keptPglitePath, aiOpts, schemaPack, skipEmbedCheck, content });
   }
 
   // Supabase/Postgres mode
@@ -140,15 +226,88 @@ export async function runInit(args: string[]) {
     const envUrl = effectiveEnvDatabaseUrl();
     if (envUrl) {
       databaseUrl = envUrl;
+    } else if (preservedPostgresUrl) {
+      databaseUrl = preservedPostgresUrl;
+    } else if (keptPostgresUrl) {
+      databaseUrl = keptPostgresUrl;
     } else {
       console.error('--non-interactive requires --url <connection_string> or GBRAIN_DATABASE_URL env var');
       process.exit(1);
     }
+  } else if (preservedPostgresUrl) {
+    databaseUrl = preservedPostgresUrl;
   } else {
     databaseUrl = await supabaseWizard();
   }
 
-  return initPostgres({ databaseUrl, jsonOutput, apiKey, aiOpts, schemaPack, skipEmbedCheck });
+  return initPostgres({ databaseUrl, jsonOutput, apiKey, aiOpts, schemaPack, skipEmbedCheck, content });
+}
+
+const INIT_BOOLEAN_FLAGS = new Set([
+  '--pglite',
+  '--supabase',
+  '--mcp-only',
+  '--force',
+  '--non-interactive',
+  '--migrate-only',
+  '--json',
+  '--no-embedding',
+  '--skip-embed-check',
+  '--db-only',
+  '--git',
+  '--no-git',
+  // db-availability loop (5a): Postgres-first ladder for harness installs.
+  '--prefer-postgres',
+  '--allow-docker',
+  '--allow-create-db',
+  '--local-postgres',
+]);
+
+const INIT_VALUE_FLAGS = new Set([
+  '--url',
+  '--key',
+  '--path',
+  '--content-root',
+  '--schema-pack',
+  '--embedding-model',
+  '--model',
+  '--embedding-dimensions',
+  '--expansion-model',
+  '--chat-model',
+  '--mcp-url',
+  '--issuer-url',
+  '--oauth-client-id',
+  '--oauth-client-secret',
+  '--surface',
+  '--search-mode',
+]);
+
+function validateInitFlags(args: string[]) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith('-')) continue;
+
+    if (INIT_BOOLEAN_FLAGS.has(arg)) continue;
+
+    if (INIT_VALUE_FLAGS.has(arg)) {
+      if (i + 1 >= args.length || args[i + 1].startsWith('-')) {
+        failInitFlag(`gbrain init: ${arg} requires a value`, args.includes('--json'));
+      }
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--')) {
+      failInitFlag(`gbrain init: unknown flag ${arg}`, args.includes('--json'));
+    }
+  }
+}
+
+function failInitFlag(message: string, jsonOutput: boolean): never {
+  if (jsonOutput) process.exit(initJsonError({ status: 'error', reason: 'invalid_flag', message }, 'invalid_params', message, 'Run `gbrain init --help` for supported flags.'));
+  console.error(message);
+  console.error('Run `gbrain init --help` for supported flags.');
+  process.exit(exitCodeForCode('invalid_params'));
 }
 
 interface ResolveAIOptionsArgs {
@@ -161,13 +320,50 @@ interface ResolveAIOptionsArgs {
   nonInteractive: boolean;       // --non-interactive (forces D3 fail-loud, no picker)
 }
 
-interface ResolvedAIOptions {
+export interface ResolvedAIOptions {
   embedding_model?: string;
   embedding_dimensions?: number;
   expansion_model?: string;
   chat_model?: string;
   /** v0.37 (D9): user opted into deferred embedding setup. */
   noEmbedding?: boolean;
+  /** GBRA-248: noEmbedding came from the no-provider-key fallback, not a choice (init-embedding-plane.ts). */
+  implicitKeyless?: boolean;
+}
+
+/**
+ * Seed init's AI options from persisted config, falling back to the raw env
+ * vars when loadConfig() returned null (#1058). On a cold install (no
+ * config.json AND no DATABASE_URL) loadConfig short-circuits BEFORE its env
+ * merge, so GBRAIN_EMBEDDING_MODEL / GBRAIN_EMBEDDING_DIMENSIONS /
+ * GBRAIN_EXPANSION_MODEL / GBRAIN_CHAT_MODEL were silently ignored by init
+ * and Tier-3 detection auto-picked by API key instead. Exported for unit
+ * tests (env injectable).
+ */
+export function seedAIOptionsFromConfig(
+  cfg: GBrainConfig | null,
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedAIOptions {
+  const envDims = env.GBRAIN_EMBEDDING_DIMENSIONS
+    ? parseInt(env.GBRAIN_EMBEDDING_DIMENSIONS, 10)
+    : NaN;
+  const seed = cfg ?? {
+    embedding_disabled: undefined,
+    embedding_model: env.GBRAIN_EMBEDDING_MODEL,
+    embedding_dimensions: Number.isFinite(envDims) ? envDims : undefined,
+    expansion_model: env.GBRAIN_EXPANSION_MODEL,
+    chat_model: env.GBRAIN_CHAT_MODEL,
+  };
+  const out: ResolvedAIOptions = {};
+  if (seed.embedding_disabled) {
+    out.noEmbedding = true;
+  } else if (seed.embedding_model) {
+    out.embedding_model = seed.embedding_model;
+    if (seed.embedding_dimensions) out.embedding_dimensions = seed.embedding_dimensions;
+  }
+  if (seed.expansion_model) out.expansion_model = seed.expansion_model;
+  if (seed.chat_model) out.chat_model = seed.chat_model;
+  return out;
 }
 
 /**
@@ -203,24 +399,26 @@ async function resolveAIOptions(opts: ResolveAIOptionsArgs): Promise<ResolvedAIO
   // user already opted into deferred mode.
   try {
     const { loadConfig } = await import('../core/config.ts');
-    const cfg = loadConfig();
-    if (cfg?.embedding_disabled) {
-      out.noEmbedding = true;
-    } else if (cfg?.embedding_model) {
-      out.embedding_model = cfg.embedding_model;
-      if (cfg.embedding_dimensions) out.embedding_dimensions = cfg.embedding_dimensions;
-    }
-    if (cfg?.expansion_model) out.expansion_model = cfg.expansion_model;
-    if (cfg?.chat_model) out.chat_model = cfg.chat_model;
+    // #1058: loadConfig() returns null on a cold install (no config.json AND
+    // no DATABASE_URL) — before it ever reaches its env merge. The seed helper
+    // falls back to the same GBRAIN_* env vars directly in that case.
+    Object.assign(out, seedAIOptionsFromConfig(loadConfig()));
   } catch {
-    // loadConfig throws when no brain configured — first-time install, fall
-    // through to env detection.
+    // loadConfig threw — treat as first-time install, fall through to env
+    // detection.
   }
 
   // --- Tier 1+2: explicit flags ---------------------------------------------
 
   if (verbose) {
     out.embedding_model = verbose;
+    // v0.46.3: an EXPLICIT --embedding-model wins over a seeded deferred-setup
+    // sentinel — without this, `gbrain init --force --embedding-model
+    // voyage:voyage-4` on a keyless brain (embedding_disabled persisted) would
+    // silently re-persist embedding_disabled and the documented recovery
+    // command would be a no-op. (--no-embedding is parsed later and still
+    // wins when both flags are passed.)
+    delete out.noEmbedding;
   } else if (shorthand) {
     const { getRecipe } = await import('../core/ai/recipes/index.ts');
     const recipe = getRecipe(shorthand);
@@ -240,13 +438,22 @@ async function resolveAIOptions(opts: ResolveAIOptionsArgs): Promise<ResolvedAIO
       );
       process.exit(1);
     }
-    const firstModel = recipe.touchpoints.embedding?.models[0];
-    if (!firstModel) {
+    // v0.46.3: the shorthand resolves the recipe's canonical model, not array
+    // position — Voyage lists voyage-4-large first but its canonical default
+    // is voyage-4 (see EmbeddingTouchpoint.default_model).
+    const canonicalModel =
+      recipe.touchpoints.embedding?.default_model ?? recipe.touchpoints.embedding?.models[0];
+    if (!canonicalModel) {
       console.error(`Provider ${shorthand} has no embedding models listed. Use --embedding-model provider:model.`);
       process.exit(1);
     }
-    out.embedding_model = `${shorthand}:${firstModel}`;
-    out.embedding_dimensions = recipe.touchpoints.embedding!.default_dims;
+    out.embedding_model = `${shorthand}:${canonicalModel}`;
+    // v0.46.3: explicit flag wins over a seeded deferred-setup sentinel (see the
+    // verbose branch above).
+    delete out.noEmbedding;
+    // #2051: width follows the model actually chosen, not the recipe default.
+    const { embeddingDimsForModel } = await import('../core/ai/model-resolver.ts');
+    out.embedding_dimensions = embeddingDimsForModel(recipe, canonicalModel);
   }
 
   if (dimsArg !== null && !Number.isNaN(dimsArg) && dimsArg > 0) {
@@ -270,8 +477,13 @@ async function resolveAIOptions(opts: ResolveAIOptionsArgs): Promise<ResolvedAIO
       );
       process.exit(1);
     }
-    if (recipe?.touchpoints.embedding?.default_dims) {
-      out.embedding_dimensions = recipe.touchpoints.embedding.default_dims;
+    // #2051: resolve the width from the SPECIFIC model, not the recipe-wide
+    // default. `--embedding-model ollama:bge-m3` must yield 1024, not Ollama's
+    // nomic-shaped 768.
+    if (recipe) {
+      const { embeddingDimsForModel } = await import('../core/ai/model-resolver.ts');
+      const dims = embeddingDimsForModel(recipe, out.embedding_model);
+      if (dims > 0) out.embedding_dimensions = dims;
     }
   }
 
@@ -393,19 +605,23 @@ export async function findEnvKeyTypos(
   return out;
 }
 
-/** Emit the fail-loud "no embedding provider" message + paste-ready setup. */
+/** Emit the "no embedding provider" message + paste-ready setup. Keyless
+ *  continue leads (it always works); key setup follows for the upgrade. */
 function printNoEmbeddingProviderHint(typos: Array<{ userSet: string; suggested: string }>): void {
-  console.error('\nNo embedding provider configured. Set one of:');
-  console.error('  export OPENAI_API_KEY=sk-…        # openai:text-embedding-3-large (1536d)');
-  console.error('  export ZEROENTROPY_API_KEY=ze-…   # zeroentropyai:zembed-1 (2560d, Matryoshka)');
-  console.error('  export VOYAGE_API_KEY=pa-…        # voyage:voyage-3-large (1024d)');
+  console.error('\nNo embedding provider configured.');
+  console.error('Continue without one (keyless — keyword search + memory your agent writes):');
+  console.error('  gbrain init --pglite --no-embedding');
+  console.error('  (enable semantic search later by re-running with a key:');
+  console.error('   gbrain init --force --pglite --embedding-model <id>)');
+  console.error('');
+  console.error('Or set a key to upgrade capabilities:');
+  console.error('  export VOYAGE_API_KEY=pa-…        # semantic search (voyage:voyage-4, 1024d) — default');
+  console.error('  export OPENAI_API_KEY=sk-…        # semantic search (1536d) + automatic fact extraction');
+  console.error('  export ANTHROPIC_API_KEY=sk-ant-… # automatic fact extraction (no embeddings API)');
   console.error('Then re-run: gbrain init --pglite');
   console.error('');
   console.error('Or pick explicitly:');
-  console.error('  gbrain init --pglite --embedding-model openai:text-embedding-3-large');
-  console.error('');
-  console.error('Or defer setup: gbrain init --pglite --no-embedding');
-  console.error('  (you can configure later with `gbrain config set embedding_model <id>`)');
+  console.error('  gbrain init --pglite --embedding-model voyage:voyage-4');
   // D13: surface near-miss env vars (e.g. OPENAPI_API_KEY → OPENAI_API_KEY).
   if (typos.length > 0) {
     console.error('');
@@ -415,28 +631,107 @@ function printNoEmbeddingProviderHint(typos: Array<{ userSet: string; suggested:
   }
 }
 
+async function writeNewInstallRerankerDefault(
+  engine: { getConfig(key: string): Promise<string | null>; setConfig(key: string, value: string): Promise<void> },
+  resolvedModel: string | undefined,
+): Promise<void> {
+  try {
+    // Never-clobber: an existing explicit reranker model OR enabled override
+    // means the user already decided — leave both keys alone.
+    const [existingModel, existingEnabled] = await Promise.all([
+      engine.getConfig('search.reranker.model'),
+      engine.getConfig('search.reranker.enabled'),
+    ]);
+    if (existingModel || existingEnabled != null) return;
+    const { DEFAULT_RERANKER_MODEL } = await import('../core/ai/defaults.ts');
+    const { rerankerReadiness } = await import('../core/ai/reranker-readiness.ts');
+    const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
+    // Same plane the CLI hands the gateway: env > file > DB-plane provider keys
+    // (a `--force` re-init of a brain whose Voyage key lives only in the config
+    // table must not be classified keyless and locked into `enabled=false`).
+    const fileCfg = loadConfigFileOnly();
+    let mergedCfg = fileCfg;
+    try {
+      const { loadConfigWithEngine } = await import('../core/config.ts');
+      mergedCfg = await loadConfigWithEngine(engine as any, fileCfg);
+    } catch { mergedCfg = fileCfg; }
+    const readiness = rerankerReadiness(DEFAULT_RERANKER_MODEL, mergedProviderEnv(mergedCfg, process.env));
+    if (readiness.ready) {
+      // Nothing to write: the bundle default already resolves to it.
+      console.log(
+        `  Reranker: ${DEFAULT_RERANKER_MODEL} (mode-bundle default` +
+        `${readiness.requiredKey ? `; same ${readiness.requiredKey}` : ''})`,
+      );
+      return;
+    }
+    if (resolvedModel) {
+      const key = readiness.requiredKey ?? 'VOYAGE_API_KEY';
+      await engine.setConfig('search.reranker.enabled', 'false');
+      console.log(
+        `  Reranker: disabled (no ${key} — enable later: export ${key}=… && ` +
+        'gbrain config set search.reranker.enabled true)',
+      );
+    }
+  } catch {
+    // Cosmetic; never block init.
+  }
+}
+
+/** Loud keyless-continue notice for the no-keys default path. The upgrade
+ *  command is `init --force` re-init, NOT `config set embedding_model` — that
+ *  key is a schema-sizing file-plane field that `gbrain config set` refuses
+ *  (it would be a silent no-op), so pointing users there is a dead end. */
+function printKeylessContinueNotice(): void {
+  console.error(
+    'No provider keys detected — continuing in keyless mode:\n' +
+    '  keyword search + memory your agent writes down itself. Everything works.\n' +
+    '  One optional key upgrades capabilities — OpenAI: semantic search + automatic\n' +
+    '  fact extraction; Voyage: semantic search; Anthropic: fact extraction.\n' +
+    '  Fact extraction activates as soon as the key is set (no re-init); semantic\n' +
+    '  search needs a re-run:\n' +
+    '  `gbrain init --force --pglite --embedding-model <id>` (re-imports via `gbrain sync`).',
+  );
+}
+
 async function resolveEmbeddingByEnv(out: ResolvedAIOptions, nonInteractive: boolean): Promise<void> {
-  const ready = await groupReadyByProvider('embedding');
+  // v0.46.3: provider readiness folds FILE-PLANE keys too (docs explicitly
+  // permit `voyage_api_key` etc. in ~/.gbrain/config.json) — env still wins
+  // via buildGatewayConfig's spread order. Without this, a non-interactive
+  // fresh install keyed only via config.json reported zero providers and
+  // silently persisted keyless mode.
+  const fileCfgForKeys = loadConfigFileOnly();
+  let effectiveEnv: NodeJS.ProcessEnv = process.env;
+  if (fileCfgForKeys) {
+    try {
+      const { buildGatewayConfig } = await import('../core/ai/build-gateway-config.ts');
+      effectiveEnv = buildGatewayConfig(fileCfgForKeys).env as NodeJS.ProcessEnv;
+    } catch {
+      // Fold failure → env-only readiness (pre-v0.46.3 behavior).
+    }
+  }
+  const ready = await groupReadyByProvider('embedding', effectiveEnv);
   const isTTY = !nonInteractive && !!process.stdin.isTTY;
 
   if (ready.length === 1) {
     const r = ready[0].recipe;
     const tp = r.touchpoints.embedding!;
     if (Array.isArray(tp.models) && tp.models.length > 0) {
-      const model = tp.models[0];
+      // v0.46.3: recipes carry a canonical default_model — array order is
+      // quality-sorted, not recommendation-sorted (Voyage lists voyage-4-large
+      // first; the canonical pick is voyage-4).
+      const model = tp.default_model ?? tp.models[0];
       const fullModel = `${r.id}:${model}`;
-      // When the resolved provider matches the canonical default model
-      // (DEFAULT_EMBEDDING_MODEL), use the gateway's
-      // DEFAULT_EMBEDDING_DIMENSIONS instead of the recipe's `default_dims`
-      // (which is the recipe's "largest sensible" tier). This keeps
-      // fresh-install schema width aligned with the v0.37.11.0 system
-      // default — for ZE that means 1280 (the Matryoshka step closest to
-      // legacy OpenAI 1536), not the recipe's 2560.
-      const { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } =
+      // When the resolved provider matches the NEW-INSTALL canonical default
+      // model, use NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS instead of the
+      // recipe's `default_dims` so fresh-install schema width stays aligned
+      // with the system default (1024 for voyage-4).
+      const { NEW_INSTALL_DEFAULT_EMBEDDING_MODEL, NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS } =
         await import('../core/ai/defaults.ts');
-      const dims = fullModel === DEFAULT_EMBEDDING_MODEL
-        ? DEFAULT_EMBEDDING_DIMENSIONS
-        : tp.default_dims;
+      const { embeddingDimsForModel } = await import('../core/ai/model-resolver.ts');
+      // #2051: non-canonical models resolve per-model, not recipe-wide.
+      const dims = fullModel === NEW_INSTALL_DEFAULT_EMBEDDING_MODEL
+        ? NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS
+        : embeddingDimsForModel(r, model);
       out.embedding_model = fullModel;
       out.embedding_dimensions = dims;
       console.error(
@@ -448,37 +743,70 @@ async function resolveEmbeddingByEnv(out: ResolvedAIOptions, nonInteractive: boo
     }
   }
 
-  // Zero or multi — pick or fail loud.
+  // Zero keys — keyless is a first-class posture (the whole paste-in
+  // bootstrap runs on it), so the DEFAULT is to continue keyless with a loud
+  // notice, not exit 1. Fail-loud survives in exactly one zero-key case: a
+  // near-miss env var (OPENAPI_API_KEY → OPENAI_API_KEY) signals the user
+  // MEANT to configure a key — completing keyless there would silently bury
+  // their typo.
   if (ready.length === 0) {
-    if (!isTTY) {
-      const typos = await findEnvKeyTypos();
+    const typos = await findEnvKeyTypos();
+    if (typos.length > 0) {
       printNoEmbeddingProviderHint(typos);
       process.exit(1);
     }
-    // TTY → picker; on null (user aborted) still fail loud.
+    if (!isTTY) {
+      printKeylessContinueNotice();
+      out.noEmbedding = out.implicitKeyless = true;
+      return;
+    }
+    // TTY → picker (local providers like ollama may be selectable); a null
+    // pick (nothing offered, user skipped, or EOF) continues keyless.
     const { pickProvider } = await import('./init-provider-picker.ts');
-    const picked = await pickProvider({ touchpoint: 'embedding', env: process.env, isTTY: true });
+    const picked = await pickProvider({ touchpoint: 'embedding', env: effectiveEnv, isTTY: true });
     if (!picked) {
-      const typos = await findEnvKeyTypos();
-      printNoEmbeddingProviderHint(typos);
-      process.exit(1);
+      printKeylessContinueNotice();
+      out.noEmbedding = out.implicitKeyless = true;
+      return;
     }
     out.embedding_model = picked.fullModel;
     out.embedding_dimensions = picked.dim;
     return;
   }
 
-  // ready.length > 1 — picker (TTY) or fail-loud (non-TTY) per D2/D3.
+  // ready.length > 1 — picker (TTY); non-TTY auto-picks the canonical default
+  // when its key is present (the most common agent/dev setup is 2+ provider
+  // keys — failing there blocked scripted installs), else fail-loud per D2/D3
+  // (a genuinely ambiguous set with no canonical candidate stays explicit).
   if (!isTTY) {
+    const { NEW_INSTALL_DEFAULT_EMBEDDING_MODEL, NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS } =
+      await import('../core/ai/defaults.ts');
+    const canonicalProvider = NEW_INSTALL_DEFAULT_EMBEDDING_MODEL.split(':')[0];
+    const canonical = ready.find((p) => p.recipeId === canonicalProvider);
+    if (canonical) {
+      out.embedding_model = NEW_INSTALL_DEFAULT_EMBEDDING_MODEL;
+      out.embedding_dimensions = NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS;
+      console.error(
+        `Multiple embedding providers env-ready (${ready.map(p => p.recipeId).join(', ')}). ` +
+        `Using the default ${NEW_INSTALL_DEFAULT_EMBEDDING_MODEL} (${NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS}d). ` +
+        `Override with --embedding-model.`,
+      );
+      return;
+    }
     console.error(`Multiple embedding providers env-ready: ${ready.map(p => p.recipeId).join(', ')}.`);
     console.error(`Disambiguate by passing --embedding-model <provider>:<model>, or unset extra env vars.`);
     process.exit(1);
   }
   const { pickProvider } = await import('./init-provider-picker.ts');
-  const picked = await pickProvider({ touchpoint: 'embedding', env: process.env, isTTY: true });
+  const picked = await pickProvider({ touchpoint: 'embedding', env: effectiveEnv, isTTY: true });
   if (!picked) {
-    console.error('Init aborted: no embedding provider picked.');
-    process.exit(1);
+    // The embedding picker offers an explicit "0) none — continue keyless"
+    // option (and returns null on it). Honor that instead of aborting: a user
+    // with multiple keys who deliberately chose keyless gets keyless, matching
+    // the zero-key path. (Ctrl-D / EOF / invalid also land here → keyless.)
+    printKeylessContinueNotice();
+    out.noEmbedding = true;
+    return;
   }
   out.embedding_model = picked.fullModel;
   out.embedding_dimensions = picked.dim;
@@ -499,21 +827,33 @@ async function resolveExpansionByEnv(out: ResolvedAIOptions): Promise<void> {
   // and falls back gracefully at call time when key isn't set.
 }
 
-async function resolveChatByEnv(out: ResolvedAIOptions): Promise<void> {
+/** @internal exported for tests — pins the no-persist contract (key-aware
+ *  runtime resolution replaced install-time chat_model pins). */
+export async function resolveChatByEnv(out: ResolvedAIOptions): Promise<void> {
   const ready = await groupReadyByProvider('chat');
   if (ready.length === 1) {
     const r = ready[0].recipe;
     const tp = r.touchpoints.chat!;
     if (Array.isArray(tp.models) && tp.models.length > 0) {
-      out.chat_model = `${r.id}:${tp.models[0]}`;
-      console.error(`Detected ${r.auth_env?.required?.[0] ?? r.id} env var. Using ${out.chat_model} for chat.`);
+      // Deliberately does NOT write out.chat_model: key-aware tier defaults
+      // (model-config.ts resolveTierDefault + resolveEffectiveChatModel)
+      // route chat/extraction to this provider at runtime, and a persisted
+      // install-time pin freezes the provider choice — it goes stale the
+      // moment the user switches keys. Detection stays for the init summary;
+      // the displayed model is the same resolution the runtime will use
+      // (discovered-latest for OpenAI, recipe entry otherwise).
+      const { resolveTierDefault } = await import('../core/model-config.ts');
+      const effective = resolveTierDefault('reasoning');
+      const shown = effective.startsWith(`${r.id}:`) ? effective : `${r.id}:${tp.models[0]}`;
+      console.error(
+        `Detected ${r.auth_env?.required?.[0] ?? r.id} env var. Chat + fact extraction will use ` +
+        `${shown} (key-aware default; nothing written to config).`,
+      );
     }
   }
-  // 0 or >1 → silent: gateway default (`anthropic:claude-sonnet-4-6`) wins.
+  // 0 or >1 → silent: the key-aware tier default wins at runtime.
   // The subagent enforcement at minions/queue.ts already routes subagent jobs
-  // to Anthropic regardless of the chat_model setting (D7 caveat fires from
-  // T6's initPGLite post-config branch when chat_model is non-Anthropic and
-  // ANTHROPIC_API_KEY is missing).
+  // via classifyCapabilities regardless of the chat_model setting.
 }
 
 /**
@@ -530,18 +870,18 @@ async function initMigrateOnly(opts: { jsonOutput: boolean }) {
   try {
     const result = await runMigrateOnlyCore();
     if (opts.jsonOutput) {
-      console.log(JSON.stringify({ status: 'success', engine: result.engine, mode: 'migrate-only' }));
+      setInitJsonResult({ status: 'success', engine: result.engine, mode: 'migrate-only' });
     } else {
       console.log(`Schema up to date (engine: ${result.engine}).`);
     }
   } catch (e) {
+    // Preserve the CLI's shared retryable busy envelope for migration callers.
+    if (e instanceof PgliteBusyError || (e as { code?: unknown }).code === 'client_behind') throw e;
     const isNoConfig = e instanceof MigrateOnlyError && e.message.startsWith('No brain configured');
     const msg = e instanceof Error ? e.message : String(e);
-    if (opts.jsonOutput) {
-      console.log(JSON.stringify({ status: 'error', reason: isNoConfig ? 'no_config' : 'migrate_failed', message: msg }));
-    } else {
-      console.error(msg);
-    }
+    if (opts.jsonOutput) process.exit(initJsonError({ status: 'error', reason: isNoConfig ? 'no_config' : 'migrate_failed', message: msg },
+      isNoConfig ? 'no_brain' : 'database_error', msg, isNoConfig ? 'Run `gbrain init --pglite --no-embedding` first.' : 'Run `gbrain doctor --json` to see what blocks the schema bring-up.'));
+    console.error(msg);
     process.exit(1);
   }
 }
@@ -577,12 +917,12 @@ async function initRemoteMcp(opts: {
   const clientSecret = (arg('--oauth-client-secret') ?? process.env.GBRAIN_REMOTE_CLIENT_SECRET ?? '').trim();
 
   function fail(reason: string, message: string, extra: Record<string, unknown> = {}): never {
-    if (jsonOutput) {
-      console.log(JSON.stringify({ status: 'error', reason, message, ...extra }));
-    } else {
-      console.error(message);
-    }
-    process.exit(1);
+    const code = reason.startsWith('missing_') ? 'invalid_params' : reason.startsWith('token_') ? 'invalid_token'
+      : reason.startsWith('discovery_') || reason.startsWith('mcp_smoke_') ? 'unavailable' : 'config_error';
+    if (jsonOutput) process.exit(initJsonError({ status: 'error', reason, message, ...extra }, code, message.split('\n')[0],
+      message.split('\n').slice(1).join(' ') || 'Run `gbrain init --help` for the thin-client flags.'));
+    console.error(message);
+    process.exit(code === 'invalid_params' ? exitCodeForCode(code) : 1);
   }
 
   if (!issuerUrl) fail('missing_issuer_url', '--issuer-url is required (or set GBRAIN_REMOTE_ISSUER_URL). Example: --issuer-url https://brain-host.local:3001');
@@ -590,18 +930,7 @@ async function initRemoteMcp(opts: {
   if (!clientId) fail('missing_client_id', '--oauth-client-id is required (or set GBRAIN_REMOTE_CLIENT_ID). Get it from `gbrain auth register-client` on the host.');
   if (!clientSecret) fail('missing_client_secret', '--oauth-client-secret is required (or set GBRAIN_REMOTE_CLIENT_SECRET). Get it from `gbrain auth register-client` on the host.');
 
-  // Re-run guard for --mcp-only specifically: refuse without --force to
-  // avoid silently rotating credentials on a working install.
-  const existing = loadConfig();
-  if (isThinClient(existing) && !isForce) {
-    const prevUrl = existing!.remote_mcp!.mcp_url;
-    fail(
-      'thin_client_config_present',
-      `Thin-client config already present at ${configPath()} (remote_mcp.mcp_url=${prevUrl}).\n` +
-      `Re-running --mcp-only would overwrite. Use --force to refresh.`,
-      { mcp_url: prevUrl },
-    );
-  }
+  const existing = inspectRemoteInitState(isForce, fail);
 
   if (!jsonOutput) {
     console.log('Thin-client setup — running pre-flight smoke...');
@@ -626,9 +955,10 @@ async function initRemoteMcp(opts: {
   if (!tokenRes.ok) {
     fail(
       `token_${tokenRes.reason}`,
-      `Pre-flight failed: OAuth /token — ${tokenRes.message}\n` +
-      `Hint: the host operator can run \`gbrain auth register-client <name> --grant-types client_credentials --scopes read,write,admin\` to mint fresh credentials.`,
-      { detail: tokenRes.message, ...(tokenRes.status ? { status: tokenRes.status } : {}) },
+      `Pre-flight failed: OAuth /token — ${tokenRes.message}\n` + (tokenRes.reason === 'rate_limited'
+        ? `Hint: the host's /token mint budget is spent; rerun after the wait, or the host operator can raise GBRAIN_OAUTH_TOKEN_RATE_LIMIT_MAX.`
+        : `Hint: the host operator can run \`gbrain auth register-client <name> --grant-types client_credentials --scopes read,write,admin\` to mint fresh credentials.`),
+      { detail: tokenRes.message, ...(tokenRes.status ? { status: tokenRes.status } : {}), ...(tokenRes.retry_after_s !== undefined ? { retry_after_s: tokenRes.retry_after_s } : {}) },
     );
   }
   if (!jsonOutput) console.log(`  ✓ OAuth /token (${tokenRes.token.token_type ?? 'bearer'}, scope=${tokenRes.token.scope ?? 'unspecified'})`);
@@ -675,17 +1005,18 @@ async function initRemoteMcp(opts: {
   const configRecord = config as unknown as Record<string, unknown>;
   delete configRecord.database_url;
   delete configRecord.database_path;
+  preserveConversionConfig(true);
   saveConfig(config);
 
   if (jsonOutput) {
-    console.log(JSON.stringify({
+    setInitJsonResult({
       status: 'success',
       mode: 'thin-client',
       issuer_url: config.remote_mcp!.issuer_url,
       mcp_url: config.remote_mcp!.mcp_url,
       oauth_client_id: config.remote_mcp!.oauth_client_id,
       oauth_secret_in_config: 'oauth_client_secret' in config.remote_mcp!,
-    }));
+    });
   } else {
     console.log('');
     console.log('Thin-client mode configured. No local DB.');
@@ -699,19 +1030,6 @@ async function initRemoteMcp(opts: {
   }
 }
 
-/**
- * Configure the AI gateway with the merged precedence
- * `CLI flags > env > existing file > gateway internal defaults`, then read
- * back the resolved values so the caller can both print them and persist
- * them to config.json.
- *
- * v0.37 fix wave (Lane B.1/B.2/B.3): pre-fix, the gateway was only configured
- * when a flag was passed. Bare `gbrain init --pglite` left the gateway
- * unconfigured and engine.initSchema() fell through to stale OpenAI/1536
- * defaults — schema sized to 1536 while the ZE default emitted 1280. Now
- * the gateway is ALWAYS configured before initSchema; the schema matches
- * the resolved provider/dim out of the box.
- */
 async function configureGatewayWithMergedPrecedence(
   aiOpts?: { embedding_model?: string; embedding_dimensions?: number; expansion_model?: string; chat_model?: string },
 ): Promise<{ embedding_model: string; embedding_dimensions: number; expansion_model: string; chat_model: string }> {
@@ -748,9 +1066,6 @@ async function configureGatewayWithMergedPrecedence(
   };
 }
 
-/**
- * Print the resolved AI choice + a ZE setup hint when applicable.
- */
 function printResolvedAIChoice(
   resolved: { embedding_model: string; embedding_dimensions: number; expansion_model: string; chat_model: string },
   aiOpts?: { embedding_model?: string },
@@ -761,26 +1076,23 @@ function printResolvedAIChoice(
   console.log(`  Expansion: ${resolved.expansion_model}`);
   console.log(`  Chat:      ${resolved.chat_model}`);
 
-  // ZE setup hint: if resolved provider is ZE and no ZE key is set in env
-  // OR in the file plane, surface the setup gap at init time instead of
-  // letting the first embed call blow up. After Lane C, file-plane
-  // zeroentropy_api_key propagates through buildGatewayConfig.
-  if (resolved.embedding_model.startsWith('zeroentropyai:')) {
-    const fileCfg = loadConfigFileOnly();
-    if (!process.env.ZEROENTROPY_API_KEY && !fileCfg?.zeroentropy_api_key) {
-      console.warn('');
-      console.warn('  Heads up: ZEROENTROPY_API_KEY is not set.');
-      console.warn('  Set it before first embed:');
-      console.warn('    export ZEROENTROPY_API_KEY=...');
-      console.warn('  Or add to ~/.gbrain/config.json:');
-      console.warn('    "zeroentropy_api_key": "..."');
-      console.warn('  Or pick a different provider:');
-      console.warn('    gbrain init --pglite --embedding-model openai:text-embedding-3-large --embedding-dimensions 1536');
+}
+
+async function assertInitEmbeddingIdentity(engine: BrainEngine, model: string | undefined): Promise<void> {
+  if (!model) return;
+  const stored = await readStoredEmbeddingIdentity(engine);
+  if (stored?.model === model) return;
+  for (const table of await readPrimaryEmbeddingStores(engine)) {
+    const rows = await engine.executeRaw<{ present: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM ${table} WHERE embedding IS NOT NULL) AS present`,
+    );
+    if (rows[0]?.present) {
+      throw new Error('Existing vectors belong to a different or unrecorded embedding model. Re-initialization cannot change their identity, even at the same width. Run gbrain migrate embeddings --status and preview an explicit migration with --dry-run.');
     }
   }
 }
 
-async function initPGLite(opts: {
+export async function initPGLite(opts: {
   jsonOutput: boolean;
   apiKey: string | null;
   customPath: string | null;
@@ -790,6 +1102,7 @@ async function initPGLite(opts: {
   schemaPack?: string;
   /** v0.42 (#1780 Gap 2): skip the init-time embedding-key validation. */
   skipEmbedCheck?: boolean;
+  content?: SharedContentOptions;
 }) {
   const dbPath = opts.customPath || gbrainPath('brain.pglite');
   console.log(`Setting up local brain with PGLite (no server needed)...`);
@@ -803,7 +1116,7 @@ async function initPGLite(opts: {
   let resolvedModel: string | undefined;
   if (opts.aiOpts?.noEmbedding) {
     // D9 deferred-setup mode: skip preflight, no model/dim resolved.
-    console.log(`  --no-embedding: deferred setup — configure with \`gbrain config set embedding_model <id>\` before import`);
+    if (!opts.aiOpts.implicitKeyless) console.log(deferredEmbeddingHint({ engine: 'pglite', database_path: dbPath, embedding_disabled: true }));
   } else if (opts.aiOpts?.embedding_model) {
     const { resolveSchemaEmbeddingDim } = await import('../core/embedding-dim-check.ts');
     const pre = resolveSchemaEmbeddingDim({
@@ -812,9 +1125,7 @@ async function initPGLite(opts: {
     });
     if (!pre.ok) {
       console.error(`\nRefusing to init: ${pre.error}\n`);
-      if (opts.jsonOutput) {
-        console.log(JSON.stringify({ status: 'error', reason: 'preflight_failed', error: pre.error }));
-      }
+      if (opts.jsonOutput) process.exit(initJsonError({ status: 'error', reason: 'preflight_failed', error: pre.error }, 'config_error', pre.error, INIT_EMBEDDING_HINT));
       process.exit(1);
     }
     resolvedDim = pre.dim;
@@ -831,43 +1142,45 @@ async function initPGLite(opts: {
   // resolveAIOptions above: CLI flags > env vars > existing file > gateway
   // defaults.
   const { configureGateway } = await import('../core/ai/gateway.ts');
-  configureGateway({
-    embedding_model: resolvedModel ?? opts.aiOpts?.embedding_model,
-    embedding_dimensions: resolvedDim ?? opts.aiOpts?.embedding_dimensions,
-    expansion_model: opts.aiOpts?.expansion_model,
-    chat_model: opts.aiOpts?.chat_model,
-    env: { ...process.env },
-  });
+  // v0.46.3: keyless fresh installs size the embedding column at the NEW-INSTALL
+  // width (1024), not the legacy configless fallback (1280) — the sizing is an
+  // explicit param here, NOT a rewire of the schema generators' legacy import
+  // (those also run on existing-brain reconnects, where legacy must stay
+  // legacy). Existing keyless brains are unaffected: initSchema never resizes
+  // an existing column, and the Lane B.5 mismatch guard stays off for keyless
+  // (resolvedDim is undefined).
+  const { NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS: newInstallDims } =
+    await import('../core/ai/defaults.ts');
   if (resolvedModel) console.log(`  Embedding: ${resolvedModel} (${resolvedDim}d)`);
   if (opts.aiOpts?.expansion_model) console.log(`  Expansion: ${opts.aiOpts.expansion_model}`);
   if (opts.aiOpts?.chat_model) console.log(`  Chat: ${opts.aiOpts.chat_model}`);
 
-  // v0.42 (#1780 Gap 2): validate the embedding key at init for ALL providers
-  // (generalizes the prior ZeroEntropy-only warning). Config-only diagnose
-  // catches a missing key; a best-effort live test-embed catches an
-  // invalid/expired key. Loud warning to stderr, init still succeeds.
-  // Skipped by --no-embedding / --skip-embed-check / GBRAIN_INIT_SKIP_EMBED_CHECK=1.
-  const embedCheck = await runInitEmbedCheck({
-    resolvedModel,
-    resolvedDim,
-    expansionModel: opts.aiOpts?.expansion_model,
-    chatModel: opts.aiOpts?.chat_model,
-    apiKey: opts.apiKey ?? undefined,
-    noEmbedding: opts.aiOpts?.noEmbedding,
-    skipFlag: opts.skipEmbedCheck,
-  });
 
   const engine = await createEngine({ engine: 'pglite' });
   try {
     await engine.connect({ database_path: dbPath, engine: 'pglite' });
+    const freshContentDatabase = await isNewContentDatabase(engine);
+    await assertInitEmbeddingIdentity(engine, resolvedModel);
+    const kept = await keptEmbeddingIdentity(engine, opts.aiOpts, freshContentDatabase);
+    if (opts.aiOpts?.implicitKeyless) console.log(kept ? keptEmbeddingNotice(kept) : deferredEmbeddingHint({ engine: 'pglite', database_path: dbPath, embedding_disabled: true }));
+    configureGateway({
+      embedding_model: resolvedModel ?? kept?.model ?? opts.aiOpts?.embedding_model,
+      embedding_dimensions: resolvedDim ?? kept?.dimensions ?? opts.aiOpts?.embedding_dimensions ??
+        (opts.aiOpts?.noEmbedding ? newInstallDims : undefined),
+      expansion_model: opts.aiOpts?.expansion_model,
+      chat_model: opts.aiOpts?.chat_model,
+      env: { ...process.env },
+    });
+    const embedCheck = await runInitEmbedCheck({
+      resolvedModel,
+      resolvedDim,
+      expansionModel: opts.aiOpts?.expansion_model,
+      chatModel: opts.aiOpts?.chat_model,
+      apiKey: opts.apiKey ?? undefined,
+      noEmbedding: opts.aiOpts?.noEmbedding,
+      skipFlag: opts.skipEmbedCheck,
+    });
 
-    // v0.28.5 (A4) + v0.37.11.0 Lane B.5: refuse to silently re-template an
-    // existing brain with a mismatched embedding dimension. Catches both the
-    // explicit-flag case (v0.28.5) AND the bare-init case where a user with
-    // a 1536 brain runs `gbrain init --pglite` after upgrading to v0.36+
-    // and would silently end up with runtime ZE/1280 against a 1536 column
-    // (Lane B.5). Fresh-install case is now structurally impossible after
-    // v0.37.10.0 T6's preflight.
     if (resolvedDim) {
       const { readContentChunksEmbeddingDim, embeddingMismatchMessage } = await import('../core/embedding-dim-check.ts');
       const existing = await readContentChunksEmbeddingDim(engine);
@@ -880,14 +1193,8 @@ async function initPGLite(opts: {
           engineKind: 'pglite',
           databasePath: dbPath,
         }) + '\n');
-        if (opts.jsonOutput) {
-          console.log(JSON.stringify({
-            status: 'error',
-            reason: 'embedding_dim_mismatch',
-            current_dims: existing.dims,
-            requested_dims: resolvedDim,
-          }));
-        }
+        if (opts.jsonOutput) process.exit(initJsonError({ status: 'error', reason: 'embedding_dim_mismatch', current_dims: existing.dims, requested_dims: resolvedDim },
+          'embedding_width_mismatch', `The brain's vectors are ${existing.dims}d; the requested model produces ${resolvedDim}d.`, INIT_EMBEDDING_HINT));
         process.exit(1);
       }
     }
@@ -916,14 +1223,8 @@ async function initPGLite(opts: {
       }
     }
 
-    // v0.37.10.0 T7 (D9) + v0.37.11.0 Lane B.4: atomic embedding-config
-    // persistence on top of the existing file-plane config (preserves
-    // user-set fields like zeroentropy_api_key, chat_model, expansion_model).
-    // Either the deferred-setup sentinel (`embedding_disabled: true`) OR the
-    // resolved (model, dimensions) tuple. Never a partial state. Precedence:
-    // CLI flags this invocation > existing file plane > resolved defaults.
-    // Use loadConfigFileOnly() — loadConfig() would poison config.json with
-    // any DATABASE_URL the current process happens to have set (CDX2-7).
+    await writeNewInstallRerankerDefault(engine, resolvedModel);
+
     const existingFile = loadConfigFileOnly() ?? ({} as GBrainConfig);
     const config: GBrainConfig = {
       ...existingFile,
@@ -931,7 +1232,7 @@ async function initPGLite(opts: {
       database_path: dbPath,
       ...(opts.apiKey ? { openai_api_key: opts.apiKey } : {}),
       ...(opts.aiOpts?.noEmbedding
-        ? { embedding_disabled: true }
+        ? kept ? { embedding_model: kept.model, embedding_dimensions: kept.dimensions } : { embedding_disabled: true }
         : (resolvedModel && resolvedDim)
           ? { embedding_model: resolvedModel, embedding_dimensions: resolvedDim }
           : {}),
@@ -942,14 +1243,36 @@ async function initPGLite(opts: {
       // unless explicitly overridden by --schema-pack on re-init.
       ...(opts.schemaPack ? { schema_pack: opts.schemaPack } : {}),
     };
+    delete config.remote_mcp;
+    delete config.database_url;
+    // v0.46.3: leaving deferred-setup mode — a resolved (model, dims) tuple must
+    // also CLEAR a stale embedding_disabled sentinel inherited via the
+    // ...existingFile spread, or the documented recovery command
+    // (`init --force --embedding-model ...`) persists a config that still
+    // disables embedding at runtime.
+    if (!opts.aiOpts?.noEmbedding && resolvedModel && resolvedDim) {
+      delete config.embedding_disabled;
+      await recordInitEmbedding(engine, resolvedModel, resolvedDim);
+    }
     // PR1: new installs publish their skill catalog over MCP by default
     // (existing config wins on re-init, so a prior opt-out is preserved).
-    config.mcp = { publish_skills: true, ...(config.mcp ?? {}) };
+    config.mcp = { ...(freshContentDatabase && !existingFile.engine ? { publish_skills: true } : {}), ...(config.mcp ?? {}) };
     // v0.42: new installs default self-upgrade to NOTIFY (a nudge on every
     // gbrain invocation). mode_prompted=true so the upgrade-time banner doesn't
     // also fire on a fresh install. Hands-off: gbrain config set self_upgrade.mode auto
-    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(config.self_upgrade ?? {}) };
+    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(freshContentDatabase && !existingFile.engine ? { channel: 'stable' as const } : {}), ...(config.self_upgrade ?? {}) };
+    // MEMORY_VERBS v1 [D6C]: TTHW stamp — `gbrain protocol stats` derives
+    // install→first-verb-call from this. Idempotent on re-init.
+    config.protocol_installed_at = config.protocol_installed_at ?? new Date().toISOString();
+    preserveConversionConfig(false);
     saveConfig(config);
+    if (freshContentDatabase) (await import('./migrations/fresh-install.ts')).recordFreshInstallMigrations();
+    if (freshContentDatabase) { const n = await import('../core/behavior-change-notice.ts'); n.stampFreshBrainBaseline(n.behaviorBrainKey(config)); }
+    const contentReceipt = await setupSharedBrainContent({ engine, config, sourceId: await resolveSourceId(engine, undefined), remote: false, dryRun: false, logger: { info: console.error, warn: console.error, error: console.error } }, {
+      ...opts.content, fresh: freshContentDatabase,
+      ...(process.env.GBRAIN_IN_AGENT_SETUP === '1' && !opts.content?.root ? { root: join(dirname(configPath()), '..', 'memory') } : {}),
+    });
+    if (!opts.jsonOutput) console.error(`[init] Content: ${contentReceipt.root ?? contentReceipt.repository_kind} (${contentReceipt.repository_kind}; ${contentReceipt.status}). ${contentReceipt.pending_actions.join(' ')}`);
     if (opts.schemaPack) {
       process.stderr.write(
         `[init] Using schema pack: ${opts.schemaPack} (override with --schema-pack <name>)\n`,
@@ -968,42 +1291,108 @@ async function initPGLite(opts: {
     // DB config writes are valid. Idempotent: skipped on re-init if already set.
     // Non-TTY auto-selects; --json emits a structured event.
     const { runModePicker } = await import('./init-mode-picker.ts');
-    await runModePicker(engine, { jsonOutput: opts.jsonOutput });
+    let searchMode: { mode: SearchModeName; reason: string } | undefined;
+    await runModePicker(engine, { jsonOutput: opts.jsonOutput, ...searchModeChoice, onDecision: d => { searchMode = d; } });
 
     const stats = await engine.getStats();
 
     if (opts.jsonOutput) {
-      console.log(JSON.stringify({ status: 'success', engine: 'pglite', path: dbPath, pages: stats.page_count, embedding_check: embedCheck }));
+      setInitJsonResult({ status: 'success', engine: 'pglite', path: dbPath, pages: stats.page_count, embedding_check: embedCheck, content: contentReceipt, ...firstRunJson(await firstRunBundle(engine, searchMode, registrationSurface)) });
+    } else if (process.env.GBRAIN_IN_AGENT_SETUP === '1') {
+      printInAgentReady(dbPath, freshContentDatabase);
     } else {
       console.log(`\nBrain ready at ${dbPath}`);
       console.log(`${stats.page_count} pages. Engine: PGLite (local Postgres).`);
+      // Reference/status blocks print FIRST and terse; the ONE primary action
+      // (the memory demo) prints LAST so it is the final, unmistakable thing on
+      // screen. Krug: one obvious next action, everything else subordinate.
       if (stats.page_count > 0) {
         console.log('');
-        console.log('Existing brain detected. To wire up the v0.10.3 knowledge graph:');
+        console.log('Existing brain detected. Wire up the knowledge graph:');
         console.log('  gbrain extract links --source db        (typed link backfill)');
         console.log('  gbrain extract timeline --source db     (structured timeline backfill)');
         console.log('  gbrain stats                            (verify links > 0)');
-      } else {
-        console.log('Next: gbrain import <dir>');
       }
-      console.log('');
-      console.log('When you outgrow local: gbrain migrate --to supabase');
       reportModStatus();
-      const { printAdvisoryIfRecommended } = await import('../core/skillpack/post-install-advisory.ts');
-      const { VERSION } = await import('../version.ts');
-      printAdvisoryIfRecommended({ version: VERSION, context: 'init' });
 
       // v0.41.18.0 (A4 + A18 + A20, T14): post-initSchema onboard nudge.
-      // Fail-open; 3s wallclock cap. Skipped silently in non-TTY contexts.
+      // Fail-open; 3s wallclock cap.
       const { runInitNudge } = await import('../core/onboard/init-nudge.ts');
       await runInitNudge(engine);
+
+      // G5: the ONE first-run decision bundle (search mode, writeback,
+      // harness wiring, skills scaffold); never blocks init.
+      writeCliNotices(await firstRunBundle(engine, searchMode, registrationSurface));
+
+      // The single primary action, last-on-screen.
+      printMemoryVerbsQuickstart({ emptyBrain: stats.page_count === 0, onPglite: true, keyless: config.embedding_disabled === true });
     }
   } finally {
     try { await engine.disconnect(); } catch { /* best-effort */ }
   }
 }
 
-async function initPostgres(opts: {
+const INIT_EMBEDDING_HINT = 'Pick an embedding model whose dimensions match (`gbrain init --help`), or pass --no-embedding for a keyless brain.';
+
+/**
+ * MEMORY_VERBS v1 quickstart funnel (E3 + D4B + T1 consent). Printed LAST in
+ * both init epilogues as the ONE primary action. The copy-next block is
+ * three commands (codex DX 9): wire the harness (the readiness
+ * `harness_wiring` fix: absolute binary, `--surface full` or init's `--surface`), save an
+ * install-check marker (never a made-up fact about the user), and recall it.
+ * The demo uses the facts arm only, so it works with NO embedding key [F-B]. Secondary paths (import, migrate) ride a single terse
+ * "More:" footer so they never compete with the primary action.
+ */
+let registrationSurface: McpSurface | undefined;
+let searchModeChoice: import('./init-mode-picker.ts').SearchModeChoice = {};
+function printMemoryVerbsQuickstart(opts: { emptyBrain?: boolean; onPglite?: boolean; keyless?: boolean } = {}): void {
+  const register = harnessRegistrationCommand(registrationSurface);
+  console.log('');
+  console.log(`→ Do this next — give your agent memory (copy these ${register ? 'three' : 'two'} commands):`);
+  if (register) console.log(`  ${register}`);
+  else console.log('  (register gbrain with your agent app first: install gbrain globally so the registration can use its absolute path, then follow docs/protocol/MEMORY_VERBS_v1.md)');
+  console.log('  gbrain remember "gbrain install check" --provenance install-check');
+  console.log('  gbrain recall --query "gbrain install check"');
+  console.log('Then ask your agent in a NEW session to recall "gbrain install check" — it remembers. Ask it to forget that fact afterwards.');
+  console.log('');
+  console.log('Note: memories agents save are readable by every agent connected to');
+  console.log('this brain; use visibility:"private" for local-only facts.');
+  console.log('Other harnesses (Codex, OpenClaw): docs/protocol/MEMORY_VERBS_v1.md');
+  console.log('If `claude` is not found: install Claude Code first, or use the per-harness blocks in that doc.');
+  // Secondary paths, one line, clearly subordinate to the action above.
+  console.log('');
+  console.log(
+    'More: ' +
+      (opts.emptyBrain ? `bulk-load notes \`gbrain import <dir>${opts.keyless ? ' --no-embed' : ''}\` · ` : '') +
+      (opts.onPglite ? 'scale up `gbrain migrate --to postgres --plan` · ' : '') +
+      'health `gbrain doctor`',
+  );
+}
+
+/**
+ * db-availability loop (5a): typed failure for initPostgresCore. The ladder
+ * (`init --prefer-postgres`) treats it as RUNG FAILURE and falls through to
+ * the next rung; the initPostgres wrapper preserves the historical
+ * process.exit(1) for direct `--supabase`/`--url` invocations.
+ */
+export class InitPostgresFailure extends Error {
+  constructor(public reason: string, message?: string) {
+    super(message ?? reason);
+    this.name = 'InitPostgresFailure';
+  }
+}
+
+/** Exit-preserving wrapper — direct invocations keep their contract. */
+async function initPostgres(opts: Parameters<typeof initPostgresCore>[0]) {
+  try {
+    await initPostgresCore(opts);
+  } catch (e) {
+    if (e instanceof InitPostgresFailure) process.exit((opts.jsonOutput ? writeDeferredInitJsonError() : null) ?? 1);
+    throw e;
+  }
+}
+
+export async function initPostgresCore(opts: {
   databaseUrl: string;
   jsonOutput: boolean;
   apiKey: string | null;
@@ -1012,21 +1401,22 @@ async function initPostgres(opts: {
   schemaPack?: string;
   /** v0.42 (#1780 Gap 2): skip the init-time embedding-key validation. */
   skipEmbedCheck?: boolean;
+  content?: SharedContentOptions;
 }) {
   const { databaseUrl } = opts;
 
   // v0.37.10.0 T6 (D11) + v0.37.11.0 Lane B.2: ALWAYS configure gateway BEFORE
   // initSchema. Same preflight contract as PGLite. Refuse to call initSchema
-  // until the gateway-resolved dim is validated. Schema substitution in
-  // src/schema.sql is currently a static `vector(1536)` for Postgres (unlike
-  // PGLite's templated dim), so a Voyage/ZE-configured Postgres brain will
-  // still need a future schema rewrite path — preflight makes the
-  // not-yet-supported case fail loud rather than silently produce a stuck
-  // 1536d column.
+  // until the gateway-resolved dim is validated. PostgresEngine.initSchema()
+  // passes the resolved model and dimensions through getPostgresSchema(),
+  // which templates the static `vector(1536)` source before executing it.
+  // Preflight therefore prevents an invalid dimension from reaching schema
+  // generation, while the post-init assertion below guards against templating
+  // drift.
   let resolvedDim: number | undefined;
   let resolvedModel: string | undefined;
   if (opts.aiOpts?.noEmbedding) {
-    console.log(`  --no-embedding: deferred setup — configure with \`gbrain config set embedding_model <id>\` before import`);
+    if (!opts.aiOpts.implicitKeyless) console.log(deferredEmbeddingHint({ engine: 'postgres', database_url: databaseUrl, embedding_disabled: true }));
   } else if (opts.aiOpts?.embedding_model) {
     const { resolveSchemaEmbeddingDim } = await import('../core/embedding-dim-check.ts');
     const pre = resolveSchemaEmbeddingDim({
@@ -1035,10 +1425,8 @@ async function initPostgres(opts: {
     });
     if (!pre.ok) {
       console.error(`\nRefusing to init: ${pre.error}\n`);
-      if (opts.jsonOutput) {
-        console.log(JSON.stringify({ status: 'error', reason: 'preflight_failed', error: pre.error }));
-      }
-      process.exit(1);
+      if (opts.jsonOutput) deferInitJsonError({ status: 'error', reason: 'preflight_failed', error: pre.error }, 'config_error', pre.error, INIT_EMBEDDING_HINT);
+      throw new InitPostgresFailure('preflight_failed', pre.error);
     }
     resolvedDim = pre.dim;
     resolvedModel = pre.model;
@@ -1046,30 +1434,14 @@ async function initPostgres(opts: {
 
   // T6: unconditional configureGateway BEFORE initSchema.
   const { configureGateway } = await import('../core/ai/gateway.ts');
-  configureGateway({
-    embedding_model: resolvedModel ?? opts.aiOpts?.embedding_model,
-    embedding_dimensions: resolvedDim ?? opts.aiOpts?.embedding_dimensions,
-    expansion_model: opts.aiOpts?.expansion_model,
-    chat_model: opts.aiOpts?.chat_model,
-    env: { ...process.env },
-  });
+  // v0.46.3: keyless fresh installs size at the NEW-INSTALL width (see the
+  // PGLite path's comment — same explicit-param rationale).
+  const { NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS: newInstallDims } =
+    await import('../core/ai/defaults.ts');
   if (resolvedModel) console.log(`  Embedding: ${resolvedModel} (${resolvedDim}d)`);
   if (opts.aiOpts?.expansion_model) console.log(`  Expansion: ${opts.aiOpts.expansion_model}`);
   if (opts.aiOpts?.chat_model) console.log(`  Chat: ${opts.aiOpts.chat_model}`);
 
-  // v0.42 (#1780 Gap 2): validate the embedding key at init for ALL providers
-  // (generalizes the prior ZeroEntropy-only warning). Same contract as the
-  // PGLite path: loud warning to stderr, init still succeeds; skipped by
-  // --no-embedding / --skip-embed-check / GBRAIN_INIT_SKIP_EMBED_CHECK=1.
-  const embedCheck = await runInitEmbedCheck({
-    resolvedModel,
-    resolvedDim,
-    expansionModel: opts.aiOpts?.expansion_model,
-    chatModel: opts.aiOpts?.chat_model,
-    apiKey: opts.apiKey ?? undefined,
-    noEmbedding: opts.aiOpts?.noEmbedding,
-    skipFlag: opts.skipEmbedCheck,
-  });
 
   // Detect Supabase direct connection URLs and warn about IPv6
   if (databaseUrl.match(/db\.[a-z]+\.supabase\.co/) || databaseUrl.includes('.supabase.co:5432')) {
@@ -1078,6 +1450,9 @@ async function initPostgres(opts: {
     console.warn('  Direct connections are IPv6 only and fail in many environments.');
     console.warn('  Use the Transaction pooler connection string instead (port 6543):');
     console.warn('  Supabase Dashboard > Connect (top bar) > Connection String > Transaction pooler');
+    console.warn('  (With a pooler URL, gbrain derives a direct connection for DDL and falls back');
+    console.warn('  to the pooler automatically if that host is unreachable. Power users:');
+    console.warn('  GBRAIN_DIRECT_DATABASE_URL overrides the derived URL; GBRAIN_DISABLE_DIRECT_POOL=1 disables it.)');
     console.warn('');
   }
 
@@ -1091,9 +1466,34 @@ async function initPostgres(opts: {
       if (databaseUrl.includes('supabase.co') && (msg.includes('ECONNREFUSED') || msg.includes('ETIMEDOUT'))) {
         console.error('Connection failed. Supabase direct connections (db.*.supabase.co:5432) are IPv6 only.');
         console.error('Use the Transaction pooler connection string instead (port 6543).');
+        console.error('(gbrain derives its own direct connection from pooler URLs for DDL; if that host is');
+        console.error('unreachable it falls back to the pooler. GBRAIN_DIRECT_DATABASE_URL overrides the');
+        console.error('derived URL; GBRAIN_DISABLE_DIRECT_POOL=1 disables the direct pool entirely.)');
       }
       throw e;
     }
+
+    const freshContentDatabase = await isNewContentDatabase(engine);
+    await assertInitEmbeddingIdentity(engine, resolvedModel);
+    const kept = await keptEmbeddingIdentity(engine, opts.aiOpts, freshContentDatabase);
+    if (opts.aiOpts?.implicitKeyless) console.log(kept ? keptEmbeddingNotice(kept) : deferredEmbeddingHint({ engine: 'postgres', database_url: databaseUrl, embedding_disabled: true }));
+    configureGateway({
+      embedding_model: resolvedModel ?? kept?.model ?? opts.aiOpts?.embedding_model,
+      embedding_dimensions: resolvedDim ?? kept?.dimensions ?? opts.aiOpts?.embedding_dimensions ??
+        (opts.aiOpts?.noEmbedding ? newInstallDims : undefined),
+      expansion_model: opts.aiOpts?.expansion_model,
+      chat_model: opts.aiOpts?.chat_model,
+      env: { ...process.env },
+    });
+    const embedCheck = await runInitEmbedCheck({
+      resolvedModel,
+      resolvedDim,
+      expansionModel: opts.aiOpts?.expansion_model,
+      chatModel: opts.aiOpts?.chat_model,
+      apiKey: opts.apiKey ?? undefined,
+      noEmbedding: opts.aiOpts?.noEmbedding,
+      skipFlag: opts.skipEmbedCheck,
+    });
 
     // Check and auto-create pgvector extension
     try {
@@ -1111,8 +1511,13 @@ async function initPostgres(opts: {
           throw new Error('pgvector extension missing');
         }
       }
-    } catch {
-      // Non-fatal
+    } catch (e) {
+      // 5b: the deliberate throw above used to be EATEN here, so an install
+      // with no pgvector "succeeded" into initSchema and died later with a
+      // worse message. Rethrow it; only the pg_extension PROBE failure stays
+      // non-fatal (odd hosted PG catalogs — initSchema surfaces the truth).
+      if (e instanceof Error && e.message === 'pgvector extension missing') throw e;
+      // Non-fatal: probe-read failure only.
     }
 
     // v0.28.5 (A4) + v0.37.11.0 Lane B.5: refuse to silently re-template an
@@ -1131,20 +1536,15 @@ async function initPostgres(opts: {
           source: 'init',
           engineKind: 'postgres',
         }) + '\n');
-        if (opts.jsonOutput) {
-          console.log(JSON.stringify({
-            status: 'error',
-            reason: 'embedding_dim_mismatch',
-            current_dims: existing.dims,
-            requested_dims: resolvedDim,
-          }));
-        }
-        process.exit(1);
+        if (opts.jsonOutput) deferInitJsonError({ status: 'error', reason: 'embedding_dim_mismatch', current_dims: existing.dims, requested_dims: resolvedDim },
+          'embedding_width_mismatch', `The brain's vectors are ${existing.dims}d; the requested model produces ${resolvedDim}d.`, INIT_EMBEDDING_HINT);
+        throw new InitPostgresFailure('embedding_dim_mismatch');
       }
     }
 
     console.log('Running schema migration...');
-    await engine.initSchema();
+    const { runInitSchemaWithRetry } = await import('../core/init-schema-retry.ts');
+    await runInitSchemaWithRetry(engine);
 
     // v0.37.10.0 T6 (D11): post-initSchema invariant assertion guardrail.
     if (resolvedDim) {
@@ -1160,9 +1560,11 @@ async function initPostgres(opts: {
           source: 'init',
           engineKind: 'postgres',
         }));
-        process.exit(1);
+        throw new InitPostgresFailure('post_init_dim_invariant');
       }
     }
+
+    await writeNewInstallRerankerDefault(engine, resolvedModel);
 
     // v0.37.10.0 T7 (D9) + v0.37.11.0 Lane B.4 (Postgres mirror): atomic
     // embedding-config persistence on top of the existing file-plane config.
@@ -1175,7 +1577,7 @@ async function initPostgres(opts: {
       database_path: undefined, // clear any stale PGLite path
       ...(opts.apiKey ? { openai_api_key: opts.apiKey } : {}),
       ...(opts.aiOpts?.noEmbedding
-        ? { embedding_disabled: true }
+        ? kept ? { embedding_model: kept.model, embedding_dimensions: kept.dimensions } : { embedding_disabled: true }
         : (resolvedModel && resolvedDim)
           ? { embedding_model: resolvedModel, embedding_dimensions: resolvedDim }
           : {}),
@@ -1184,14 +1586,31 @@ async function initPostgres(opts: {
       // v0.42 (T17): same schema_pack default as PGLite path.
       ...(opts.schemaPack ? { schema_pack: opts.schemaPack } : {}),
     };
+    delete config.remote_mcp;
+    // v0.46.3: leaving deferred-setup mode — a resolved (model, dims) tuple must
+    // also CLEAR a stale embedding_disabled sentinel inherited via the
+    // ...existingFile spread, or the documented recovery command
+    // (`init --force --embedding-model ...`) persists a config that still
+    // disables embedding at runtime.
+    if (!opts.aiOpts?.noEmbedding && resolvedModel && resolvedDim) {
+      delete config.embedding_disabled;
+      await recordInitEmbedding(engine, resolvedModel, resolvedDim);
+    }
     // PR1: new installs publish their skill catalog over MCP by default
     // (existing config wins on re-init, so a prior opt-out is preserved).
-    config.mcp = { publish_skills: true, ...(config.mcp ?? {}) };
+    config.mcp = { ...(freshContentDatabase && !existingFile.engine ? { publish_skills: true } : {}), ...(config.mcp ?? {}) };
     // v0.42: new installs default self-upgrade to NOTIFY (a nudge on every
     // gbrain invocation). mode_prompted=true so the upgrade-time banner doesn't
     // also fire on a fresh install. Hands-off: gbrain config set self_upgrade.mode auto
-    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(config.self_upgrade ?? {}) };
+    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(freshContentDatabase && !existingFile.engine ? { channel: 'stable' as const } : {}), ...(config.self_upgrade ?? {}) };
+    // MEMORY_VERBS v1 [D6C]: TTHW stamp (see the PGLite path).
+    config.protocol_installed_at = config.protocol_installed_at ?? new Date().toISOString();
+    preserveConversionConfig(false);
     saveConfig(config);
+    if (freshContentDatabase) (await import('./migrations/fresh-install.ts')).recordFreshInstallMigrations();
+    if (freshContentDatabase) { const n = await import('../core/behavior-change-notice.ts'); n.stampFreshBrainBaseline(n.behaviorBrainKey(config)); }
+    const contentReceipt = await setupSharedBrainContent({ engine, config, sourceId: await resolveSourceId(engine, undefined), remote: false, dryRun: false, logger: { info: console.error, warn: console.error, error: console.error } }, { ...opts.content, fresh: freshContentDatabase });
+    if (!opts.jsonOutput) console.error(`[init] Content: ${contentReceipt.root ?? contentReceipt.repository_kind} (${contentReceipt.repository_kind}; ${contentReceipt.status}). ${contentReceipt.pending_actions.join(' ')}`);
     console.log('Config saved to ~/.gbrain/config.json');
     if (opts.schemaPack) {
       process.stderr.write(
@@ -1208,32 +1627,34 @@ async function initPostgres(opts: {
     // v0.32.3 search-lite install-time mode picker. Same shape as the
     // PGLite path above — runs AFTER initSchema, idempotent on re-init.
     const { runModePicker: runPostgresModePicker } = await import('./init-mode-picker.ts');
-    await runPostgresModePicker(engine, { jsonOutput: opts.jsonOutput });
+    let searchMode: { mode: SearchModeName; reason: string } | undefined;
+    await runPostgresModePicker(engine, { jsonOutput: opts.jsonOutput, ...searchModeChoice, onDecision: d => { searchMode = d; } });
 
     const stats = await engine.getStats();
 
     if (opts.jsonOutput) {
-      console.log(JSON.stringify({ status: 'success', engine: 'postgres', pages: stats.page_count, embedding_check: embedCheck }));
+      setInitJsonResult({ status: 'success', engine: 'postgres', pages: stats.page_count, embedding_check: embedCheck, content: contentReceipt, ...firstRunJson(await firstRunBundle(engine, searchMode, registrationSurface)) });
     } else {
       console.log(`\nBrain ready. ${stats.page_count} pages. Engine: Postgres (Supabase).`);
       if (stats.page_count > 0) {
         console.log('');
-        console.log('Existing brain detected. To wire up the v0.10.3 knowledge graph:');
+        console.log('Existing brain detected. Wire up the knowledge graph:');
         console.log('  gbrain extract links --source db        (typed link backfill)');
         console.log('  gbrain extract timeline --source db     (structured timeline backfill)');
         console.log('  gbrain stats                            (verify links > 0)');
-      } else {
-        console.log('Next: gbrain import <dir>');
       }
       reportModStatus();
-      const { printAdvisoryIfRecommended } = await import('../core/skillpack/post-install-advisory.ts');
-      const { VERSION } = await import('../version.ts');
-      printAdvisoryIfRecommended({ version: VERSION, context: 'init' });
 
       // v0.41.18.0 (A4 + A18 + A20, T14): post-initSchema onboard nudge.
-      // Fail-open; 3s wallclock cap. Skipped silently in non-TTY contexts.
+      // Fail-open; 3s wallclock cap.
       const { runInitNudge } = await import('../core/onboard/init-nudge.ts');
       await runInitNudge(engine);
+
+      // G5: the first-run decision bundle — same contract as the PGLite arm.
+      writeCliNotices(await firstRunBundle(engine, searchMode, registrationSurface));
+
+      // The single primary action, last-on-screen.
+      printMemoryVerbsQuickstart({ emptyBrain: stats.page_count === 0 });
     }
   } finally {
     try { await engine.disconnect(); } catch { /* best-effort */ }
@@ -1269,6 +1690,15 @@ function countMarkdownFiles(dir: string, maxScan = 1500): number {
 }
 
 async function supabaseWizard(): Promise<string> {
+  // Non-TTY guard: without a terminal the URL prompt below can never be
+  // answered — the legacy behavior was a silent exit-0 no-op (stdin closed →
+  // readLine never resolved data → process ended with NO config written), the
+  // worst failure shape for a scripted/agent caller. Fail loud with the fix.
+  if (!process.stdin.isTTY) {
+    console.error('gbrain init --supabase needs an interactive terminal to prompt for the connection URL.');
+    console.error('Non-interactive: pass --url <connection_string>, or set GBRAIN_DATABASE_URL and use --non-interactive.');
+    process.exit(1);
+  }
   try {
     execSync('bunx supabase --version', { stdio: 'pipe' });
     console.log('Supabase CLI detected.');
@@ -1279,10 +1709,10 @@ async function supabaseWizard(): Promise<string> {
   }
 
   console.log('\nEnter your Supabase/Postgres connection URL:');
-  console.log('  Format: postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres'); /* allow-pg-url-literal */
+  console.log('  Format: postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres?sslmode=require'); /* allow-pg-url-literal */
   console.log('  Find it: Supabase Dashboard > Connect (top bar) > Connection String > Transaction pooler\n');
 
-  const url = await readLine('Connection URL: ');
+  const url = (await promptLineStderr('Connection URL: ')) ?? '';
   if (!url) {
     console.error('No URL provided.');
     process.exit(1);
@@ -1290,19 +1720,6 @@ async function supabaseWizard(): Promise<string> {
   return url;
 }
 
-function readLine(prompt: string): Promise<string> {
-  return new Promise((resolve) => {
-    process.stdout.write(prompt);
-    let data = '';
-    process.stdin.setEncoding('utf-8');
-    process.stdin.once('data', (chunk) => {
-      data = chunk.toString().trim();
-      process.stdin.pause();
-      resolve(data);
-    });
-    process.stdin.resume();
-  });
-}
 
 /**
  * v0.32.3 [CDX-9]: readLine + EOF detection + default fallback + timeout.
@@ -1323,47 +1740,17 @@ function readLine(prompt: string): Promise<string> {
  * Non-TTY stdin (pipe, scripted init) returns defaultValue immediately
  * without printing the prompt, so e2e tests don't hang.
  */
-export function readLineSafe(
+export async function readLineSafe(
   prompt: string,
   defaultValue: string,
   timeoutMs: number = 60_000,
 ): Promise<string> {
-  return new Promise((resolve) => {
-    // Non-TTY (pipe, redirect, scripted init) → no prompt, no wait.
-    if (!process.stdin.isTTY) {
-      resolve(defaultValue);
-      return;
-    }
-
-    process.stdout.write(prompt);
-    process.stdin.setEncoding('utf-8');
-
-    let settled = false;
-    const finish = (value: string) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      process.stdin.removeListener('data', onData);
-      process.stdin.removeListener('end', onEnd);
-      try { process.stdin.pause(); } catch { /* swallow */ }
-      resolve(value);
-    };
-
-    const onData = (chunk: Buffer | string) => {
-      const raw = chunk.toString().trim();
-      finish(raw.length === 0 ? defaultValue : raw);
-    };
-    const onEnd = () => finish(defaultValue);
-
-    const timer = setTimeout(() => {
-      process.stdout.write(`\n[timeout after ${Math.round(timeoutMs / 1000)}s, using default: ${defaultValue}]\n`);
-      finish(defaultValue);
-    }, timeoutMs);
-
-    process.stdin.once('data', onData);
-    process.stdin.once('end', onEnd);
-    process.stdin.resume();
-  });
+  // Non-TTY (pipe, redirect, scripted init) → no prompt, no wait.
+  if (!process.stdin.isTTY) return defaultValue;
+  // A5: the shared bounded reader (EOF / timeout → null → the default).
+  const answer = await promptLineStderr(prompt, { timeoutMs });
+  if (answer === null) process.stderr.write(`\n[no answer, using default: ${defaultValue}]\n`);
+  return answer ? answer : defaultValue;
 }
 
 /**
@@ -1445,23 +1832,18 @@ export function reportModStatus(): void {
     skillCount = manifest.skills?.length || 0;
   } catch { /* manifest not found */ }
 
+  // One line per fact, one pointer per optional extra — this block sits on
+  // the init success screen, where every extra call-to-action competes with
+  // the memory-verbs funnel (the one action that matters). Krug: one screen,
+  // one primary action.
   console.log('');
   console.log('--- GBrain Mod Status ---');
-  console.log(`Skills: ${skillCount} loaded`);
-  console.log(`GStack: ${gstack.found ? `found (${gstack.host})` : 'not found'}`);
-  if (!gstack.found) {
-    console.log('  Install GStack for coding skills:');
-    console.log('  git clone https://github.com/garrytan/gstack.git ~/.claude/skills/gstack');
-    console.log('  cd ~/.claude/skills/gstack && ./setup');
-  }
-  console.log('Resolver: skills/RESOLVER.md');
-  console.log('Soul audit: run `gbrain soul-audit` to customize agent identity');
+  console.log(`Skills: ${skillCount} loaded (router: skills/RESOLVER.md)`);
+  console.log(`GStack: ${gstack.found ? `found (${gstack.host})` : 'not found (coding skills — see github.com/garrytan/gstack)'}`);
   // Retrieval Reflex (#1981): the deterministic pointer layer is ON by default
   // (no action needed). The policy skill is installed into the HOST repo on
-  // request — we PRINT the command rather than silently mutating the host repo.
-  console.log('Retrieval reflex: on by default (entity pointers injected per turn)');
-  console.log('  Install the policy skill into your agent repo:');
-  console.log('  gbrain integrations install retrieval-reflex --target <host-repo>');
+  // request — we PRINT the pointer rather than silently mutating the host repo.
+  console.log('Retrieval reflex: on by default. More: `gbrain integrations` (policy skill), skills/soul-audit (identity).');
   console.log('');
 }
 
@@ -1473,7 +1855,7 @@ USAGE
   gbrain init [flags]
 
 ENGINE SELECTION (mutually exclusive)
-  --pglite              Use embedded PGLite (zero-config, default for <1000 .md files)
+  --pglite              Use embedded PGLite (zero-config, the default)
   --supabase            Use Supabase Postgres (recommended for 1000+ files)
   --url <URL>           Use a manual Postgres connection string
   --mcp-only            Thin-client mode: connect to a remote gbrain MCP, no local engine
@@ -1484,6 +1866,10 @@ OPTIONS
   --migrate-only        Apply pending schema migrations against the configured engine
                         without re-saving config (used by post-upgrade and orchestrators)
   --json                JSON output for status reporting
+  --content-root <path> Use a new owned content directory (existing source roots win)
+  --db-only             Keep memory database-only; shared publication needs export/adoption
+  --git                 Authorize Git init in the new owned empty content directory
+  --no-git              Keep a content directory without Git (default)
   --path <DIR>          Override default brain path (PGLite only)
   --key <APIKEY>        Provide an API key non-interactively (Supabase only)
   --embedding-model <PROVIDER:MODEL>
@@ -1496,6 +1882,9 @@ OPTIONS
   --chat-model <PROVIDER:MODEL>
                         Default subagent driver (v0.27+)
   --no-embedding        Defer embedding setup (skips the embedding-key check)
+  --surface <verbs|starter|full>  Tool surface the printed harness registration pins, listed in full
+                                  (default: starter, listing the memory verbs and request_tools)
+  --search-mode <conservative|balanced|tokenmax>  Record the operator's search mode (no first-run ask; an existing brain's mode needs --force)
   --skip-embed-check    Skip the init-time embedding-key validation (config +
                         live test-embed). Also via GBRAIN_INIT_SKIP_EMBED_CHECK=1
 
@@ -1503,12 +1892,16 @@ EXAMPLES
   gbrain init --pglite                      # Local-only, no API keys
   gbrain init --supabase                    # Interactive Supabase setup
   gbrain init --url postgresql://...        # Use a custom Postgres
-  gbrain init --mcp-only --url https://...  # Thin-client mode
+  gbrain init --mcp-only --issuer-url https://host:3001 --mcp-url https://host:3001/mcp --oauth-client-id <id> --oauth-client-secret <secret>  # Thin-client mode
 
 NOTES
-  - Bare \`gbrain init\` in a directory with 1000+ .md files defaults to Supabase
-    interactive setup. With <1000 files (or with --pglite explicitly), defaults
-    to PGLite at ~/.gbrain/brain.pglite.
+  - Bare \`gbrain init\` always defaults to PGLite at ~/.gbrain/brain.pglite.
+    In a directory with 1000+ .md files it prints a suggestion to use
+    \`gbrain init --supabase\` (faster search at scale) but still proceeds
+    with PGLite.
   - Existing config is preserved unless --force is passed.
 `.trim());
 }
+
+/** Test-only seam (v0.48.2): the reranker-default write is pure enough to unit-test with a stub engine. */
+export const _exports_for_test = { writeNewInstallRerankerDefault };

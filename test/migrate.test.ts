@@ -1,19 +1,18 @@
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
 import { LATEST_VERSION, runMigrations, MIGRATIONS, getIdleBlockers, hasPendingMigrations } from '../src/core/migrate.ts';
 import type { IdleBlocker } from '../src/core/migrate.ts';
+import { migrationStatementTimeoutMs } from '../src/core/migration-timeout.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { withColdPglite } from './helpers/with-snapshot.ts';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
+import { surfaceFileSource, surfaceSource } from './helpers/source-surface.ts';
 
 describe('migrate', () => {
   test('LATEST_VERSION is a number >= 1', () => {
     expect(typeof LATEST_VERSION).toBe('number');
     expect(LATEST_VERSION).toBeGreaterThanOrEqual(1);
-  });
-
-  test('runMigrations is exported and callable', async () => {
-    expect(typeof runMigrations).toBe('function');
   });
 
   // Integration tests for actual migration execution require DATABASE_URL
@@ -50,16 +49,20 @@ describe('hasPendingMigrations', () => {
   }, 30000);
 
   test('returns true when version config is missing entirely (defensive default)', async () => {
-    const engine = new PGLiteEngine();
-    await engine.connect({});
-    try {
-      // Don't call initSchema. Probe against an empty PGlite — getConfig should
-      // either return null (treated as version=1) or throw on missing config
-      // table; either way the probe must say "yes pending."
-      expect(await hasPendingMigrations(engine)).toBe(true);
-    } finally {
-      await engine.disconnect();
-    }
+    // W0: opt out of the default-on snapshot — this test's premise is an
+    // empty PGlite with no config table at all.
+    await withColdPglite(async () => {
+      const engine = new PGLiteEngine();
+      await engine.connect({});
+      try {
+        // Don't call initSchema. Probe against an empty PGlite — getConfig
+        // should either return null (treated as version=1) or throw on missing
+        // config table; either way the probe must say "yes pending."
+        expect(await hasPendingMigrations(engine)).toBe(true);
+      } finally {
+        await engine.disconnect();
+      }
+    });
   }, 30000);
 });
 
@@ -245,7 +248,7 @@ describe('migrate v36 — subagent_provider_neutral_persistence_v0_27', () => {
   });
 
   test('embedded schema (src/core/schema-embedded.ts) reflects v36 columns', async () => {
-    const { SCHEMA_SQL } = await import('../src/core/schema-embedded.ts');
+    const { SCHEMA_SQL } = await import('../src/core/schema-embedded.generated.ts');
     expect(SCHEMA_SQL).toContain('schema_version');
     expect(SCHEMA_SQL).toContain('provider_id');
     expect(SCHEMA_SQL).toContain('idx_subagent_messages_provider');
@@ -548,6 +551,57 @@ describe('migration v35 — auto_rls_event_trigger structural guards', () => {
     expect(sql).toMatch(/rolbypassrls/);
     expect(sql).toMatch(/RAISE\s+EXCEPTION/i);
   });
+
+  // ── #3603: managed Postgres (RDS/Aurora) has NO reachable superuser role
+  // (rds_superuser is not enough for CREATE EVENT TRIGGER), so the original
+  // unconditional DROP+CREATE could never apply — config.version stalled at 34
+  // and every later migration silently never ran while the server kept
+  // serving. Pins: create-if-absent for BOTH objects (so a master-user
+  // pre-create converges — CREATE OR REPLACE / DROP would fail on
+  // master-owned objects), plus an actionable privilege message.
+  test('does NOT issue a bare DROP EVENT TRIGGER (#3603)', () => {
+    const v35 = MIGRATIONS.find(m => m.version === 35);
+    const sql = ((v35?.sqlFor as any)?.postgres ?? '') as string;
+    expect(sql.toUpperCase()).not.toContain('DROP EVENT TRIGGER');
+  });
+
+  test('event trigger is create-if-absent via a pg_event_trigger probe (#3603)', () => {
+    const v35 = MIGRATIONS.find(m => m.version === 35);
+    const sql = ((v35?.sqlFor as any)?.postgres ?? '') as string;
+    expect(sql).toMatch(
+      /IF NOT EXISTS\s*\(\s*SELECT 1 FROM pg_event_trigger WHERE evtname = 'auto_rls_on_create_table'\s*\)/,
+    );
+    expect(sql).toMatch(/CREATE EVENT TRIGGER auto_rls_on_create_table/);
+  });
+
+  test('trigger function is create-if-absent so a master-pre-created function converges (#3603)', () => {
+    const v35 = MIGRATIONS.find(m => m.version === 35);
+    const sql = ((v35?.sqlFor as any)?.postgres ?? '') as string;
+    expect(sql).not.toMatch(/CREATE\s+OR\s+REPLACE\s+FUNCTION\s+auto_enable_rls/i);
+    expect(sql).toMatch(/pg_proc/);
+    expect(sql).toMatch(/proname = 'auto_enable_rls'/);
+  });
+
+  test('CREATE EVENT TRIGGER failure raises an actionable insufficient_privilege message (#3603)', () => {
+    const v35 = MIGRATIONS.find(m => m.version === 35);
+    const sql = ((v35?.sqlFor as any)?.postgres ?? '') as string;
+    expect(sql).toMatch(/EXCEPTION\s+WHEN\s+insufficient_privilege/i);
+    expect(sql).toMatch(/master user/);
+    // Still no blanket swallow — only the privilege error is translated.
+    expect(sql.toUpperCase()).not.toContain('EXCEPTION WHEN OTHERS');
+  });
+
+  test('BYPASSRLS gate messages carry the achievable ALTER ROLE grant hint (#3603)', () => {
+    // "Re-run as postgres" is unachievable on managed Postgres (the master
+    // user is not BYPASSRLS either); the achievable fix is granting it.
+    const sqlOf = (v: number): string => {
+      const m = MIGRATIONS.find(x => x.version === v);
+      return ((m?.sqlFor as any)?.postgres ?? m?.sql ?? '') as string;
+    };
+    for (const v of [24, 29, 31, 32, 35]) {
+      expect(sqlOf(v)).toMatch(/ALTER ROLE % BYPASSRLS/);
+    }
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -564,7 +618,7 @@ describe('migration v35 — auto_rls_event_trigger structural guards', () => {
 //   1. Structural — assert the migration SQL literally contains the helper
 //      CREATE INDEX + DROP INDEX (deterministic, fast, catches the regression
 //      even at 0-row scale where wall-clock can't distinguish O(n²) from O(1)).
-//   2. Behavioral — populate 1000 duplicates and assert the migration completes
+//   2. Behavioral — populate 200 duplicates and assert the migration completes
 //      under the wall-clock cap. Sanity check at small scale; the structural
 //      assertion is the real guard.
 
@@ -624,24 +678,71 @@ describe('migrate v14 — pages_updated_at_index (handler-based, engine-aware)',
     expect(v14!.sql).toBe('');
   });
 
-  test('v14 handler source contains CONCURRENTLY + invalid-index cleanup for Postgres branch', async () => {
-    const { readFileSync } = await import('fs');
-    const src = readFileSync('src/core/migrate.ts', 'utf-8');
+  test('v14 handler source delegates invalid-remnant cleanup to the shared helper (#1178)', async () => {
+    const src = surfaceFileSource('migrate', 'src/core/schema-migrations/v014-pages-updated-at-index.ts');
     const v14Start = src.indexOf("name: 'pages_updated_at_index'");
     expect(v14Start).toBeGreaterThan(-1);
     const v14Block = src.slice(v14Start, v14Start + 3000);
-    expect(v14Block).toContain('pg_index');
-    expect(v14Block).toContain('indisvalid');
-    expect(v14Block).toContain('DROP INDEX CONCURRENTLY IF EXISTS idx_pages_updated_at_desc');
+    expect(v14Block).toContain("dropInvalidConcurrentIndex(engine, 14, 'idx_pages_updated_at_desc')");
     expect(v14Block).toContain('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pages_updated_at_desc');
-    // Order within the handler body: DROP IF EXISTS must precede CREATE IF NOT EXISTS,
-    // so a failed prior CONCURRENTLY build is cleaned before re-create. Anchor on the
-    // explicit "IF EXISTS" / "IF NOT EXISTS" phrases so the header doc-comment
-    // (which mentions both unqualified) doesn't fool the ordering assertion.
-    const dropIdx = v14Block.indexOf('DROP INDEX CONCURRENTLY IF EXISTS');
+    expect(v14Block).not.toContain('DO $$');
+    // Order within the handler body: the cleanup call must precede CREATE IF NOT
+    // EXISTS, so a failed prior CONCURRENTLY build is cleaned before re-create.
+    const dropIdx = v14Block.indexOf('dropInvalidConcurrentIndex');
     const createIdx = v14Block.indexOf('CREATE INDEX CONCURRENTLY IF NOT EXISTS');
     expect(dropIdx).toBeLessThan(createIdx);
     expect(v14Block).toContain('engine.kind');
+  });
+});
+
+// #1178: DO $$ ... EXECUTE 'DROP INDEX CONCURRENTLY ...' END $$ is rejected by
+// Postgres whenever the guard condition fires (CONCURRENTLY can't run from any
+// function/EXECUTE context). All 11 historical migrations that pre-drop an
+// invalid CONCURRENTLY remnant now route through the dropInvalidConcurrentIndex()
+// helper instead. This locks the whole file against the old shape reappearing —
+// e.g. a future migration copy-pasting the nearest similar one instead of
+// reaching for the helper.
+describe('migrate — DROP INDEX CONCURRENTLY invalid-remnant cleanup (#1178, file-wide)', () => {
+  const KNOWN_SITES: Array<{ version: number; indexName: string }> = [
+    { version: 14, indexName: 'idx_pages_updated_at_desc' },
+    { version: 34, indexName: 'pages_deleted_at_purge_idx' },
+    { version: 38, indexName: 'pages_coalesce_date_idx' },
+    { version: 66, indexName: 'idx_chunks_embedding_null' },
+    { version: 71, indexName: 'takes_resolved_at_idx' },
+    { version: 91, indexName: 'pages_generation_idx' },
+    { version: 96, indexName: 'idx_facts_extract_conversation_session' },
+    { version: 97, indexName: 'pages_dedup_idx' },
+    { version: 103, indexName: 'content_chunks_stale_idx' },
+    { version: 104, indexName: 'pages_atom_source_hash_idx' },
+    { version: 112, indexName: 'pages_links_extracted_at_idx' },
+  ];
+
+  test('no DO $$ ... EXECUTE .DROP INDEX CONCURRENTLY. shape remains anywhere in migrate.ts', async () => {
+    const src = surfaceSource('migrate');
+    // `DO $$ ... END $$` blocks are a normal Postgres idiom used all over this
+    // file for unrelated conditional DDL — only the specific combination that
+    // EXECUTEs a DROP INDEX CONCURRENTLY string is the #1178 bug shape.
+    expect(src).not.toMatch(/EXECUTE\s+'DROP INDEX CONCURRENTLY/);
+  });
+
+  test('every known invalid-remnant site calls dropInvalidConcurrentIndex(engine, version, indexName)', async () => {
+    const src = surfaceSource('migrate');
+    for (const { version, indexName } of KNOWN_SITES) {
+      expect(src).toContain(`dropInvalidConcurrentIndex(engine, ${version}, '${indexName}')`);
+    }
+  });
+
+  test('dropInvalidConcurrentIndex helper itself probes pg_index.indisvalid and issues a standalone DROP (no DO block)', async () => {
+    const src = surfaceFileSource('migrate', 'src/core/schema-migrations/helpers.ts');
+    const helperStart = src.indexOf('async function dropInvalidConcurrentIndex');
+    expect(helperStart).toBeGreaterThan(-1);
+    const helperBlock = src.slice(helperStart, helperStart + 1200);
+    expect(helperBlock).toContain('pg_index');
+    expect(helperBlock).toContain('indisvalid');
+    expect(helperBlock).toContain('executeRaw');
+    expect(helperBlock).toContain('DROP INDEX CONCURRENTLY IF EXISTS');
+    expect(helperBlock).not.toContain('DO $$');
+    expect(helperBlock).not.toContain('EXECUTE ');
   });
 });
 
@@ -695,7 +796,7 @@ describe('migrate — runner behavioral (v14 handler + v15 backfill)', () => {
 
   test('v15 backfilled any max_stalled=1 rows (smoke: schema default is 5)', async () => {
     await (engine as any).db.exec(
-      `INSERT INTO minion_jobs (name, queue, status, max_stalled) VALUES ('test', 'default', 'waiting', 1)`
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, max_stalled) VALUES ('{"version":1,"kind":"application"}'::jsonb, 'test', 'default', 'waiting', 1)`
     );
     await (engine as any).db.exec(
       `UPDATE minion_jobs SET max_stalled = 5
@@ -736,26 +837,44 @@ describe('migrate v66 — embed_stale_partial_index (D6)', () => {
     expect(v66!.sql).toBe('');
   });
 
-  test('v66 handler source: CONCURRENTLY + invalid-index cleanup on Postgres branch', async () => {
-    const { readFileSync } = await import('fs');
-    const src = readFileSync('src/core/migrate.ts', 'utf-8');
+  test('v66 handler source delegates invalid-remnant cleanup to the shared helper (#1178)', async () => {
+    const src = surfaceFileSource('migrate', 'src/core/schema-migrations/v066-embed-stale-partial-index.ts');
     const v66Start = src.indexOf("name: 'embed_stale_partial_index'");
     expect(v66Start).toBeGreaterThan(-1);
     const v66Block = src.slice(v66Start, v66Start + 3000);
-    expect(v66Block).toContain('pg_index');
-    expect(v66Block).toContain('indisvalid');
-    expect(v66Block).toContain('DROP INDEX CONCURRENTLY IF EXISTS idx_chunks_embedding_null');
+    // #1178: `DO $$ BEGIN ... EXECUTE 'DROP INDEX CONCURRENTLY ...'; END $$;`
+    // is rejected by Postgres whenever the guard condition actually fires
+    // (CONCURRENTLY can't run from any function/EXECUTE context). The fix
+    // moves the probe + drop to the dropInvalidConcurrentIndex() helper
+    // (defined above MIGRATIONS, tested directly in
+    // test/e2e/migration-drop-invalid-concurrent-index.test.ts) — the
+    // migration body just calls it.
+    expect(v66Block).toContain("dropInvalidConcurrentIndex(engine, 66, 'idx_chunks_embedding_null')");
     expect(v66Block).toContain('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_embedding_null');
+    expect(v66Block).not.toMatch(/EXECUTE\s+'DROP INDEX CONCURRENTLY/);
     // Partial index predicate must match the production query in
     // postgres-engine.ts / pglite-engine.ts: `WHERE embedding IS NULL`.
     expect(v66Block).toContain('WHERE embedding IS NULL');
-    // DROP IF EXISTS must precede CREATE IF NOT EXISTS so a failed prior
+    // The cleanup call must precede CREATE IF NOT EXISTS so a failed prior
     // CONCURRENTLY build is cleaned before re-create.
-    const dropIdx = v66Block.indexOf('DROP INDEX CONCURRENTLY IF EXISTS');
+    const dropIdx = v66Block.indexOf('dropInvalidConcurrentIndex');
     const createIdx = v66Block.indexOf('CREATE INDEX CONCURRENTLY IF NOT EXISTS');
     expect(dropIdx).toBeLessThan(createIdx);
     // Branches on engine.kind (handler-pattern from v14).
     expect(v66Block).toContain('engine.kind');
+  });
+
+  test('dropInvalidConcurrentIndex helper itself probes pg_index.indisvalid and issues a standalone DROP (no DO block)', async () => {
+    const src = surfaceFileSource('migrate', 'src/core/schema-migrations/helpers.ts');
+    const helperStart = src.indexOf('async function dropInvalidConcurrentIndex');
+    expect(helperStart).toBeGreaterThan(-1);
+    const helperBlock = src.slice(helperStart, helperStart + 1200);
+    expect(helperBlock).toContain('pg_index');
+    expect(helperBlock).toContain('indisvalid');
+    expect(helperBlock).toContain('executeRaw');
+    expect(helperBlock).toContain('DROP INDEX CONCURRENTLY IF EXISTS');
+    expect(helperBlock).not.toContain('DO $$');
+    expect(helperBlock).not.toContain('EXECUTE ');
   });
 
   test('v66 idempotent flag is true (re-run safety)', () => {
@@ -776,12 +895,71 @@ describe('migrate runner v66 — partial index materialized on PGLite', () => {
     await engine.disconnect();
   });
 
-  test('v66 created idx_chunks_embedding_null on PGLite via handler branch', async () => {
-    const rows = await (engine as any).db.query(
+  // v225 drops the index again at head (content_chunks_stale_idx is the same
+  // partial index), so the handler branch is exercised directly.
+  test('v66 creates idx_chunks_embedding_null on PGLite via handler branch', async () => {
+    const indexes = async () => (await (engine as any).db.query(
       `SELECT indexname FROM pg_indexes WHERE indexname = 'idx_chunks_embedding_null'`
-    );
-    expect(rows.rows.length).toBe(1);
+    )).rows;
+    expect(await indexes()).toHaveLength(0);
+    await MIGRATIONS.find(m => m.version === 66)!.handler!(engine);
+    expect(await indexes()).toHaveLength(1);
   });
+});
+
+// v225: idx_chunks_embedding_null (v66) and content_chunks_stale_idx (v103)
+// were the same partial btree; v225 drops the v66 copy only while the kept
+// index is valid and identical.
+describe('v225 — drop_duplicate_embedding_null_index', () => {
+  const stale = async (engine: PGLiteEngine) => (await engine.executeRaw<{ indexname: string; indexdef: string }>(
+    `SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'content_chunks'
+      AND indexname IN ('idx_chunks_embedding_null', 'content_chunks_stale_idx') ORDER BY indexname`)).map(r => r.indexname);
+
+  test('a fresh brain keeps only content_chunks_stale_idx, and re-running is a no-op', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      expect(await stale(engine)).toEqual(['content_chunks_stale_idx']);
+      await MIGRATIONS.find(m => m.version === 225)!.handler!(engine);
+      expect(await stale(engine)).toEqual(['content_chunks_stale_idx']);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('a brain at v224 loses the duplicate and keeps the stale index', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      await MIGRATIONS.find(m => m.version === 66)!.handler!(engine);
+      expect(await stale(engine)).toEqual(['content_chunks_stale_idx', 'idx_chunks_embedding_null']);
+      await engine.setConfig('version', '224');
+      await runMigrations(engine);
+      expect(await stale(engine)).toEqual(['content_chunks_stale_idx']);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('keeps idx_chunks_embedding_null when content_chunks_stale_idx is missing or defined differently', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const v225 = MIGRATIONS.find(m => m.version === 225)!;
+      await MIGRATIONS.find(m => m.version === 66)!.handler!(engine);
+      await engine.executeRaw(`DROP INDEX content_chunks_stale_idx`);
+      await v225.handler!(engine);
+      expect(await stale(engine)).toEqual(['idx_chunks_embedding_null']);
+      await engine.executeRaw(`CREATE INDEX content_chunks_stale_idx ON content_chunks (page_id) WHERE embedding IS NULL`);
+      await v225.handler!(engine);
+      expect(await stale(engine)).toEqual(['content_chunks_stale_idx', 'idx_chunks_embedding_null']);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -886,7 +1064,7 @@ describe('migrate runner v67 — typed-claim columns materialized on PGLite', ()
   });
 });
 
-describe('migrate: v8 (links_dedup) regression — must be fast on 1K duplicate rows', () => {
+describe('migrate: v8 (links_dedup) regression — must be fast on 200 duplicate rows', () => {
   let engine: PGLiteEngine;
 
   beforeAll(async () => {
@@ -899,7 +1077,7 @@ describe('migrate: v8 (links_dedup) regression — must be fast on 1K duplicate 
     await engine.disconnect();
   });
 
-  test('1000 duplicate links dedup completes in <90s and leaves table deduped', async () => {
+  test('200 duplicate links dedup completes in <90s and leaves table deduped', async () => {
     // Set up: drop BOTH the old (v8) and new (v11) unique constraints so
     // duplicates can be inserted, then reset version so v8 + v11 re-run.
     // v11 replaces the v8 constraint name; we drop whichever is present.
@@ -913,15 +1091,19 @@ describe('migrate: v8 (links_dedup) regression — must be fast on 1K duplicate 
     const fromId = (await db.query(`SELECT id FROM pages WHERE slug = 'p/from'`)).rows[0].id;
     const toId = (await db.query(`SELECT id FROM pages WHERE slug = 'p/to'`)).rows[0].id;
 
-    // Insert 1000 duplicates of the same (from, to, type) row
-    for (let i = 0; i < 1000; i++) {
+    // Insert 200 duplicates of the same (from, to, type) row
+    // 200 rows, not 1000: the O(n²) shape this gate guards is still
+    // unmistakable at 200 (minutes vs sub-second dedup) and the insert loop
+    // stops burning ~15-25s of suite budget per test on row traffic that
+    // adds no discriminating power.
+    for (let i = 0; i < 200; i++) {
       await db.query(
         `INSERT INTO links (from_page_id, to_page_id, link_type, context) VALUES ($1, $2, $3, $4)`,
         [fromId, toId, 'mention', `dup-${i}`]
       );
     }
     const beforeCount = (await db.query(`SELECT COUNT(*)::int AS c FROM links`)).rows[0].c;
-    expect(beforeCount).toBe(1000);
+    expect(beforeCount).toBe(200);
 
     // Reset version to 7 so v8 + v9 + v10 + v11 re-run
     await engine.setConfig('version', '7');
@@ -963,7 +1145,7 @@ describe('migrate: v8 (links_dedup) regression — must be fast on 1K duplicate 
   });
 });
 
-describe('migrate: v9 (timeline_dedup_index) regression — must be fast on 1K duplicate rows', () => {
+describe('migrate: v9 (timeline_dedup_index) regression — must be fast on 200 duplicate rows', () => {
   let engine: PGLiteEngine;
 
   beforeAll(async () => {
@@ -976,22 +1158,26 @@ describe('migrate: v9 (timeline_dedup_index) regression — must be fast on 1K d
     await engine.disconnect();
   });
 
-  test('1000 duplicate timeline entries dedup completes in <90s and leaves table deduped', async () => {
+  test('200 duplicate timeline entries dedup completes in <90s and leaves table deduped', async () => {
     const db = (engine as any).db;
     await db.exec(`DROP INDEX IF EXISTS idx_timeline_dedup`);
 
     await engine.putPage('p/timeline', { type: 'concept', title: 'TL', compiled_truth: '', timeline: '' });
     const pageId = (await db.query(`SELECT id FROM pages WHERE slug = 'p/timeline'`)).rows[0].id;
 
-    // Insert 1000 duplicates of the same (page_id, date, summary) row
-    for (let i = 0; i < 1000; i++) {
+    // Insert 200 duplicates of the same (page_id, date, summary) row
+    // 200 rows, not 1000: the O(n²) shape this gate guards is still
+    // unmistakable at 200 (minutes vs sub-second dedup) and the insert loop
+    // stops burning ~15-25s of suite budget per test on row traffic that
+    // adds no discriminating power.
+    for (let i = 0; i < 200; i++) {
       await db.query(
         `INSERT INTO timeline_entries (page_id, date, source, summary, detail) VALUES ($1, $2::date, $3, $4, $5)`,
         [pageId, '2024-01-15', `src-${i}`, 'Founded NovaMind', `detail-${i}`]
       );
     }
     const beforeCount = (await db.query(`SELECT COUNT(*)::int AS c FROM timeline_entries`)).rows[0].c;
-    expect(beforeCount).toBe(1000);
+    expect(beforeCount).toBe(200);
 
     await engine.setConfig('version', '7');
 
@@ -1095,7 +1281,7 @@ describe('PR #356 — LATEST_VERSION is max(versions), not array[-1]', () => {
 
     // Guard against regression to array[-1]: the production source must use
     // Math.max, never indexed access to the last element.
-    const src = readFileSync(resolve('src/core/migrate.ts'), 'utf-8');
+    const src = surfaceFileSource('migrate', 'src/core/migrate.ts');
     expect(src).toMatch(/LATEST_VERSION\s*=\s*MIGRATIONS\.length[\s\S]{0,200}Math\.max/);
     expect(src).not.toMatch(/MIGRATIONS\[MIGRATIONS\.length\s*-\s*1\]\.version/);
   });
@@ -1225,7 +1411,7 @@ describe('PR #356 + #363 — session timeouts applied via startup parameters', (
     // PgBouncer-transaction-mode-safe). The setSessionDefaults function is
     // kept as a no-op shim for back-compat with existing call sites.
     const dbSrc = readFileSync(resolve('src/core/db.ts'), 'utf-8');
-    const pgSrc = readFileSync(resolve('src/core/postgres-engine.ts'), 'utf-8');
+    const pgSrc = surfaceSource('postgres-engine');
 
     // Helper still exists for back-compat
     expect(dbSrc).toContain('export async function setSessionDefaults');
@@ -1263,13 +1449,21 @@ describe('PR #356 — non-transactional DDL runs via reserved connection', () =>
     // immediately above. The wrapper calls runMigrationSQL inside its retry
     // body, so it must come BEFORE in the source — which is why a prefix
     // match would catch the wrong function.
-    const source = readFileSync(resolve('src/core/migrate.ts'), 'utf-8');
+    const source = surfaceFileSource('migrate', 'src/core/migrate.ts');
 
     const runFnIdx = source.indexOf('async function runMigrationSQL(');
     expect(runFnIdx).toBeGreaterThan(-1);
     const fnBody = source.slice(runFnIdx, runFnIdx + 2500);
-    expect(fnBody).toContain('withReservedConnection');
-    expect(fnBody).toContain("SET statement_timeout = '600000'");
+    // The else-branch runs through schema-migrations/helpers.ts runMigrationStatement, which a handler's own
+    // statement (v265's VALIDATE CONSTRAINT) shares.
+    expect(fnBody).toContain('await runMigrationStatement(engine, m.version, sql);');
+    const helpers = surfaceFileSource('migrate', 'src/core/schema-migrations/helpers.ts');
+    const helperIdx = helpers.indexOf('export async function runMigrationStatement(');
+    expect(helperIdx).toBeGreaterThan(-1);
+    const helperBody = helpers.slice(helperIdx, helperIdx + 1500);
+    expect(helperBody).toContain('withReservedConnection');
+    expect(helperBody).toContain("SET statement_timeout = '${migrationStatementTimeoutMs()}'");
+    expect(migrationStatementTimeoutMs()).toBe(600_000);
   });
 });
 
@@ -2197,8 +2391,8 @@ describe('v117 — context_volunteer_events_table', () => {
     expect(m!.idempotent).toBe(true);
   });
 
-  test('LATEST_VERSION is at or above 117', () => {
-    expect(LATEST_VERSION).toBeGreaterThanOrEqual(117);
+  test('LATEST_VERSION is at or above 136', () => {
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(136);
   });
 
   test('table exists after initSchema with the documented columns', async () => {
@@ -2226,6 +2420,8 @@ describe('v117 — context_volunteer_events_table', () => {
 
   test('insert + 90-day purge round-trip (purgeStaleVolunteerEvents)', async () => {
     const { insertVolunteerEvents, purgeStaleVolunteerEvents } = await import('../src/core/context/volunteer-events.ts');
+    await engine.putPage('people/alice-example', { type: 'person', title: 'Alice Example', compiled_truth: '', timeline: '' });
+    await engine.putPage('projects/acme-example', { type: 'project', title: 'Acme Example', compiled_truth: '', timeline: '' });
     await insertVolunteerEvents(engine, [
       { source_id: 'default', slug: 'people/alice-example', confidence: 0.9, match_arm: 'alias', rationale: 'alias match', channel: 'op' },
       { source_id: 'default', slug: 'projects/acme-example', confidence: 0.8, match_arm: 'title', rationale: 'exact title', channel: 'reflex', session_id: 's1', turn: 3 },
@@ -2242,4 +2438,39 @@ describe('v117 — context_volunteer_events_table', () => {
     );
     expect(left.map(r => r.slug)).toEqual(['people/alice-example']);
   });
+});
+
+// #4252 — v134 heal: brains whose `migrate embeddings` run predates the
+// runSchemaTransition capture/replay fix lost both `embedding IS NULL`
+// partial indexes to the DROP COLUMN cascade. v66/v103 are recorded as
+// applied on those brains, so their IF NOT EXISTS never re-runs; v134
+// re-issues both defs. No-op on healthy brains.
+describe('v134 — restore_chunks_embedding_null_partial_indexes', () => {
+  test('recreates both partial indexes lost to a pre-fix embedding transition', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      // Simulate the pre-fix damage: both partial indexes gone.
+      await engine.executeRaw(`DROP INDEX IF EXISTS idx_chunks_embedding_null`);
+      await engine.executeRaw(`DROP INDEX IF EXISTS content_chunks_stale_idx`);
+      // Rewind so v134 re-runs.
+      await engine.setConfig('version', '133');
+      await runMigrations(engine);
+
+      const rows = await engine.executeRaw<{ indexname: string; indexdef: string }>(
+        `SELECT indexname, indexdef FROM pg_indexes
+          WHERE tablename = 'content_chunks'
+            AND indexname IN ('idx_chunks_embedding_null', 'content_chunks_stale_idx')
+          ORDER BY indexname`,
+      );
+      // v134 re-creates both; v225 then drops the v66 duplicate of content_chunks_stale_idx.
+      expect(rows.map(r => r.indexname)).toEqual(['content_chunks_stale_idx']);
+      for (const r of rows) {
+        expect(r.indexdef).toMatch(/WHERE\s+\(?embedding IS NULL\)?/i);
+      }
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
 });

@@ -7,10 +7,14 @@
  * Tests use PGLite in-memory and a captured-output approach (process.exit
  * is intercepted) to verify the resolution chain produces the right
  * repoPath OR the right error.
+ *
+ * Also covers per-source scoping of the two sidecar reads in the export loop
+ * (tags + raw data), which are keyed by slug and so cross source boundaries
+ * unless pinned to the page's own source.
  */
 
 import { describe, test, expect, beforeEach, afterEach, beforeAll, afterAll } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, realpathSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -38,7 +42,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  tmp = mkdtempSync(join(tmpdir(), 'gbrain-export-test-'));
+  tmp = realpathSync(mkdtempSync(join(tmpdir(), 'gbrain-export-test-')));
   outDir = join(tmp, 'out');
   exitCode = null;
   stderr = [];
@@ -142,5 +146,50 @@ describe('export --restore-only resolution chain (D5)', () => {
     await tryRunExport(['--dir', outDir]);
     expect(exitCode).toBeNull();
     expect(stdout.some((line) => line.includes('Exporting 0'))).toBe(true);
+  });
+});
+
+describe('export sidecar reads are scoped to the page owning source', () => {
+  // Both fixtures use the SAME slug in two sources — the only shape where a
+  // slug-keyed read can cross a boundary, since slugs are unique per source
+  // rather than brain-wide.
+  const SLUG = 'notes/shared';
+
+  beforeEach(async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('other', 'Other') ON CONFLICT DO NOTHING`,
+    );
+    for (const sourceId of ['default', 'other']) {
+      await engine.putPage(
+        SLUG,
+        { type: 'note', title: `${sourceId} title`, compiled_truth: 'body' },
+        { sourceId },
+      );
+      await engine.addTag(SLUG, `tag-${sourceId}`, { sourceId });
+      await engine.putRawData(SLUG, `feed-${sourceId}`, { owner: sourceId }, { sourceId });
+    }
+
+  });
+
+  test("a non-default page exports its own tags, not the default source's", async () => {
+    await tryRunExport(['--dir', outDir, '--source', 'other']);
+    expect(exitCode).toBeNull();
+
+    const md = readFileSync(join(outDir, SLUG + '.md'), 'utf-8');
+    expect(md).toContain('other title');
+    expect(md).toContain('tag-other');
+    expect(md).not.toContain('tag-default');
+  });
+
+  test('raw-data sidecars carry only the owning source rows', async () => {
+    await tryRunExport(['--dir', outDir, '--source', 'other']);
+    expect(exitCode).toBeNull();
+
+    // Unscoped, getRawData applies no source predicate at all: both sources'
+    // rows come back and the export loop merges them into a single object
+    // keyed by `rd.source`.
+    const raw = JSON.parse(readFileSync(join(outDir, 'notes', '.raw', 'shared.json'), 'utf-8'));
+    expect(Object.keys(raw)).toEqual(['feed-other']);
+    expect(raw['feed-other']).toEqual({ owner: 'other' });
   });
 });

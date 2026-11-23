@@ -29,9 +29,15 @@ afterAll(async () => {
 });
 
 async function truncateAll() {
-  for (const t of ['content_chunks', 'links', 'tags', 'raw_data', 'timeline_entries', 'page_versions', 'ingest_log', 'pages']) {
+  for (const t of ['content_chunks', 'links', 'tags', 'raw_data', 'timeline_entries', 'page_versions', 'ingest_log', 'config', 'pages']) {
     await (engine as any).db.exec(`DELETE FROM ${t}`);
   }
+  // Re-seed the two config keys this file touches back to their documented
+  // defaults (both default to ON). This makes every test deterministic even if
+  // an earlier test threw before its finally restored auto_link/auto_timeline,
+  // and even though absent-key already resolves truthy via isAuto*Enabled.
+  await engine.setConfig('auto_link', 'true');
+  await engine.setConfig('auto_timeline', 'true');
 }
 
 function makeContext(): OperationContext {
@@ -77,10 +83,12 @@ describe('E2E graph quality (v0.10.1 pipeline)', () => {
     await runExtract(engine, ['links', '--source', 'db']);
     await runExtract(engine, ['timeline', '--source', 'db']);
 
-    // Verify graph populated.
+    // Verify graph populated. Concrete floors derived from the seeded fixtures:
+    //   resolvable entity refs: alice->acme, bob->acme, standup->alice, standup->bob = 4
+    //   timeline lines: alice(2) + bob(1) + acme(1) + standup(1) = 5
     const stats = await engine.getStats();
-    expect(stats.link_count).toBeGreaterThan(0);
-    expect(stats.timeline_entry_count).toBeGreaterThan(0);
+    expect(stats.link_count).toBeGreaterThanOrEqual(4);
+    expect(stats.timeline_entry_count).toBeGreaterThanOrEqual(5);
 
     // Verify typed link inference.
     const aliceLinks = await engine.getLinks('people/alice');
@@ -91,8 +99,17 @@ describe('E2E graph quality (v0.10.1 pipeline)', () => {
     const bobAcme = bobLinks.find(l => l.to_slug === 'companies/acme');
     expect(bobAcme?.link_type).toBe('invested_in');
 
-    const meetingLinks = await engine.getLinks('meetings/standup');
-    expect(meetingLinks.every(l => l.link_type === 'attended')).toBe(true);
+    // The standup meeting lists Alice and Bob as attendees. Canonical attendance
+    // is stored person -> meeting, so the exact attendee edges are backlinks
+    // typed 'attended' and the meeting has no outgoing attendance.
+    const meetingBacklinks = await engine.getBacklinks('meetings/standup');
+    const attended = new Set(
+      meetingBacklinks.filter(l => l.link_type === 'attended').map(l => l.from_slug),
+    );
+    expect(attended.has('people/alice')).toBe(true);
+    expect(attended.has('people/bob')).toBe(true);
+    expect(meetingBacklinks.every(l => l.link_type === 'attended')).toBe(true);
+    expect((await engine.getLinks('meetings/standup')).filter(l => l.link_type === 'attended')).toEqual([]);
   });
 
   test('auto-link via put_page operation handler', async () => {
@@ -118,7 +135,9 @@ Attendees: [Alice](people/alice). Discussed [Acme](companies/acme).
     // The response should include auto_links results.
     expect((result as any).auto_links).toBeDefined();
     const autoLinks = (result as any).auto_links;
-    expect(autoLinks.created).toBeGreaterThan(0);
+    // The page references exactly two seeded, resolvable targets (Alice + Acme),
+    // so exactly two links are created.
+    expect(autoLinks.created).toBe(2);
     expect(autoLinks.errors).toBe(0);
 
     // Verify links actually exist in DB.
@@ -152,6 +171,7 @@ I met [Alice](people/alice) today.
     // Second write: removes Alice ref, adds Bob ref.
     const result = await putOp.handler(makeContext(), {
       slug: 'notes/test',
+      expected_revision: (await engine.readPageSnapshot('notes/test'))!.revision,
       content: `---
 type: concept
 title: Test Note
@@ -187,8 +207,7 @@ Dana is a founder.
 `,
     });
 
-    expect((result as any).auto_timeline).toBeDefined();
-    expect((result as any).auto_timeline.created).toBe(2);
+    expect((result as any).write_request.state).toBe('committed');
 
     const entries = await engine.getTimeline('people/dana');
     expect(entries.length).toBe(2);
@@ -211,13 +230,17 @@ title: Eve
 - **2026-03-15** | Shipped
 `;
     await putOp.handler(makeContext(), { slug: 'people/eve', content });
-    await putOp.handler(makeContext(), { slug: 'people/eve', content });
+    const snapshot = (await engine.readPageSnapshot('people/eve'))!;
+    const replay = await putOp.handler(makeContext(), { slug: 'people/eve', content,
+      expected_revision: snapshot.revision });
+    expect((replay as any).write_request.state).toBe('committed');
+    expect((await engine.readPageSnapshot('people/eve'))!.revision).toBe(snapshot.revision);
 
     const entries = await engine.getTimeline('people/eve');
     expect(entries.length).toBe(1);
   });
 
-  test('auto-timeline respects auto_timeline=false config', async () => {
+  test('canonical timeline is coherent with auto_timeline=false config', async () => {
     await engine.setConfig('auto_timeline', 'false');
     try {
       const putOp = operationsByName['put_page'];
@@ -234,8 +257,9 @@ title: Frank
 `,
       });
       expect((result as any).auto_timeline).toBeUndefined();
+      expect((result as any).write_request.state).toBe('committed');
       const entries = await engine.getTimeline('people/frank');
-      expect(entries.length).toBe(0);
+      expect(entries.length).toBe(1);
     } finally {
       await engine.setConfig('auto_timeline', 'true');
     }
@@ -283,19 +307,66 @@ Mention of [Alice](people/alice).
     expect(paths[0].link_type).toBe('works_at');
   });
 
+  test('graph-query traversal: direction out and both, plus depth:2 multi-hop', async () => {
+    // Seed a 2-hop chain: alice -works_at-> acme -partnered_with-> beta.
+    await engine.putPage('people/alice', { type: 'person', title: 'Alice', compiled_truth: '', timeline: '' });
+    await engine.putPage('companies/acme', { type: 'company', title: 'Acme', compiled_truth: '', timeline: '' });
+    await engine.putPage('companies/beta', { type: 'company', title: 'Beta', compiled_truth: '', timeline: '' });
+    await engine.addLink('people/alice', 'companies/acme', '', 'works_at');
+    await engine.addLink('companies/acme', 'companies/beta', '', 'partnered_with');
+
+    // direction:'out' from alice, depth 1 -> only the first hop.
+    const out1 = await engine.traversePaths('people/alice', { direction: 'out', depth: 1 });
+    expect(out1.length).toBe(1);
+    expect(out1[0].from_slug).toBe('people/alice');
+    expect(out1[0].to_slug).toBe('companies/acme');
+    expect(out1[0].depth).toBe(1);
+
+    // depth:2 -> both hops, depths 1 and 2.
+    const out2 = await engine.traversePaths('people/alice', { direction: 'out', depth: 2 });
+    const out2Edges = new Set(out2.map(p => `${p.from_slug}->${p.to_slug}@${p.depth}`));
+    expect(out2Edges.has('people/alice->companies/acme@1')).toBe(true);
+    expect(out2Edges.has('companies/acme->companies/beta@2')).toBe(true);
+    expect(out2.length).toBe(2);
+
+    // direction:'both' from acme depth 1 -> sees the inbound edge from alice AND
+    // the outbound edge to beta. Edges keep their natural from->to orientation.
+    const both = await engine.traversePaths('companies/acme', { direction: 'both', depth: 1 });
+    const bothEdges = new Set(both.map(p => `${p.from_slug}->${p.to_slug}`));
+    expect(bothEdges.has('people/alice->companies/acme')).toBe(true);
+    expect(bothEdges.has('companies/acme->companies/beta')).toBe(true);
+  });
+
+  test('graph-query cycle safety: A->B->A terminates and returns bounded results', async () => {
+    await engine.putPage('people/alice', { type: 'person', title: 'Alice', compiled_truth: '', timeline: '' });
+    await engine.putPage('people/bob', { type: 'person', title: 'Bob', compiled_truth: '', timeline: '' });
+    // Create a 2-cycle: alice -> bob -> alice.
+    await engine.addLink('people/alice', 'people/bob', '', 'knows');
+    await engine.addLink('people/bob', 'people/alice', '', 'knows');
+
+    // High depth must NOT loop forever; the visited-set guard bounds the walk.
+    const paths = await engine.traversePaths('people/alice', { direction: 'out', depth: 100 });
+    const edges = new Set(paths.map(p => `${p.from_slug}->${p.to_slug}`));
+    // Both edges of the cycle are reachable exactly once.
+    expect(edges.has('people/alice->people/bob')).toBe(true);
+    expect(edges.has('people/bob->people/alice')).toBe(true);
+    // Bounded: there are only two edges in the graph, so no path explosion.
+    expect(paths.length).toBe(2);
+  });
+
   test('search backlink boost: well-connected pages rank higher', async () => {
     // Create 3 pages all matching a search term, but with different inbound link counts.
-    await engine.putPage('topic/popular', {
+    const popular = await engine.putPage('topic/popular', {
       type: 'concept', title: 'Popular Topic',
       compiled_truth: 'This is the popular topic about widgets.',
       timeline: '',
     });
-    await engine.putPage('topic/medium', {
+    const medium = await engine.putPage('topic/medium', {
       type: 'concept', title: 'Medium Topic',
       compiled_truth: 'This is a medium topic about widgets.',
       timeline: '',
     });
-    await engine.putPage('topic/obscure', {
+    const obscure = await engine.putPage('topic/obscure', {
       type: 'concept', title: 'Obscure Topic',
       compiled_truth: 'This is an obscure topic about widgets.',
       timeline: '',
@@ -310,9 +381,9 @@ Mention of [Alice](people/alice).
     await engine.addLink('ref/popular-0', 'topic/medium', '', 'mentions');
 
     // Verify backlink counts.
-    const counts = await engine.getBacklinkCounts(['topic/popular', 'topic/medium', 'topic/obscure']);
-    expect(counts.get('topic/popular')).toBe(5);
-    expect(counts.get('topic/medium')).toBe(1);
-    expect(counts.get('topic/obscure')).toBe(0);
+    const counts = await engine.getBacklinkCounts([popular.id, medium.id, obscure.id]);
+    expect(counts.get(popular.id)).toBe(5);
+    expect(counts.get(medium.id)).toBe(1);
+    expect(counts.get(obscure.id)).toBe(0);
   });
 });

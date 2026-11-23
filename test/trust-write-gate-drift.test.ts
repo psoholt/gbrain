@@ -1,0 +1,123 @@
+/**
+ * ENG-21 drift guard (#5575): every fact, take or page writer in the write
+ * attribution inventory (docs/architecture/system-of-record.md, pinned by
+ * test/write-attribution-legacy.test.ts) either calls the write gate directly
+ * or is declared exempt here with a reason. A new writer fails until it is
+ * classified; an exemption for a writer that now calls the gate fails as stale.
+ *
+ * test-reads-source-ok[structural]: a source-text tripwire over the writer inventory, like the attribution inventory it extends.
+ */
+import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const root = join(import.meta.dir, '..');
+const GATE = /\b(?:decideFactWrite|decideTakeWrite|assess(?:Page|Fact|Take|Timeline)ForGate|guardFenceRows)\s*\(|\bwriteGate\s*[:?]|\bgateInput\s*\(/;
+
+/** Writers that never persist new attacker-controllable text, or reach the gate through a callee, with the reason. */
+const EXEMPT: Record<string, string> = {
+  'src/commands/extract-timeline-db.ts': 're-derives timeline rows from stored page text the page gate already assessed',
+  'src/commands/migrate-engine.ts': 'copies rows verbatim between engines; tiers and receipts travel with them',
+  'src/commands/sync/holds.ts': 'held-file bookkeeping; writes no content',
+  'src/core/repair/url-clone-fences.ts': 'restores a gbrain-owned clone file to its HEAD bytes (what a sync imports) and keeps the fence rows the database already holds; it adds no content',
+  'src/core/repair/rename-identity.ts': 'owner repair behind preview-bound destructive consent: moves the old page to the new slug (updateSlug), copies fence-row attributes the two pages already store and retires the provisional page; the new file imports through importFile, which passes the owner gate input (import-file.ts)',
+  'src/commands/sync/rename-collision.ts': 'moves a page between slugs (updateSlug, tombstone re-key, source_path repair) and writes no content; the renamed body still imports through importFile, which passes the owner gate input (import-file.ts)',
+  'src/core/calibration/undo-wave.ts': 'restores prior take lifecycle fields; no new text',
+  'src/core/company-brain/profile.ts': 'company profile publication of an owner-approved company source (operator_curated, never gated)',
+  'src/core/cycle/dream-provenance.ts': 'stamps provenance frontmatter; no new text',
+  'src/core/cycle/grade-takes.ts': 'writes resolution fields on existing takes; no new claim text',
+  'src/core/cycle/phantom-redirect.ts': 'slug redirect (placement only)',
+  'src/core/embed-facts.ts': 'embedding columns only',
+  'src/core/embedding-dim-check.ts': 'embedding columns only',
+  'src/core/extract/receipt-writer.ts': 'gbrain-generated extraction receipt page (counts, cost, model id); no external text',
+  'src/core/facts/derivation-inputs.ts': 'derivation edge ledger; ids only',
+  'src/core/facts/file-body-guard.ts': 'row-locked compare-and-swap body mirror: fence-write callers gate newly appended rows; forget, proposal-supersede, unfenced-facts and phantom-redirect only strike, adopt or relocate facts already stored; this helper adds no independently sourced text',
+  'src/core/facts/gone-page-facts.ts': 'retention purge expires the purged page\'s existing facts inside the purge\'s maintenance transaction (lifecycle); no new text',
+  'src/core/facts/forget.ts': 'withdrawal strike (lifecycle)',
+  'src/core/facts/ontology-rekey.ts': 'drops duplicate copies of existing ontology rows before a re-key (placement)',
+  'src/core/facts/proposal-supersede.ts': 'checked supersede of existing rows (lifecycle)',
+  'src/core/facts/purge.ts': 'purge deletes rows',
+  'src/core/facts/relink-publish.ts': 'relinks existing facts to an entity (placement)',
+  'src/core/facts/unfenced-facts.ts': 'repairs fence positions of existing rows',
+  'src/core/facts/withdrawal.ts': 'withdrawal ledger and expiry (lifecycle)',
+  'src/core/page-state/materialize.ts': 'writes stored timeline rows back into the page body; no new text',
+  'src/core/page-state/rename-alias.ts': 'slug alias (placement only)',
+  'src/core/page-state/versions.ts': 'page_versions snapshots copy the live row',
+  'src/core/persistence/connector-google-receipts.ts': 'connector delivery receipts; the connector page publication is gated (connector-sync.ts)',
+  'src/core/persistence/sync-image.ts': 'managed sync image import of an owner-committed file through importImageFile, which has no gate seam (its page text is gbrain-generated OCR/caption); import-prepare.ts takes the same image path',
+  'src/core/persistence/sync-streamed.ts': 'managed sync of a file over the single-string ceiling applies the import page-body/streamed-import.ts prepared, which takes the owner gate input and holds a page whose tier the write gate would scan; its own writes are the rename and path stamps',
+  'src/core/page-body/segment-rewrite.ts': 'forget, withdrawal and fact purge strike or drop existing fence rows of a segmented body (lifecycle); no new text',
+  'src/core/persistence/links-maintenance.ts': 'link extraction from stored page text',
+  'src/core/persistence/loop-fact-retirement.ts': 'expires a loop fact (lifecycle)',
+  'src/core/persistence/connector-fact-retirement.ts': 'expires a connector\'s own facts rows (exact facts.source) and strikes their fence rows, keeping the page tier (lifecycle); no new text and no withdrawal record',
+  'src/core/persistence/page-purge.ts': 'the purge\'s in-transaction recheck versions and soft-deletes the page it was asked to purge when a page derived from it still needs it (lifecycle); no new text',
+  'src/core/persistence/forget-prepare.ts': 'forget (lifecycle): strikes withdrawn rows and records the withdrawal; it writes no new claim',
+  'src/core/repair/captured-facts.ts': 'owner repair of existing rows',
+  'src/core/repair/agent-session-facts.ts': 'owner repair of existing rows',
+  'src/core/repair/consolidate-ties.ts': 'owner repair reopening the validity of existing facts (lifecycle)',
+  'src/core/repair/duplicate-facts.ts': 'owner repair behind a preview hash: supersedes exact copies of an existing fact with its oldest row (expired_at, superseded_by; lifecycle, no new text); fenced copies are struck through put_page, which runs the gate',
+  'src/core/generations/adapters/extracted-facts.ts': 'callers gate first and pass only rows the gate inserts or flags (the conversation lane and the backstop decide in conversation-publication.ts and backstop.ts); restore puts back a row\'s own recorded state',
+  'src/core/generations/adapters/fact-rows.ts': 'generation restore puts back a fact row\'s own recorded before-state (lifecycle); no new text',
+  'src/core/repair/fact-claim-dates.ts': 'owner repair moving the valid_from of existing database-only facts to the date their claim states (lifecycle)',
+  'src/core/repair/extractor-facts.ts': 'owner repair of existing rows',
+  'src/core/repair/purged-page-facts.ts': 'owner repair behind a preview hash: only sets expired_at and clears row_num on existing fact rows (lifecycle); writes no new text',
+  'src/core/repair/purged-change-reasons.ts': 'owner repair behind a preview hash: only sets matched page_versions.change_reason values to [purged] (redaction); writes no new text',
+  'src/core/repair/unwithdrawn-facts.ts': 'owner repair behind a preview hash: puts back an existing fact row\'s own ledger before-state (lifecycle and row number); no new text',
+  'src/core/generations/fence-evidence.ts': 'renumbers a kept existing fact row inside the gated fence projection or reconcile; no new text',
+  'src/core/repair/secret-spans.ts': 'owner repair behind a preview hash: replaces only the credential spans the secret scanner finds in a page\'s stored copies with <REDACTED:rule> markers (no new text)',
+  'src/core/repair/redacted-facts.ts': 'owner repair behind a preview hash: puts back into existing fact rows the words a stored source page proves; fenced rows publish through put_page, which runs the gate',
+  'src/core/repair/facts-rehome.ts': 'owner repair moving existing facts onto their entity page (placement)',
+  'src/core/repair/frontmatter.ts': 'owner repair of existing frontmatter',
+  'src/core/persistence/twin-merge.ts': 'owner repair or post-sync heal of verified duplicate-origin twins (#6948): moves rows the twin already stores (links, timeline, raw data, tags, aliases, facts) onto the canonical page with their tiers unchanged, then soft-deletes the twin; no new text, and a tier difference holds the file instead of merging',
+  'src/core/repair/ghost-pages.ts': 'retires an owner-approved ghost page (version + soft delete, lifecycle); no new text',
+  'src/core/repair/moved-pages.ts': 'owner repair behind a preview hash: folds a page whose file provably moved into the moved page (twin merge of stored rows, its versions re-pointed, then soft delete); no new text',
+  'src/core/repair/ontology-facts.ts': 'owner repair restoring existing ontology rows',
+  'src/core/persistence/derived-retirement-hold.ts': 'versions, soft-deletes and stamps derived pages a writer retires (lifecycle); writes no content',
+  'src/core/repair/atoms-restore.ts': 'restores an owner-approved retired atom to its own earlier version (lifecycle); no new text',
+  'src/core/repair/take-supersession.ts': 'owner repair of take supersession pointers',
+  'src/core/repair/timeline-comments.ts': 'owner repair of timeline comment markup',
+  'src/core/repair/open-facts.ts': 'operator-only local CLI repair (remote callers and member mode refused) behind a preview hash and --expect: only flips existing fact rows from private to world, and back on --undo (no new text); fenced rows rewrite only the visibility cell of their page through the label write (writeLabelFile, importAtRevision)',
+  'src/core/repair/visibility.ts': 'owner repair behind a preview: only tightens existing fact rows from world to private (no new text); fenced rows and page labels publish through put_page, which runs the gate',
+  'src/core/schema-pack/page-to-alias.ts': 'schema-pack retype of existing pages',
+  'src/core/schema-pack/page-to-link.ts': 'schema-pack retype of existing pages',
+  'src/core/schema-pack/retype.ts': 'schema-pack retype of existing pages',
+  'src/core/schema-pack/sync.ts': 'schema-pack sync of existing pages',
+  'src/core/sweep.ts': 're-derives links and timeline rows from stored page text',
+  'src/core/takes-write.ts': 'shared fence helpers; the takes_* verbs gate in takes-prepare.ts',
+  'src/core/timeline-dedup-repair.ts': 'owner repair deduplicating existing timeline rows',
+  'src/core/timeline-write-through.ts': 'rendering helpers for add_timeline_entry, which gates the row in semantic-pages.ts',
+  'src/core/trust/held-removals.ts': 'owner accept (W1) of a held take or timeline removal: deletes the row, or re-projects it from the stored page text like sweep.ts; a fence-carried take reruns as takes_remove, which gates in takes-prepare.ts',
+  'src/core/trust/owner-actions.ts': 'owner release publishes a held row the owner confirmed (CEO-9); the gate already held it',
+  'src/core/trust/supersede-handlers.ts': 'owner accept/undo re-tiers existing rows inside the checked supersede',
+  'src/core/repair/conversation-labels.ts': 'owner repair of existing conversation labels',
+  'src/core/facts/conversation-relink.ts': 'free conversation relink sets entity_slug and a context note on existing derived rows; no claim text is written, so there is nothing for the gate to judge',
+  'src/core/generations/adapters/single-page.ts': 'the dream summary (an index of the run\'s output pages, stamped at their taint), the drift report (gbrain-generated) and the pending think --save page (quote-grounded synthesis, no page gate seam yet), each a single-item generation (GBRA-161 PR 5)',
+  'src/core/persistence/change-reason.ts': 'stamps the canonical reason of a page write onto the snapshot that write archived, inside the page publication the door already gated; it admits no content of its own',
+  'src/core/facts/fence-fact-append.ts': 'remember gates in memory-prepare.ts before calling it and records the flag receipt on the row it indexes; it renders and indexes the fact its caller passes',
+  'src/core/facts/fence-write.ts': 'callers decide the gate (backstop, loops-extract) and pass the decision; it records the flag receipt on the new row',
+  'src/core/facts/write-single.ts': 'callers gate first (loops-extract decides; remember gates in memory-prepare); it records a passed decision\'s flag receipt',
+  'src/core/output/writer.ts': 'gbrain integrity auto-repair (owner-run local CLI) rewrites citations and back-links of existing pages',
+  'src/core/persistence/prepared-maintenance.ts': 'consolidation takes gate in takes-prepare; pending: derived maintenance pages carry intent.derivation for the page-prepare gate',
+};
+
+function inventory(): string[] {
+  const doc = readFileSync(join(root, 'docs/architecture/system-of-record.md'), 'utf8');
+  return ['write-attribution-covered', 'write-attribution-unattributed'].flatMap(marker => {
+    const section = doc.split(`<!-- ${marker}:start -->`)[1]?.split(`<!-- ${marker}:end -->`)[0] ?? '';
+    return [...section.matchAll(/^- `([^`]+)` \(\d+\)/gm)].map(m => m[1]!);
+  });
+}
+const callsGate = (path: string) => GATE.test(readFileSync(join(root, path), 'utf8')
+  .split('\n').filter(line => !/^\s*(?:\/\/|\/?\*)/.test(line)).join('\n'));
+
+describe('write gate drift (ENG-21)', () => {
+  test('every inventoried writer calls the gate or is exempt with a reason; no exemption is stale', () => {
+    const writers = inventory();
+    expect(writers.length).toBeGreaterThan(40);
+    const unclassified = writers.filter(path => !callsGate(path) && !(path in EXEMPT));
+    expect(unclassified, 'Gate the writer (write-gate.ts / write-gate-store.ts, or pass writeGate to importFromContent) or add it to EXEMPT with a reason.').toEqual([]);
+    const stale = Object.keys(EXEMPT).filter(path => !writers.includes(path) || callsGate(path));
+    expect(stale, 'These exemptions are stale: the writer left the inventory or now calls the gate.').toEqual([]);
+    for (const reason of Object.values(EXEMPT)) expect(reason.length).toBeGreaterThan(10);
+  });
+});

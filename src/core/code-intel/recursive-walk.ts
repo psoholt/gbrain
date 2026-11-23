@@ -16,7 +16,9 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import type { CodeEdgeResult } from '../types.ts';
+import { readEdgeResolution } from '../chunkers/symbol-resolver.ts';
 import { classifySink, type SinkKind } from './sinks/index.ts';
+import { codeReadFilter } from './read-scope.ts';
 
 export type WalkDirection = 'callers' | 'callees';
 
@@ -35,7 +37,11 @@ export interface WalkOpts {
 
 export interface WalkNode {
   symbol: string;
-  /** Origin chunk for the edge, when known. */
+  /**
+   * The node's own chunk, when known: the caller's chunk on a callers hop,
+   * the resolved callee's chunk on a callees hop (#5439). Absent when the
+   * edge was unresolved (the walk continued by name).
+   */
   chunk_id?: number;
   /** Sink kind for terminal nodes in code_flow. */
   sink_kind?: SinkKind;
@@ -84,8 +90,8 @@ async function disambiguateSymbol(
     const exact = await engine.executeRaw<{ symbol_name_qualified: string }>(
       `SELECT DISTINCT symbol_name_qualified
          FROM content_chunks
-         JOIN pages ON pages.id = content_chunks.page_id
-        WHERE pages.source_id = $1
+         JOIN pages p ON p.id = content_chunks.page_id
+        WHERE p.source_id = $1 AND ${codeReadFilter([], {})}
           AND symbol_name_qualified IS NOT NULL
           AND (symbol_name = $2 OR symbol_name_qualified = $2)
         LIMIT 25`,
@@ -99,8 +105,8 @@ async function disambiguateSymbol(
     const fuzzy = await engine.executeRaw<{ symbol_name_qualified: string }>(
       `SELECT DISTINCT symbol_name_qualified
          FROM content_chunks
-         JOIN pages ON pages.id = content_chunks.page_id
-        WHERE pages.source_id = $1
+         JOIN pages p ON p.id = content_chunks.page_id
+        WHERE p.source_id = $1 AND ${codeReadFilter([], {})}
           AND symbol_name_qualified IS NOT NULL
           AND symbol_name_qualified ILIKE $2
         LIMIT 5`,
@@ -119,28 +125,59 @@ async function disambiguateSymbol(
 }
 
 /**
- * Detect the language of a qualified symbol by looking at the owning
- * chunk's language. Returns null when not found.
+ * Languages of every chunk defining a qualified symbol. A bare name can be
+ * defined in several files and languages at once (gbrain-evals N13-3: a Go
+ * and a Python `shared_helper` share the qualified name), so the gate must
+ * see all of them, not one arbitrary row.
  */
-async function detectSymbolLanguage(
+async function symbolLanguages(
   engine: BrainEngine,
   qualified: string,
   sourceId: string,
-): Promise<string | null> {
+): Promise<string[]> {
   try {
     const rows = await engine.executeRaw<{ language: string | null }>(
-      `SELECT content_chunks.language
+      `SELECT DISTINCT content_chunks.language
          FROM content_chunks
-         JOIN pages ON pages.id = content_chunks.page_id
-        WHERE pages.source_id = $1
+         JOIN pages p ON p.id = content_chunks.page_id
+        WHERE p.source_id = $1 AND ${codeReadFilter([], {})}
           AND content_chunks.symbol_name_qualified = $2
-        LIMIT 1`,
+          AND content_chunks.language IS NOT NULL`,
       [sourceId, qualified],
     );
-    return rows[0]?.language ?? null;
+    return rows.map((r) => r.language as string);
   } catch {
-    return null;
+    return [];
   }
+}
+
+const isSupportedLang = (lang: string): boolean =>
+  SUPPORTED_LANGS.includes(lang as (typeof SUPPORTED_LANGS)[number]);
+
+/** Edge origin chunks written in a supported language (one batched read). */
+async function supportedChunkIds(engine: BrainEngine, ids: number[]): Promise<Set<number>> {
+  if (ids.length === 0) return new Set();
+  const rows = await engine.executeRaw<{ id: number }>(
+    `SELECT id FROM content_chunks WHERE id = ANY($1::int[]) AND language = ANY($2::text[])`,
+    [ids, [...SUPPORTED_LANGS]],
+  );
+  return new Set(rows.map((r) => Number(r.id)));
+}
+
+/**
+ * A frontier entry (#5439): a chunk identity when the hop that reached it
+ * was resolved (the next hop is read by that chunk, so a namesake in another
+ * file never fans in), else the qualified name. The start is always a name.
+ */
+interface WalkFrontierNode { symbol: string; chunkId?: number }
+const frontierKey = (n: WalkFrontierNode): string => (n.chunkId === undefined ? `name:${n.symbol}` : `chunk:${n.chunkId}`);
+
+/** The node an edge leads to, in the walk's direction. */
+function nextNode(e: CodeEdgeResult, direction: WalkDirection): WalkFrontierNode {
+  if (direction === 'callers') return { symbol: e.from_symbol_qualified, chunkId: e.from_chunk_id };
+  const resolution = readEdgeResolution(e.edge_metadata);
+  const chunkId = e.to_chunk_id ?? (resolution.kind === 'resolved' ? resolution.chunk_id : undefined);
+  return chunkId === undefined ? { symbol: e.to_symbol_qualified } : { symbol: e.to_symbol_qualified, chunkId };
 }
 
 /**
@@ -168,14 +205,21 @@ export async function runRecursiveWalk(
     qualifiedStart = matches[0]!;
   }
 
-  // Step 2: language gate (per D18 honest scope).
-  const lang = await detectSymbolLanguage(engine, qualifiedStart, opts.sourceId);
-  if (lang && !SUPPORTED_LANGS.includes(lang as (typeof SUPPORTED_LANGS)[number])) {
+  // Step 2: language gate (per D18 honest scope), scoped to the symbol's
+  // own definitions: unsupported only when NO defining chunk is in a
+  // supported language. When an unsupported-language namesake shares the
+  // qualified name, the walk keeps only edges whose origin chunk is in a
+  // supported language, so the namesake's call graph does not leak in.
+  const langs = await symbolLanguages(engine, qualifiedStart, opts.sourceId);
+  const lang = langs.find(isSupportedLang) ?? langs[0] ?? null;
+  if (lang && !isSupportedLang(lang)) {
     return { result: 'unsupported_language', supported: SUPPORTED_LANGS };
   }
+  const mixedLanguages = langs.some((l) => !isSupportedLang(l));
 
-  // Step 3: BFS walk.
-  const visited = new Set<string>([qualifiedStart]);
+  // Step 3: BFS walk, keyed by source-scoped chunk identity where the edge
+  // was resolved and by name otherwise (#5439).
+  const visited = new Set<string>([`name:${qualifiedStart}`]);
   const depthGroups: DepthGroup[] = [];
   let cyclesDetected = false;
   let truncation: 'none' | 'max_nodes' | 'depth_cap' | 'both' = 'none';
@@ -183,30 +227,41 @@ export async function runRecursiveWalk(
   let freshness: 'fresh' | 'partial' = 'fresh';
   const terminalNodes: { symbol: string; sink_kind: SinkKind }[] = [];
 
-  let frontier = [qualifiedStart];
+  let frontier: WalkFrontierNode[] = [{ symbol: qualifiedStart }];
   for (let d = 1; d <= depthCap; d++) {
-    const nextFrontier: string[] = [];
+    const nextFrontier: WalkFrontierNode[] = [];
     const nodesThisDepth: WalkNode[] = [];
 
-    for (const sym of frontier) {
+    for (const cur of frontier) {
+      const sym = cur.symbol;
       let edges: CodeEdgeResult[];
       try {
+        const hopOpts = { sourceId: opts.sourceId, limit: maxNodes, ...(cur.chunkId === undefined ? {} : { chunkId: cur.chunkId }) };
         edges =
           opts.direction === 'callers'
-            ? await engine.getCallersOf(sym, { sourceId: opts.sourceId, limit: maxNodes })
-            : await engine.getCalleesOf(sym, { sourceId: opts.sourceId, limit: maxNodes });
+            ? await engine.getCallersOf(sym, hopOpts)
+            : await engine.getCalleesOf(sym, hopOpts);
       } catch {
         edges = [];
+      }
+      if (mixedLanguages && edges.length > 0) {
+        try {
+          const keep = await supportedChunkIds(engine, edges.map((e) => e.from_chunk_id));
+          edges = edges.filter((e) => keep.has(e.from_chunk_id));
+        } catch {
+          edges = [];
+        }
       }
 
       // freshness check: any edge whose owning chunk has edges_backfilled_at IS NULL
       // → partial. v0.34 W3b's getCachedOrCompute will gate this further.
 
       for (const e of edges) {
-        const next =
-          opts.direction === 'callers' ? e.from_symbol_qualified : e.to_symbol_qualified;
+        const nextEntry = nextNode(e, opts.direction);
+        const next = nextEntry.symbol;
         if (!next || next === sym) continue;
-        if (visited.has(next)) {
+        // A hop back onto the start symbol is a cycle whichever key reached it.
+        if (visited.has(frontierKey(nextEntry)) || next === qualifiedStart) {
           cyclesDetected = true;
           continue;
         }
@@ -214,9 +269,9 @@ export async function runRecursiveWalk(
           truncation = truncation === 'depth_cap' ? 'both' : 'max_nodes';
           break;
         }
-        visited.add(next);
+        visited.add(frontierKey(nextEntry));
         totalNodes += 1;
-        const node: WalkNode = { symbol: next, chunk_id: e.from_chunk_id };
+        const node: WalkNode = nextEntry.chunkId === undefined ? { symbol: next } : { symbol: next, chunk_id: nextEntry.chunkId };
         // Tag sinks for callees direction.
         if (opts.direction === 'callees' && lang) {
           const kind = classifySink(next, lang);
@@ -226,7 +281,7 @@ export async function runRecursiveWalk(
           }
         }
         nodesThisDepth.push(node);
-        nextFrontier.push(next);
+        nextFrontier.push(nextEntry);
       }
       if (truncation === 'max_nodes' || truncation === 'both') break;
     }

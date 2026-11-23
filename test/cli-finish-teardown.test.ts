@@ -14,6 +14,7 @@ import {
   finishCliTeardown,
   flushThenExit,
   computeTeardownDeadlineMs,
+  resolveDrainTimeoutMs,
   TEARDOWN_DEADLINE_FLOOR_MS,
   setCliExitVerdict,
   currentExitCode,
@@ -45,18 +46,21 @@ function fakeStream(): MinimalWritable & { writes: string[] } {
 }
 
 describe('computeTeardownDeadlineMs', () => {
-  test('formula: sinks × drain + facts grace + 2 × pool bound + slack', () => {
+  test('formula: sinks × drain + disconnect drain + close bound + facts grace + 2 × pool bound + slack', () => {
     const poolEndBoundMs = POOL_END_TIMEOUT_SECONDS * 1000 + 500;
-    // 4 sinks × 2000 + 2000 + 2×poolEnd + 2000 — the Site B worst case that
-    // falsified the old static 10s (eng-review D9).
+    // #4143 widened the formula: disconnect() embeds a second drain pass
+    // (2000ms/sink) and PGLite's close is bounded at 5000ms — both budgeted
+    // so the backstop cannot fire while every component honors its bound.
     const got = computeTeardownDeadlineMs({ sinkCount: 4, drainTimeoutMs: 2000 });
-    expect(got).toBe(4 * 2000 + 2000 + 2 * poolEndBoundMs + 2000);
+    expect(got).toBe(4 * 2000 + 4 * 2000 + 5000 + 2000 + 2 * poolEndBoundMs + 2000);
     expect(got).toBeGreaterThan(10_000); // the codex-found arithmetic bug, pinned
   });
 
-  test('floors at TEARDOWN_DEADLINE_FLOOR_MS for small budgets', () => {
+  test('small budgets now exceed the floor (the #4143 disconnect-drain + close bounds dominate), floor stays as backstop', () => {
+    const poolEndBoundMs = POOL_END_TIMEOUT_SECONDS * 1000 + 500;
     const got = computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 });
-    expect(got).toBe(TEARDOWN_DEADLINE_FLOOR_MS);
+    expect(got).toBe(1 * 100 + 1 * 2000 + 5000 + 2000 + 2 * poolEndBoundMs + 2000);
+    expect(got).toBeGreaterThanOrEqual(TEARDOWN_DEADLINE_FLOOR_MS);
   });
 
   test('GBRAIN_TEARDOWN_DEADLINE_MS env override wins over the formula', async () => {
@@ -66,23 +70,23 @@ describe('computeTeardownDeadlineMs', () => {
   });
 
   test('garbage env values fall back to the formula', async () => {
+    const poolEndBoundMs = POOL_END_TIMEOUT_SECONDS * 1000 + 500;
+    const formula = 1 * 100 + 1 * 2000 + 5000 + 2000 + 2 * poolEndBoundMs + 2000;
     await withEnv({ GBRAIN_TEARDOWN_DEADLINE_MS: 'banana' }, async () => {
       expect(
         computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 }),
-      ).toBe(TEARDOWN_DEADLINE_FLOOR_MS);
+      ).toBe(formula);
     });
   });
 
   test('zero and negative env values fall back to the formula (not "fire immediately")', async () => {
+    const poolEndBoundMs = POOL_END_TIMEOUT_SECONDS * 1000 + 500;
+    const formula = 1 * 100 + 1 * 2000 + 5000 + 2000 + 2 * poolEndBoundMs + 2000;
     await withEnv({ GBRAIN_TEARDOWN_DEADLINE_MS: '0' }, async () => {
-      expect(computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 })).toBe(
-        TEARDOWN_DEADLINE_FLOOR_MS,
-      );
+      expect(computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 })).toBe(formula);
     });
     await withEnv({ GBRAIN_TEARDOWN_DEADLINE_MS: '-5' }, async () => {
-      expect(computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 })).toBe(
-        TEARDOWN_DEADLINE_FLOOR_MS,
-      );
+      expect(computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 })).toBe(formula);
     });
   });
 
@@ -105,13 +109,76 @@ describe('computeTeardownDeadlineMs', () => {
           drainTimeoutMs: 5000,
         });
         expect(withOne).toBeGreaterThan(TEARDOWN_DEADLINE_FLOOR_MS); // above the floor — delta is visible
-        expect(withTwo).toBe(withOne + 5000);
+        // Each sink now costs its exit-drain bound (5000 here) PLUS the fixed
+        // 2000ms disconnect-drain pass (#4143 second drain inside disconnect()).
+        expect(withTwo).toBe(withOne + 5000 + 2000);
       } finally {
         un2();
       }
     } finally {
       un1();
     }
+  });
+});
+
+describe('resolveDrainTimeoutMs', () => {
+  test('defaults to the 2000ms registry budget', () => {
+    expect(resolveDrainTimeoutMs()).toBe(2_000);
+  });
+
+  test('GBRAIN_DRAIN_TIMEOUT_MS env override wins over the default', async () => {
+    await withEnv({ GBRAIN_DRAIN_TIMEOUT_MS: '30000' }, async () => {
+      expect(resolveDrainTimeoutMs()).toBe(30_000);
+    });
+  });
+
+  test('garbage, zero, and negative env values fall back to the default', async () => {
+    await withEnv({ GBRAIN_DRAIN_TIMEOUT_MS: 'banana' }, async () => {
+      expect(resolveDrainTimeoutMs()).toBe(2_000);
+    });
+    await withEnv({ GBRAIN_DRAIN_TIMEOUT_MS: '0' }, async () => {
+      expect(resolveDrainTimeoutMs()).toBe(2_000);
+    });
+    await withEnv({ GBRAIN_DRAIN_TIMEOUT_MS: '-5' }, async () => {
+      expect(resolveDrainTimeoutMs()).toBe(2_000);
+    });
+  });
+
+  test('finishCliTeardown drains with the env-resolved budget when no explicit drainTimeoutMs', async () => {
+    await withEnv({ GBRAIN_DRAIN_TIMEOUT_MS: '12345' }, async () => {
+      let drainBudget = -1;
+      await finishCliTeardown({
+        engine: { disconnect: async () => {} },
+        deadlineMs: 250,
+        drain: async ({ timeoutMs }) => {
+          drainBudget = timeoutMs;
+        },
+        exit: () => {},
+        warn: () => {},
+        stdout: fakeStream(),
+        stderr: fakeStream(),
+      });
+      expect(drainBudget).toBe(12_345);
+    });
+  });
+
+  test('an explicit drainTimeoutMs still wins over the env override', async () => {
+    await withEnv({ GBRAIN_DRAIN_TIMEOUT_MS: '12345' }, async () => {
+      let drainBudget = -1;
+      await finishCliTeardown({
+        engine: { disconnect: async () => {} },
+        drainTimeoutMs: 777,
+        deadlineMs: 250,
+        drain: async ({ timeoutMs }) => {
+          drainBudget = timeoutMs;
+        },
+        exit: () => {},
+        warn: () => {},
+        stdout: fakeStream(),
+        stderr: fakeStream(),
+      });
+      expect(drainBudget).toBe(777);
+    });
   });
 });
 
@@ -185,7 +252,7 @@ describe('finishCliTeardown — backstop on hung teardown', () => {
       await teardown;
     } finally {
       _resetCliExitVerdictForTests();
-      process.exitCode = prevCode;
+      process.exitCode = prevCode ?? 0;
     }
   });
 
@@ -211,7 +278,7 @@ describe('finishCliTeardown — backstop on hung teardown', () => {
       await teardown;
     } finally {
       _resetCliExitVerdictForTests();
-      process.exitCode = prevCode;
+      process.exitCode = prevCode ?? 0;
     }
   });
 
@@ -238,7 +305,7 @@ describe('finishCliTeardown — backstop on hung teardown', () => {
       resolveHang();
       await teardown;
     } finally {
-      process.exitCode = prevCode;
+      process.exitCode = prevCode ?? 0;
     }
   });
 });
@@ -267,7 +334,7 @@ describe('verdict channel — immune to PGLite WASM process.exitCode writes', ()
       expect(currentExitCode()).toBe(1);
     } finally {
       _resetCliExitVerdictForTests();
-      process.exitCode = prevCode;
+      process.exitCode = prevCode ?? 0;
     }
   });
 
@@ -361,7 +428,7 @@ describe('flushThenExit', () => {
       expect(exits).toEqual([3]);
       expect(process.exitCode).toBe(3); // belt-and-braces for natural exit
     } finally {
-      process.exitCode = prevCode;
+      process.exitCode = prevCode ?? 0;
     }
   });
 
@@ -394,7 +461,7 @@ describe('flushThenExit', () => {
       expect(exits).toEqual([0]);
       expect(fencedAt).toBeGreaterThanOrEqual(0);
     } finally {
-      process.exitCode = prevCode;
+      process.exitCode = prevCode ?? 0;
     }
   });
 
@@ -422,7 +489,7 @@ describe('flushThenExit', () => {
       expect(exits).toEqual([0]);
       expect(Date.now() - t0).toBeGreaterThanOrEqual(100);
     } finally {
-      process.exitCode = prevCode;
+      process.exitCode = prevCode ?? 0;
     }
   });
 
@@ -448,7 +515,7 @@ describe('flushThenExit', () => {
       await sleep(50);
       expect(exits).toEqual([0]);
     } finally {
-      process.exitCode = prevCode;
+      process.exitCode = prevCode ?? 0;
     }
   });
 
@@ -468,7 +535,7 @@ describe('flushThenExit', () => {
         expect(exits).toEqual([0]); // grace 0: exit right after the fence
       });
     } finally {
-      process.exitCode = prevCode;
+      process.exitCode = prevCode ?? 0;
     }
   });
 
@@ -504,7 +571,7 @@ describe('flushThenExit', () => {
       await sleep(400);
       expect(exits).toEqual([0]); // exactly one exit despite guard + late cb
     } finally {
-      process.exitCode = prevCode;
+      process.exitCode = prevCode ?? 0;
     }
   });
 });

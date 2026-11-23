@@ -1,21 +1,22 @@
-import postgres from 'postgres';
+import postgres from '#postgres'
+import { claimOwner, isOneShotCommand } from './persistence/claim-phase.ts';
+import { traceSqlOptions } from './sql-trace.ts';
+import { tlsRequiredDefaultError, withPgTls } from './pg-tls.ts';
+import { beginReadWrite } from './postgres-engine/read-write-transactions.ts';
+import { warnPoolerPrepareOffOnce } from './pooler-notice.ts';
 import { GBrainError, type EngineConfig } from './types.ts';
-import { SCHEMA_SQL } from './schema-embedded.ts';
+import { SCHEMA_SQL } from './schema-embedded.generated.ts';
+import { applyPostgresForwardReferenceBootstrap } from './engine-sql/bootstrap.ts';
 import type { BrainEngine } from './engine.ts';
 import { verifySchema } from './schema-verify.ts';
+import { POOL_END_TIMEOUT_SECONDS } from './pool-end-timeout.ts';
+import { isConnectTimeoutError, isRetryableConnError } from './retry-matcher.ts';
+import { loadSharedParameterTypes, sharedArrayTypes, sharedParameterTypes, type SharedArrayTypes, type SharedParameterTypes } from './pg-type-cache.ts';
 
 let sql: ReturnType<typeof postgres> | null = null;
 let connectedUrl: string | null = null;
 
-/**
- * #1972: hard upper bound (seconds) on a single pool `.end()` drain. postgres.js
- * accepts `{ timeout }` but applies it internally — against PgBouncer
- * transaction-mode the drain can still hang, and a stubbed `.end()` ignores it
- * entirely. So `endPoolBounded` ALSO wraps each end in a gbrain-owned
- * Promise.race and passes this value as the postgres.js hint so a healthy drain
- * still finishes fast.
- */
-export const POOL_END_TIMEOUT_SECONDS = 2;
+export { POOL_END_TIMEOUT_SECONDS };
 
 /**
  * #1972: end a postgres.js pool with a gbrain-owned hard bound. Resolves as soon
@@ -34,9 +35,13 @@ export async function endPoolBounded(
   pool: { end: (opts?: { timeout?: number }) => Promise<void> },
 ): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  // The guard timer stays ref'd while the race is pending (#5332): an unref'd
+  // timer is dropped by a runtime with nothing else to wait on (and parked
+  // under `bun test` on Windows), so the never-settling .end() it exists for
+  // was the one case it did not bound. The finally clears it, so a healthy
+  // drain never holds the process open past the race.
   const guard = new Promise<void>((resolve) => {
     timer = setTimeout(resolve, POOL_END_TIMEOUT_SECONDS * 1000 + 500);
-    timer.unref?.();
   });
   try {
     await Promise.race([
@@ -104,6 +109,140 @@ export function resolvePrepare(url: string): boolean | undefined {
   return undefined;
 }
 
+/** Why a read-side pool got its `max_pipeline` (#6543); `/health?deep=1` reports it beside the live value. */
+export type ReadPoolPipelineReason = 'url_max_pipeline' | 'env_pgmax_pipeline' | 'transaction_pooler_port' | 'url_prepare_false' | 'gbrain_prepare_off' | 'default';
+
+/**
+ * #6543: the `max_pipeline` a read-side pool (the module singleton, an engine's
+ * instance pool, the connection manager's read pool) is built with. A
+ * transaction-mode pooler cannot carry statements pipelined on one client
+ * connection across transaction boundaries: through Supavisor they hung or came
+ * back with another statement's rows. So a transaction-mode URL (port 6543 or
+ * `?prepare=false`, read from the URL itself because `GBRAIN_PREPARE` wins
+ * inside `resolvePrepare`) or `GBRAIN_PREPARE=0` gets `0`. A session-mode
+ * pooler (Supabase's :5432) keeps pipelining. The driver lets the options
+ * object outrank the URL and `PGMAX_PIPELINE`, so `value` is null (the option
+ * stays unset and the driver reads them, default 100) whenever the URL names
+ * `max_pipeline` or `PGMAX_PIPELINE` is set and non-empty. The direct pool
+ * never calls this.
+ */
+export function resolveReadPoolPipeline(url: string): { value: number | null; reason: ReadPoolPipelineReason } {
+  const [beforeFragment = ''] = url.split('#', 1);
+  const queryAt = beforeFragment.indexOf('?');
+  const params = new URLSearchParams(queryAt >= 0 ? beforeFragment.slice(queryAt + 1) : '');
+  if (params.has('max_pipeline')) return { value: null, reason: 'url_max_pipeline' };
+  if ((process.env.PGMAX_PIPELINE ?? '').trim() !== '') return { value: null, reason: 'env_pgmax_pipeline' };
+  let port = '';
+  try { port = new URL(url.replace(/^postgres(ql)?:\/\//, 'http://')).port; } catch { /* unparseable: no port */ }
+  if (AUTO_DETECT_PORTS.has(port)) return { value: 0, reason: 'transaction_pooler_port' };
+  if (params.get('prepare') === 'false') return { value: 0, reason: 'url_prepare_false' };
+  if (process.env.GBRAIN_PREPARE === 'false' || process.env.GBRAIN_PREPARE === '0') return { value: 0, reason: 'gbrain_prepare_off' };
+  return { value: null, reason: 'default' };
+}
+
+/** The read-side pool option `resolveReadPoolPipeline` decides: `{ max_pipeline: 0 }` or nothing. */
+export function readPoolPipelineOptions(url: string): { max_pipeline?: number } {
+  const { value } = resolveReadPoolPipeline(url);
+  return value === null ? {} : { max_pipeline: value };
+}
+
+/** Pipeline depth inside a transaction on a pool that does not pipeline across transactions (#6930). */
+export const TRANSACTION_PIPELINE_DEPTH = 100;
+
+/**
+ * #6930: a read-side pool that `resolveReadPoolPipeline` keeps from pipelining (a transaction-mode pooler) still
+ * pipelines the statements of one transaction on the connection its owner holds (sql.begin, sql.reserve): the pooler
+ * pins one server connection from BEGIN until the transaction ends, and the driver never sends a statement behind one
+ * that may end the transaction, so #6543's boundary stays closed. Prepared statements stay off (`resolvePrepare`).
+ * `GBRAIN_PG_TXN_PIPELINE=0` restores one round trip per statement.
+ */
+export function transactionPipelineOptions(url: string): { transaction_pipeline?: number } {
+  const off = process.env.GBRAIN_PG_TXN_PIPELINE === '0' || process.env.GBRAIN_PG_TXN_PIPELINE === 'false';
+  return !off && resolveReadPoolPipeline(url).value === 0 ? { transaction_pipeline: TRANSACTION_PIPELINE_DEPTH } : {};
+}
+
+/**
+ * Seconds a pool waits for a connection before giving up with CONNECT_TIMEOUT
+ * when its URL names no `connect_timeout` of its own.
+ */
+const FALLBACK_CONNECT_TIMEOUT_S = 10;
+
+/**
+ * Upper bound for a URL-supplied `connect_timeout`. postgres.js arms the
+ * connect timer with `setTimeout(seconds * 1000)`, and a delay past 2^31-1 ms
+ * does not fit the runtime's timer: Bun and Node replace it with 1 ms, so a
+ * "wait practically forever" value would fail every connect at once.
+ */
+const MAX_CONNECT_TIMEOUT_S = Math.floor(0x7fffffff / 1000);
+
+/**
+ * #5984: the store a pool shares described parameter types in (the vendored
+ * driver's `shared_types`): one per database target in this process, saved for
+ * the next process (src/core/pg-type-cache.ts). A connection running a statement
+ * for the first time then skips the describe round trip and keeps pipelining.
+ * On by default; GBRAIN_PG_TYPE_CACHE=0 turns it off.
+ */
+export function resolveSharedTypes(url?: string): SharedParameterTypes | false {
+  return sharedParameterTypes(url);
+}
+/** #6930: the array types every pool for this database target shares, so only the process's first connection fetches them. */
+export function resolveArrayTypes(url?: string): SharedArrayTypes | null {
+  return sharedArrayTypes(url);
+}
+/** Forgets the shared parameter and array types of these pools; a schema change may have changed them. */
+export function clearSharedTypes(...pools: unknown[]): void {
+  for (const pool of pools) {
+    const options = (pool as { options?: { shared_types?: Map<string, number[]> | null; array_types?: SharedArrayTypes | null } } | null)?.options;
+    options?.shared_types?.clear();
+    if (options?.array_types) options.array_types.rows = null;
+  }
+}
+
+/**
+ * A new pool's connection check. It also reads the scope of the saved parameter
+ * types (server version, schema version and the database as the server names
+ * it) in the same round trip and loads them; a database without a `config`
+ * table falls back to `SELECT 1`.
+ */
+/** `persisted: false` (an engine opened from settings) keeps the shared descriptions in this process and reads no file under the home. */
+export async function checkPoolAndLoadSharedTypes(pool: ReturnType<typeof postgres>, url: string, opts: { persisted?: boolean } = {}): Promise<void> {
+  let rows: Array<{ server: string; schema: string | null; database: string | null }>;
+  try {
+    rows = await pool.unsafe(`SELECT current_setting('server_version_num') AS server, (SELECT value FROM config WHERE key='version') AS schema,
+      current_database() || '@' || coalesce(host(inet_server_addr()), '') || ':' || coalesce(inet_server_port()::text, '') || '?' || current_user AS database`) as unknown as typeof rows;
+  } catch (err) {
+    if ((err as { code?: string }).code !== '42P01') throw err;
+    await pool`SELECT 1`;
+    return;
+  }
+  if (opts.persisted !== false) loadSharedParameterTypes(url, String(rows[0]?.server ?? ''), rows[0]?.schema ?? null, rows[0]?.database ?? null);
+}
+
+/**
+ * The `connect_timeout` each postgres() pool is built with, read from that
+ * pool's own URL.
+ *
+ * Every call site has to pass the option explicitly (an unset option would
+ * drop to postgres.js's 30s default), and postgres.js lets an explicit option
+ * override the URL query. So the URL's value is honoured only if we read it
+ * here and hand it back. The query is located the way the driver's `new URL()`
+ * does (after the first `?`, before any `#`), so userinfo and host text are
+ * never consulted. Accepted: whole seconds, surrounding blanks allowed, capped
+ * at MAX_CONNECT_TIMEOUT_S. Everything else, including `0` (no timer at all in
+ * postgres.js), keeps the fallback so no gbrain connect waits unbounded.
+ */
+export function resolveUrlConnectTimeout(url: string): number {
+  const [beforeFragment = ''] = url.split('#', 1);
+  const queryAt = beforeFragment.indexOf('?');
+  if (queryAt < 0) return FALLBACK_CONNECT_TIMEOUT_S;
+
+  const requested = new URLSearchParams(beforeFragment.slice(queryAt + 1)).get('connect_timeout');
+  const digits = requested?.match(/^\s*(\d+)\s*$/)?.[1];
+  const seconds = digits === undefined ? 0 : parseInt(digits, 10);
+  if (seconds < 1) return FALLBACK_CONNECT_TIMEOUT_S;
+  return Math.min(seconds, MAX_CONNECT_TIMEOUT_S);
+}
+
 export function resolvePoolSize(explicit?: number): number {
   if (typeof explicit === 'number' && explicit > 0) return explicit;
   const raw = process.env.GBRAIN_POOL_SIZE;
@@ -112,6 +251,55 @@ export function resolvePoolSize(explicit?: number): number {
     if (Number.isFinite(parsed) && parsed > 0) return parsed;
   }
   return DEFAULT_POOL_SIZE_FALLBACK;
+}
+
+let warnedBadMaxLifetime = false;
+/** Test-only: reset the warn-once latch. */
+export function _resetMaxLifetimeWarningForTests(): void {
+  warnedBadMaxLifetime = false;
+}
+
+/**
+ * Client-pool connection max lifetime for every postgres() call site
+ * (module singleton, engine instance pool, ConnectionManager read + direct
+ * pools).
+ *
+ * postgres.js already defaults to `60 * (30 + Math.random() * 30)` — and
+ * critically that built-in default is a FUNCTION, re-evaluated PER
+ * CONNECTION (connection.js: `typeof seconds === 'function' ? seconds() :
+ * seconds`), so each connection gets its own 30–60min deadline. A
+ * pre-evaluated number would make every connection in a pool share ONE
+ * recycle deadline — a warm-up burst then reconnects simultaneously
+ * (data-migration specialist finding). The default here is therefore the
+ * same per-connection jitter function; only the env override returns a
+ * fixed number (the explicit escape hatch):
+ *
+ *   GBRAIN_POOL_MAX_LIFETIME_S=900   # recycle after 15 min
+ *   GBRAIN_POOL_MAX_LIFETIME_S=0     # disable recycling entirely
+ *
+ * max_lifetime only recycles connections as they are RETURNED to the pool;
+ * it cannot reclaim a leaked checkout — this is explicitness + a knob, not
+ * a starvation fix. Invalid values warn once on stderr and fall back to the
+ * default. The env param is injectable so tests never mutate process.env.
+ */
+export function resolveMaxLifetimeSeconds(
+  env: Record<string, string | undefined> = process.env,
+): number | null | (() => number) {
+  const raw = env.GBRAIN_POOL_MAX_LIFETIME_S;
+  if (raw !== undefined && raw !== '') {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && Number.isInteger(parsed) && parsed >= 0) {
+      return parsed === 0 ? null : parsed;
+    }
+    if (!warnedBadMaxLifetime) {
+      warnedBadMaxLifetime = true;
+      process.stderr.write(
+        `[gbrain] Ignoring invalid GBRAIN_POOL_MAX_LIFETIME_S=${JSON.stringify(raw)} (want a non-negative integer of seconds; 0 disables); using the jittered 30-60min default\n`,
+      );
+    }
+  }
+  // Per-connection jitter, matching the postgres.js built-in default shape.
+  return () => Math.floor(60 * (30 + Math.random() * 30));
 }
 
 /**
@@ -143,19 +331,116 @@ export function resolvePoolSize(explicit?: number): number {
  * Set any env var to '0' or 'off' to disable that GUC entirely.
  *
  * Delivered via postgres.js's `connection` option, which sends these as
- * startup parameters in the initial connection packet. Works correctly
- * with PgBouncer session mode AND transaction mode: startup parameters
- * pass through to the backend on connection creation and persist for the
- * backend's lifetime (unlike `SET` commands which transaction-mode
- * PgBouncer strips between transactions).
+ * startup parameters in the initial connection packet. A direct server and a
+ * session-mode pooler apply them for the backend's lifetime. A transaction-mode
+ * pooler does not: PgBouncer and Supavisor (Supabase :6543) drop or ignore
+ * startup parameters, so `SHOW statement_timeout` through them reads `0` and no
+ * server-side timeout bounds an autocommit statement (#6543; doctor's
+ * `persistence_session_timeouts` and serve's transport line report it, and
+ * `ALTER ROLE ... SET statement_timeout` is the fix there).
  *
  * Supersedes the v0.21.0 `setSessionDefaults(sql)` helper, which used
- * a post-pool `SET` command. That approach is unreliable in PgBouncer
- * transaction mode (transaction-mode poolers strip session-state SETs
- * between transactions); startup parameters are durable.
+ * a post-pool `SET` command; transaction-mode poolers strip session-state
+ * SETs between transactions.
  */
 const DEFAULT_STATEMENT_TIMEOUT = '5min';
 const DEFAULT_IDLE_TX_TIMEOUT = '5min';
+
+/**
+ * #6317 (C1): the `application_name` every gbrain pool starts its connections
+ * with, `gbrain <kind>:<pid>:<nonce8>`, so `writer status` can find the owner
+ * process's backends in `pg_stat_activity` (and a ClientRead wedge is visible
+ * in one command). Through a transaction-mode pooler the server connection is
+ * shared, so the mapping is partial; readers say `backend_visibility: pooled`.
+ */
+export function gbrainApplicationName(): string {
+  const owner = claimOwner();
+  return `gbrain ${owner.kind}:${owner.pid}:${(owner.nonce ?? '').slice(0, 8)}`.slice(0, 63);
+}
+
+/**
+ * #6383: the driver's pool-health hooks and the in-flight watchdog budget, one
+ * set per pool. `PoolHealthHooks` is what an engine passes to every pool it
+ * opens; `poolHealthOptions` turns it into postgres.js options.
+ */
+/** #6543 (A4): `reason` is `age` when the statement kept receiving bytes past its budget, `idle` when nothing came back; `budget_ms` is that statement's own cap. */
+export interface StuckConnectionInfo { age_ms: number; queued: number; statement: string; reason?: 'age' | 'idle'; budget_ms?: number }
+/** #6543 (A6): a connection the driver retired for an incident (`stuck`, `desync`, `closed` under statements) reconnected, or failed to. */
+export interface ConnectionRecoveryInfo { connection: number; cause: 'stuck' | 'desync' | 'closed'; code?: string }
+export interface PoolHealthHooks {
+  /** #5730: a connection came back to the pool inside a transaction and was discarded. */
+  onpoisoned?: (status: string) => void;
+  /** #6383: the in-flight watchdog retired a connection whose statement never answered. */
+  onstuck?: (info: StuckConnectionInfo) => void;
+  /** #6383: a statement failed to build (`UNDEFINED_VALUE`, `MAX_PARAMETERS_EXCEEDED`) and was rejected alone; #6543: `parameter` is the undefined one's 1-based index. */
+  onbuilderror?: (code: string, statement: string, parameter?: number) => void;
+  /** An answer arrived on a connection with no statement waiting for it; the driver retired the connection. */
+  ondesync?: (info: DesyncConnectionInfo) => void;
+  /** #6543 (A6): a connection retired by an incident completed a new startup. */
+  onrecovered?: (info: ConnectionRecoveryInfo) => void;
+  /** #6543 (A6): the reconnect of a connection retired by an incident failed. */
+  onrecoveryfailed?: (info: ConnectionRecoveryInfo) => void;
+}
+export interface DesyncConnectionInfo { message: string; connection: number; statement: string }
+
+const DEFAULT_STUCK_GRACE_MS = 30_000;
+
+/** A `statement_timeout` GUC value in milliseconds (a bare number is milliseconds), or null when unset or 0. */
+export function gucMilliseconds(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  const m = /^\s*(\d+(?:\.\d+)?)\s*(us|ms|s|min|h|d)?\s*$/i.exec(value);
+  if (!m) return null;
+  const n = Number(m[1]);
+  const unit = (m[2] ?? 'ms').toLowerCase();
+  const ms = unit === 'us' ? n / 1000 : unit === 'ms' ? n : unit === 's' ? n * 1000 : unit === 'min' ? n * 60_000 : unit === 'h' ? n * 3_600_000 : n * 86_400_000;
+  return ms > 0 ? ms : null;
+}
+
+/**
+ * #6383: the pool's in-flight budget in seconds: its `statement_timeout` plus
+ * `GBRAIN_PG_STUCK_GRACE_MS` (default 30000). The driver retires a connection
+ * whose head statement waits that long with nothing coming back (`reason=idle`)
+ * or, since #6543, runs that long in total while bytes keep arriving
+ * (`reason=age`). A statement whose operation declared a longer
+ * `statement_timeout` on its connection gets that timeout plus the grace; a
+ * declared 0 has no cap. Null, which disables the watchdog, when the statement
+ * timeout is off or the grace is `0`/`off`.
+ */
+export function resolveInflightTimeoutSeconds(statementTimeout: string | undefined): number | null {
+  const grace = resolveStuckGraceMs();
+  const budget = gucMilliseconds(statementTimeout);
+  return budget === null || grace === null ? null : Math.ceil((budget + grace) / 1000);
+}
+
+/** `GBRAIN_PG_STUCK_GRACE_MS` (default 30000), or null when it is `0`/`off` (the watchdog is disabled). */
+export function resolveStuckGraceMs(): number | null {
+  const raw = process.env.GBRAIN_PG_STUCK_GRACE_MS;
+  if (raw === '0' || raw === 'off') return null;
+  return raw !== undefined && Number.isFinite(Number(raw)) && Number(raw) > 0 ? Number(raw) : DEFAULT_STUCK_GRACE_MS;
+}
+
+/**
+ * The postgres.js options for `PoolHealthHooks` on a pool whose connections start with `connection.statement_timeout`.
+ * #6543 (A4): the same budget caps a statement's total age (`inflight_max`, never reset by received bytes) and its
+ * silence (`inflight_timeout`). The driver raises both for a statement whose operation declared a longer
+ * `statement_timeout` on its connection (to that timeout plus `inflight_grace`) and drops both for a declared 0, so
+ * the budget travels with the operation and does not depend on a session `SET` reaching the backend.
+ */
+export function poolHealthOptions(hooks: PoolHealthHooks | undefined, statementTimeout: string | undefined): Record<string, unknown> {
+  const seconds = resolveInflightTimeoutSeconds(statementTimeout);
+  const grace = resolveStuckGraceMs();
+  return {
+    onpoisoned: hooks?.onpoisoned,
+    onstuck: hooks?.onstuck,
+    onbuilderror: hooks?.onbuilderror,
+    ondesync: hooks?.ondesync,
+    onrecovered: hooks?.onrecovered,
+    onrecoveryfailed: hooks?.onrecoveryfailed,
+    inflight_timeout: seconds,
+    inflight_max: seconds,
+    inflight_grace: seconds === null || grace === null ? null : grace / 1000,
+  };
+}
 
 export function resolveSessionTimeouts(): Record<string, string> {
   const out: Record<string, string> = {};
@@ -214,7 +499,7 @@ export function getConnection(): ReturnType<typeof postgres> {
  *
  * Back-compat: callers that ignore the return value are unaffected.
  */
-export async function connect(config: EngineConfig): Promise<boolean> {
+export async function connect(config: EngineConfig, hooks: PoolHealthHooks = {}): Promise<boolean> {
   if (sql) {
     // Warn if a different URL is passed — the old connection is still in use
     if (config.database_url && connectedUrl && config.database_url !== connectedUrl) {
@@ -236,9 +521,11 @@ export async function connect(config: EngineConfig): Promise<boolean> {
     const prepare = resolvePrepare(url);
     const timeouts = resolveSessionTimeouts();
     const opts: Record<string, unknown> = {
-      max: resolvePoolSize(),
+      max: resolvePoolSize(config.pool_max),
       idle_timeout: 20,
-      connect_timeout: 10,
+      connect_timeout: resolveUrlConnectTimeout(url),
+      // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
+      max_lifetime: resolveMaxLifetimeSeconds(),
       types: {
         // Register pgvector type
         bigint: postgres.BigInt,
@@ -248,22 +535,24 @@ export async function connect(config: EngineConfig): Promise<boolean> {
       // during migrations + initSchema, and breaks stdout-parsing callers like
       // `gbrain jobs submit --json | ...`). Opt back in with GBRAIN_PG_NOTICES=1.
       onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
+      ...poolHealthOptions(hooks, timeouts.statement_timeout),
+      shared_types: resolveSharedTypes(url),
+      array_types: resolveArrayTypes(url),
+      ...readPoolPipelineOptions(url),
+      ...transactionPipelineOptions(url),
     };
-    if (Object.keys(timeouts).length > 0) {
-      opts.connection = timeouts;
-    }
+    opts.connection = { ...timeouts, application_name: gbrainApplicationName() };
     if (typeof prepare === 'boolean') {
       opts.prepare = prepare;
-      if (!prepare) {
-        console.warn(
-          '[gbrain] Prepared statements disabled (PgBouncer transaction-mode convention on port 6543). Override with GBRAIN_PREPARE=true if your pooler runs in session mode.',
-        );
-      }
+      if (!prepare) warnPoolerPrepareOffOnce(url);
     }
-    sql = postgres(url, opts);
+    sql = postgres(url, traceSqlOptions(withPgTls(url, opts), 'module'));
 
+    // GBRA-156: a one-shot command's startup reads its retired-marker state beside its persistence row, which opened the
+    // pool's second connection on the critical path (about three round trips behind a pooler); it opens beside the first.
+    if (isOneShotCommand() && Number(opts.max) >= 3) sql`SELECT 1`.catch(() => undefined);
     // Test connection
-    await sql`SELECT 1`;
+    await checkPoolAndLoadSharedTypes(sql, url);
     connectedUrl = url;
 
     await setSessionDefaults(sql);
@@ -271,11 +560,13 @@ export async function connect(config: EngineConfig): Promise<boolean> {
   } catch (e: unknown) {
     sql = null;
     connectedUrl = null;
+    const tlsRefusal = await tlsRequiredDefaultError(url, e);
+    if (tlsRefusal) throw tlsRefusal;
     const msg = e instanceof Error ? e.message : String(e);
     throw new GBrainError(
       'Cannot connect to database',
       msg,
-      'Check your connection URL in ~/.gbrain/config.json',
+      'Check the database URL; `gbrain engine status --probe` names where it comes from (environment variable or the config file under GBRAIN_HOME)',
     );
   }
 }
@@ -305,8 +596,16 @@ export async function disconnect(): Promise<void> {
 export async function initSchema(): Promise<void> {
   const conn = getConnection();
   // Advisory lock prevents concurrent initSchema() calls from deadlocking
+  // Lock-census (PR6 D5): INTENTIONALLY brain-global (session lock, fixed key 42) — schema replay mutates the whole database, not one source.
   await conn`SELECT pg_advisory_lock(42)`;
   try {
+    // #4477: run the same forward-reference bootstrap as
+    // PostgresEngine.initSchema BEFORE replaying the schema blob. Without
+    // it, an older brain whose tables predate the blob's forward-referenced
+    // columns (e.g. pages.deleted_at ← pages_deleted_at_purge_idx) wedges
+    // on the blob's CREATE INDEX. Idempotent single-probe no-op on fresh
+    // installs and modern brains.
+    await applyPostgresForwardReferenceBootstrap(conn);
     await conn.unsafe(SCHEMA_SQL);
   } finally {
     await conn`SELECT pg_advisory_unlock(42)`;
@@ -316,31 +615,33 @@ export async function initSchema(): Promise<void> {
 export { verifySchema } from './schema-verify.ts';
 
 export async function withTransaction<T>(fn: (tx: ReturnType<typeof postgres>) => Promise<T>): Promise<T> {
-  const conn = getConnection();
-  return conn.begin(async (tx) => {
-    return fn(tx as unknown as ReturnType<typeof postgres>);
-  }) as Promise<T>;
+  return beginReadWrite(getConnection(), async (tx) => fn(tx as unknown as ReturnType<typeof postgres>));
 }
 
-const RETRYABLE_DB_CONNECT_PATTERNS = [
-  /password authentication failed/i,
-  /connection refused/i,
-  /the database system is starting up/i,
-  /Connection terminated unexpectedly/i,
-  /ECONNRESET/i,
-];
-
-export function isRetryableDbConnectError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  if (!msg) return false;
-  return RETRYABLE_DB_CONNECT_PATTERNS.some(p => p.test(msg));
-}
+// issue #1720 (proposal 4): the startup connect matcher and the runtime
+// matcher drifted — this used to be a private 5-pattern list that predated
+// /connection.*closed/i and the CONNECTION_ENDED/CONNECTION_CLOSED codes, so
+// a pooler close hitting connectWithRetry was treated as permanent. One
+// canonical source now: retry-matcher.ts's isRetryableConnError (a strict
+// superset of the old list). Do NOT reintroduce a local pattern list here;
+// the agreement guard in test/worker-conn-resilience-1720.test.ts pins it.
+export const isRetryableDbConnectError = isRetryableConnError;
 
 export interface ConnectWithRetryOpts {
   attempts?: number;
   baseDelayMs?: number;
   noRetry?: boolean;
   log?: (line: string) => void;
+  /**
+   * Also retry postgres.js CONNECT_TIMEOUT (#5946). Set it only when this
+   * process already holds a connection to the same database_url, as the
+   * per-worker pools of parallel import and incremental sync do: the route is
+   * then known to work, so a missed handshake timer means the handshake was
+   * starved (typically by a long synchronous stretch on this event loop), and
+   * no session existed yet, so dialing again is safe. Every other caller
+   * keeps failing fast on a timeout, which usually means a bad route.
+   */
+  retryConnectTimeout?: boolean;
 }
 
 export async function connectWithRetry(
@@ -360,7 +661,7 @@ export async function connectWithRetry(
       return;
     } catch (e: unknown) {
       lastErr = e;
-      const retryable = isRetryableDbConnectError(e);
+      const retryable = isRetryableDbConnectError(e) || (opts.retryConnectTimeout === true && isConnectTimeoutError(e));
       const isLast = i === attempts - 1;
       if (!retryable || isLast) {
         throw e;

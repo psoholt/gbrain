@@ -3,18 +3,33 @@
  *
  * Architecture (codex round 2 #3 + D11 + D2 + D13):
  *
- * - Op-layer, NOT engine-layer. This module is called from the `search` /
- *   `query` / `get_page` op handlers in `operations.ts` AFTER the engine
- *   returns. Internal callers (sync, migrations, helper flows) bypass the
- *   op layer entirely, so this never fires from `import-file.ts`, the
- *   dream cycle, doctor probes, etc. Pure signal: "a user-facing surface
+ * - Op-layer, NOT engine-layer. The writers are the `search`, `query`,
+ *   `get_page` and `fetch` op handlers and `recall`'s `query` arm (the page
+ *   search it runs beside the facts), each AFTER the engine returns; recall's
+ *   facts-only reads write nothing. test/last-retrieved-writers.test.ts pins
+ *   this list, so a new reader that bumps is a deliberate choice. Internal
+ *   callers (sync, migrations, helper flows) bypass the op layer entirely,
+ *   so this never fires from `import-file.ts`, the dream cycle, doctor
+ *   probes, etc. Pure signal: "a user-facing surface
  *   just surfaced this page."
  *
- * - 5-min throttle (D2). The UPDATE includes a `WHERE last_retrieved_at IS
- *   NULL OR last_retrieved_at < NOW() - INTERVAL '5 minutes'` clause so
- *   hot pages surfaced by many concurrent searches don't pile up MVCC
- *   row versions. ~90% of writes skipped in steady state on a heavily-
- *   searched brain. Mirrors `embedded_at` reset gating in `upsertChunks`.
+ * - 5-min throttle (D2). The upsert only moves a timestamp older than
+ *   5 minutes, so hot pages surfaced by many concurrent searches don't pile
+ *   up MVCC row versions. ~90% of writes skipped in steady state on a
+ *   heavily-searched brain. Mirrors `embedded_at` reset gating in
+ *   `upsertChunks`.
+ *
+ * - Narrow side table (migration v224). The timestamp lives in
+ *   `page_retrievals(page_id, last_retrieved_at)`, not on `pages`: an UPDATE
+ *   of `pages` fired seven triggers per statement, wrote a new wide heap
+ *   tuple plus an entry in every pages index, and advanced
+ *   `page_generation_clock_seq` even when the throttle matched no row, which
+ *   expired the query-cache bookmark, the get_health memo and the projection
+ *   readiness memo on every read. The upsert is a HOT update of a 40-byte
+ *   row with no triggers. Readers take
+ *   `GREATEST(pages.last_retrieved_at, page_retrievals.last_retrieved_at)`:
+ *   the migration copied the column, and a mixed-version writer still
+ *   updating `pages.last_retrieved_at` stays visible.
  *
  * - Default-on with `search.track_retrieval` config escape hatch (D13).
  *   Operators worried about per-search write amplification can opt out:
@@ -34,10 +49,13 @@
  */
 
 import type { BrainEngine } from './engine.ts';
-import { isUndefinedColumnError } from './utils.ts';
-import { registerBackgroundWorkDrainer } from './background-work.ts';
+import { isMissingSchemaObject } from './utils.ts';
+import { deferUntilResponse, registerBackgroundWorkDrainer } from './background-work.ts';
+import { engineKey } from './engine-key.ts';
+import { noteReturnedPages } from './access/read-log.ts';
 
-let _trackRetrievalCache: { ts: number; enabled: boolean } | null = null;
+/** Per engine, so each mounted brain honors its own setting. */
+let _trackRetrievalCache = new WeakMap<object, { ts: number; enabled: boolean }>();
 const TRACK_RETRIEVAL_CACHE_TTL_MS = 30_000;
 
 /**
@@ -135,14 +153,16 @@ registerBackgroundWorkDrainer({
 });
 
 /**
- * Resolve `search.track_retrieval` config with a 30s in-process cache so
- * hot-path callers don't pay a SELECT per search. Default-on: missing
+ * Resolve `search.track_retrieval` config with a 30s in-process cache per
+ * engine so hot-path callers don't pay a SELECT per search. Default-on: missing
  * config OR unparseable value → true (D13 default).
  */
 async function isTrackingEnabled(engine: BrainEngine): Promise<boolean> {
   const now = Date.now();
-  if (_trackRetrievalCache && now - _trackRetrievalCache.ts < TRACK_RETRIEVAL_CACHE_TTL_MS) {
-    return _trackRetrievalCache.enabled;
+  const key = engineKey(engine);
+  const cached = _trackRetrievalCache.get(key);
+  if (cached && now - cached.ts < TRACK_RETRIEVAL_CACHE_TTL_MS) {
+    return cached.enabled;
   }
   let enabled = true;
   try {
@@ -153,25 +173,43 @@ async function isTrackingEnabled(engine: BrainEngine): Promise<boolean> {
   } catch {
     // getConfig miss / connection blip → default to enabled (D13 default).
   }
-  _trackRetrievalCache = { ts: now, enabled };
+  _trackRetrievalCache.set(key, { ts: now, enabled });
   return enabled;
 }
 
 /** Test seam — drops the cache so subsequent calls re-read config. */
 export function _resetTrackRetrievalCacheForTests(): void {
-  _trackRetrievalCache = null;
+  _trackRetrievalCache = new WeakMap();
 }
+
+/**
+ * $1 page ids. Ids of pages that do not exist are skipped, as the UPDATE of
+ * `pages` skipped them. The SELECT drops rows still inside the window before
+ * the upsert, because ON CONFLICT locks (and so dirties) a conflicting row even
+ * when its WHERE then skips it; the ON CONFLICT test keeps a concurrent bump
+ * from moving a row twice.
+ */
+export const BUMP_LAST_RETRIEVED_SQL = `INSERT INTO page_retrievals (page_id, last_retrieved_at)
+  SELECT p.id, NOW() FROM pages p LEFT JOIN page_retrievals r ON r.page_id = p.id
+   WHERE p.id = ANY($1::int[]) AND (r.page_id IS NULL OR r.last_retrieved_at < NOW() - INTERVAL '5 minutes')
+  ON CONFLICT (page_id) DO UPDATE SET last_retrieved_at = EXCLUDED.last_retrieved_at
+    WHERE page_retrievals.last_retrieved_at < NOW() - INTERVAL '5 minutes'`;
 
 /**
  * Bump `last_retrieved_at` on the given page_ids. Fire-and-forget — caller
  * MUST NOT await this for the op response. Empty ids list is a no-op.
  *
  * @param engine The BrainEngine handling the op.
- * @param pageIds The page ids surfaced by the op (search hits, query results,
- *   or the single id returned by get_page).
+ * @param pageIds The page ids surfaced by the op (search, query or recall
+ *   query hits, or the single page get_page or fetch returned).
  */
 export function bumpLastRetrievedAt(engine: BrainEngine, pageIds: number[]): void {
   if (pageIds.length === 0) return;
+  noteReturnedPages(pageIds);
+  deferUntilResponse(() => startBump(engine, pageIds));
+}
+
+function startBump(engine: BrainEngine, pageIds: number[]): void {
   // Fire-and-forget on purpose for callers (MCP, internal). The CLI
   // path awaits the drain helper below before disconnecting, which
   // is how #1247/#1269/#1290 are fixed without exposing the IIFE
@@ -180,21 +218,14 @@ export function bumpLastRetrievedAt(engine: BrainEngine, pageIds: number[]): voi
     try {
       const enabled = await isTrackingEnabled(engine);
       if (!enabled) return;
-      // 5-minute throttle (D2) + best-effort. The UPDATE is idempotent:
+      // 5-minute throttle (D2) + best-effort. The upsert is idempotent:
       // setting last_retrieved_at = NOW() multiple times in a row is the
       // same as setting it once (TIMESTAMPTZ comparison is monotonic).
-      await engine.executeRaw(
-        `UPDATE pages
-           SET last_retrieved_at = NOW()
-           WHERE id = ANY($1::int[])
-             AND (last_retrieved_at IS NULL
-                  OR last_retrieved_at < NOW() - INTERVAL '5 minutes')`,
-        [pageIds]
-      );
+      await engine.executeRaw(BUMP_LAST_RETRIEVED_SQL, [pageIds]);
     } catch (err) {
-      // Pre-v77 brain (column missing) falls through silently — the search
+      // Pre-v224 brain (table missing) falls through silently — the search
       // op already returned, the LSD signal just stays NULL until upgrade.
-      if (isUndefinedColumnError(err, 'last_retrieved_at')) return;
+      if (isMissingSchemaObject(err, 'table', 'page_retrievals')) return;
       // Other errors: stderr-warn but don't break the op response.
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[last-retrieved] write-back failed (best-effort): ${msg}`);

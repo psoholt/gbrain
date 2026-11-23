@@ -21,6 +21,9 @@ set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT"
+# Seam: GBRAIN_GUARD_ROOT points the scan at a fixture tree's skills/; the
+# doctor that runs it is always this checkout's CLI.
+SKILLS_ROOT="${GBRAIN_GUARD_ROOT:-$ROOT}"
 
 # Run doctor with this repo's own skills as the explicit target.
 #
@@ -39,7 +42,7 @@ TMPOUT="$(mktemp -t gbrain-doctor-XXXXXXXX)"
 # shellcheck disable=SC2064
 trap "rm -f \"$TMPOUT\"" EXIT
 
-GBRAIN_SKILLS_DIR="$ROOT/skills" bun run src/cli.ts doctor --fast --json >"$TMPOUT" 2>/dev/null || true
+GBRAIN_SKILLS_DIR="$SKILLS_ROOT/skills" bun run src/cli.ts doctor --fast --json >"$TMPOUT" 2>/dev/null || true
 
 # Extract the skill_brain_first check status. Use python3 (already a
 # repo-wide dependency via image-decoders + admin tooling) so we don't

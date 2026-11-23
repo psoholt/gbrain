@@ -13,7 +13,7 @@ Step-by-step walkthroughs that take you from zero to a working outcome. Concrete
 
 These are the next tutorials on the roadmap. Open an issue if one of them is the one you need most; that's how we'll prioritize.
 
-- **Set up GBrain for VC dealflow** — the operator's recipe. People pages for founders, companies with typed Facts fence carrying ARR / team-size / runway across dates, meetings auto-ingested, deal pages linking everything. Shows `gbrain whoknows`, `gbrain find_trajectory`, and `gbrain founder scorecard` on real workflows.
+- **Set up GBrain for VC dealflow** — the operator's recipe. People pages for founders, companies with typed Facts fence carrying ARR / team-size / runway across dates, meetings auto-ingested, deal pages linking everything. Shows `gbrain whoknows`, `gbrain find-trajectory`, and `gbrain founder scorecard` on real workflows.
 
 - **Migrate your existing vault into GBrain** — for Notion / Obsidian / Roam users with a vault that doesn't match GBrain's default layout. Walks through `gbrain schema detect` → `suggest` → `review-candidates` so the brain learns your shape instead of forcing you to learn its.
 
@@ -32,5 +32,6 @@ Tutorials follow the [Diataxis](https://diataxis.fr/) tutorial pattern: learning
 - **Reference:** [`docs/architecture/`](../architecture/) — system design, topologies, retrieval theory
 - **How-to:** [`docs/guides/`](../guides/) — task-oriented runbooks (sub-agent routing, minion deployment, skill development, brain-first lookup, idea capture, diligence ingestion). Highlight: [scaling skills past 300](../guides/scaling-skills.md) — the three-tier architecture for agents that have outgrown the always-loaded skill manifest.
 - **Integrations:** [`docs/integrations/`](../integrations/) — connecting external data sources (voice, email, calendar, embedding providers)
-- **MCP setup:** [`docs/mcp/`](../mcp/) — per-client setup (Claude Desktop, Code, Cursor, ChatGPT, Perplexity, Cowork)
+- **MCP setup:** [`docs/mcp/`](../mcp/) — per-client setup (Claude Desktop, Claude Code, Codex, ChatGPT, Perplexity, Cowork)
 - **Install paths:** [`docs/INSTALL.md`](../INSTALL.md) — every install path, end to end
+- **Agent bootstrap:** [`docs/guides/bootstrap.md`](../guides/bootstrap.md) — the paste-in path that turns a coding agent into a full agent (identity, per-turn context, schedules, a private repo as its durable body)

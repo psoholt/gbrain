@@ -13,6 +13,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { withEnv } from './helpers/with-env.ts';
 
 let home: string;
 const origHome = process.env.GBRAIN_HOME;
@@ -43,6 +44,26 @@ describe('classifyLiveness (Codex #9)', () => {
   });
 });
 
+describe('parseEtimeToMs (PID-reuse guard, timezone-free)', () => {
+  test('parses every portable ps etime shape', async () => {
+    const { parseEtimeToMs } = await reg();
+    expect(parseEtimeToMs('00:00')).toBe(0);
+    expect(parseEtimeToMs('00:42')).toBe(42_000);
+    expect(parseEtimeToMs('01:23')).toBe(83_000);
+    expect(parseEtimeToMs('12:34:56')).toBe(((12 * 3600) + (34 * 60) + 56) * 1000);
+    expect(parseEtimeToMs('3-04:05:06')).toBe(((3 * 86400) + (4 * 3600) + (5 * 60) + 6) * 1000);
+    expect(parseEtimeToMs('  01:00  ')).toBe(60_000);
+  });
+
+  test('returns null when elapsed time cannot be determined', async () => {
+    const { parseEtimeToMs } = await reg();
+    expect(parseEtimeToMs('')).toBeNull();
+    expect(parseEtimeToMs('garbage')).toBeNull();
+    expect(parseEtimeToMs('not:a:number:at:all')).toBeNull();
+    expect(parseEtimeToMs('Mon Sep  7 00:30:32 2026')).toBeNull(); // the old lstart shape
+  });
+});
+
 describe('register + read round trip', () => {
   test('registerWorker writes under gbrainPath; readWorkers returns the live worker', async () => {
     const { registerWorker, readWorkers, workerRegistryDir } = await reg();
@@ -65,6 +86,23 @@ describe('register + read round trip', () => {
 
     cleanup();
     expect(readWorkers(() => 10).length).toBe(0);
+  });
+
+  test('#4885: a live worker survives a runtime zone that differs from the one ps prints in', async () => {
+    const { registerWorker, readWorkers } = await reg();
+    // Bun re-resolves the runtime zone on reassignment but does not hand the
+    // mutation to the ps child, so a zone-dependent start-time parse drifts by
+    // the offset (+12h here) and drops a live worker. etime is zone-free.
+    await withEnv({ TZ: 'Etc/GMT+12' }, async () => {
+      const cleanup = registerWorker({
+        pid: process.pid, queue: 'default', nice_requested: 10, nice_effective: 10, started_at: Date.now(),
+      });
+      try {
+        expect(readWorkers(() => 10).length).toBe(1);
+      } finally {
+        cleanup();
+      }
+    });
   });
 
   test('cleanup unlinks the entry file', async () => {
@@ -118,4 +156,54 @@ describe('pruning + guards', () => {
     expect(() => readWorkers(() => 5)).not.toThrow();
     expect(readWorkers(() => 5).length).toBe(0);
   });
+});
+
+describe('unreadable registry is unknown, not empty', () => {
+  // queueWorkerAlive, wedged_queue and remediation all keep a liveness-unknown
+  // path for a throwing read; readWorkers must actually throw to reach it.
+  test('a missing registry dir reads as empty and no-worker', async () => {
+    const { readWorkers, workerRegistryDir } = await reg();
+    const { queueWorkerAlive } = await import('../src/core/minions/no-worker.ts');
+    expect(existsSync(workerRegistryDir())).toBe(false);
+    expect(readWorkers(() => null)).toEqual([]);
+    expect(queueWorkerAlive('default')).toBe(false);
+  });
+
+  test('a registry path that cannot be listed (ENOTDIR) throws; liveness is unknown, so no no_worker advice', async () => {
+    const { readWorkers, workerRegistryDir } = await reg();
+    const { queueWorkerAlive } = await import('../src/core/minions/no-worker.ts');
+    const { deriveWedgeSignal } = await import('../src/core/minions/queue.ts');
+    require('fs').mkdirSync(join(home, '.gbrain'), { recursive: true });
+    writeFileSync(workerRegistryDir(), 'not a directory');
+    expect(() => readWorkers(() => null)).toThrow(/ENOTDIR/);
+    const { WorkerRegistryUnreadableError, workerRegistryReadFailure } = await reg();
+    let caught: unknown;
+    try { readWorkers(() => null); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(WorkerRegistryUnreadableError);
+    expect(workerRegistryReadFailure(caught)).toEqual({ errno: 'ENOTDIR', path: workerRegistryDir() });
+    expect(queueWorkerAlive('default')).toBeUndefined();
+    const signal = deriveWedgeSignal(
+      { queue: 'default', active_healthy: 0, waiting: 3, minutes_since_completion: null },
+      { workerAlive: queueWorkerAlive('default') },
+    );
+    expect(signal.no_worker).toBe(false);
+    expect(signal.wedged).toBe(true);
+  });
+
+  test.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'an unsearchable parent (EACCES) throws instead of reading as absent',
+    async () => {
+      const { readWorkers } = await reg();
+      const { queueWorkerAlive } = await import('../src/core/minions/no-worker.ts');
+      const parent = join(home, '.gbrain');
+      require('fs').mkdirSync(join(parent, 'workers'), { recursive: true });
+      require('fs').chmodSync(parent, 0o000);
+      try {
+        expect(() => readWorkers(() => null)).toThrow(/EACCES/);
+        expect(queueWorkerAlive('default')).toBeUndefined();
+      } finally {
+        require('fs').chmodSync(parent, 0o700);
+      }
+    },
+  );
 });

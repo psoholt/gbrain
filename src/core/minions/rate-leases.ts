@@ -77,6 +77,7 @@ export async function acquireLease(
   return engine.transaction(async (tx) => {
     // txn-scoped advisory lock keyed on the rate-lease key name. Released
     // automatically when the txn commits/rolls back.
+    // Lock-census (PR6 D5): INTENTIONALLY not source-keyed — a rate lease meters a shared external resource (per lease key, e.g. provider concurrency) brain-wide, not per source.
     await tx.executeRaw(`SELECT pg_advisory_xact_lock($1::bigint)`, [lockKey.toString()]);
 
     // Pre-prune stale leases for this key.
@@ -95,13 +96,16 @@ export async function acquireLease(
       return { acquired: false, activeCount, maxConcurrent };
     }
 
-    const rows = await tx.executeRaw<{ id: number }>(
+    const rows = await tx.executeRaw<{ id: number | bigint }>(
       `INSERT INTO subagent_rate_leases (key, owner_job_id, expires_at)
        VALUES ($1, $2, now() + ($3::double precision * interval '1 millisecond'))
        RETURNING id`,
       [key, ownerJobId, ttlMs],
     );
-    const leaseId = rows[0]!.id;
+    // BIGSERIAL arrives as a native BigInt on Postgres (postgres.js
+    // `types: { bigint }`); PGLite hands back a Number. Coerce once here so
+    // `leaseId` is honestly a number for every caller.
+    const leaseId = Number(rows[0]!.id);
     return { acquired: true, leaseId, activeCount: activeCount + 1, maxConcurrent };
   });
 }
@@ -149,4 +153,33 @@ export async function renewLeaseWithBackoff(engine: BrainEngine, leaseId: number
     }
   }
   return false;
+}
+
+/**
+ * Thrown when acquireLease returns acquired=false. The worker and the inline
+ * dream drain both recognize it and requeue WITHOUT burning an attempt
+ * (lease-full is a scheduling condition, not a failure). Lives here — the
+ * lease layer — because subagent.ts, subagent-oneshot.ts, worker.ts and
+ * inline-drain.ts all need it and a handler file is a poor home for a
+ * cross-cutting error type (subagent.ts re-exports it for compatibility).
+ */
+export class RateLeaseUnavailableError extends Error {
+  /**
+   * Optional caller-suggested requeue delay (ms). #4310: the global-LLM-halt
+   * cooldown defers jobs for the REMAINING cooldown, not the 1-3s lease
+   * bounce — worker.ts honors this when present, else leaseFullBackoffMs().
+   */
+  constructor(public key: string, public active: number, public max: number, public retryInMs?: number) {
+    super(`rate lease "${key}" full (${active}/${max})`);
+    this.name = 'RateLeaseUnavailableError';
+  }
+}
+
+/**
+ * Shared lease-full requeue backoff (1-3s jittered): "yield the slot, try
+ * again soon" — one definition so worker.ts and inline-drain.ts cannot
+ * silently desync.
+ */
+export function leaseFullBackoffMs(): number {
+  return 1000 + Math.floor(Math.random() * 2000);
 }

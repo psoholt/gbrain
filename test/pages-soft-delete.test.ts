@@ -12,19 +12,31 @@
  * Runs against PGLite — same SQL contract as Postgres but DATABASE_URL-free.
  * Postgres-specific paths (CONCURRENTLY index, two-stage CTE) covered by
  * separate Postgres E2E tests.
+ *
+ * One shared engine for the whole file (schema init paid once, snapshot
+ * allowed — nothing here asserts bootstrap behavior); each describe gets a
+ * clean slate via a describe-scoped resetPgliteState beforeAll. Reset is
+ * per-DESCRIBE, not per-test: tests within a describe deliberately share
+ * state (the purge/dry-run describes assert against leftover rows from
+ * earlier tests), matching the original one-engine-per-describe semantics.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 
-delete process.env.GBRAIN_PGLITE_SNAPSHOT;
+let engine: PGLiteEngine;
 
-async function setupBrain(): Promise<PGLiteEngine> {
-  const engine = new PGLiteEngine();
+beforeAll(async () => {
+  engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-  return engine;
-}
+}, 30000);
+
+afterAll(async () => {
+  await engine.disconnect();
+});
 
 async function seedPage(engine: PGLiteEngine, slug: string): Promise<void> {
   await engine.putPage(slug, {
@@ -37,14 +49,8 @@ async function seedPage(engine: PGLiteEngine, slug: string): Promise<void> {
 }
 
 describe('softDeletePage', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = await setupBrain();
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.disconnect();
+    await resetPgliteState(engine);
   });
 
   test('happy path: sets deleted_at and returns slug', async () => {
@@ -75,14 +81,8 @@ describe('softDeletePage', () => {
 });
 
 describe('restorePage', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = await setupBrain();
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.disconnect();
+    await resetPgliteState(engine);
   });
 
   test('clears deleted_at on a soft-deleted page', async () => {
@@ -107,14 +107,8 @@ describe('restorePage', () => {
 });
 
 describe('purgeDeletedPages (TTL boundary)', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = await setupBrain();
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.disconnect();
+    await resetPgliteState(engine);
   });
 
   test('purges pages whose deleted_at is older than the cutoff', async () => {
@@ -176,32 +170,128 @@ describe('purgeDeletedPages (TTL boundary)', () => {
     expect(remaining[0].n).toBe(0);
   });
 
-  test('clamps negative hours to 0 (no crash, no future-cutoff explosion)', async () => {
+  test('refuses negative hours and purges nothing', async () => {
     await seedPage(engine, 'people/ivan');
     await engine.softDeletePage('people/ivan');
-    // The contract being pinned: negative input must NOT pass through to the
-    // SQL as a literal negative interval (which would purge from the future
-    // and effectively delete every soft-deleted row). Implementation does
-    // `Math.max(0, Math.floor(olderThanHours))`, so -72 collapses to 0. With
-    // hours=0, the predicate `deleted_at < now()` may or may not match a row
-    // soft-deleted in the same statement (timing-dependent), so this test
-    // pins only the safety contract: it returns successfully with a finite
-    // count and doesn't blow up the brain.
-    const result = await engine.purgeDeletedPages(-72);
-    expect(result.count).toBeGreaterThanOrEqual(0);
-    expect(Number.isFinite(result.count)).toBe(true);
+    // The contract being pinned: a negative age must NOT purge anything. It used to clamp to 0 hours and purge every
+    // tombstone; it is now refused before any statement runs (#9823 post-land finding 1, every engine alike).
+    await expect(engine.purgeDeletedPages(-72)).rejects.toMatchObject({ name: 'PurgeAgeError', code: 'invalid_argument' });
+    expect((await engine.getPage('people/ivan', { includeDeleted: true }))?.slug).toBe('people/ivan');
+  });
+});
+
+describe('purgeDeletedPages dry-run (shares the delete predicate)', () => {
+  beforeAll(async () => {
+    await resetPgliteState(engine);
+  });
+
+  async function pageCount(): Promise<number> {
+    const rows = await engine.executeRaw<{ n: number }>(`SELECT COUNT(*)::int AS n FROM pages`);
+    return rows[0].n;
+  }
+
+  test('dryRun: true deletes nothing (row count unchanged)', async () => {
+    await seedPage(engine, 'dryrun/keeps-rows');
+    await engine.softDeletePage('dryrun/keeps-rows');
+    await engine.executeRaw(
+      `UPDATE pages SET deleted_at = now() - INTERVAL '73 hours' WHERE slug = $1`,
+      ['dryrun/keeps-rows'],
+    );
+    const before = await pageCount();
+    const preview = await engine.purgeDeletedPages(72, { dryRun: true });
+    expect(preview.count).toBeGreaterThanOrEqual(1);
+    expect(preview.slugs).toContain('dryrun/keeps-rows');
+    expect(await pageCount()).toBe(before);
+  });
+
+  test('dryRun set === set actually deleted by the subsequent real run; live pages in neither', async () => {
+    await seedPage(engine, 'dryrun/old-a');
+    await seedPage(engine, 'dryrun/old-b');
+    await seedPage(engine, 'dryrun/recent');
+    await seedPage(engine, 'dryrun/live');
+    await engine.softDeletePage('dryrun/old-a');
+    await engine.softDeletePage('dryrun/old-b');
+    await engine.softDeletePage('dryrun/recent');
+    await engine.executeRaw(
+      `UPDATE pages SET deleted_at = now() - INTERVAL '73 hours' WHERE slug IN ($1, $2)`,
+      ['dryrun/old-a', 'dryrun/old-b'],
+    );
+
+    const preview = await engine.purgeDeletedPages(72, { dryRun: true });
+    const purged = await engine.purgeDeletedPages(72);
+
+    expect([...preview.slugs].sort()).toEqual([...purged.slugs].sort());
+    expect(preview.count).toBe(purged.count);
+    // Live and inside-window pages are in neither set.
+    expect(preview.slugs).not.toContain('dryrun/live');
+    expect(preview.slugs).not.toContain('dryrun/recent');
+    expect(purged.slugs).not.toContain('dryrun/live');
+    expect(purged.slugs).not.toContain('dryrun/recent');
+    // The real run actually removed the previewed rows.
+    const rows = await engine.executeRaw<{ slug: string }>(`SELECT slug FROM pages`);
+    const remaining = rows.map((r) => r.slug);
+    expect(remaining).not.toContain('dryrun/old-a');
+    expect(remaining).not.toContain('dryrun/old-b');
+    expect(remaining).toContain('dryrun/live');
+    expect(remaining).toContain('dryrun/recent');
+  });
+
+  test('dry-run pages carry deleted_at as a Date (for CLI display)', async () => {
+    await seedPage(engine, 'dryrun/dated');
+    await engine.softDeletePage('dryrun/dated');
+    await engine.executeRaw(
+      `UPDATE pages SET deleted_at = now() - INTERVAL '73 hours' WHERE slug = $1`,
+      ['dryrun/dated'],
+    );
+    const preview = await engine.purgeDeletedPages(72, { dryRun: true });
+    const entry = preview.pages?.find((p) => p.slug === 'dryrun/dated');
+    expect(entry).toBeDefined();
+    expect(entry!.deleted_at).toBeInstanceOf(Date);
+    // Clean up so later tests in this describe see a stable baseline.
+    await engine.purgeDeletedPages(72);
+  });
+
+  test('red contrast: the old listPages enumeration under-counts once live pages consume the cap', async () => {
+    // The pre-fix dry-run enumerated listPages({ includeDeleted: true,
+    // limit: 10000 }) and filtered in JS against Date.now(). Live pages
+    // consume the cap, so a soft-deleted row past the cap is silently
+    // missed. Reproduce the class at small scale: 3 recently-updated live
+    // pages + 1 old soft-deleted page, enumeration capped at 3.
+    for (const slug of ['cap/live-1', 'cap/live-2', 'cap/live-3', 'cap/victim']) {
+      await seedPage(engine, slug);
+    }
+    await engine.softDeletePage('cap/victim');
+    // Old deleted_at (past the 72h cutoff) AND old updated_at so the victim
+    // sorts LAST under listPages' default updated_desc — exactly the row
+    // shape that fell off the capped enumeration.
+    await engine.executeRaw(
+      `UPDATE pages SET deleted_at = now() - INTERVAL '73 hours', updated_at = now() - INTERVAL '100 hours' WHERE slug = $1`,
+      ['cap/victim'],
+    );
+
+    // Old predicate, verbatim (src/commands/pages.ts pre-fix), cap = 3.
+    const candidates = await engine.listPages({ includeDeleted: true, limit: 3 });
+    const cutoff = Date.now() - 72 * 60 * 60 * 1000;
+    const oldStyle = candidates.filter(
+      (p) => p.deleted_at && p.deleted_at instanceof Date && p.deleted_at.getTime() < cutoff,
+    );
+    expect(oldStyle.map((p) => p.slug)).not.toContain('cap/victim'); // the bug
+
+    // The predicate-sharing dry-run finds it, and the real run deletes it.
+    const preview = await engine.purgeDeletedPages(72, { dryRun: true });
+    expect(preview.slugs).toContain('cap/victim');
+    const purged = await engine.purgeDeletedPages(72);
+    expect(purged.slugs).toContain('cap/victim');
+  });
+
+  test('dry-run refuses negative hours like the real run', async () => {
+    await expect(engine.purgeDeletedPages(-72, { dryRun: true })).rejects.toMatchObject({ name: 'PurgeAgeError', code: 'invalid_argument' });
   });
 });
 
 describe('getPage / listPages includeDeleted contract (Q3 IRON RULE)', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = await setupBrain();
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.disconnect();
+    await resetPgliteState(engine);
   });
 
   test('Q3 round-trip: delete → get returns null → get(include_deleted) returns row → restore → get returns row again', async () => {
@@ -251,14 +341,8 @@ describe('getPage / listPages includeDeleted contract (Q3 IRON RULE)', () => {
 });
 
 describe('search visibility (soft-deleted pages hidden from searchKeyword)', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = await setupBrain();
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.disconnect();
+    await resetPgliteState(engine);
   });
 
   test('searchKeyword hides soft-deleted pages', async () => {
@@ -278,10 +362,10 @@ describe('search visibility (soft-deleted pages hidden from searchKeyword)', () 
       frontmatter: {},
     });
     // Force chunk creation so search has something to index.
-    await engine.upsertChunks('people/nora', [
+    await installFixtureChunks(engine, 'people/nora', [
       { chunk_index: 0, chunk_text: 'gbrainquantum signature term occurs here', chunk_source: 'compiled_truth' as any },
     ]);
-    await engine.upsertChunks('people/oscar', [
+    await installFixtureChunks(engine, 'people/oscar', [
       { chunk_index: 0, chunk_text: 'gbrainquantum signature term occurs here too', chunk_source: 'compiled_truth' as any },
     ]);
 
@@ -302,14 +386,9 @@ describe('search visibility (soft-deleted pages hidden from searchKeyword)', () 
     await engine.executeRaw(
       `INSERT INTO pages (source_id, slug, type, title) VALUES ('archived-src', 'archived-src/secret', 'note', 'Secret')`,
     );
-    const pageRows = await engine.executeRaw<{ id: number }>(
-      `SELECT id FROM pages WHERE slug = 'archived-src/secret'`,
-    );
-    await engine.executeRaw(
-      `INSERT INTO content_chunks (page_id, chunk_index, chunk_text, chunk_source) VALUES ($1, 0, 'gbrainsemaphore unique term', 'compiled_truth')`,
-      [pageRows[0].id],
-    );
-    // Trigger should populate search_vector via the schema trigger.
+    await installFixtureChunks(engine, 'archived-src/secret', [
+      { chunk_index: 0, chunk_text: 'gbrainsemaphore unique term', chunk_source: 'compiled_truth' },
+    ], { sourceId: 'archived-src' });
     const before = await engine.searchKeyword('gbrainsemaphore');
     expect(before.length).toBe(1);
 

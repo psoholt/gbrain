@@ -39,9 +39,10 @@
  *   be reverted.
  */
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../spawn.ts';
 import { GSTACK_LEARNING_NAMESPACE } from './gstack-coupling.ts';
 import type { BrainEngine } from '../engine.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 export interface UndoWaveOpts {
   /** Wave version to reverse. v0.36.1.0 ship state: 'v0.36.1.0'. */
@@ -106,7 +107,8 @@ export async function undoWave(
      WHERE wave_version = $1 AND applied = true`,
     [waveVersion],
   );
-  const targetTakeIds = targetTakeRows.map(r => r.take_id);
+  // Postgres returns bigint ids as BigInt, which a `$1::bigint[]` parameter cannot bind.
+  const targetTakeIds = targetTakeRows.map(r => Number(r.take_id));
 
   if (targetTakeIds.length > 0) {
     if (dryRun) {
@@ -118,7 +120,7 @@ export async function undoWave(
       );
       result.resolutions_reverted = counted[0]?.count ?? 0;
     } else {
-      const reverted = await engine.executeRaw<{ id: number }>(
+      const reverted = await maintenanceTransaction(engine, tx => tx.executeRaw<{ id: number }>(
         `UPDATE takes
            SET resolved_at = NULL,
                resolved_outcome = NULL,
@@ -131,7 +133,7 @@ export async function undoWave(
            AND resolved_by = $2
          RETURNING id`,
         [targetTakeIds, resolvedByLabel],
-      );
+      ));
       result.resolutions_reverted = reverted.length;
     }
   }

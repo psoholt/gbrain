@@ -27,18 +27,22 @@
 
 import { createAuditWriter, computeIsoWeekFilename } from './audit/audit-writer.ts';
 
-/** Stable error-classification union; matches RerankError.reason. */
 export type RerankFailureReason =
   | 'auth'
+  | 'no_key'
   | 'rate_limit'
   | 'network'
+  | 'unreachable'
   | 'timeout'
+  | 'budget'
   | 'payload_too_large'
+  | 'empty_result_set'
+  | 'malformed_shape'
   | 'unknown';
 
 export interface RerankFailureEvent {
   ts: string;
-  /** Provider:model — e.g. `'zeroentropyai:zerank-2'`. */
+
   model: string;
   /** Classified failure mode (see RerankFailureReason). */
   reason: RerankFailureReason;

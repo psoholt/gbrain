@@ -7,6 +7,8 @@
  * needed at runtime.
  */
 
+import type { Effect } from '../../core/agent-output.ts';
+
 export interface FeaturePitch {
   /** One-line headline printed post-upgrade. */
   headline: string;
@@ -32,12 +34,26 @@ export interface OrchestratorOpts {
   hostDir?: string;
   /** Skip autopilot install (Phase F). */
   noAutopilotInstall: boolean;
+  dbOnlyExport?: {
+    root: string;
+    sourceId: string;
+    confirmQuiesced: boolean;
+    backup?: 'operator_verified' | 'acknowledged_unprotected';
+    /** The runner's own orchestration lease, which the quiescence check ignores. */
+    ownLeaseToken?: string;
+  };
+  /** #5476: `--accept-reviewed-inventory <source>=<digest>`: the reviewed shared-skills inventory change to accept, per source. */
+  acceptReviewedInventory?: Record<string, string>;
 }
 
 export interface OrchestratorPhaseResult {
   name: string;
   status: 'complete' | 'skipped' | 'failed';
   detail?: string;
+  /** A stable code for why the phase ended this way (kept in the ledger), for readers that must not parse `detail`. */
+  reason?: string;
+  /** The exact command that resolves or inspects what this phase left open; printed by the runner and kept in the ledger. */
+  argv?: string[];
 }
 
 export interface OrchestratorResult {
@@ -57,4 +73,34 @@ export interface Migration {
   featurePitch: FeaturePitch;
   /** Run the migration. Must be idempotent. */
   orchestrator: (opts: OrchestratorOpts) => Promise<OrchestratorResult>;
+  preview?: (opts: OrchestratorOpts) => Promise<unknown>;
+  reconcile?: boolean;
+  /**
+   * #6466: brain-level DB config key whose explicit off value declines this
+   * migration (`./opt-out.ts`): the runner skips it, reconcile included,
+   * lists it `declined`, and refuses an explicit `--migration <v>`.
+   */
+  optOut?: { key: string };
+  /**
+   * Consent effects the orchestrator performs (agent operator contract A4);
+   * apply-migrations asks for them before running it. `persistent_install`
+   * is skipped (and not asked) under --no-autopilot-install or on PGLite.
+   */
+  effects?: readonly Effect[];
+  /**
+   * True only when the orchestrator changes nothing on a brain `gbrain init`
+   * just created: schema already current, no data to backfill, no files,
+   * preferences or services to write. Init records these as complete
+   * (`fresh_install: true` ledger entries, `./fresh-install.ts`); every other
+   * migration lists as `pending_fresh_install` until it runs. Each flagged
+   * migration is proven by test/migrations-fresh-install-audit.serial.test.ts.
+   */
+  fresh_install_noop?: true;
+  /**
+   * The orchestrator opens the brain only through `connectMigrationEngine`
+   * (`./run-engine.ts`) and calls `releaseRunEngine` before any `gbrain` child
+   * that needs the brain, so consecutive flagged migrations of one run share
+   * one PGLite open.
+   */
+  sharesRunEngine?: true;
 }

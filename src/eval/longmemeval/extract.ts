@@ -127,7 +127,23 @@ export function getCacheStats(): CacheStats {
   return { hits: cacheHits, misses: cacheMisses, size: cache.size };
 }
 
-const EXTRACTOR_SYSTEM_PROMPT = `You extract typed claims and events from a single chat-session transcript.
+/**
+ * The `methodology_note` disclosure stamped on routed rows and printed at
+ * run end ("gbrain + <extractor>-preprocess", not "gbrain alone"). It names
+ * the extractor that ran: a Haiku model keeps the published
+ * `extractor=haiku-preprocess-full-haystack-v1` byte for byte, any other
+ * model is named by its resolved id.
+ */
+export function trajectoryMethodologyNote(extractorModel: string): string {
+  const modelId = extractorModel.slice(extractorModel.indexOf(':') + 1);
+  const name = /haiku/i.test(modelId) ? 'haiku' : extractorModel;
+  return `extractor=${name}-preprocess-full-haystack-v1`;
+}
+
+/** Output cap the extractor call sends. */
+export const EXTRACTOR_MAX_TOKENS = 2000;
+
+export const EXTRACTOR_SYSTEM_PROMPT = `You extract typed claims and events from a single chat-session transcript.
 
 Output a JSON array of records. Each record has these fields:
   - entity:     The thing the claim is ABOUT (person name, company, place, object).
@@ -256,7 +272,7 @@ async function callExtractor(
   try {
     response = await client.create({
       model,
-      max_tokens: 2000,
+      max_tokens: EXTRACTOR_MAX_TOKENS,
       system: EXTRACTOR_SYSTEM_PROMPT,
       messages: [{ role: 'user', content: body }],
     });

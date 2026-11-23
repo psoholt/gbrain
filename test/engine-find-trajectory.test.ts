@@ -15,6 +15,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import {
   detectRegressions,
   computeDriftScore,
@@ -26,12 +27,24 @@ import type { TrajectoryPoint } from '../src/core/engine.ts';
 let engine: PGLiteEngine;
 
 beforeAll(async () => {
+  // This file hardcodes 1536-d vectors (vecForMetric). initSchema sizes the
+  // facts halfvec column from the AMBIENT gateway state, and a beforeAll runs
+  // before the legacy-embedding-preload's per-test restore — so a preceding
+  // file in the shard that left the gateway reset or non-1536 would seed a
+  // 1280-d schema and every insert here would fail with a width mismatch.
+  // Pin the schema shape explicitly (the pattern bunfig's preload documents).
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: 1536,
+    env: { ...process.env },
+  });
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
 });
 
 afterAll(async () => {
+  resetGateway(); // R5: restore the preload baseline for later files in this shard
   await engine.disconnect();
 });
 
@@ -96,10 +109,32 @@ describe('findTrajectory — chronological ordering (R3)', () => {
     const idJan = await insertTyped({ entity_slug: 'traj-order', metric: 'mrr', value: 50000,  valid_from: new Date('2026-01-15') });
     const idApr = await insertTyped({ entity_slug: 'traj-order', metric: 'mrr', value: 200000, valid_from: new Date('2026-04-12') });
 
-    const points = await engine.findTrajectory({ entitySlug: 'traj-order' });
+    const points = await engine.findTrajectory({ entitySlug: 'traj-order', remote: false });
     expect(points.map(p => p.fact_id)).toEqual([idJan, idApr, idJul]);
     expect(points[0].valid_from.toISOString().slice(0, 10)).toBe('2026-01-15');
     expect(points[2].valid_from.toISOString().slice(0, 10)).toBe('2026-07-08');
+  });
+});
+
+describe('findTrajectory — a capped series keeps its NEWEST points (read-path audit #4)', () => {
+  test('limit returns the newest N, still chronological, so the latest value is current', async () => {
+    const day0 = Date.UTC(2024, 0, 1);
+    for (let i = 0; i < 150; i++) {
+      await insertTyped({ entity_slug: 'traj-cap', metric: 'mrr', value: i, valid_from: new Date(day0 + i * 86_400_000) });
+    }
+    const points = await engine.findTrajectory({ entitySlug: 'traj-cap', remote: false, limit: 100 });
+    expect(points.length).toBe(100);
+    expect(points[points.length - 1].value).toBe(149);
+    expect(points[0].value).toBe(50);
+    expect(points.map(p => p.value)).toEqual(Array.from({ length: 100 }, (_, i) => i + 50));
+  });
+
+  test('same-day ties break on id, newest id last', async () => {
+    const d = new Date('2026-03-01');
+    const ids = [];
+    for (let i = 0; i < 3; i++) ids.push(await insertTyped({ entity_slug: 'traj-tie', metric: 'mrr', value: i, valid_from: d }));
+    const points = await engine.findTrajectory({ entitySlug: 'traj-tie', remote: false, limit: 2 });
+    expect(points.map(p => p.fact_id)).toEqual([ids[1], ids[2]]);
   });
 });
 
@@ -108,11 +143,11 @@ describe('findTrajectory — source scoping (D-CDX-6)', () => {
     await insertTyped({ source_id: 'traj-src-A', entity_slug: 'traj-srcscope', metric: 'mrr', value: 50000, valid_from: new Date('2026-01-15') });
     await insertTyped({ source_id: 'traj-src-B', entity_slug: 'traj-srcscope', metric: 'mrr', value: 99999, valid_from: new Date('2026-01-15') });
 
-    const pointsA = await engine.findTrajectory({ entitySlug: 'traj-srcscope', sourceId: 'traj-src-A' });
+    const pointsA = await engine.findTrajectory({ entitySlug: 'traj-srcscope', sourceId: 'traj-src-A', remote: false });
     expect(pointsA.length).toBe(1);
     expect(pointsA[0].value).toBe(50000);
 
-    const pointsB = await engine.findTrajectory({ entitySlug: 'traj-srcscope', sourceId: 'traj-src-B' });
+    const pointsB = await engine.findTrajectory({ entitySlug: 'traj-srcscope', sourceId: 'traj-src-B', remote: false });
     expect(pointsB.length).toBe(1);
     expect(pointsB[0].value).toBe(99999);
   });
@@ -125,6 +160,7 @@ describe('findTrajectory — source scoping (D-CDX-6)', () => {
     const points = await engine.findTrajectory({
       entitySlug: 'traj-fed',
       sourceIds: ['traj-src-A', 'traj-src-B'],
+      remote: false,
     });
     // Two of three sources visible, in chronological order.
     expect(points.length).toBe(2);
@@ -145,13 +181,16 @@ describe('findTrajectory — visibility filter (D-CDX-1 / R6)', () => {
     expect(remote[0].value).toBe(99999);
   });
 
-  test('remote default (undefined) is treated as trusted — sees both', async () => {
+  test('FAIL-CLOSED: remote default (undefined) is world-only — private rows hidden', async () => {
     await insertTyped({ entity_slug: 'traj-vis-default', metric: 'mrr', value: 50000, visibility: 'private', valid_from: new Date('2026-01-15') });
     await insertTyped({ entity_slug: 'traj-vis-default', metric: 'mrr', value: 99999, visibility: 'world',   valid_from: new Date('2026-04-12') });
 
-    // No `remote` field — engine default must be trusted.
-    const all = await engine.findTrajectory({ entitySlug: 'traj-vis-default' });
-    expect(all.length).toBe(2);
+    // No `remote` field — fail-closed: an omitted flag (cast-bypassed
+    // context, forgotten threading) must degrade to world-only, never leak
+    // private rows.
+    const worldOnly = await engine.findTrajectory({ entitySlug: 'traj-vis-default' });
+    expect(worldOnly.length).toBe(1);
+    expect(worldOnly[0].value).toBe(99999);
   });
 });
 
@@ -160,7 +199,7 @@ describe('findTrajectory — metric + since + until filters', () => {
     await insertTyped({ entity_slug: 'traj-m', metric: 'mrr', value: 50000, valid_from: new Date('2026-01-15') });
     await insertTyped({ entity_slug: 'traj-m', metric: 'arr', value: 600000, valid_from: new Date('2026-01-15') });
 
-    const mrrOnly = await engine.findTrajectory({ entitySlug: 'traj-m', metric: 'mrr' });
+    const mrrOnly = await engine.findTrajectory({ entitySlug: 'traj-m', metric: 'mrr', remote: false });
     expect(mrrOnly.length).toBe(1);
     expect(mrrOnly[0].metric).toBe('mrr');
   });
@@ -174,6 +213,7 @@ describe('findTrajectory — metric + since + until filters', () => {
       entitySlug: 'traj-w',
       since: '2026-02-01',
       until: '2026-05-01',
+      remote: false,
     });
     expect(inWindow.length).toBe(1);
     expect(inWindow[0].value).toBe(99999);
@@ -199,6 +239,7 @@ function makePoint(args: {
   return {
     fact_id: args.id,
     valid_from: new Date(args.date),
+    valid_until: null,
     metric: args.metric,
     value: args.value,
     unit: 'USD',

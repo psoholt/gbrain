@@ -30,6 +30,10 @@ import { tmpdir } from 'os';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { v0_22_4, __setTestEngineOverride } from '../../src/commands/migrations/v0_22_4.ts';
 
+// Cold-path opt-out: drives the real v0_22_4 migration orchestrator — the
+// engine under migration must be a cold build, not a snapshot restore.
+delete process.env.GBRAIN_PGLITE_SNAPSHOT;
+
 const fence = '---';
 
 let workdir: string;
@@ -38,6 +42,7 @@ let brainRootA: string;
 let brainRootB: string;
 let engine: PGLiteEngine;
 let originalHome: string | undefined;
+let originalGbrainHome: string | undefined;
 const originalContents = new Map<string, string>();
 
 beforeAll(async () => {
@@ -86,12 +91,15 @@ beforeAll(async () => {
   );
   __setTestEngineOverride(engine);
 
-  // Redirect ~/.gbrain/migrations/ output. The orchestrator's gbrainDir()
-  // helper reads process.env.HOME at call time, so the override takes
-  // effect even though Bun's os.homedir() does not observe mid-process
-  // mutations.
+  // Redirect ~/.gbrain/migrations/ output. The orchestrator resolves it via
+  // gbrainPath(): GBRAIN_HOME is a PARENT dir with '.gbrain' appended, so
+  // GBRAIN_HOME=tmpHome routes the audit JSON and pending-host-work to
+  // `tmpHome/.gbrain/migrations/`. HOME moves too so any HOME-based read
+  // stays inside the tmpdir.
   originalHome = process.env.HOME;
+  originalGbrainHome = process.env.GBRAIN_HOME;
   process.env.HOME = tmpHome;
+  process.env.GBRAIN_HOME = tmpHome;
 });
 
 afterAll(async () => {
@@ -99,6 +107,8 @@ afterAll(async () => {
   if (engine) await engine.disconnect();
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
+  if (originalGbrainHome === undefined) delete process.env.GBRAIN_HOME;
+  else process.env.GBRAIN_HOME = originalGbrainHome;
   rmSync(workdir, { recursive: true, force: true });
 });
 

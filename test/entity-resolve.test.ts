@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import {
   resolveEntitySlug,
   resolveEntitySlugWithSource,
+  looksLikeSlug,
   slugify,
   type ResolutionSource,
 } from '../src/core/entities/resolve.ts';
@@ -29,8 +30,8 @@ beforeAll(async () => {
 
   // Seed test pages. Naming pattern:
   //   - alice-example: single-match case (only people/alice-*)
-  //   - bob-example vs bob-rosenstein: multi-match tiebreaker (bob-example wins on connections)
-  //   - charlie-example vs charlie-bankcroft: multi-match tiebreaker (charlie-example wins on connections)
+  //   - bob-example vs bob-rosenstein: ambiguous bare-name collision
+  //   - charlie-example vs charlie-bankcroft: ambiguous bare-name collision
   //   - dave-example: single-match case
   const pages = [
     { slug: 'people/alice-example', title: 'Alice Example', type: 'person' },
@@ -39,8 +40,11 @@ beforeAll(async () => {
     { slug: 'people/charlie-example', title: 'Charlie Example', type: 'person' },
     { slug: 'people/charlie-bankcroft', title: 'Charlie Bankcroft', type: 'person' },
     { slug: 'people/dave-example', title: 'Dave Example', type: 'person' },
+    { slug: 'people/한글-예시', title: '한글 예시', type: 'person' },
+    { slug: '한글-개념', title: '한글 개념', type: 'concept' },
     { slug: 'companies/stripe', title: 'Stripe', type: 'company' },
     { slug: 'companies/stripe-atlas', title: 'Stripe Atlas', type: 'company' },
+    { slug: 'companies/benton-capital', title: 'Benton Capital', type: 'company' },
   ];
 
   for (const p of pages) {
@@ -113,14 +117,14 @@ describe('resolveEntitySlug — prefix expansion', () => {
     expect(result).toBe('people/alice-example');
   });
 
-  it('resolves "Bob" to people/bob-example (more connections)', async () => {
+  it('refuses to choose between people sharing the same bare first name', async () => {
     const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Bob');
-    expect(result).toBe('people/bob-example');
+    expect(result).toBe('bob');
   });
 
-  it('resolves "Charlie" to people/charlie-example (more connections)', async () => {
+  it('does not use connection count to turn bare-name ambiguity into confidence', async () => {
     const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Charlie');
-    expect(result).toBe('people/charlie-example');
+    expect(result).toBe('charlie');
   });
 
   it('resolves "Dave" to people/dave-example (single match)', async () => {
@@ -138,6 +142,11 @@ describe('resolveEntitySlug — prefix expansion', () => {
     expect(result).toBe('people/alice-example');
   });
 
+  it('exact match works for fully-qualified Unicode slugs', async () => {
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'people/한글-예시');
+    expect(result).toBe('people/한글-예시');
+  });
+
   it('multi-word input does NOT trigger prefix expansion', async () => {
     // "Alice Example" should go through fuzzy match, not prefix expansion
     const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Alice Example');
@@ -145,14 +154,82 @@ describe('resolveEntitySlug — prefix expansion', () => {
     expect(result).toContain('alice-example');
   });
 
+  it('does not attach a near-name to an existing person (a typo and a different person look alike)', async () => {
+    // "Alice Exampl" is one edit from "Alice Example", exactly as "Carol Exampl" is
+    // one edit from "Carol Example": trigram similarity cannot tell a typo from a
+    // different person, so the reference keeps its own slug.
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Alice Exampl');
+    expect(result).toBe('alice-exampl');
+  });
+
+  it('resolves the same person written in another order or case', async () => {
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'example, ALICE');
+    expect(result).toBe('people/alice-example');
+  });
+
   it('hyphenated input does NOT trigger prefix expansion', async () => {
     const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'alice-example');
     expect(result).toBe('people/alice-example');
   });
 
+  it('preserves an explicit full company-name match', async () => {
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Benton Capital');
+    expect(result).toBe('companies/benton-capital');
+  });
+
+  it('refuses a company match supported mainly by a shared generic token', async () => {
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Beacon Capital');
+    expect(result).toBe('beacon-capital');
+  });
+
   it('returns null for empty input', async () => {
     const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', '');
     expect(result).toBeNull();
+  });
+});
+
+describe('source-scoped full basename resolution', () => {
+  it('resolves hyphenated names and concepts without relying on title similarity', async () => {
+    for (const slug of ['companies/acme-example', 'concepts/retrieval-testing']) {
+      await engine.putPage(slug, {
+        type: 'note', title: 'Unrelated display title', compiled_truth: 'Existing page', frontmatter: {},
+      }, { sourceId: 'default' });
+      const basename = slug.split('/')[1];
+      for (const raw of [basename, basename.replaceAll('-', ' ')]) {
+        expect(await resolveEntitySlug(engine, 'default', raw)).toBe(slug);
+        expect(await resolveEntitySlugWithSource(engine, 'default', raw)).toEqual({
+          slug, source: 'fuzzy_match',
+        });
+      }
+    }
+  });
+
+  it('refuses same-basename ambiguity even if one title is a perfect fuzzy match', async () => {
+    for (const slug of ['companies/shared-example', 'projects/shared-example']) {
+      await engine.putPage(slug, {
+        type: 'note', title: slug.startsWith('companies/') ? 'shared-example' : 'Other title',
+        compiled_truth: 'Existing page', frontmatter: {},
+      }, { sourceId: 'default' });
+    }
+    expect(await resolveEntitySlug(engine, 'default', 'shared-example')).toBe('shared-example');
+    expect(await resolveEntitySlugWithSource(engine, 'default', 'shared-example')).toEqual({
+      slug: 'shared-example', source: 'fallback_slugify',
+    });
+  });
+
+  it('ignores same-basename pages in other sources and deleted pages', async () => {
+    await engine.executeRaw(`INSERT INTO sources (id, name) VALUES ('basename-other', 'Other')`);
+    await engine.putPage('companies/scoped-example', {
+      type: 'company', title: 'Unrelated title', compiled_truth: 'Other source', frontmatter: {},
+    }, { sourceId: 'basename-other' });
+    await engine.putPage('companies/scoped-example', {
+      type: 'company', title: 'Unrelated title', compiled_truth: 'Deleted page', frontmatter: {},
+    }, { sourceId: 'default' });
+    await engine.softDeletePage('companies/scoped-example', { sourceId: 'default' });
+    expect((await resolveEntitySlugWithSource(engine, 'default', 'scoped-example'))?.source)
+      .toBe('fallback_slugify');
+    expect(await resolveEntitySlug(engine, 'basename-other', 'scoped-example'))
+      .toBe('companies/scoped-example');
   });
 });
 
@@ -167,6 +244,32 @@ describe('slugify', () => {
 
   it('strips accents', () => {
     expect(slugify('José García')).toBe('jose-garcia');
+  });
+
+  // Stroke/bar/ligature letters carry no Unicode decomposition, so the NFKD
+  // pass cannot fold them and the non-alphanumeric sweep used to delete them:
+  // "Đăng Example" slugged to "ang-example", filing facts under an entity slug
+  // that no lookup by name could ever resolve.
+  it('folds stroke letters that NFKD cannot decompose', () => {
+    expect(slugify('Đăng Example')).toBe('dang-example');
+    expect(slugify('Bảo Đào Example')).toBe('bao-dao-example');
+  });
+
+  it('folds the same class across other Latin scripts', () => {
+    expect(slugify('Łukasz Example')).toBe('lukasz-example');
+    expect(slugify('Søren Example')).toBe('soren-example');
+    expect(slugify('Weiß Example')).toBe('weiss-example');
+    expect(slugify('Þór Example')).toBe('thor-example');
+  });
+
+  it('folds a stroke letter that also carries a combining accent', () => {
+    // "ǿ" decomposes to "ø" + U+0301: the mark strips, then the table folds.
+    expect(slugify('Ǿrn Example')).toBe('orn-example');
+  });
+
+  it('keeps a name that is only stroke letters reachable', () => {
+    // Pre-fix this collapsed to the empty string.
+    expect(slugify('Đ')).toBe('d');
   });
 });
 
@@ -219,19 +322,22 @@ describe('resolveEntitySlugWithSource — fuzzy_match branch', () => {
     expect(result!.source).toBe<ResolutionSource>('fuzzy_match');
   });
 
-  it('returns fuzzy_match for prefix-expansion (bare first name "Alice")', async () => {
+});
+
+describe('resolveEntitySlugWithSource — prefix_expansion branch', () => {
+  it('returns prefix_expansion for a bare first name ("Alice")', async () => {
     // Bare name "Alice" doesn't exact-match any slug, fuzzy fails the
     // 0.4 threshold on short trigrams, so prefix expansion fires and
-    // resolves to people/alice-example. We tag this branch as
-    // fuzzy_match (not fallback_slugify) so trajectory routing knows
-    // it's a real-page resolution.
+    // resolves to people/alice-example. Tagged prefix_expansion: a
+    // real-page resolution, but chosen only because it is the sole
+    // people/alice-* page, so fact writes flag it as unverified.
     const result = await resolveEntitySlugWithSource(
       engine as unknown as BrainEngine,
       'default',
       'Alice',
     );
     expect(result!.slug).toBe('people/alice-example');
-    expect(result!.source).toBe<ResolutionSource>('fuzzy_match');
+    expect(result!.source).toBe<ResolutionSource>('prefix_expansion');
   });
 });
 
@@ -306,5 +412,149 @@ describe('resolveEntitySlugWithSource — back-compat with resolveEntitySlug', (
     const b = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'Zelda');
     expect(b!.slug).toBe(a!);
     expect(b!.source).toBe<ResolutionSource>('fallback_slugify');
+  });
+});
+
+describe('alias_exact branch (v0.46.15 identity wave, #3730)', () => {
+  it('an unambiguous registered alias resolves before prefix expansion / fuzzy', async () => {
+    await engine.setPageAliases('people/bob-rosenstein', 'default', ['rosey']);
+    const a = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'rosey');
+    expect(a).toBe('people/bob-rosenstein');
+    const b = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'rosey');
+    expect(b!.slug).toBe('people/bob-rosenstein');
+    expect(b!.source).toBe<ResolutionSource>('alias_exact');
+  });
+
+  it('alias beats the ambiguous bare-name collision that prefix expansion refuses', async () => {
+    // "bob" prefix-expands ambiguously (bob-example vs bob-rosenstein) and
+    // previously fell to fallback_slugify('bob'). A registered alias resolves it.
+    await engine.setPageAliases('people/bob-example', 'default', ['bob']);
+    const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'bob');
+    expect(r!.slug).toBe('people/bob-example');
+    expect(r!.source).toBe<ResolutionSource>('alias_exact');
+  });
+
+  it('a phantom alias (deleted page) is ignored — falls through to the old chain', async () => {
+    await engine.putPage('people/ghost-example', {
+      type: 'person', title: 'Ghost Example', compiled_truth: 'b', timeline: '', frontmatter: {},
+    } as never);
+    await engine.setPageAliases('people/ghost-example', 'default', ['spectre']);
+    await engine.softDeletePage('people/ghost-example');
+    const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'spectre');
+    expect(r!.source).toBe<ResolutionSource>('fallback_slugify');
+    expect(r!.slug).toBe('spectre');
+  });
+});
+
+describe('alias_exact — liveness before uniqueness (v0.46.15 codex ship-review)', () => {
+  it('a stale sibling alias row (deleted page) cannot veto the sole live target', async () => {
+    await engine.putPage('people/nickname-live', {
+      type: 'person', title: 'Nickname Live', compiled_truth: 'b', timeline: '', frontmatter: {},
+    } as never);
+    await engine.putPage('people/nickname-old', {
+      type: 'person', title: 'Nickname Old', compiled_truth: 'b', timeline: '', frontmatter: {},
+    } as never);
+    await engine.setPageAliases('people/nickname-live', 'default', ['nicky']);
+    await engine.setPageAliases('people/nickname-old', 'default', ['nicky']);
+    await engine.softDeletePage('people/nickname-old');
+    // Raw-hit uniqueness would see 2 rows, reject, and fall through to
+    // fallback_slugify('nicky') — recreating a phantom slug on a WRITE path.
+    const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'nicky');
+    expect(r!.slug).toBe('people/nickname-live');
+    expect(r!.source).toBe<ResolutionSource>('alias_exact');
+  });
+
+  it('two LIVE holders of the same alias stay ambiguous (no pointer)', async () => {
+    await engine.putPage('people/twin-a', {
+      type: 'person', title: 'Twin A', compiled_truth: 'b', timeline: '', frontmatter: {},
+    } as never);
+    await engine.putPage('people/twin-b', {
+      type: 'person', title: 'Twin B', compiled_truth: 'b', timeline: '', frontmatter: {},
+    } as never);
+    await engine.setPageAliases('people/twin-a', 'default', ['twinsy']);
+    await engine.setPageAliases('people/twin-b', 'default', ['twinsy']);
+    const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'twinsy');
+    expect(r!.source).not.toBe<ResolutionSource>('alias_exact');
+  });
+});
+
+describe('Unicode slug shape (#5421)', () => {
+  it('a non-Latin slug without a slash takes the exact-match path', async () => {
+    expect(await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', '한글-개념'))
+      .toEqual({ slug: '한글-개념', source: 'exact_page' });
+  });
+
+  it('a fully-qualified non-Latin slug takes the exact-match path', async () => {
+    expect(await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'people/한글-예시'))
+      .toEqual({ slug: 'people/한글-예시', source: 'exact_page' });
+  });
+
+  it('accepts Unicode letters and numbers but still rejects uppercase, whitespace and punctuation', () => {
+    expect(looksLikeSlug('people/한글-예시')).toBe(true);
+    expect(looksLikeSlug('한글_예시2')).toBe(true);
+    expect(looksLikeSlug('people/alice-example')).toBe(true);
+    expect(looksLikeSlug('People/Alice-Example')).toBe(false);
+    expect(looksLikeSlug('people/Alice-example')).toBe(false);
+    expect(looksLikeSlug('people/한글 예시')).toBe(false);
+    expect(looksLikeSlug('people/alice.example')).toBe(false);
+  });
+
+  it('mixed-case Latin input never takes the exact-match path', async () => {
+    const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'People/Alice-Example');
+    expect(r!.source).not.toBe<ResolutionSource>('exact_page');
+  });
+
+  it('a non-Latin slug that exists only in another source never wins', async () => {
+    await engine.executeRaw(`INSERT INTO sources (id, name) VALUES ('unicode-other', 'Unicode other')`);
+    await engine.putPage('people/다른-예시', {
+      type: 'person', title: '다른 예시', compiled_truth: 'Other source', frontmatter: {},
+    }, { sourceId: 'unicode-other' });
+    const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'people/다른-예시');
+    expect(r!.source).not.toBe<ResolutionSource>('exact_page');
+    expect(await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'unicode-other', 'people/다른-예시'))
+      .toEqual({ slug: 'people/다른-예시', source: 'exact_page' });
+  });
+});
+
+describe('non-Latin fallback slugs (#6691)', () => {
+  let e: PGLiteEngine;
+  beforeAll(async () => {
+    e = new PGLiteEngine();
+    await e.connect({ database_url: '' });
+    await e.initSchema();
+  });
+  afterAll(async () => { await e.disconnect(); });
+  const resolve = (raw: string) => resolveEntitySlug(e as unknown as BrainEngine, 'default', raw);
+
+  it('a non-Latin name with no page mints the slug sync would mint, never an empty slug', async () => {
+    expect(await resolve('Мария')).toBe('мария');
+    expect(await resolve('Иван Петров')).toBe('иван-петров');
+    expect(await resolve('席位')).toBe('席位');
+    expect(await resolveEntitySlugWithSource(e as unknown as BrainEngine, 'default', 'Мария'))
+      .toEqual({ slug: 'мария', source: 'fallback_slugify' });
+  });
+
+  it('a path-shaped non-Latin ref keeps every segment', async () => {
+    expect(await resolve('people/Мария Example')).toBe('people/мария-example');
+  });
+
+  it('input with no letters or numbers resolves to null instead of an empty slug', async () => {
+    expect(await resolve('!!!')).toBeNull();
+    expect(await resolveEntitySlugWithSource(e as unknown as BrainEngine, 'default', '—')).toBeNull();
+  });
+
+  it('Latin names keep their ASCII fallback slugs', async () => {
+    expect(await resolve("O'Brien Example")).toBe('o-brien-example');
+    expect(await resolve('AT&T')).toBe('at-t');
+    expect(await resolve('Søren Example')).toBe('soren-example');
+    expect(await resolve('Đăng Example')).toBe('dang-example');
+    expect(await resolve('José García')).toBe('jose-garcia');
+  });
+
+  it('an empty entity slug filters listFactsSince to nothing, never to every entity', async () => {
+    await e.insertFact({ fact: 'Alice ships weekly', entity_slug: 'people/alice-example', source: 'test', visibility: 'world' }, { source_id: 'default' });
+    const since = new Date(Date.now() - 60_000);
+    expect((await e.listFactsSince('default', since, { entitySlug: 'people/alice-example' })).length).toBe(1);
+    expect(await e.listFactsSince('default', since, { entitySlug: '' })).toEqual([]);
   });
 });

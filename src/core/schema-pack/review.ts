@@ -13,6 +13,8 @@
 import type { BrainEngine } from '../engine.ts';
 import { runDetect } from './detect.ts';
 import { loadActivePack } from './load-active.ts';
+import { loadActivePackForLocalEngine } from './best-effort.ts';
+import { storedTypeMissesPack, type TypeUsagePack } from './type-usage.ts';
 import { loadConfig, gbrainPath, configPath } from '../config.ts';
 import { existsSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -100,13 +102,87 @@ export async function runReviewCandidates(
 
 // ----- T5 review-orphans ------------------------------------------
 
+export interface TypeOrphan {
+  slug: string;
+  source_id: string;
+  /** Stored `pages.type` ('' when untyped). */
+  type: string;
+  reason: 'untyped' | 'undeclared';
+}
+
+export interface TypeOrphansResult {
+  /** Every page in scope with no active-pack type match (not just the returned page). */
+  orphan_count: number;
+  orphans: TypeOrphan[];
+  /** Stored types the pack neither declares nor aliases, with page counts. */
+  undeclared_types: Array<{ type: string; count: number }>;
+  /** Active pack name, or null when no pack resolved (only untyped pages are then checked). */
+  pack: string | null;
+  /** True when orphan_count exceeds the returned orphans. */
+  truncated: boolean;
+}
+
+/**
+ * Pages with no active-pack type match: an empty type, or a type the pack
+ * neither declares nor aliases (`storedTypeMissesPack`, the same predicate as
+ * `schema lint --with-db`'s `stored_type_undeclared`). Shared by the
+ * `schema review-orphans` CLI and the `schema_review_orphans` MCP op.
+ */
+export async function findTypeOrphans(
+  engine: BrainEngine,
+  manifest: (TypeUsagePack & { name: string }) | null,
+  scope: { sourceId?: string; sourceIds?: string[] },
+  limit: number,
+): Promise<TypeOrphansResult> {
+  const params: unknown[] = [];
+  let where = 'deleted_at IS NULL';
+  if (scope.sourceIds && scope.sourceIds.length > 0) {
+    params.push(scope.sourceIds);
+    where += ` AND source_id = ANY($${params.length}::text[])`;
+  } else if (scope.sourceId) {
+    params.push(scope.sourceId);
+    where += ` AND source_id = $${params.length}`;
+  }
+  const typeRows = await engine.executeRaw<{ type: string | null; n: string }>(
+    `SELECT type, count(*)::text AS n FROM pages WHERE ${where} GROUP BY type`,
+    params,
+  );
+  const missing = typeRows.filter((r) => (manifest ? storedTypeMissesPack(r.type, manifest) : !r.type));
+  const undeclared = missing
+    .filter((r): r is { type: string; n: string } => !!r.type)
+    .map((r) => ({ type: r.type, count: Number(r.n) }))
+    .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
+  const orphanCount = missing.reduce((sum, r) => sum + Number(r.n), 0);
+  if (orphanCount === 0) {
+    return { orphan_count: 0, orphans: [], undeclared_types: [], pack: manifest?.name ?? null, truncated: false };
+  }
+  const rowLimit = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 100;
+  const rows = await engine.executeRaw<{ slug: string; source_id: string; type: string | null }>(
+    `SELECT slug, COALESCE(source_id, 'default') AS source_id, type FROM pages
+      WHERE ${where} AND (type IS NULL OR type = '' OR type = ANY($${params.length + 1}::text[]))
+      ORDER BY source_id, slug
+      LIMIT ${rowLimit}`,
+    [...params, undeclared.map((u) => u.type)],
+  );
+  return {
+    orphan_count: orphanCount,
+    orphans: rows.map((r) => ({
+      slug: r.slug,
+      source_id: r.source_id,
+      type: r.type ?? '',
+      reason: r.type ? 'undeclared' : 'untyped',
+    })),
+    undeclared_types: undeclared,
+    pack: manifest?.name ?? null,
+    truncated: orphanCount > rows.length,
+  };
+}
+
 export interface ReviewOrphansOpts {
   sourceId?: string;
 }
 
-export interface ReviewOrphansResult {
-  orphans: Array<{ slug: string; source_id: string }>;
-  orphan_count: number;
+export interface ReviewOrphansResult extends TypeOrphansResult {
   source_id: string;
 }
 
@@ -115,18 +191,7 @@ export async function runReviewOrphans(
   opts: ReviewOrphansOpts = {},
 ): Promise<ReviewOrphansResult> {
   const sourceId = opts.sourceId ?? 'default';
-  const rows = await engine.executeRaw<{ slug: string; source_id: string }>(
-    `SELECT slug, source_id FROM pages
-     WHERE source_id = $1
-       AND deleted_at IS NULL
-       AND (type IS NULL OR type = '')
-     ORDER BY slug
-     LIMIT 1000`,
-    [sourceId],
-  );
-  return {
-    orphans: rows.map((r) => ({ slug: r.slug, source_id: r.source_id })),
-    orphan_count: rows.length,
-    source_id: sourceId,
-  };
+  const pack = await loadActivePackForLocalEngine(engine, { sourceId });
+  const result = await findTypeOrphans(engine, pack?.manifest ?? null, { sourceId }, 1000);
+  return { ...result, source_id: sourceId };
 }

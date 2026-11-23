@@ -114,6 +114,14 @@ Opus for that batch.
 All cross-references use standard markdown links: `[Title](relative/path.md)`.
 NEVER use `[[wiki-links]]` — they don't render on GitHub.
 
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `get_page` returns `page_not_found`: the raw dump moved or the slug is wrong; search for the title before reporting the article missing.
+- The rewrite returns `revision_conflict`: someone else edited the page since you read it. Re-read, re-apply the enrichment to the new text, and save with the new revision; never overwrite blind.
+- `write_pending` (exit 10): poll `gbrain write-request <request_id>`; only report the page enriched once the receipt commits.
+
 ## Anti-Patterns
 
 - ❌ Paraphrasing quotes ("the author argues that…"). Quotes are verbatim
@@ -140,10 +148,10 @@ This skill guarantees:
 - Routing matches the canonical triggers in the frontmatter.
 - Output written under the directories listed in `writes_to:` (when applicable).
 - Conventions referenced (`quality.md`, `brain-first.md`, `_brain-filing-rules.md`) are followed.
-- Privacy contract preserved: no real names, no fork-specific filesystem path literals, no upstream-fork references.
+- Examples use placeholder names and paths.
 
-The full behavior contract is documented in the body sections above; this section exists for the conformance test.
+The full behavior contract is documented in the body sections above.
 
 ## Output Format
 
-The skill's output shape is documented inline in the body sections above (see "Output", "Brain page format", or equivalent). The literal section header here exists for the conformance test (`test/skills-conformance.test.ts`).
+The skill's output shape is documented inline in the body sections above (see "Output", "Brain page format", or equivalent).

@@ -20,9 +20,11 @@
 # Usage: scripts/check-gateway-routed-no-direct-anthropic.sh
 # Exit:  0 when clean, 1 when a guarded file imports the SDK as a runtime value.
 
+# Seam: GBRAIN_GUARD_ROOT (fixture tree root).
+
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+ROOT="${GBRAIN_GUARD_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$ROOT"
 
 # Files whose contract is "ALL chat calls route through gateway.chat()".

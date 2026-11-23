@@ -17,8 +17,11 @@ import {
   parseWindow,
   volunteerContext,
   volunteerUsageStats,
+  gateVolunteeredPointers,
+  candidatesByNorm,
   VOLUNTEER_DEFAULT_MIN_CONFIDENCE,
 } from '../src/core/context/volunteer.ts';
+import type { PointerBlock } from '../src/core/context/retrieval-reflex.ts';
 import { insertVolunteerEvents } from '../src/core/context/volunteer-events.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../src/core/takes-fence.ts';
 
@@ -239,6 +242,58 @@ describe('volunteerContext', () => {
   });
 });
 
+describe('gateVolunteeredPointers — direct unit (the pure gate step)', () => {
+  const BLOCK: PointerBlock = {
+    pointers: [
+      { display: 'Alice Example', slug: 'people/alice-example', source_id: 'default', synopsis: 'x', arm: 'alias', confidence: 0.9 },
+      { display: 'Widget Co', slug: 'companies/widget-co', source_id: 'default', synopsis: 'y', arm: 'slug-suffix', confidence: 0.6 },
+    ],
+    text: 'BLOCK',
+  };
+  const CANDS = candidatesByNorm(
+    extractCandidatesFromWindow([{ role: 'user', text: 'Alice Example met Widget Co' }]),
+  );
+
+  test('gates below-threshold arms out; passes alias arm with newest-turn boost', () => {
+    const pages = gateVolunteeredPointers(BLOCK, CANDS, { windowSize: 1 });
+    expect(pages.map((p) => p.slug)).toEqual(['people/alice-example']); // slug-suffix 0.6+0.05 < 0.7
+    expect(pages[0].confidence).toBeCloseTo(0.95); // 0.9 alias + 0.05 newest-turn
+  });
+
+  test('idempotent: re-gating the survivors changes nothing', () => {
+    const once = gateVolunteeredPointers(BLOCK, CANDS, { windowSize: 1 });
+    const survivorsAsBlock: PointerBlock = {
+      pointers: once.map((p) => ({ display: p.display, slug: p.slug, source_id: p.source_id, synopsis: p.synopsis, arm: p.arm, confidence: p.confidence })),
+      text: 'SURVIVORS',
+    };
+    const twice = gateVolunteeredPointers(survivorsAsBlock, CANDS, { windowSize: 1 });
+    expect(twice.map((p) => p.slug)).toEqual(once.map((p) => p.slug));
+  });
+
+  test('excludeSlugs skips BEFORE the cap so a recurring slug never starves new pages', () => {
+    const pages = gateVolunteeredPointers(BLOCK, CANDS, {
+      windowSize: 1,
+      excludeSlugs: new Set(['people/alice-example']),
+    });
+    expect(pages).toEqual([]);
+  });
+
+  test('title-surname arm clears the 0.70 gate unboosted and renders a surname rationale (R2-7)', () => {
+    const block: PointerBlock = {
+      pointers: [
+        { display: 'Galewright', slug: 'people/ronan-galewright', source_id: 'default', synopsis: 'z', arm: 'title-surname', confidence: 0.72 },
+      ],
+      text: 'B',
+    };
+    // Empty candidate map: no salience boost — the arm's base 0.72 alone must
+    // survive the 0.70 volunteer floor (the reason it isn't 0.65).
+    const pages = gateVolunteeredPointers(block, new Map(), { windowSize: 1 });
+    expect(pages).toHaveLength(1);
+    expect(pages[0].confidence).toBeCloseTo(0.72);
+    expect(pages[0].rationale).toContain('surname match "Galewright"');
+  });
+});
+
 describe('volunteerUsageStats', () => {
   test('join math: used = last_retrieved_at > volunteered_at, labeled approximate', async () => {
     await seed('people/alice-example', 'Alice Example', 'Founder.');
@@ -450,7 +505,10 @@ describe('window-cap ordering — the newest user mention survives the cap', () 
       { role: 'assistant', text: `consider ${stale}.` },
       { role: 'user', text: 'actually ask Alice Example first' },
     ]);
-    expect(cands.length).toBeLessThanOrEqual(CAP);
+    // Re-pinned for the v0.46.15 identity wave: the STRONG cap is what this
+    // test pins; lowercase weak candidates ("consider", "ask", …) ride a
+    // separate alias-arm-restricted budget and never evict strong ones.
+    expect(cands.filter((c) => !c.weak).length).toBeLessThanOrEqual(CAP);
     const alice = cands.find((c) => normalizeAlias(c.query) === normalizeAlias('Alice Example'));
     expect(alice).toBeDefined();
     // Recency + user-role weighting puts the newest user mention FIRST.

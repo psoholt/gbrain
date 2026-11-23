@@ -11,8 +11,7 @@
 // Hermetic: PGLite + withEnv per CLAUDE.md R1/R3/R4.
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { readFileSync } from 'fs';
-import { join } from 'path';
+import { doctorSource } from './helpers/doctor-source.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { buildChecks, doctorReportRemote, type Check } from '../src/commands/doctor.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
@@ -53,12 +52,12 @@ describe('embedding_env_override check (buildChecks seam)', () => {
   });
 
   test('env+DB agree → ok', async () => {
-    await engine.setConfig('embedding_model', 'zeroentropyai:zembed-1');
-    await engine.setConfig('embedding_dimensions', '1280');
+    await engine.setConfig('embedding_model', 'voyage:voyage-4');
+    await engine.setConfig('embedding_dimensions', '1024');
     await withEnv(
       {
-        GBRAIN_EMBEDDING_MODEL: 'zeroentropyai:zembed-1',
-        GBRAIN_EMBEDDING_DIMENSIONS: '1280',
+        GBRAIN_EMBEDDING_MODEL: 'voyage:voyage-4',
+        GBRAIN_EMBEDDING_DIMENSIONS: '1024',
       },
       async () => {
         const checks = await buildChecks(engine, []);
@@ -70,7 +69,7 @@ describe('embedding_env_override check (buildChecks seam)', () => {
   });
 
   test('env model disagrees with DB → warn with details.mismatches', async () => {
-    await engine.setConfig('embedding_model', 'zeroentropyai:zembed-1');
+    await engine.setConfig('embedding_model', 'voyage:voyage-4');
     await withEnv(
       { GBRAIN_EMBEDDING_MODEL: 'openai:text-embedding-3-large' },
       async () => {
@@ -81,7 +80,7 @@ describe('embedding_env_override check (buildChecks seam)', () => {
         expect(details.mismatches).toHaveLength(1);
         expect(details.mismatches[0].key).toBe('GBRAIN_EMBEDDING_MODEL');
         expect(details.mismatches[0].env).toBe('openai:text-embedding-3-large');
-        expect(details.mismatches[0].db).toBe('zeroentropyai:zembed-1');
+        expect(details.mismatches[0].db).toBe('voyage:voyage-4');
         // Message includes paste-ready unset
         expect(check!.message).toContain('unset GBRAIN_EMBEDDING_MODEL');
       },
@@ -89,7 +88,7 @@ describe('embedding_env_override check (buildChecks seam)', () => {
   });
 
   test('env dim disagrees with DB → warn with details.mismatches', async () => {
-    await engine.setConfig('embedding_dimensions', '1280');
+    await engine.setConfig('embedding_dimensions', '1024');
     await withEnv(
       { GBRAIN_EMBEDDING_DIMENSIONS: '1536' },
       async () => {
@@ -104,8 +103,8 @@ describe('embedding_env_override check (buildChecks seam)', () => {
   });
 
   test('both disagree → 2 mismatches', async () => {
-    await engine.setConfig('embedding_model', 'zeroentropyai:zembed-1');
-    await engine.setConfig('embedding_dimensions', '1280');
+    await engine.setConfig('embedding_model', 'voyage:voyage-4');
+    await engine.setConfig('embedding_dimensions', '1024');
     await withEnv(
       {
         GBRAIN_EMBEDDING_MODEL: 'openai:x',
@@ -124,7 +123,7 @@ describe('embedding_env_override check (buildChecks seam)', () => {
 
   test('doctorReportRemote() includes the check (cross-surface parity)', async () => {
     await withEnv({ GBRAIN_EMBEDDING_MODEL: 'openai:something' }, async () => {
-      await engine.setConfig('embedding_model', 'zeroentropyai:zembed-1');
+      await engine.setConfig('embedding_model', 'voyage:voyage-4');
       const report = await doctorReportRemote(engine);
       const check = findCheck(report.checks, 'embedding_env_override');
       expect(check).toBeDefined();
@@ -138,10 +137,7 @@ describe('cross-surface parity (source-grep regression guard)', () => {
     // Static regression assertion: the helper must be called from BOTH surfaces.
     // If a future maintainer removes the call from one surface, this test fails
     // pointing at the asymmetry.
-    const src = readFileSync(
-      join(import.meta.dir, '../src/commands/doctor.ts'),
-      'utf-8',
-    );
+    const src = doctorSource();
     // The helper is called as `await checkEmbeddingEnvOverride(engine)`
     const matches = src.match(/await checkEmbeddingEnvOverride\(engine\)/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(2);

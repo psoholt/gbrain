@@ -25,6 +25,9 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import type { TrustTier } from '../trust/tier.ts';
+import type { ReadEligibility } from '../eligibility/policy.ts';
+import { proactiveEligibility } from '../eligibility/registry.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import {
   extractCandidatesFromWindow,
@@ -35,6 +38,7 @@ import {
   resolveEntitiesToPointers,
   ARM_CONFIDENCE,
   type ResolveArm,
+  type PointerBlock,
 } from './retrieval-reflex.ts';
 
 export const VOLUNTEER_DEFAULT_MAX_PAGES = 3;
@@ -52,6 +56,9 @@ export interface VolunteeredPage {
   /** Deterministic template string — never raw conversation text. */
   rationale: string;
   synopsis: string;
+  /** #5575 A6: the page's trust tier and short write origin. */
+  trust_tier?: TrustTier;
+  origin?: string;
 }
 
 export interface VolunteerOpts {
@@ -68,6 +75,14 @@ export interface VolunteerOpts {
   excludeSlugs?: ReadonlySet<string>;
   maxPages?: number;
   minConfidence?: number;
+  /** v0.46.15: lexical-arms kill switch — see ResolvePointersOpts.lexicalArms. */
+  lexicalArms?: boolean;
+  /** Private-page filter — see ResolvePointersOpts.excludePrivate (default true). */
+  excludePrivate?: boolean;
+  /** #5575: the enclosing surface's proactive eligibility; absent, the `volunteer` surface policy applies. */
+  eligibility?: ReadEligibility;
+  /** #5575 DX-10: receives the page keys (`source_id:slug`) activation control withheld. */
+  onWithheld?: (keys: string[]) => void;
 }
 
 /** Shared wire protocol for window turns — watch.ts imports this so the two
@@ -112,6 +127,8 @@ function rationaleFor(arm: ResolveArm, display: string, c: WindowEntityCandidate
   const armText =
     arm === 'alias' ? `alias match "${display}"`
     : arm === 'title' ? `exact title match "${display}"`
+    : arm === 'title-surname' ? `surname match "${display}"`
+    : arm === 'cjk-title' ? `exact CJK title/slug match "${display}"`
     : `slug match "${display}"`;
   if (!c) return armText;
   const parts = [armText];
@@ -121,40 +138,42 @@ function rationaleFor(arm: ResolveArm, display: string, c: WindowEntityCandidate
   return parts.join('; ');
 }
 
-/**
- * Volunteer confidence-gated pages for a conversation window. Pure read —
- * event logging is the CALLER's job (through the volunteer-events sink).
- * Non-relational, zero-LLM; returns [] when nothing clears the gate.
- */
-export async function volunteerContext(
-  engine: BrainEngine,
-  turns: WindowTurn[],
-  opts: VolunteerOpts,
-): Promise<VolunteeredPage[]> {
-  if (!turns.length || !opts.sourceIds?.length) return [];
-  const candidates = extractCandidatesFromWindow(turns);
-  if (!candidates.length) return [];
+/** Options for the pure confidence-gate step (see gateVolunteeredPointers). */
+export interface GateOpts {
+  maxPages?: number;
+  minConfidence?: number;
+  /** Skipped BEFORE gate + cap — see VolunteerOpts.excludeSlugs. */
+  excludeSlugs?: ReadonlySet<string>;
+  /** Turn count of the extraction window — feeds the rationale template. */
+  windowSize: number;
+}
+
+/** Build the norm→candidate provenance map the gate joins pointers against. */
+export function candidatesByNorm(candidates: WindowEntityCandidate[]): Map<string, WindowEntityCandidate> {
   const byNorm = new Map<string, WindowEntityCandidate>();
   for (const c of candidates) {
     const norm = normalizeAlias(c.query);
     if (norm && !byNorm.has(norm)) byNorm.set(norm, c);
   }
+  return byNorm;
+}
 
+/**
+ * The pure confidence-gate step: pointer pool in, gated VolunteeredPage[] out.
+ * Extracted from volunteerContext so the gate is deterministic, zero-I/O, and
+ * directly unit-testable (idempotency pinned in test/volunteer-context.test.ts:
+ * gating an already-gated set is a no-op).
+ */
+export function gateVolunteeredPointers(
+  block: PointerBlock,
+  byNorm: ReadonlyMap<string, WindowEntityCandidate>,
+  opts: GateOpts,
+): VolunteeredPage[] {
   const maxPages = clampMaxPages(opts.maxPages);
   const minConfidence =
     typeof opts.minConfidence === 'number' && opts.minConfidence >= 0 && opts.minConfidence <= 1
       ? opts.minConfidence
       : VOLUNTEER_DEFAULT_MIN_CONFIDENCE;
-
-  // Resolve up to the hard cap so the confidence gate sees the full pool —
-  // a gated-out alias hit must not shadow a passing title hit behind it.
-  const block = await resolveEntitiesToPointers(engine, opts.sourceIds[0], candidates, {
-    sourceIds: opts.sourceIds,
-    priorContextText: opts.priorContext,
-    suppression: 'slug-only',
-    maxPointers: VOLUNTEER_MAX_PAGES_CAP * 2,
-  });
-  if (!block) return [];
 
   const out: VolunteeredPage[] = [];
   for (const p of block.pointers) {
@@ -166,18 +185,136 @@ export async function volunteerContext(
     const boost = cand && (cand.occurrences >= 2 || cand.inNewestTurn) ? VOLUNTEER_SALIENCE_BOOST : 0;
     const confidence = Math.min(0.99, ARM_CONFIDENCE[p.arm] + boost);
     if (confidence < minConfidence) continue;
+    // Collapse whitespace in display at CONSTRUCTION (adversarial review,
+    // 2026-09): display comes from brain content (page titles/aliases) and
+    // renders into single-line prompt bullets in both lanes — a multi-line
+    // title must not be able to forge markdown structure in the injected
+    // block. synopsis is already collapse+clip sanitized (safeSynopsis);
+    // rationale is template-generated from this sanitized display.
+    const display = p.display.replace(/\s+/g, ' ').trim();
     out.push({
       slug: p.slug,
       source_id: p.source_id,
-      display: p.display,
+      display,
       confidence,
       arm: p.arm,
-      rationale: rationaleFor(p.arm, p.display, cand, turns.length),
+      rationale: rationaleFor(p.arm, display, cand, opts.windowSize),
       synopsis: p.synopsis,
+      ...(p.trust_tier ? { trust_tier: p.trust_tier, origin: p.origin } : {}),
     });
     if (out.length >= maxPages) break;
   }
   return out;
+}
+
+/**
+ * The resolve I/O a volunteer stage needs — structurally compatible with the
+ * reflex orchestrator's ResolveEntitiesFn AND a directly-bound
+ * resolveEntitiesToPointers closure, without importing either (reflex.ts
+ * imports this module; a type import back would be a cycle).
+ */
+export type VolunteerResolveFn = (
+  candidates: WindowEntityCandidate[],
+  opts: {
+    priorContextText?: string;
+    /**
+     * CONTRACT (red-team, 2026-09): the resolver MUST honor this cap — the
+     * volunteer stage requests a wide ungated pool (VOLUNTEER_MAX_PAGES_CAP*2)
+     * so the confidence gate sees every candidate; a resolver that silently
+     * applies its own smaller pointer budget reintroduces the gated-out-alias-
+     * shadows-a-passing-title bug the wide pool exists to prevent, with no
+     * telemetry (host rungs can't log). Host-injected resolvers that ignore
+     * `probe` are tolerated; ignoring `maxPointers` is not.
+     */
+    maxPointers?: number;
+    suppression?: 'slug-and-title' | 'slug-only';
+    lexicalArms?: boolean;
+    /** Telemetry marker: a wide ungated pool resolve for the volunteer gate —
+     * delivery loggers must NOT count it as injected pointers. */
+    probe?: 'volunteer';
+  },
+) => Promise<PointerBlock | null>;
+
+export interface VolunteerStageOpts {
+  /** Skipped BEFORE gate + cap — typically the turn's already-injected pointer slugs. */
+  excludeSlugs?: ReadonlySet<string>;
+  priorContextText?: string;
+  lexicalArms?: boolean;
+  maxPages?: number;
+  minConfidence?: number;
+}
+
+/**
+ * THE volunteer primitive (2026-08 fix wave, eng-review E1/E2): window
+ * candidates in, gated VolunteeredPage[] out, resolve I/O injected. It OWNS
+ * its resolve options — slug-only suppression and the wide ungated pool cap —
+ * so no caller's seam configuration can skew the stage: volunteerContext
+ * (op/watch/turn-context), the production reflex lane, and the BrainBench
+ * openclaw adapter all volunteer identically BY CONSTRUCTION. Callers pass
+ * only data (resolve closure, candidates, exclusions, prior context).
+ */
+export async function volunteerStage(
+  resolve: VolunteerResolveFn,
+  candidates: WindowEntityCandidate[],
+  windowSize: number,
+  opts: VolunteerStageOpts = {},
+): Promise<VolunteeredPage[]> {
+  if (!candidates.length) return [];
+  // Resolve up to the hard cap so the confidence gate sees the full pool —
+  // a gated-out alias hit must not shadow a passing title hit behind it.
+  const block = await resolve(candidates, {
+    priorContextText: opts.priorContextText,
+    suppression: 'slug-only',
+    maxPointers: VOLUNTEER_MAX_PAGES_CAP * 2,
+    lexicalArms: opts.lexicalArms,
+    probe: 'volunteer',
+  });
+  if (!block) return [];
+
+  return gateVolunteeredPointers(block, candidatesByNorm(candidates), {
+    maxPages: opts.maxPages,
+    minConfidence: opts.minConfidence,
+    excludeSlugs: opts.excludeSlugs,
+    windowSize,
+  });
+}
+
+/**
+ * Volunteer confidence-gated pages for a conversation window. Pure read —
+ * event logging is the CALLER's job (through the volunteer-events sink).
+ * Non-relational, zero-LLM; returns [] when nothing clears the gate.
+ * Engine-bound wrapper over volunteerStage (the one implementation).
+ */
+export async function volunteerContext(
+  engine: BrainEngine,
+  turns: WindowTurn[],
+  opts: VolunteerOpts,
+): Promise<VolunteeredPage[]> {
+  if (!turns.length || !opts.sourceIds?.length) return [];
+  const candidates = extractCandidatesFromWindow(turns);
+  const eligibility = opts.eligibility ?? await proactiveEligibility({ engine }, 'volunteer');
+  return volunteerStage(
+    (cands, ropts) =>
+      resolveEntitiesToPointers(engine, opts.sourceIds[0], cands, {
+        sourceIds: opts.sourceIds,
+        priorContextText: ropts.priorContextText,
+        suppression: ropts.suppression,
+        maxPointers: ropts.maxPointers,
+        lexicalArms: ropts.lexicalArms,
+        excludePrivate: opts.excludePrivate,
+        eligibility,
+        onWithheld: opts.onWithheld,
+      }),
+    candidates,
+    turns.length,
+    {
+      excludeSlugs: opts.excludeSlugs,
+      priorContextText: opts.priorContext,
+      lexicalArms: opts.lexicalArms,
+      maxPages: opts.maxPages,
+      minConfidence: opts.minConfidence,
+    },
+  );
 }
 
 /**
@@ -233,10 +370,11 @@ export async function volunteerUsageStats(
     rows = await engine.executeRaw(
       `SELECT e.match_arm, e.channel,
               count(*)::text AS volunteered,
-              count(*) FILTER (WHERE p.last_retrieved_at > e.volunteered_at)::text AS used
+              count(*) FILTER (WHERE GREATEST(p.last_retrieved_at, r.last_retrieved_at) > e.volunteered_at)::text AS used
          FROM context_volunteer_events e
          LEFT JOIN pages p
            ON p.source_id = e.source_id AND p.slug = e.slug AND p.deleted_at IS NULL
+         LEFT JOIN page_retrievals r ON r.page_id = p.id
         WHERE e.source_id = ANY($1::text[])
           AND e.volunteered_at > now() - ($2 || ' days')::interval
         GROUP BY e.match_arm, e.channel

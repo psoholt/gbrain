@@ -14,14 +14,22 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
-import matter from 'gray-matter';
+import { dataFrontmatter as matter } from '../../src/core/data-frontmatter.ts';
 import { runCapture, __testing } from '../../src/commands/capture.ts';
+import { configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
+import { currentExitCode, setCliExitVerdict, _resetCliExitVerdictForTests } from '../../src/core/cli-force-exit.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
 let brainDir: string;
 
 beforeAll(async () => {
+  // Keep capture's put_page integration hermetic under CI's fake provider keys.
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: 1536,
+    env: {},
+  });
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -29,6 +37,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
+  resetGateway();
 });
 
 beforeEach(async () => {
@@ -37,7 +46,30 @@ beforeEach(async () => {
   brainDir = path.join(tmpRoot, 'brain');
   fs.mkdirSync(brainDir, { recursive: true });
   await engine.setConfig('sync.repo_path', brainDir);
+  // #4655: pin the active pack via the DB plane (tier-4) so the write-time
+  // vocabulary check resolves gbrain-base regardless of the host's file config.
+  await engine.setConfig('schema_pack', 'gbrain-base');
 });
+
+/** Capture the CLI's owned verdict; error receipts return through normal teardown. */
+async function runCaptureExpectingExit(args: string[]): Promise<{ exitCode: number | undefined; stderr: string }> {
+  const errCaptured: string[] = [];
+  const origErr = console.error;
+  const originalVerdict = currentExitCode();
+  const originalExitCode = process.exitCode;
+  _resetCliExitVerdictForTests();
+  let exitCode: number | undefined;
+  console.error = (...a: unknown[]) => errCaptured.push(a.map(String).join(' '));
+  try {
+    await runCapture(engine, args);
+    exitCode = currentExitCode();
+  } finally {
+    console.error = origErr;
+    setCliExitVerdict(originalVerdict);
+    process.exitCode = originalExitCode ?? 0;
+  }
+  return { exitCode, stderr: errCaptured.join('\n') };
+}
 
 describe('capture — defaultSlug helper', () => {
   test('builds inbox/YYYY-MM-DD-<hash8> shape', () => {
@@ -136,12 +168,13 @@ describe('capture — buildContent', () => {
     expect(parsed.data.title).toBe('Real first line');
   });
 
-  test('caps title at 80 chars', () => {
+  test('caps title at 80 chars with explicit ellipsis', () => {
     const longLine = 'x'.repeat(200);
     const result = __testing.buildContent(longLine, {});
     const parsed = matter(result);
     expect(typeof parsed.data.title).toBe('string');
     expect((parsed.data.title as string).length).toBeLessThanOrEqual(80);
+    expect((parsed.data.title as string).endsWith('…')).toBe(true);
   });
 
   test('honors --source via captured_via', () => {
@@ -204,6 +237,47 @@ describe('capture — local install integration', () => {
     const page = await engine.getPage('inbox/from-file');
     expect(page).not.toBeNull();
     expect(page?.compiled_truth).toContain('body content here');
+  });
+
+  // #4655: EXPLICIT undeclared page types fail loud on the CLI surface too.
+  test('--type with an undeclared page type exits 1 before writing', async () => {
+    const { exitCode, stderr } = await runCaptureExpectingExit(
+      ['--slug', 'inbox/bad-explicit-type', '--type', 'definitely_not_a_type', '--quiet', 'body'],
+    );
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("page type 'definitely_not_a_type' is not declared");
+    expect(stderr).toContain('gbrain-base');
+    // The rejection names the declared vocabulary so agents can self-correct.
+    expect(stderr).toContain('Use a declared page type');
+    expect(stderr).toContain('analysis');
+    expect(await engine.getPage('inbox/bad-explicit-type')).toBeNull();
+  });
+
+  test('--file rejects an undeclared frontmatter type before writing', async () => {
+    const file = path.join(tmpRoot, 'bad-type.md');
+    fs.writeFileSync(file, '---\ntype: definitely_not_a_type\n---\n\nbody content here');
+    const { exitCode, stderr } = await runCaptureExpectingExit(
+      ['--file', file, '--slug', 'inbox/bad-frontmatter-type', '--quiet'],
+    );
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("page type 'definitely_not_a_type' is not declared");
+    expect(await engine.getPage('inbox/bad-frontmatter-type')).toBeNull();
+    expect(fs.existsSync(path.join(brainDir, 'inbox/bad-frontmatter-type.md'))).toBe(false);
+  });
+
+  test('a declared --type still captures under an active pack', async () => {
+    const logCaptured: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]) => logCaptured.push(args.map(String).join(' '));
+    try {
+      await runCapture(engine, ['--slug', 'inbox/declared-type', '--type', 'meeting', '--quiet', 'a meeting note']);
+    } finally {
+      console.log = origLog;
+    }
+    const page = await engine.getPage('inbox/declared-type');
+    expect(page).not.toBeNull();
+    // put_page lifts the stamped frontmatter `type` into the type column.
+    expect(page?.type).toBe('meeting');
   });
 
   test('--json emits structured output', async () => {
